@@ -1,8 +1,8 @@
 use crate::AppConfig;
 use crate::AppState;
-use crate::protect::crypto::{calcul_factorhash, decrypt, derive_key_from_secret};
+use crate::token::crypto::{calcul_factorhash, decrypt, derive_key_from_secret};
 use crate::timezone::check_date_token;
-use crate::build_info::get;
+use crate::build::build_info::get;
 use actix_web::web;
 use chrono::{Timelike, Utc, Duration, TimeZone};
 use hex;
@@ -142,7 +142,7 @@ pub async fn validate_token(
     data_app: &web::Data<AppState>,
     config: &AppConfig,
     ip: &str,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let key = derive_key_from_secret(&config.secret);
 
     let decrypt_token = decrypt(token, &key).map_err(|_| "Invalid token format")?;
@@ -197,7 +197,7 @@ pub async fn validate_token(
         );
     }
 
-    Ok(user.username.to_string())
+    Ok((user.username.to_string(), data[3].to_string()))
 }
 
 pub fn extract_token_user(token: &str, config: &AppConfig, ip: String) -> Result<String, String> {
