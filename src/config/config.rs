@@ -1,19 +1,19 @@
-use crate::token::auth::generate_random_string;
 use crate::stats::tokencount::CounterToken;
+use crate::token::auth::generate_random_string;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
-use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
-use std::collections::HashMap;
-use std::fs;
-use std::sync::Arc;
 use hyper::Client;
 use hyper::client::HttpConnector;
-use hyper_rustls::HttpsConnector;
 use hyper_proxy::ProxyConnector;
+use hyper_rustls::HttpsConnector;
 use serde::Deserializer;
-use std::fmt;
 use serde::de::MapAccess;
 use serde::de::Visitor;
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
+use std::collections::HashMap;
+use std::fmt;
+use std::fs;
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 pub struct RouteRule {
@@ -38,7 +38,6 @@ pub struct RouteRule {
     #[serde(default = "default_backends")]
     pub backends: Vec<BackendInput>,
 }
-
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BackendConfig {
@@ -264,11 +263,9 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
     Arc::new(config)
 }
 
-fn deserialize_log_map<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<String, String>, D::Error>
+fn deserialize_log_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
 where
-D: Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     struct LogMapVisitor;
 
@@ -281,7 +278,7 @@ D: Deserializer<'de>,
 
         fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
         where
-        M: MapAccess<'de>,
+            M: MapAccess<'de>,
         {
             let mut map = HashMap::new();
             while let Some((k, v)) = access.next_entry::<String, serde_json::Value>()? {
