@@ -2,7 +2,7 @@ use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::revoke::db::revoke_token;
+use crate::revoke::load::revoke_token;
 
 #[derive(Deserialize)]
 pub struct RevokeRequest {
@@ -23,7 +23,7 @@ pub async fn revoke_route(
             let token_id = &body.token_id;
             let exp = body.exp;
 
-            match revoke_token(token_id, exp, &data.revoked_tokens) {
+            match revoke_token(token_id, exp, &data.revoked_tokens).await {
                 Ok(_) => {
                     if exp.is_some() {
                         HttpResponse::Ok().body("Token revoked with expiration.")

@@ -2,7 +2,7 @@ use actix_web::{App, HttpResponse, test, web};
 use proxyauth::network::shared_client::{
     ClientOptions, build_hyper_client_cert, build_hyper_client_normal, build_hyper_client_proxy,
 };
-use proxyauth::revoke::load::load_revoked_tokens;
+use proxyauth::revoke::db::load_revoked_tokens;
 use proxyauth::{AppConfig, AppState, CounterToken, RouteConfig, auth as auth_handler};
 use serde::de::DeserializeOwned;
 use serde_json::json;
