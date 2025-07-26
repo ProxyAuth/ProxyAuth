@@ -31,7 +31,7 @@ use crate::adm::revoke::revoke_route;
 use crate::build::build_info::update_build_info;
 use crate::cli::prompt::prompt;
 use crate::keystore::import::decrypt_keystore;
-use crate::revoke::load::{start_revoked_token_ttl, load_revoked_tokens};
+use crate::revoke::db::{start_revoked_token_ttl, load_revoked_tokens};
 use crate::tls::check_port;
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{App, HttpServer, web};
@@ -49,13 +49,15 @@ use socket2::{Domain, Protocol, Socket, Type};
 use start_actix::mode_actix_web;
 use stats::stats::stats as metric_stats;
 pub use stats::tokencount::CounterToken;
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::{fs, process, sync::Arc, time::Duration};
+use std::sync::RwLock;
 use tls::load_rustls_config;
 use token::auth::auth;
 use token::security::init_derived_key;
 use tokio::sync::mpsc::unbounded_channel;
-use tracing::warn;
+use tracing::{warn, error};
 use tracing_loki::url::Url;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
@@ -130,7 +132,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let counter_token = Arc::new(CounterToken::new());
 
-    let revoked_tokens = load_revoked_tokens().expect("failed to load revoked token database");
+    let revoked_tokens = match load_revoked_tokens() {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            error!("Failed to load revoked token database: {}. Using empty token map.", e);
+            Arc::new(RwLock::new(HashMap::new()))
+        }
+    };
+
+    start_revoked_token_ttl(revoked_tokens.clone(), std::time::Duration::from_secs(15), config.redis.clone()).await;
 
     let client_normal = build_hyper_client_normal(&config);
     let client_with_cert = build_hyper_client_cert(
@@ -165,7 +175,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         revoked_tokens
     });
 
-    start_revoked_token_ttl(state.revoked_tokens.clone(), Duration::from_secs(15)).await;
     init_derived_key(&config.secret);
 
     // logs
