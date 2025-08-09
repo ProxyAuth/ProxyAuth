@@ -17,25 +17,60 @@ use std::str::FromStr;
 use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 use once_cell::sync::OnceCell;
+use std::cmp::Ordering;
 
 static ORDERED_ROUTE_IDX: OnceCell<Vec<usize>> = OnceCell::new();
 
+
+fn norm_len(prefix: &str) -> usize {
+    if prefix == "/" { 0 } else { prefix.trim_end_matches('/').len() }
+}
+
 pub fn init_routes(routes: &[RouteRule]) {
     let mut idx: Vec<usize> = (0..routes.len()).collect();
-    idx.sort_by_key(|&i| (routes[i].prefix == "/") as u8);
+
+    idx.sort_by(|&i, &j| {
+        let pi = routes[i].prefix.as_str();
+        let pj = routes[j].prefix.as_str();
+
+        let ri = pi == "/";
+        let rj = pj == "/";
+
+        match (ri, rj) {
+            (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                _ => {
+                    let li = norm_len(pi);
+                    let lj = norm_len(pj);
+                    if li != lj {
+                        lj.cmp(&li)
+                    } else {
+                        pi.cmp(pj)
+                    }
+                }
+        }
+    });
+
     ORDERED_ROUTE_IDX.set(idx).ok();
 }
 
+fn matches_prefix(path: &str, prefix: &str) -> bool {
+    if prefix == "/" { return true; }
+    let p = prefix.trim_end_matches('/');
+    path == p || path.starts_with(&(p.to_string() + "/"))
+}
+
 pub fn match_route<'a>(path: &str, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
-    let idx = ORDERED_ROUTE_IDX.get().expect("route order not initialized");
-    for &i in idx {
+    let order = ORDERED_ROUTE_IDX.get().expect("route order not initialized");
+    for &i in order {
         let r = &routes[i];
-        if path.starts_with(&r.prefix) {
+        if matches_prefix(path, &r.prefix) {
             return Some(r);
         }
     }
     None
 }
+
 
 
 pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -> Builder {

@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "0.8.6"
+version = "0.8.7-beta0"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://github.com/ProxyAuth/ProxyAuth"
@@ -99,3 +99,5 @@ mime = "0.3"
 flate2 = "1"
 subtle = "2"
 brotli = "3.3"
+lru = "0.12"
+hkdf = "0.12"
