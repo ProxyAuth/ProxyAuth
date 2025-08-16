@@ -17,7 +17,7 @@ use rand::RngCore;
 
 const KEY_LEN: usize = 32;
 const TAG_V1: u8 = 1;
-const TAG_V1_PW: u8 = 0xE1;
+pub const TAG_V1_PW: u8 = 0xE1;
 const HKDF_SALT_CONST: &[u8] = b"proxyauth.hkdf.v1";
 const HKDF_INFO_DERIVE: &[u8] = b"derive_key_from_secret.v1";
 const HKDF_INFO_PW: &[u8] = b"encrypt_base64.password.v1";
@@ -85,7 +85,7 @@ pub fn decrypt(obsf: &str, key: &[u8]) -> Result<String, ()> {
     String::from_utf8(pt).map_err(|_| ())
 }
 
-fn split_hash(s: String, n: usize) -> Vec<String> {
+pub fn split_hash(s: String, n: usize) -> Vec<String> {
     if n == 0 {
         return vec![s];
     }
@@ -97,12 +97,12 @@ fn split_hash(s: String, n: usize) -> Vec<String> {
     out
 }
 
-struct Blake3Keystream {
+pub struct Blake3Keystream {
     rdr: blake3::OutputReader,
 }
 
 impl Blake3Keystream {
-    fn new(factor: u64) -> Self {
+    pub fn new(factor: u64) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(b"proxyauth.process_string.keystream.v1");
         h.update(&factor.to_le_bytes());
@@ -110,7 +110,7 @@ impl Blake3Keystream {
         Self { rdr }
     }
     #[inline]
-    fn next_u8(&mut self) -> u8 {
+    pub fn next_u8(&mut self) -> u8 {
         let mut b = [0u8; 1];
         self.rdr.fill(&mut b);
         b[0]

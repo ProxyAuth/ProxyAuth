@@ -13,21 +13,12 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime};
-use tokio::spawn;
-use tokio::time::{Duration as TokioDuration, interval};
 use actix_web::HttpResponseBuilder;
+use tokio::time::{MissedTickBehavior, interval};
 use actix_web::http::{header::{CONTENT_TYPE as CONTENT_TYPE_ACTIX, HeaderValue as HeaderValue_ACTIX}, StatusCode};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[derive(Clone)]
-pub struct CsrfNonceStore {
-    used: Arc<DashMap<Vec<u8>, i64>>,
-}
-
-pub static CSRF_STORE: Lazy<CsrfNonceStore> = Lazy::new(|| {
-    let store = CsrfNonceStore::new();
-    spawn_csrf_purger(store.clone());
-    store
-});
+pub static PURGE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 impl CsrfNonceStore {
     pub fn new() -> Self {
@@ -54,18 +45,161 @@ impl CsrfNonceStore {
     pub fn purge_expired(&self) {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         self.used.retain(|_, exp| *exp > now);
+
+        // + compteur test-only
+        {
+            PURGE_HOOK.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
 pub fn spawn_csrf_purger(store: CsrfNonceStore) {
-    spawn(async move {
-        let mut tick = interval(TokioDuration::from_secs(3600));
-        loop {
-            tick.tick().await;
-            store.purge_expired();
-        }
-    });
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                store.purge_expired();
+            }
+        });
+    } else {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+                store.purge_expired();
+            }
+        });
+    }
 }
+
+
+pub trait IntoStdDuration {
+    fn into_std(self) -> std::time::Duration;
+}
+
+impl IntoStdDuration for std::time::Duration {
+    #[inline]
+    fn into_std(self) -> std::time::Duration { self }
+}
+
+impl IntoStdDuration for time::Duration {
+    #[inline]
+    fn into_std(self) -> std::time::Duration {
+        self.try_into().expect("negative duration not supported")
+    }
+}
+
+
+#[allow(dead_code)]
+pub fn spawn_csrf_purger_for_tests(
+    store: CsrfNonceStore,
+    period: impl IntoStdDuration,
+) {
+    let period_std: std::time::Duration = period.into_std();
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let mut tick = tokio::time::interval(period_std);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                tick.tick().await;
+                let count: usize = purge_and_count(&store);
+                PURGE_HOOK.fetch_add(count, Ordering::SeqCst);
+            }
+        });
+    } else {
+        std::thread::spawn(move || {
+            // purge immédiate au lancement (utile pour les tests)
+            let count0: usize = purge_and_count(&store);
+            PURGE_HOOK.fetch_add(count0, Ordering::SeqCst);
+
+            loop {
+                std::thread::sleep(period_std);
+                let count: usize = purge_and_count(&store);
+                PURGE_HOOK.fetch_add(count, Ordering::SeqCst);
+            }
+        });
+    }
+}
+
+#[allow(dead_code)]
+pub fn spawn_csrf_purger_for_tests_with_notify(
+    store: CsrfNonceStore,
+    period: std::time::Duration,
+    notify: Option<tokio::sync::oneshot::Sender<usize>>,
+) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let mut tick = interval(period);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            tick.tick().await;
+            let count = purge_and_count(&store);
+            PURGE_HOOK.fetch_add(count, Ordering::SeqCst);
+            if let Some(tx) = notify { let _ = tx.send(count); }
+
+            loop {
+                tick.tick().await;
+                let c = purge_and_count(&store);
+                PURGE_HOOK.fetch_add(c, Ordering::SeqCst);
+            }
+        });
+    } else {
+        std::thread::spawn(move || {
+            let count0 = purge_and_count(&store);
+            PURGE_HOOK.fetch_add(count0, Ordering::SeqCst);
+            if let Some(tx) = notify {
+
+                let _ = tx.send(count0);
+            }
+            loop {
+                std::thread::sleep(period);
+                let c = purge_and_count(&store);
+                PURGE_HOOK.fetch_add(c, Ordering::SeqCst);
+            }
+        });
+    }
+}
+
+
+fn purge_and_count(store: &CsrfNonceStore) -> usize {
+    store.purge_expired();
+    1
+}
+
+
+
+
+
+impl CsrfNonceStore {
+    #[allow(dead_code)]
+    pub fn clear_for_tests(&self) {
+        self.used.clear();
+    }
+
+    #[allow(dead_code)]
+    pub fn insert_expired_for_tests(&self, key: &str) {
+        use time::Duration;
+        use time::OffsetDateTime;
+
+        // exemple : un timestamp dans le passé
+        let exp = (OffsetDateTime::now_utc() - Duration::seconds(5)).unix_timestamp();
+        self.used.insert(key.as_bytes().to_vec(), exp);
+    }
+}
+
+#[derive(Clone)]
+pub struct CsrfNonceStore {
+    pub used: Arc<DashMap<Vec<u8>, i64>>,
+}
+
+pub static CSRF_STORE: Lazy<CsrfNonceStore> = Lazy::new(|| {
+    let store = CsrfNonceStore::new();
+    spawn_csrf_purger(store.clone());
+    store
+});
+
 
 pub fn validate_csrf_token(
     method: &actix_web::http::Method,
@@ -298,7 +432,7 @@ pub fn inject_csrf_token(
     }
 }
 
-fn is_static_asset(path: &str) -> bool {
+pub fn is_static_asset(path: &str) -> bool {
     path.starts_with("/assets/")
     || path.ends_with(".css")
     || path.ends_with(".js")
