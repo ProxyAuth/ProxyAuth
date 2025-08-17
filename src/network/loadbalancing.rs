@@ -34,14 +34,12 @@ type ProxyArcClient = Arc<Client<ProxyConnector<hyper_rustls::HttpsConnector<Htt
 type ProxyClientPool = DashMap<(String, String), ProxyArcClient, RandomState>;
 static PROXY_CLIENT_POOL: Lazy<ProxyClientPool> = Lazy::new(ProxyClientPool::default);
 
-static LAST_GOOD_BACKEND: Lazy<AHasherDashMap<&'static str, (String, Instant)>> =
+static LAST_GOOD_BACKEND: Lazy<AHasherDashMap<String, (String, Instant)>> =
 Lazy::new(Default::default);
 static BACKEND_COOLDOWN: Lazy<AHasherDashMap<String, CooldownEntry>> =
 Lazy::new(Default::default);
 static ROUND_ROBIN_COUNTER: Lazy<AtomicUsize> =
 Lazy::new(|| AtomicUsize::new(0));
-
-const BACKEND_CACHE_KEY: &str = "service";
 
 struct CooldownEntry {
     last_failed: Instant,
@@ -50,13 +48,13 @@ struct CooldownEntry {
 
 fn lb() -> &'static LbTuning {
     LB_TUNING.get().unwrap_or(&LbTuning {
-        request_timeout_ms: 1500,
+        request_timeout_ms: 2000,
         pool_max_idle_per_host: 1000,
         keep_alive_secs: 30,
-        backend_valid_duration_secs: 10,
-        cooldown_base_secs: 5,
-        cooldown_max_secs: 10,
-        backend_reset_threshold_secs: 5,
+        backend_valid_duration_secs: 2,
+        cooldown_base_secs: 2,
+        cooldown_max_secs: 5,
+        backend_reset_threshold_secs: 10,
     })
 }
 
@@ -89,6 +87,11 @@ fn is_in_cooldown(url: &str) -> bool {
 struct SwrrState {
     effective: i32,
     current: i32,
+}
+
+fn cache_key(method: &Method, uri: &Uri, _headers: &hyper::HeaderMap) -> String {
+    let host = uri.authority().map(|a| a.as_str()).unwrap_or("default");
+    format!("{}|{}", method, host)
 }
 
 static SWRR_STATE: Lazy<DashMap<String, SwrrState, RandomState>> =
@@ -222,11 +225,13 @@ pub async fn forward_failover(
     let headers = req.headers().clone();
     let body_bytes = to_bytes(req.into_body()).await?;
 
-    // Purge soft des cooldowns
+    // Purge soft cooldowns
     let now = Instant::now();
     BACKEND_COOLDOWN.retain(|_, entry| now.duration_since(entry.last_failed) < backend_reset_threshold());
 
-    if let Some((cached_url, when)) = LAST_GOOD_BACKEND.get(BACKEND_CACHE_KEY).map(|e| e.clone()) {
+    let ctx_key = cache_key(&method, &uri, &headers);
+
+    if let Some((cached_url, when)) = LAST_GOOD_BACKEND.get(&ctx_key).map(|e| e.clone()) {
         if when.elapsed() <= backend_valid_duration() && !is_in_cooldown(&cached_url) {
             match try_forward_to_backend(&cached_url, proxy_addr, &body_bytes, &method, &uri, &headers).await {
                 Ok(resp) => return Ok(resp),
@@ -297,7 +302,7 @@ async fn try_backends(
 
         match try_forward_to_backend(url, proxy_addr, body_bytes, method, uri, headers).await {
             Ok(resp) => {
-                LAST_GOOD_BACKEND.insert(BACKEND_CACHE_KEY, (url.clone(), Instant::now()));
+                LAST_GOOD_BACKEND.insert(cache_key(method, uri, headers), (url.clone(), Instant::now()));
                 BACKEND_COOLDOWN.remove(url);
                 return Some(resp);
             }
@@ -420,13 +425,13 @@ mod tests {
     #[test]
     fn lb_defaults_are_used_when_not_set() {
         let d = lb();
-        assert_eq!(d.request_timeout_ms, 1500);
+        assert_eq!(d.request_timeout_ms, 2000);
         assert_eq!(d.pool_max_idle_per_host, 1000);
         assert_eq!(d.keep_alive_secs, 30);
-        assert_eq!(d.backend_valid_duration_secs, 10);
-        assert_eq!(d.cooldown_base_secs, 5);
-        assert_eq!(d.cooldown_max_secs, 10);
-        assert_eq!(d.backend_reset_threshold_secs, 5);
+        assert_eq!(d.backend_valid_duration_secs, 2);
+        assert_eq!(d.cooldown_base_secs, 2);
+        assert_eq!(d.cooldown_max_secs, 5);
+        assert_eq!(d.backend_reset_threshold_secs, 10);
     }
 
     #[serial_test::serial]

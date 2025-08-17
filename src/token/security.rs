@@ -15,7 +15,6 @@ use blake3;
 use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use tracing::{error, info, warn};
@@ -173,10 +172,7 @@ pub fn generate_token(
 ) -> String {
     let values_map = HashMap::from([
         ("username", username.to_string()),
-        (
-          "secret_with_timestamp",
-          generate_secret(&config.secret, &config.token_expiry_seconds),
-        ),
+        ("secret_with_timestamp", generate_secret(&config.secret, &config.token_expiry_seconds)),
         ("build_time", get_build_time().to_string()),
         ("time_expire", time_expire.to_string()),
         ("build_rand", get_build_rand().to_string()),
@@ -184,15 +180,13 @@ pub fn generate_token(
     ]);
 
     let shuffled: Vec<String> = get()
-        .shuffled_order_list()
-        .iter()
-        .map(|k| values_map[k.as_str()].clone())
-        .collect();
+    .shuffled_order_list()
+    .iter()
+    .map(|k| values_map[k.as_str()].clone())
+    .collect();
 
     let shuffle_data = shuffled.join(":");
-    let mut signature = Sha256::new();
-    signature.update(shuffle_data.as_bytes());
-    format!("{:x}", signature.finalize())
+    blake3::hash(shuffle_data.as_bytes()).to_hex().to_string()
 }
 
 pub async fn validate_token(

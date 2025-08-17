@@ -22,9 +22,9 @@ pub fn init_loadbalancer(cfg: &AppConfig) {
         pool_max_idle_per_host: cfg.max_idle_per_host as usize,
         keep_alive_secs: cfg.keep_alive,
 
-        backend_valid_duration_secs: 5,
+        backend_valid_duration_secs: 2,
         cooldown_base_secs: 2,
-        cooldown_max_secs: 15,
-        backend_reset_threshold_secs: 6,
+        cooldown_max_secs: 5,
+        backend_reset_threshold_secs: 10,
     });
 }
