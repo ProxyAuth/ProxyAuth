@@ -128,6 +128,7 @@ mod tests {
 
     fn base_config() -> AppConfig {
         AppConfig {
+            fast: false,
             token_expiry_seconds: 3600,
             secret: "secret".into(),
             users: vec![],

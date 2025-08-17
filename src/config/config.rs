@@ -220,6 +220,9 @@ pub struct AppConfig {
 
     #[serde(default = "default_csrf_token")]
     pub csrf_token: bool,
+
+    #[serde(default = "default_fast")]
+    pub fast: bool,
 }
 
 impl Serialize for AppConfig {
@@ -234,6 +237,7 @@ impl Serialize for AppConfig {
         state.serialize_field("host", &self.host)?;
         state.serialize_field("port", &self.port)?;
         state.serialize_field("log", &self.log)?;
+        state.serialize_field("fast", &self.fast)?;
         state.serialize_field("cors_origins", &self.cors_origins)?;
         state.serialize_field("login_via_otp", &self.login_via_otp)?;
         state.serialize_field("max_connections", &self.max_connections)?;
@@ -341,6 +345,10 @@ fn default_need_csrf() -> bool {
 }
 
 fn default_secure() -> bool {
+    false
+}
+
+fn default_fast() -> bool {
     false
 }
 

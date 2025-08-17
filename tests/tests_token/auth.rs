@@ -100,6 +100,7 @@ mod tests {
 
     fn base_config() -> AppConfig {
         AppConfig {
+            fast: false,
             token_expiry_seconds: 3600,
             secret: "unit-secret-xyz".into(),
             users: vec![],
@@ -775,6 +776,7 @@ mod render_error_page_tests {
 
     fn base_cfg() -> AppConfig {
         AppConfig {
+            fast: false,
             token_expiry_seconds: 3600,
             secret: "unit-secret-xyz".into(),
             users: vec![],

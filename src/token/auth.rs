@@ -369,12 +369,19 @@ pub async fn auth(
         let expires_at_str = get_expiry_with_timezone_format(data.config.clone(), None);
 
         let token = generate_token(&auth.username, &data.config, &expiry_ts, &id_token);
-
         let key = derive_key_from_secret(&data.config.secret);
+
+        // mode fast token is more speed but less secure
+        // and fast is false token is more secure but it's slower
+        let token_generate = if data.config.fast {
+            token.clone()
+        } else {
+            calcul_cipher(token.clone())
+        };
 
         let cipher_token = format!(
             "{}|{}|{}|{}",
-            calcul_cipher(token.clone()),
+            token_generate,
             expiry_ts,
             index_user,
             id_token

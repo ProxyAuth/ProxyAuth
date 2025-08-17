@@ -1546,6 +1546,7 @@ mod tests_csrf {
 
     fn base_config() -> AppConfig {
         AppConfig {
+            fast: false,
             token_expiry_seconds: 3600,
             secret: "test-secret-123".into(),
             users: vec![],
@@ -1717,6 +1718,7 @@ mod tests_proxy {
 
     fn base_config() -> AppConfig {
         AppConfig {
+            fast: false,
             token_expiry_seconds: 3600,
             secret: "test-secret-123".into(),
             users: vec![],
@@ -2649,6 +2651,7 @@ mod extra_coverage_selfcontained {
 
     fn base_cfg() -> AppConfig {
         AppConfig {
+            fast: false,
             token_expiry_seconds: 3600,
             secret: "test-secret-123".into(),
             users: vec![],
@@ -3037,6 +3040,7 @@ mod proxy_with_proxy_auth {
 
     fn base_cfg() -> AppConfig {
         AppConfig {
+            fast: false,
             token_expiry_seconds: 3600,
             secret: "test-secret-123".into(),
             users: vec![],
@@ -3198,6 +3202,7 @@ mod proxy_with_proxy_auth_branches {
 
     fn base_cfg() -> AppConfig {
         AppConfig {
+            fast: false,
             token_expiry_seconds: 3600,
             secret: "test-secret-123".into(),
             users: vec![],

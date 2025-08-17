@@ -231,11 +231,25 @@ pub async fn validate_token(
     }
 
     let token_generated = generate_token(&user.username, &config, data[1], data[3]);
-    let token_hash = calcul_factorhash(token_generated);
 
-    if blake3::hash(token_hash.as_bytes()).to_hex().to_string() != token_hash_decrypt {
-        warn!("[{}] Invalid token", ip);
-        return Err("no valid token".to_string());
+    // mode fast token is more speed but less secure
+    // and fast is false token is more secure but it's slower
+    let token_hash = if config.fast {
+        token_generated.clone()
+    } else {
+        calcul_factorhash(token_generated.clone())
+    };
+
+    if config.fast {
+        if token_generated.clone() != token_hash_decrypt {
+            warn!("[{}] Invalid token", ip);
+            return Err("no valid token".to_string());
+        }
+    } else {
+        if blake3::hash(token_hash.as_bytes()).to_hex().to_string() != token_hash_decrypt {
+            warn!("[{}] Invalid token", ip);
+            return Err("no valid token".to_string());
+        }
     }
 
     if is_token_revoked(data[3], &data_app.revoked_tokens) {
