@@ -113,6 +113,8 @@ lru = "0.12"
 hkdf = "0.12"
 regex = "1"
 serial_test = "3"
+arc-swap = "1.7"
+notify = "6"
 
 [profile.release]
 opt-level = 3
