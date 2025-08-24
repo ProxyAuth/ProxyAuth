@@ -15,12 +15,11 @@ use blake3;
 use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use tracing::{error, info, warn};
 
-fn get_build_time() -> u64 {
+pub fn get_build_time() -> u64 {
     let get_build = get();
     let data = get_build.build_time;
     data
@@ -53,7 +52,7 @@ pub fn get_build_datetime() -> chrono::DateTime<chrono::Utc> {
 static DERIVED_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 #[allow(dead_code)]
-fn format_long_date(seconds: u128) -> String {
+pub fn format_long_date(seconds: u128) -> String {
     let seconds_per_year = 31_557_600u128;
     let year = seconds / seconds_per_year;
     let remaining = seconds % seconds_per_year;
@@ -97,7 +96,6 @@ pub fn check_date_token(
             ()
         })?;
 
-    // Convert to local time
     let expire_local = expire_time.with_timezone(&tz);
     let now_local = Utc::now().with_timezone(&tz);
 
@@ -174,10 +172,7 @@ pub fn generate_token(
 ) -> String {
     let values_map = HashMap::from([
         ("username", username.to_string()),
-        (
-            "secret_with_timestamp",
-            generate_secret(&config.secret, &config.token_expiry_seconds),
-        ),
+        ("secret_with_timestamp", generate_secret(&config.secret, &config.token_expiry_seconds)),
         ("build_time", get_build_time().to_string()),
         ("time_expire", time_expire.to_string()),
         ("build_rand", get_build_rand().to_string()),
@@ -185,15 +180,13 @@ pub fn generate_token(
     ]);
 
     let shuffled: Vec<String> = get()
-        .shuffled_order_list()
-        .iter()
-        .map(|k| values_map[k.as_str()].clone())
-        .collect();
+    .shuffled_order_list()
+    .iter()
+    .map(|k| values_map[k.as_str()].clone())
+    .collect();
 
     let shuffle_data = shuffled.join(":");
-    let mut signature = Sha256::new();
-    signature.update(shuffle_data.as_bytes());
-    format!("{:x}", signature.finalize())
+    blake3::hash(shuffle_data.as_bytes()).to_hex().to_string()
 }
 
 pub async fn validate_token(
@@ -232,11 +225,25 @@ pub async fn validate_token(
     }
 
     let token_generated = generate_token(&user.username, &config, data[1], data[3]);
-    let token_hash = calcul_factorhash(token_generated);
 
-    if blake3::hash(token_hash.as_bytes()).to_hex().to_string() != token_hash_decrypt {
-        warn!("[{}] Invalid token", ip);
-        return Err("no valid token".to_string());
+    // mode fast token is more speed but less secure
+    // and fast is false token is more secure but it's slower
+    let token_hash = if config.fast {
+        token_generated.clone()
+    } else {
+        calcul_factorhash(token_generated.clone())
+    };
+
+    if config.fast {
+        if token_generated.clone() != token_hash_decrypt {
+            warn!("[{}] Invalid token", ip);
+            return Err("no valid token".to_string());
+        }
+    } else {
+        if blake3::hash(token_hash.as_bytes()).to_hex().to_string() != token_hash_decrypt {
+            warn!("[{}] Invalid token", ip);
+            return Err("no valid token".to_string());
+        }
     }
 
     if is_token_revoked(data[3], &data_app.revoked_tokens) {
@@ -301,7 +308,7 @@ pub fn extract_token_user(token: &str, config: &AppConfig, ip: String) -> Result
     }
 }
 
-fn all_values_match<'a, I>(vals: I, re: &Regex) -> bool
+pub fn all_values_match<'a, I>(vals: I, re: &Regex) -> bool
 where
 I: IntoIterator<Item = &'a str>,
 {
@@ -350,7 +357,6 @@ pub fn apply_filters_regex_allow_only(
     .unwrap_or("")
     .to_ascii_lowercase();
 
-    // Décodages conditionnels du body
     let body_utf8 = if need_utf8 {
         std::str::from_utf8(body).ok()
     } else {

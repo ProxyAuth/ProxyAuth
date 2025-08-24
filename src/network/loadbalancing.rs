@@ -34,47 +34,48 @@ type ProxyArcClient = Arc<Client<ProxyConnector<hyper_rustls::HttpsConnector<Htt
 type ProxyClientPool = DashMap<(String, String), ProxyArcClient, RandomState>;
 static PROXY_CLIENT_POOL: Lazy<ProxyClientPool> = Lazy::new(ProxyClientPool::default);
 
-static LAST_GOOD_BACKEND: Lazy<AHasherDashMap<&'static str, (String, Instant)>> =
+pub static LAST_GOOD_BACKEND: Lazy<AHasherDashMap<String, (String, Instant)>> =
 Lazy::new(Default::default);
-static BACKEND_COOLDOWN: Lazy<AHasherDashMap<String, CooldownEntry>> =
+pub static BACKEND_COOLDOWN: Lazy<AHasherDashMap<String, CooldownEntry>> =
 Lazy::new(Default::default);
-static ROUND_ROBIN_COUNTER: Lazy<AtomicUsize> =
+pub static ROUND_ROBIN_COUNTER: Lazy<AtomicUsize> =
 Lazy::new(|| AtomicUsize::new(0));
 
-const BACKEND_CACHE_KEY: &str = "service";
-
-struct CooldownEntry {
-    last_failed: Instant,
-    failures: u32,
+pub struct CooldownEntry {
+    pub last_failed: Instant,
+    pub failures: u32,
 }
 
-fn lb() -> &'static LbTuning {
+pub fn lb() -> &'static LbTuning {
     LB_TUNING.get().unwrap_or(&LbTuning {
-        request_timeout_ms: 1500,
+        request_timeout_ms: 2000,
         pool_max_idle_per_host: 1000,
         keep_alive_secs: 30,
-        backend_valid_duration_secs: 10,
-        cooldown_base_secs: 5,
-        cooldown_max_secs: 10,
-        backend_reset_threshold_secs: 5,
+        backend_valid_duration_secs: 2,
+        cooldown_base_secs: 2,
+        cooldown_max_secs: 5,
+        backend_reset_threshold_secs: 10,
     })
 }
 
 fn backend_valid_duration() -> Duration {
     Duration::from_secs(lb().backend_valid_duration_secs)
 }
-fn cooldown_base() -> Duration {
+
+pub fn cooldown_base() -> Duration {
     Duration::from_secs(lb().cooldown_base_secs)
 }
+
 fn cooldown_max() -> Duration {
     Duration::from_secs(lb().cooldown_max_secs)
 }
+
 fn backend_reset_threshold() -> Duration {
     Duration::from_secs(lb().backend_reset_threshold_secs)
 }
 
 // --------- Cooldown helper ---------
-fn is_in_cooldown(url: &str) -> bool {
+pub fn is_in_cooldown(url: &str) -> bool {
     if let Some(entry) = BACKEND_COOLDOWN.get(url) {
         let mut delay = cooldown_base() * entry.failures.min(10);
         if delay > cooldown_max() {
@@ -86,15 +87,20 @@ fn is_in_cooldown(url: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SwrrState {
+pub struct SwrrState {
     effective: i32,
     current: i32,
 }
 
-static SWRR_STATE: Lazy<DashMap<String, SwrrState, RandomState>> =
+fn cache_key(method: &Method, uri: &Uri, _headers: &hyper::HeaderMap) -> String {
+    let host = uri.authority().map(|a| a.as_str()).unwrap_or("default");
+    format!("{}|{}", method, host)
+}
+
+pub static SWRR_STATE: Lazy<DashMap<String, SwrrState, RandomState>> =
 Lazy::new(Default::default);
 
-fn build_swrr_order<'a>(cands: &[&'a BackendConfig]) -> Vec<&'a BackendConfig> {
+pub fn build_swrr_order<'a>(cands: &[&'a BackendConfig]) -> Vec<&'a BackendConfig> {
     if cands.is_empty() {
         return Vec::new();
     }
@@ -154,7 +160,7 @@ fn build_swrr_order<'a>(cands: &[&'a BackendConfig]) -> Vec<&'a BackendConfig> {
     order
 }
 
-async fn get_or_build_client(backend: &str) -> ArcClient {
+pub async fn get_or_build_client(backend: &str) -> ArcClient {
     let key = backend.trim().to_lowercase();
     if let Some(client) = CLIENT_POOL.get(&key) {
         return Arc::clone(&client);
@@ -180,7 +186,7 @@ async fn get_or_build_client(backend: &str) -> ArcClient {
     arc_client
 }
 
-async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> ProxyArcClient {
+pub async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> ProxyArcClient {
     let key = (proxy_addr.to_string(), backend.to_string());
     if let Some(client) = PROXY_CLIENT_POOL.get(&key) {
         return Arc::clone(&client);
@@ -222,11 +228,13 @@ pub async fn forward_failover(
     let headers = req.headers().clone();
     let body_bytes = to_bytes(req.into_body()).await?;
 
-    // Purge soft des cooldowns
+    // Purge soft cooldowns
     let now = Instant::now();
     BACKEND_COOLDOWN.retain(|_, entry| now.duration_since(entry.last_failed) < backend_reset_threshold());
 
-    if let Some((cached_url, when)) = LAST_GOOD_BACKEND.get(BACKEND_CACHE_KEY).map(|e| e.clone()) {
+    let ctx_key = cache_key(&method, &uri, &headers);
+
+    if let Some((cached_url, when)) = LAST_GOOD_BACKEND.get(&ctx_key).map(|e| e.clone()) {
         if when.elapsed() <= backend_valid_duration() && !is_in_cooldown(&cached_url) {
             match try_forward_to_backend(&cached_url, proxy_addr, &body_bytes, &method, &uri, &headers).await {
                 Ok(resp) => return Ok(resp),
@@ -297,7 +305,7 @@ async fn try_backends(
 
         match try_forward_to_backend(url, proxy_addr, body_bytes, method, uri, headers).await {
             Ok(resp) => {
-                LAST_GOOD_BACKEND.insert(BACKEND_CACHE_KEY, (url.clone(), Instant::now()));
+                LAST_GOOD_BACKEND.insert(cache_key(method, uri, headers), (url.clone(), Instant::now()));
                 BACKEND_COOLDOWN.remove(url);
                 return Some(resp);
             }

@@ -63,7 +63,7 @@ impl FromRequest for EitherAuth {
     }
 }
 
-fn validate_csrf(req: &HttpRequest, payload: &EitherAuth, secret: &str) -> bool {
+pub fn validate_csrf(req: &HttpRequest, payload: &EitherAuth, secret: &str) -> bool {
     let m = req.method();
     if matches!(
         m,
@@ -140,7 +140,7 @@ pub fn generate_random_string(len: usize) -> String {
     hex::encode(hash.as_bytes())
 }
 
-fn get_expiry_with_timezone(
+pub fn get_expiry_with_timezone(
     config: Arc<AppConfig>,
     optional_timestamp: Option<i64>,
 ) -> DateTime<Tz> {
@@ -228,7 +228,18 @@ pub async fn auth(
         EitherAuth::Form(f) => f,
     };
 
-    let ip = client_ip(&req).expect("?").to_string();
+    let ip = client_ip(&req)
+    .map(|s| s.to_string())
+    .or_else(|| {
+        // replis classiques en HTTP
+        req.headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| req.connection_info().realip_remote_addr().map(|s| s.to_string()))
+    })
+    .unwrap_or_else(|| "-".to_string());
 
     // Check if session_cookie is enabled
     if data.config.session_cookie {
@@ -358,12 +369,19 @@ pub async fn auth(
         let expires_at_str = get_expiry_with_timezone_format(data.config.clone(), None);
 
         let token = generate_token(&auth.username, &data.config, &expiry_ts, &id_token);
-
         let key = derive_key_from_secret(&data.config.secret);
+
+        // mode fast token is more speed but less secure
+        // and fast is false token is more secure but it's slower
+        let token_generate = if data.config.fast {
+            token.clone()
+        } else {
+            calcul_cipher(token.clone())
+        };
 
         let cipher_token = format!(
             "{}|{}|{}|{}",
-            calcul_cipher(token.clone()),
+            token_generate,
             expiry_ts,
             index_user,
             id_token
