@@ -519,11 +519,7 @@ pub async fn proxy_with_proxy(
 
         request_builder = request_builder
             .header("Connection", "close")
-            .header(USER_AGENT, "ProxyAuth")
-            .header(
-                "Host",
-                uri.authority().map(|a| a.as_str()).unwrap_or("127.0.0.1"),
-            );
+            .header(USER_AGENT, "ProxyAuth");
 
         request_builder = inject_header(request_builder, &username, &data.config);
 
@@ -935,12 +931,7 @@ pub async fn proxy_without_proxy(
             }
         }
 
-        request_builder = request_builder.header(USER_AGENT, "ProxyAuth").header(
-            "Host",
-            uri.host()
-                .ok_or_else(|| error::ErrorInternalServerError("Missing host"))?,
-        );
-
+        request_builder = request_builder.header(USER_AGENT, "ProxyAuth");
         request_builder = inject_header(request_builder, &username, &data.config);
 
         let hyper_req = if method == Method::GET || method == Method::HEAD {
