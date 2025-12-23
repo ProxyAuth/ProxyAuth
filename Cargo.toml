@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "0.8.8"
+version = "0.8.10"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://github.com/ProxyAuth/ProxyAuth"
@@ -57,7 +57,7 @@ serde_json = "1.0.140"
 base64 = "0.21"
 sha2 = "0.10"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tracing-loki = "0.2.6"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.3"
@@ -93,7 +93,7 @@ http = "1"
 fxhash = "0.2"
 anyhow = "1.0"
 base32 = "0.4"
-sequoia-openpgp = { version = "2.0", default-features = false, features = ["crypto-openssl"] }
+sequoia-openpgp = { version = "2.1", default-features = false, features = ["crypto-openssl"] }
 data-encoding = "2.3"
 urlencoding = "2.1"
 totp-rs = "5.5"
