@@ -608,7 +608,7 @@ mod tests {
         use base32::Alphabet;
         // secret TOTP aléatoire RFC4648 (sans padding)
         let raw_secret: [u8; 20] = *b"0123456789ABCDEFGHIJ";
-        let b32 = base32::encode(Alphabet::RFC4648 { padding: false }, &raw_secret);
+        let b32 = base32::encode(Alphabet::Rfc4648 { padding: false }, &raw_secret);
 
         let user = User {
             username: "carol".into(),
@@ -627,7 +627,7 @@ mod tests {
         let data = mk_state(vec![], cfg);
 
         let secret_bytes =
-        base32::decode(Alphabet::RFC4648 { padding: false }, &b32).expect("decode b32");
+        base32::decode(Alphabet::Rfc4648 { padding: false }, &b32).expect("decode b32");
         let totp = TOTP::new(Algorithm::SHA512, 6, 0, 30, secret_bytes).expect("totp");
         let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

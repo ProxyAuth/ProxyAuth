@@ -23,7 +23,7 @@ jobs:
         run: sudo apt install -y nettle-dev
 
       - name: install nextest
-        run: cargo install cargo-nextest
+        run: cargo install --locked cargo-nextest
 
       - name: Build the binary
         run: cargo build --release

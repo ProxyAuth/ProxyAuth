@@ -335,7 +335,7 @@ pub async fn auth(
             };
 
             let decoded_secret =
-                match base32::decode(base32::Alphabet::RFC4648 { padding: false }, totp_key) {
+                match base32::decode(base32::Alphabet::Rfc4648 { padding: false }, totp_key) {
                     Some(bytes) => bytes,
                     None => {
                         warn!("Invalid base32 TOTP secret for user {}", user.username);

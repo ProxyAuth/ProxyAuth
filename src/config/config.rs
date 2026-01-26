@@ -228,28 +228,37 @@ pub struct AppConfig {
 impl Serialize for AppConfig {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer,
+    S: Serializer,
     {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
-        state.serialize_field("token_expiry_seconds", &self.token_expiry_seconds)?;
-        state.serialize_field("secret", &self.secret)?;
-        state.serialize_field("token_admin", &self.token_admin)?;
-        state.serialize_field("host", &self.host)?;
-        state.serialize_field("port", &self.port)?;
-        state.serialize_field("log", &self.log)?;
-        state.serialize_field("fast", &self.fast)?;
-        state.serialize_field("cors_origins", &self.cors_origins)?;
-        state.serialize_field("login_via_otp", &self.login_via_otp)?;
-        state.serialize_field("max_connections", &self.max_connections)?;
-        state.serialize_field("pending_connections_limit", &self.pending_connections_limit)?;
-        state.serialize_field("socket_listen", &self.socket_listen)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
+        state.serialize_field("cors_origins", &self.cors_origins)?;
+        state.serialize_field("fast", &self.fast)?;
+        state.serialize_field("host", &self.host)?;
         state.serialize_field("keep_alive", &self.keep_alive)?;
-        state.serialize_field("worker", &self.worker)?;
+        state.serialize_field("log", &self.log)?;
+        state.serialize_field("max_age_session_cookie", &self.max_age_session_cookie)?;
+        state.serialize_field("max_connections", &self.max_connections)?;
+        state.serialize_field("max_idle_per_host", &self.max_idle_per_host)?;
         state.serialize_field("num_instances", &self.num_instances)?;
+        state.serialize_field("pending_connections_limit", &self.pending_connections_limit)?;
+        state.serialize_field("port", &self.port)?;
         state.serialize_field("ratelimit_auth", &self.ratelimit_auth)?;
         state.serialize_field("ratelimit_proxy", &self.ratelimit_proxy)?;
+        state.serialize_field("redis", &self.redis)?;
+        state.serialize_field("secret", &self.secret)?;
+        state.serialize_field("session_cookie", &self.session_cookie)?;
+        state.serialize_field("socket_listen", &self.socket_listen)?;
+        state.serialize_field("stats", &self.stats)?;
+        state.serialize_field("tls", &self.tls)?;
+        state.serialize_field("timezone", &self.timezone)?;
+        state.serialize_field("token_admin", &self.token_admin)?;
+        state.serialize_field("token_expiry_seconds", &self.token_expiry_seconds)?;
+        state.serialize_field("login_redirect_url", &self.login_redirect_url)?;
+        state.serialize_field("login_via_otp", &self.login_via_otp)?;
+        state.serialize_field("logout_redirect_url", &self.logout_redirect_url)?;
         state.serialize_field("users", &self.users)?;
+        state.serialize_field("worker", &self.worker)?;
         state.end()
     }
 }
@@ -415,33 +424,38 @@ fn default_cert() -> HashMap<String, String> {
 pub fn load_config(path: &str) -> Arc<AppConfig> {
     let config_str = fs::read_to_string(path).expect("Could not read config.json file");
     let mut config: AppConfig =
-        serde_json::from_str(&config_str).expect("Invalid config format config.json");
+    serde_json::from_str(&config_str).expect("Invalid config format config.json");
 
     let mut updated = false;
+
     for user in &mut config.users {
         if !user.password.starts_with("$argon2") {
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
-                .hash_password(user.password.as_bytes(), &salt)
-                .expect(&format!(
-                    "Password hashing failed for user {}",
-                    user.username
-                ))
-                .to_string();
-
+            .hash_password(user.password.as_bytes(), &salt)
+            .expect(&format!("Password hashing failed for user {}", user.username))
+            .to_string();
             user.password = hash;
             updated = true;
         }
     }
 
+    let original_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
+    config.users.sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
+
+    let sorted_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
+    if original_order != sorted_order {
+        updated = true;
+    }
+
     if config.token_admin.trim().is_empty() {
-        let token: String = generate_random_string(64);
-        config.token_admin = token;
+        config.token_admin = generate_random_string(64);
         updated = true;
     }
 
     if updated {
         let updated_str = serde_json::to_string_pretty(&config).expect("Serialization failed");
+
         fs::write(path, updated_str).expect("Failed to write updated config");
     }
 
