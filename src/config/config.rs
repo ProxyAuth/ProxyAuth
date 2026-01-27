@@ -2,6 +2,7 @@ use crate::adm::method_otp::generate_base32_secret;
 use crate::revoke::db::RevokedTokenMap;
 use crate::stats::tokencount::CounterToken;
 use crate::token::auth::generate_random_string;
+use crate::smtp::smtp::SmtpConfig;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
 use hyper::Client;
@@ -112,6 +113,9 @@ pub struct User {
     pub otpkey: Option<String>, // Option<Vec<u8>>
     pub allow: Option<Vec<String>>,
     pub roles: Option<Vec<String>>,
+
+    #[allow(dead_code)]
+    pub email: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -223,6 +227,8 @@ pub struct AppConfig {
 
     #[serde(default = "default_fast")]
     pub fast: bool,
+
+    pub smtp: Option<SmtpConfig>,
 }
 
 impl Serialize for AppConfig {

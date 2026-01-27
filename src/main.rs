@@ -24,6 +24,7 @@ mod start_actix;
 mod stats;
 mod tls;
 mod token;
+mod smtp;
 
 use crate::adm::registry_otp::{get_otpauth_uri, get_otpauth_uri_option};
 use crate::adm::revoke::revoke_route;
@@ -35,6 +36,8 @@ use crate::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use crate::tls::check_port;
 use crate::network::proxy::init_routes;
 use crate::network::config::init_loadbalancer;
+use crate::smtp::template::ensure_reset_template_exists;
+use crate::smtp::smtp::SmtpClient;
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{App, http::Method, web};
 use chrono::Local;
@@ -290,6 +293,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     init_logging(&config);
+
+    // load SMTP template if smtp use
+    if let Some(smtp_cfg) = &config.smtp {
+        ensure_reset_template_exists()?;
+        SmtpClient::new(smtp_cfg)?;
+    } else {
+        println!("SMTP not configured, skipping email setup.");
+    }
 
     // check keystore if exist
     match decrypt_keystore(None) {
