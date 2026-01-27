@@ -1755,16 +1755,27 @@ mod tests_proxy {
         r.need_csrf = false;
         r.allow_methods = Some(vec!["GET".into()]);
 
-        let data = make_state_with_routes(vec![rr("/"), r.clone(), rr("/adm")], base_config());
+        let data = make_state_with_routes(
+            vec![
+                rr("/"),
+                r.clone(),
+                rr("/adm")
+            ],
+            base_config(),
+        );
 
         let req = test::TestRequest::default()
         .method(Method::POST)
         .uri("/p/thing")
         .to_http_request();
 
-        let resp = super::proxy_with_proxy(req, web::Bytes::new(), data).await.unwrap();
+        let resp = super::proxy_with_proxy(req, web::Bytes::new(), data)
+        .await
+        .unwrap();
+
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
+
 
     // ---------- proxy_with_proxy: (401 CSRF) ----------
     #[tokio::test]

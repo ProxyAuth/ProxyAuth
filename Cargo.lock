@@ -1177,15 +1177,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fxhash"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2467,7 +2458,6 @@ dependencies = [
  "data-encoding",
  "flate2",
  "futures-util",
- "fxhash",
  "hex",
  "hkdf",
  "hmac",
@@ -2496,7 +2486,7 @@ dependencies = [
  "rustc-hash",
  "rustls 0.21.12",
  "rustls-native-certs",
- "rustls-pemfile",
+ "rustls-pki-types",
  "sequoia-openpgp",
  "serde",
  "serde_json",

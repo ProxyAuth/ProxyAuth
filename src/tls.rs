@@ -10,7 +10,7 @@ use rustls::{
     Certificate, PrivateKey, ServerConfig,
 };
 use once_cell::sync::Lazy;
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use rustls_pki_types::pem::{PemObject, SectionKind};
 use std::{
     fs::File,
     io::BufReader,
@@ -45,33 +45,41 @@ fn rate_limited_log(tag: &'static str, period: Duration, msg: String) {
 
 fn load_cert_chain(path: &Path) -> anyhow::Result<Vec<Certificate>> {
     let f = File::open(path)?;
-    let mut r = BufReader::new(f);
-    let mut v = Vec::new();
-    for c in certs(&mut r)? {
-        v.push(Certificate(c));
-    }
-    anyhow::ensure!(!v.is_empty(), "no certificat in {}", path.display());
-    Ok(v)
+    let reader = BufReader::new(f);
+
+    let certs = PemObject::pem_reader_iter(reader)
+    .filter_map(|item| match item {
+        Ok((SectionKind::Certificate, der)) => Some(Certificate(der)),
+                _ => None,
+    })
+    .collect::<Vec<_>>();
+
+    anyhow::ensure!(!certs.is_empty(), "no certificates found in {}", path.display());
+    Ok(certs)
 }
 
 fn load_private_key(path: &Path) -> anyhow::Result<PrivateKey> {
-    // PKCS#8
-    {
-        let f = File::open(path)?;
-        let mut r = BufReader::new(f);
-        if let Some(k) = pkcs8_private_keys(&mut r)?.into_iter().next() {
-            return Ok(PrivateKey(k));
+    let f = File::open(path)?;
+    let reader = BufReader::new(f);
+
+    let keys = PemObject::pem_reader_iter(reader)
+    .filter_map(|item| match item {
+        Ok((kind, der))
+        if matches!(
+            kind,
+            SectionKind::PrivateKey
+            | SectionKind::RsaPrivateKey
+            | SectionKind::EcPrivateKey
+        ) =>
+        {
+            Some(PrivateKey(der))
         }
-    }
-    // RSA (fallback)
-    {
-        let f = File::open(path)?;
-        let mut r = BufReader::new(f);
-        if let Some(k) = rsa_private_keys(&mut r)?.into_iter().next() {
-            return Ok(PrivateKey(k));
-        }
-    }
-    anyhow::bail!("no key private support {}", path.display());
+        _ => None,
+    })
+    .collect::<Vec<_>>();
+
+    anyhow::ensure!(!keys.is_empty(), "no private key found in {}", path.display());
+    Ok(keys[0].clone())
 }
 
 fn load_certified_key(cert_path: &Path, key_path: &Path) -> anyhow::Result<Arc<CertifiedKey>> {

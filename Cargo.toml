@@ -78,7 +78,7 @@ hyper = { version = "0.14", features = ["client", "http1", "http2", "tcp"] }
 hyper-rustls = "0.24"
 rustls = "0.21.10"
 rustls-native-certs = "0.6"
-rustls-pemfile = "1.0"
+rustls-pki-types = "1.9"
 webpki-roots = "0.25"
 hyper-proxy = "0.9"
 rustc-hash = "1"
@@ -111,12 +111,12 @@ serial_test = "3" # it's for coverage code
 notify = "6"
 arc-swap = "1.8.0"
 
-fxhash = "0.2"
 http = "1"
 hyper-tls = "0.5"
 hmac = "0.12"
 cookie = "0.18"
 lettre = { version = "0.11", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
+
 [profile.release]
 opt-level = 3
 lto = "fat"

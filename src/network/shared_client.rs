@@ -7,7 +7,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use once_cell::sync::{Lazy, OnceCell};
 use rustls::{Certificate, PrivateKey, ClientConfig, RootCertStore, OwnedTrustAnchor};
 use rustls_native_certs::load_native_certs;
-use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustls_pki_types::pem::{PemObject, SectionKind};
 use std::{cell::RefCell, fs::File, io::BufReader, str::FromStr, sync::Arc, time::Duration};
 use webpki_roots::TLS_SERVER_ROOTS;
 
@@ -152,10 +152,44 @@ pub fn get_or_build_client_proxy(
 }
 
 
+fn load_certs(path: &str) -> Result<Vec<Certificate>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let certs = PemObject::pem_reader_iter(reader)
+    .filter_map(|item| match item {
+        Ok((kind, der)) if kind == SectionKind::Certificate => Some(Certificate(der)),
+                _ => None,
+    })
+    .collect::<Vec<_>>();
+
+    Ok(certs)
+}
+
+fn load_keys(path: &str) -> Result<Vec<PrivateKey>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let keys = PemObject::pem_reader_iter(reader)
+    .filter_map(|item| match item {
+        Ok((kind, der)) if matches!(
+            kind,
+            SectionKind::PrivateKey
+            | SectionKind::RsaPrivateKey
+            | SectionKind::EcPrivateKey
+        ) => Some(PrivateKey(der)),
+                _ => None,
+    })
+    .collect::<Vec<_>>();
+
+
+    Ok(keys)
+}
+
 pub fn build_hyper_client_cert(
     opts: ClientOptions,
     state: &Arc<AppConfig>,
-) -> Client<HttpsConnector<HttpConnector>> {
+) -> Client<HttpsConnector<HttpConnector>, Body> {
     let keep = Duration::from_secs(state.keep_alive);
 
     let want_cert = opts.use_cert
@@ -166,43 +200,27 @@ pub fn build_hyper_client_cert(
         return build_hyper_client_normal(state);
     }
 
-    let cert_path = opts.cert_path.as_ref().unwrap();
-    let key_path  = opts.key_path.as_ref().unwrap();
-
-    let (Ok(cf), Ok(kf)) = (File::open(cert_path), File::open(key_path)) else {
-        tracing::warn!("TLS: cannot open cert/key files ({:?} / {:?}), using no_client_auth", cert_path, key_path);
-        return build_hyper_client_normal(state);
-    };
-
-    let mut cert_file = BufReader::new(cf);
-    let mut key_file  = BufReader::new(kf);
-
-    let cert_chain: Vec<Certificate> = match certs(&mut cert_file) {
-        Ok(v) => v.into_iter().map(Certificate).collect(),
-        Err(e) => {
-            tracing::warn!("TLS: failed to read certs '{}': {}, using no_client_auth", cert_path, e);
+    let cert_chain = match load_certs(opts.cert_path.as_ref().unwrap()) {
+        Ok(c) if !c.is_empty() => c,
+        _ => {
+            tracing::warn!("TLS: cert chain empty or invalid, fallback to no_client_auth");
             return build_hyper_client_normal(state);
         }
     };
 
-    let mut keys: Vec<PrivateKey> = match pkcs8_private_keys(&mut key_file) {
-        Ok(v) => v.into_iter().map(PrivateKey).collect(),
-        Err(e) => {
-            tracing::warn!("TLS: failed to read private key '{}': {}, using no_client_auth", key_path, e);
+    let keys = match load_keys(opts.key_path.as_ref().unwrap()) {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            tracing::warn!("TLS: keys empty or invalid, fallback to no_client_auth");
             return build_hyper_client_normal(state);
         }
     };
-
-    if cert_chain.is_empty() || keys.is_empty() {
-        tracing::warn!("TLS: empty cert or key, using no_client_auth");
-        return build_hyper_client_normal(state);
-    }
 
     let tls_cfg = with_alpn(
         ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(global_root_store().clone())
-        .with_client_auth_cert(cert_chain, keys.remove(0))
+        .with_client_auth_cert(cert_chain, keys[0].clone())
         .expect("Invalid cert/key pair"),
     );
 
