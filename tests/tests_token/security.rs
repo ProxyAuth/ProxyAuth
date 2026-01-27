@@ -638,6 +638,7 @@ mod validate_token_path_tests {
                            allow: Some(vec!["127.0.0.1".to_string()]),
                            otpkey: Some(String::new()),
                            password: String::new(),
+                           email: None,
             });
         }
         cfg

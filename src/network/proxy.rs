@@ -1388,6 +1388,7 @@ mod more_tests {
             otpkey: None,
             allow: None,
             roles: Some(vec!["admin".into(), "dev".into()]),
+            email: None,
         }];
 
         let b = Request::builder();
@@ -1566,6 +1567,7 @@ mod tests_csrf {
             logout_redirect_url: None,
             tls: false,
             csrf_token: true,
+            ..Default::default()
         }
     }
 
@@ -1738,6 +1740,7 @@ mod tests_proxy {
             logout_redirect_url: None,
             tls: false,
             csrf_token: true,
+            ..Default::default()
         }
     }
 
@@ -1916,6 +1919,7 @@ mod extra_unit_tests {
             otpkey: None,
             allow: None,
             roles: None,
+            email: None,
         }];
         let b = Request::builder();
         let b = super::inject_header(b, "bob", &cfg);
@@ -2671,6 +2675,7 @@ mod extra_coverage_selfcontained {
             logout_redirect_url: None,
             tls: false,
             csrf_token: true,
+            ..Default::default()
         }
     }
 
@@ -3060,6 +3065,7 @@ mod proxy_with_proxy_auth {
             logout_redirect_url: None,
             tls: false,
             csrf_token: true,
+            ..Default::default()
         }
     }
 
@@ -3222,6 +3228,7 @@ mod proxy_with_proxy_auth_branches {
             logout_redirect_url: None,
             tls: false,
             csrf_token: true,
+            ..Default::default()
         }
     }
 

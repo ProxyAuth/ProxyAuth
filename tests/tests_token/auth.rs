@@ -129,6 +129,7 @@ mod tests {
             logout_redirect_url: None,
             tls: false,
             csrf_token: true,
+            ..Default::default()
         }
     }
 
@@ -246,7 +247,7 @@ mod tests {
 
     #[test]
     async fn is_ip_allowed_variants() {
-        let base = || User { username:"u".into(), password:"h".into(), otpkey:None, allow:None, roles:None };
+        let base = || User { username:"u".into(), password:"h".into(), otpkey:None, allow:None, roles:None, email: None, };
 
         let user_none = base();
         assert!(proxyauth::token::auth::is_ip_allowed("203.0.113.7", &user_none));
@@ -339,6 +340,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: Some(vec!["user".into()]),
+            email: None,
         };
 
         let mut cfg = base_config();
@@ -403,6 +405,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            email: None,
         }];
         cfg.logout_redirect_url = Some(logout_url);
         let data = mk_state(routes, cfg);
@@ -465,6 +468,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            email: None,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -521,6 +525,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            email: None,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -575,6 +580,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            email: None,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -616,6 +622,7 @@ mod tests {
             otpkey: Some(b32.clone()),
             allow: None,
             roles: None,
+            email: None,
         };
 
         let mut cfg = base_config();
@@ -673,6 +680,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            email: None,
         };
 
         let mut cfg = base_config();
@@ -805,6 +813,7 @@ mod render_error_page_tests {
             logout_redirect_url: None,
             tls: false,
             csrf_token: true,
+            ..Default::default()
         }
     }
 

@@ -366,6 +366,7 @@ mod tests {
             logout_redirect_url: None,
             tls: false,
             csrf_token: true,
+            ..Default::default()
         }
     }
 
