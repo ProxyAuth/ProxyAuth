@@ -2,8 +2,12 @@ use crate::token::security::get_build_seed2;
 
 use base64::{engine::general_purpose, Engine as _};
 use blake3;
-use chacha20poly1305::aead::{self, Aead, KeyInit, AeadCore};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce, Key
+};
+
 use hkdf::Hkdf;
 use lru::LruCache;
 use once_cell::sync::Lazy;
@@ -45,43 +49,45 @@ pub fn derive_key_from_secret(secret: &str) -> [u8; 32] {
     okm
 }
 
-pub fn encrypt(cleartext: &str, key: &[u8]) -> String {
-    assert_eq!(key.len(), KEY_LEN, "key must be 32 bytes");
-    let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let aad: &[u8] = b"";
+pub fn encrypt(message: &str, key_bytes: &[u8]) -> String {
+    assert_eq!(key_bytes.len(), KEY_LEN);
+
+    let key = Key::try_from(key_bytes).expect("invalid key length");
+    let cipher = XChaCha20Poly1305::new(&key);
+
+    let mut nonce_bytes = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = XNonce::try_from(&nonce_bytes[..]).expect("invalid nonce length");
 
     let ct = cipher
-    .encrypt(&nonce, aead::Payload { msg: cleartext.as_bytes(), aad })
-    .expect("encryption failure!");
+    .encrypt(&nonce, message.as_bytes())
+    .expect("encryption failure");
 
-    let mut out = Vec::with_capacity(1 + nonce.len() + ct.len());
+    let mut out = Vec::with_capacity(1 + 24 + ct.len());
     out.push(TAG_V1);
-    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
+
     general_purpose::STANDARD.encode(out)
 }
 
-pub fn decrypt(obsf: &str, key: &[u8]) -> Result<String, ()> {
-    if key.len() != KEY_LEN {
+pub fn decrypt(obsf: &str, key_bytes: &[u8]) -> Result<String, ()> {
+    if key_bytes.len() != KEY_LEN {
         return Err(());
     }
-    let data = match general_purpose::STANDARD.decode(obsf) {
-        Ok(b) => b,
-        Err(_) => return Err(()),
-    };
+
+    let data = general_purpose::STANDARD.decode(obsf).map_err(|_| ())?;
     if data.len() < 1 + 24 || data[0] != TAG_V1 {
         return Err(());
     }
-    let nonce = XNonce::from_slice(&data[1..25]);
+
+    let nonce = XNonce::try_from(&data[1..25]).expect("invalid nonce length");
     let ct = &data[25..];
 
-    let cipher = XChaCha20Poly1305::new(key.into());
-    let aad: &[u8] = b"";
-    let pt = match cipher.decrypt(nonce, aead::Payload { msg: ct, aad }) {
-        Ok(p) => p,
-        Err(_) => return Err(()),
-    };
+    let key = Key::try_from(key_bytes).expect("invalid key length");
+    let cipher = XChaCha20Poly1305::new(&key);
+
+    let pt = cipher.decrypt(&nonce, ct).map_err(|_| ())?;
     String::from_utf8(pt).map_err(|_| ())
 }
 
@@ -201,21 +207,24 @@ pub fn encrypt_base64(message: &str, password: &str) -> String {
     OsRng.fill_bytes(&mut salt);
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), password.as_bytes());
-    let mut key = [0u8; KEY_LEN];
-    hk.expand(HKDF_INFO_PW, &mut key).expect("HKDF expand");
+    let mut key_bytes = [0u8; KEY_LEN];
+    hk.expand(HKDF_INFO_PW, &mut key_bytes).expect("HKDF expand");
 
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let aad: &[u8] = b"pw-aead";
+    let key = Key::try_from(&key_bytes[..]).expect("invalid key");
+    let cipher = XChaCha20Poly1305::new(&key);
+
+    let mut nonce_bytes = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = XNonce::try_from(&nonce_bytes[..]).unwrap();
 
     let ct = cipher
-    .encrypt(&nonce, aead::Payload { msg: message.as_bytes(), aad })
+    .encrypt(&nonce, message.as_bytes())
     .expect("encrypt");
 
-    let mut out = Vec::with_capacity(1 + salt.len() + nonce.len() + ct.len());
+    let mut out = Vec::with_capacity(1 + 16 + 24 + ct.len());
     out.push(TAG_V1_PW);
     out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
 
     general_purpose::STANDARD.encode(out)
@@ -230,21 +239,22 @@ pub fn decrypt_base64(encoded: &str, password: &str) -> String {
     if data.len() < 1 + 16 + 24 || data[0] != TAG_V1_PW {
         panic!("Invalid ciphertext format");
     }
+
     let salt = &data[1..17];
-    let nonce = XNonce::from_slice(&data[17..41]);
+    let nonce = XNonce::try_from(&data[17..41]).expect("bad nonce");
     let ct = &data[41..];
 
-    // dérive clé
     let hk = Hkdf::<Sha256>::new(Some(salt), password.as_bytes());
-    let mut key = [0u8; KEY_LEN];
-    hk.expand(HKDF_INFO_PW, &mut key).expect("HKDF expand");
+    let mut key_bytes = [0u8; KEY_LEN];
+    hk.expand(HKDF_INFO_PW, &mut key_bytes).expect("HKDF expand");
 
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    let aad: &[u8] = b"pw-aead";
+    let key = Key::try_from(&key_bytes[..]).expect("invalid key");
+    let cipher = XChaCha20Poly1305::new(&key);
 
     let pt = cipher
-    .decrypt(nonce, aead::Payload { msg: ct, aad })
+    .decrypt(&nonce, ct)
     .expect("decryption/authentication failed");
 
     String::from_utf8(pt).expect("Invalid UTF-8")
 }
+
