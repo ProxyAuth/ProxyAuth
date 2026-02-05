@@ -19,8 +19,6 @@ use proxyauth::network::canonical_url::canonicalize_path_for_match;
 use serde_json::Value as JsonValue;
 use proxyauth::AppConfig;
 use proxyauth::AppState;
-use sha2::Sha256;
-use sha2::Digest;
 use chrono::Utc;
 
 #[cfg(test)]
@@ -340,7 +338,11 @@ mod tests {
     async fn generate_token_is_sha256_hex() {
         #[allow(dead_code)]
         #[derive(Default)]
-        struct MiniUser { username: String, roles: Option<Vec<String>> }
+        struct MiniUser {
+            username: String,
+            roles: Option<Vec<String>>,
+        }
+
         #[allow(dead_code)]
         #[derive(Default)]
         struct MiniAppConfig {
@@ -355,9 +357,14 @@ mod tests {
             s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
         }
 
+        use sha2::{Digest, Sha256};
+
         let mut hasher = Sha256::new();
         hasher.update(b"some deterministic input");
-        let hex = format!("{:x}", hasher.finalize());
+
+        let digest = hasher.finalize();
+        let hex = hex::encode(digest);
+
         assert!(looks_like_sha256_hex(&hex));
     }
 }

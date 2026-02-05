@@ -47,7 +47,7 @@ actix-http = "3.9.0"
 serde_json = "1"
 
 [dependencies]
-actix-web = { version = "4.10.2", features = ["rustls-0_21"] }
+actix-web = { version = "4.12.1", features = ["rustls-0_21"] }
 mimalloc = { version = "0.1", default-features = false }
 actix-service = "2"
 reqwest = { version = "0.11", features = ["native-tls", "json", "blocking"] }
@@ -55,7 +55,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.33"
 serde_json = "1.0.140"
 base64 = "0.21"
-sha2 = "0.10"
+sha2 = "0.11.0-rc.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tracing-loki = "0.2.6"
@@ -105,7 +105,7 @@ flate2 = "1"
 subtle = "2"
 brotli = "3.3"
 lru = "0.16"
-hkdf = "0.12"
+hkdf = "0.13.0-rc.5"
 regex = "1"
 serial_test = "3" # it's for coverage code
 notify = "6"
@@ -113,7 +113,7 @@ arc-swap = "1.8.0"
 
 http = "1"
 hyper-tls = "0.5"
-hmac = "0.12"
+hmac = "0.13.0-rc.2"
 cookie = "0.18"
 lettre = { version = "0.11", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
 
