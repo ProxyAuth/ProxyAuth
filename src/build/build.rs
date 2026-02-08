@@ -7,6 +7,21 @@ use std::io::Write;
 use std::path::Path;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
+use blake3;
+
+fn identity(seed: u64) -> String {
+    let hash = blake3::hash(&seed.to_be_bytes());
+
+    let mut mac = [0u8; 12];
+    mac.copy_from_slice(&hash.as_bytes()[..12]);
+
+    mac[0] = (mac[0] & 0b1111_1100) | 0b0000_0010;
+
+    mac.iter()
+    .map(|b| format!("{:02X}", b))
+    .collect::<Vec<_>>()
+    .join(":")
+}
 
 fn main() {
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION not set");
@@ -30,12 +45,14 @@ fn main() {
         .to_string();
 
     let random_epoch: i64 = rng.gen_range(0..999_999_999_999);
+    let identity = identity(rng.gen_range(1..999_999_999));
 
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);
     println!("cargo:rustc-env=BUILD_RAND={}", build_rand);
     println!("cargo:rustc-env=BUILD_SEED={}", build_seed);
     println!("cargo:rustc-env=BUILD_SEED2={}", build_seed2);
     println!("cargo:rustc-env=BUILD_EPOCH_DATE={}", random_epoch);
+    println!("cargo:rustc-env=id={}", identity);
 
     // SHUFFLE BUILD
     let mut fields = vec![

@@ -73,6 +73,8 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const ID: &str = env!("id");
+
 
 struct LocalTime;
 
@@ -82,7 +84,7 @@ impl FormatTime for LocalTime {
     }
 }
 
-fn print_launcher(mode: &str, version: &str, worker: u8, addr: &str) {
+fn print_launcher(mode: &str, version: &str, worker: u8, addr: &str, id: &str) {
     let msg = match mode {
         "NO_RATELIMIT_AUTH" => "ratelimit On (Proxy)",
         "NO_RATELIMIT_PROXY" => "ratelimit On (Auth)",
@@ -92,8 +94,8 @@ fn print_launcher(mode: &str, version: &str, worker: u8, addr: &str) {
     };
 
     println!(
-        "\nlaunch ProxyAuth v{} \n{}\nstarting service: \"proxyauth-service\" worker: {} listening on {}",
-        version, msg, worker, addr
+        "\nlaunch ProxyAuth v{} [{}] \n{}\nstarting service: \"proxyauth-service\" worker: {} listening on {}",
+        version, id, msg, worker, addr
     );
 }
 
@@ -358,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut server_futures = Vec::new();
 
-    print_launcher(mode_actix, VERSION, config.worker, &addr.to_string());
+    print_launcher(mode_actix, VERSION, config.worker, &addr.to_string(), ID);
 
     for _instance_id in 0..num_instances {
         let listener = create_listener(
@@ -656,7 +658,7 @@ mod tests {
             "UNKNOWN_MODE",
         ];
         for m in modes {
-            print_launcher(m, "0.0.0-test", 4, "127.0.0.1:1234");
+            print_launcher(m, "0.0.0-test", 4, "127.0.0.1:1234", ID);
         }
     }
 
