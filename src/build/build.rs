@@ -9,15 +9,25 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 use blake3;
 
-fn identity(seed: u64) -> String {
-    let hash = blake3::hash(&seed.to_be_bytes());
+pub fn identity(seed: u64) -> String {
+    let timestamp = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .expect("Time went backwards")
+    .as_nanos();
 
-    let mut mac = [0u8; 12];
-    mac.copy_from_slice(&hash.as_bytes()[..12]);
+    let mut input = Vec::with_capacity(24);
+    input.extend_from_slice(&seed.to_be_bytes());
+    input.extend_from_slice(&timestamp.to_be_bytes());
 
-    mac[0] = (mac[0] & 0b1111_1100) | 0b0000_0010;
+    let hash = blake3::hash(&input);
 
-    mac.iter()
+    let mut id = [0u8; 9];
+    id.copy_from_slice(&hash.as_bytes()[..9]);
+
+    // unicast + locally administered
+    id[0] = (id[0] & 0b1111_1100) | 0b0000_0010;
+
+    id.iter()
     .map(|b| format!("{:02X}", b))
     .collect::<Vec<_>>()
     .join(":")
