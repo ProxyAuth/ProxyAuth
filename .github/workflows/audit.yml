@@ -9,6 +9,14 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: theoparis/rust-toolchain@stable
+        with:
+          toolchain: stable
+          override: true
+
       - run: cargo install cargo-audit
       - run: cargo audit

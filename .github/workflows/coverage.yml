@@ -11,16 +11,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+        uses: theoparis/rust-toolchain@stable
         with:
           toolchain: stable
           override: true
 
       - name: Install dependancy
-        run: sudo apt install -y nettle-dev
+        run: apt update && apt install -y nettle-dev
 
       - name: install tarpaulin for coverage
         run: cargo install cargo-tarpaulin
