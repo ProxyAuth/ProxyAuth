@@ -11,7 +11,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    Prepare,
+    Prepare {
+        #[arg(long)]
+        insecure: bool,
+    },
     Stats,
-    Sync { target: Option<String> },
+    Sync {
+        target: Option<String>,
+    },
 }
