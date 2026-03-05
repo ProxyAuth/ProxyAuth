@@ -20,7 +20,7 @@ jobs:
           override: true
 
       - name: Install dependancy
-        run: apt install -y nettle-dev sudo
+        run: apt update && apt install -y nettle-dev sudo
 
       - name: install nextest
         run: cargo install --locked cargo-nextest
