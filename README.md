@@ -6,9 +6,9 @@
 </div>
 <br>
 
-![Audit Status](https://github.com/ProxyAuth/ProxyAuth/actions/workflows/audit.yml/badge.svg)
-[![Build Status](https://github.com/ProxyAuth/ProxyAuth/actions/workflows/proxyauth.yml/badge.svg)](https://github.com/vBlackOut/ProxyAuth/actions/workflows/proxyauth.yml)
-![Last commit](https://img.shields.io/github/last-commit/ProxyAuth/ProxyAuth)
+![Audit Status](https://git.proxyauth.app/ProxyAuth/ProxyAuth/badges/workflows/audit.yml/badge.svg?ref=HEAD&label=audit%20CI)
+[![Build Status](https://git.proxyauth.app/ProxyAuth/ProxyAuth/badges/workflows/proxyauth.yml/badge.svg?ref=HEAD&label=proxyauth%20CI)](https://github.com/vBlackOut/ProxyAuth/actions/workflows/proxyauth.yml)
+![Last commit](https://img.shields.io/gitea/last-commit/ProxyAuth/ProxyAuth?gitea_url=https%3A%2F%2Fgit.proxyauth.app)
 
 ![Security Score](https://img.shields.io/badge/SECURITY%20SCORE-92%2F100-blue?style=for-the-badge&logo=rust)
 [![Crates.io downloads](https://img.shields.io/crates/d/proxyauth?style=for-the-badge)](https://crates.io/crates/proxyauth)
