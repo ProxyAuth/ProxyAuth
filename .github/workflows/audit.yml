@@ -1,4 +1,4 @@
-name: Cargo Audit
+name: CI/CD ProxyAuth
 
 on:
   push:
@@ -21,3 +21,84 @@ jobs:
 
       - run: cargo install cargo-audit
       - run: cargo audit
+
+  coverage:
+    needs: audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: theoparis/rust-toolchain@stable
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install dependancy
+        run: apt update && apt install -y nettle-dev
+
+      - name: install tarpaulin for coverage
+        run: cargo install cargo-tarpaulin
+
+      - name: Coverage
+        run: cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm -- --test-threads=1
+        continue-on-error: true
+
+  ci:
+    needs: [audit, coverage]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: theoparis/rust-toolchain@stable
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install dependancy
+        run: apt update && apt install -y nettle-dev sudo
+
+      - name: install nextest
+        run: cargo install --locked cargo-nextest
+
+      - name: Build the binary
+        run: cargo build --release
+
+      - name: Prepare User for run proxyauth
+        run: sudo ./target/release/proxyauth prepare --insecure
+
+      - name: Generate self-signed cert for ProxyAuth
+        run: |
+            sudo mkdir -p /etc/proxyauth/certs
+            sudo openssl req -x509 -newkey rsa:2048 -sha256 -days 1 \
+            -nodes \
+            -keyout /etc/proxyauth/certs/key.pem \
+            -out /etc/proxyauth/certs/cert.pem \
+            -subj "/CN=localhost"
+            sudo chown -R proxyauth:proxyauth /etc/proxyauth/certs
+
+      - name: Test ProxyAuth (unittest)
+        run: cargo nextest run --verbose --no-fail-fast --test-threads=1
+
+      - name: Cleanup test database files & Fix permissions
+        run: |
+            sudo rm -rf /opt/proxyauth/db/*
+            sudo chmod 700 -R /opt/proxyauth
+
+      - name: Start ProxyAuth in background
+        run: |
+          sudo -u proxyauth ./target/release/proxyauth &
+          echo $! > proxyauth.pid
+          sleep 2  # wait start server
+      - name: Test HTTP response
+        run: curl -k -I https://localhost:8080 || (cat proxyauth.pid | xargs kill && exit 1)
+
+      - name: Stop the server
+        run: |
+          cat proxyauth.pid | xargs kill || true
+
