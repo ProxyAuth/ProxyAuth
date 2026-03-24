@@ -5,7 +5,6 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use hyper::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use memchr::memmem;
 use once_cell::sync::Lazy;
 use rand::RngCore;
@@ -45,11 +44,7 @@ impl CsrfNonceStore {
     pub fn purge_expired(&self) {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         self.used.retain(|_, exp| *exp > now);
-
-        // + compteur test-only
-        {
-            PURGE_HOOK.fetch_add(1, Ordering::SeqCst);
-        }
+        PURGE_HOOK.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -72,7 +67,6 @@ pub fn spawn_csrf_purger(store: CsrfNonceStore) {
     }
 }
 
-
 pub trait IntoStdDuration {
     fn into_std(self) -> std::time::Duration;
 }
@@ -89,7 +83,6 @@ impl IntoStdDuration for time::Duration {
     }
 }
 
-
 #[allow(dead_code)]
 pub fn spawn_csrf_purger_for_tests(
     store: CsrfNonceStore,
@@ -101,7 +94,6 @@ pub fn spawn_csrf_purger_for_tests(
         handle.spawn(async move {
             let mut tick = tokio::time::interval(period_std);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
             loop {
                 tick.tick().await;
                 let count: usize = purge_and_count(&store);
@@ -110,10 +102,8 @@ pub fn spawn_csrf_purger_for_tests(
         });
     } else {
         std::thread::spawn(move || {
-            // purge immédiate au lancement (utile pour les tests)
             let count0: usize = purge_and_count(&store);
             PURGE_HOOK.fetch_add(count0, Ordering::SeqCst);
-
             loop {
                 std::thread::sleep(period_std);
                 let count: usize = purge_and_count(&store);
@@ -133,12 +123,10 @@ pub fn spawn_csrf_purger_for_tests_with_notify(
         handle.spawn(async move {
             let mut tick = interval(period);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
             tick.tick().await;
             let count = purge_and_count(&store);
             PURGE_HOOK.fetch_add(count, Ordering::SeqCst);
             if let Some(tx) = notify { let _ = tx.send(count); }
-
             loop {
                 tick.tick().await;
                 let c = purge_and_count(&store);
@@ -149,10 +137,7 @@ pub fn spawn_csrf_purger_for_tests_with_notify(
         std::thread::spawn(move || {
             let count0 = purge_and_count(&store);
             PURGE_HOOK.fetch_add(count0, Ordering::SeqCst);
-            if let Some(tx) = notify {
-
-                let _ = tx.send(count0);
-            }
+            if let Some(tx) = notify { let _ = tx.send(count0); }
             loop {
                 std::thread::sleep(period);
                 let c = purge_and_count(&store);
@@ -162,15 +147,10 @@ pub fn spawn_csrf_purger_for_tests_with_notify(
     }
 }
 
-
 fn purge_and_count(store: &CsrfNonceStore) -> usize {
     store.purge_expired();
     1
 }
-
-
-
-
 
 impl CsrfNonceStore {
     #[allow(dead_code)]
@@ -182,8 +162,6 @@ impl CsrfNonceStore {
     pub fn insert_expired_for_tests(&self, key: &str) {
         use time::Duration;
         use time::OffsetDateTime;
-
-        // exemple : un timestamp dans le passé
         let exp = (OffsetDateTime::now_utc() - Duration::seconds(5)).unix_timestamp();
         self.used.insert(key.as_bytes().to_vec(), exp);
     }
@@ -199,7 +177,6 @@ pub static CSRF_STORE: Lazy<CsrfNonceStore> = Lazy::new(|| {
     spawn_csrf_purger(store.clone());
     store
 });
-
 
 pub fn validate_csrf_token(
     method: &actix_web::http::Method,
@@ -233,9 +210,10 @@ pub fn validate_csrf_token(
             }
         }
 
+        // Utiliser &str pour accéder aux headers actix — évite le conflit http 0.2 vs 1.x
         let content_type = req
         .headers()
-        .get(CONTENT_TYPE)
+        .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
@@ -286,7 +264,7 @@ pub fn make_csrf_token(secret: &str) -> String {
     payload.extend_from_slice(&nonce);
     payload.extend_from_slice(&exp_b);
 
-    let key = blake3::hash(secret.as_bytes()); // 32 bytes
+    let key = blake3::hash(secret.as_bytes());
     let sig = blake3::keyed_hash(key.as_bytes(), &payload);
 
     format!(
@@ -357,8 +335,9 @@ pub fn inject_csrf_token(
     const P1: &[u8] = b"{{ csrf_token }}";
     const P2: &[u8] = b"{{csrf_token}}";
 
+    // Utiliser &str pour accéder au HeaderMap hyper — évite le conflit CONTENT_TYPE
     let ct = headers
-    .get(CONTENT_TYPE)
+    .get("content-type")
     .and_then(|v| v.to_str().ok())
     .unwrap_or("");
     let ct_l = ct.to_ascii_lowercase();
@@ -371,7 +350,7 @@ pub fn inject_csrf_token(
     }
 
     let enc = headers
-    .get(CONTENT_ENCODING)
+    .get("content-encoding")
     .and_then(|v| v.to_str().ok())
     .map(|s| s.to_ascii_lowercase());
 

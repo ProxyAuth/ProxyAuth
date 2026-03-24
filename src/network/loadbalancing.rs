@@ -6,12 +6,17 @@ use crate::config::config::BackendConfig;
 use crate::network::config::{LB_TUNING, LbTuning};
 use ahash::{AHashSet, RandomState};
 use dashmap::DashMap;
-use hyper::body::to_bytes;
-use hyper::client::HttpConnector;
-use hyper::{Body, Client, Method, Request, Response, Uri};
-use hyper_proxy::{Intercept, Proxy, ProxyConnector};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper::{Method, Request, Response, Uri};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+use hyper_http_proxy::{Intercept, Proxy, ProxyConnector};
 use hyper_rustls::HttpsConnectorBuilder;
+use http_body_util::{Full, Empty, BodyExt};
+use hyper::body::Bytes;
+use crate::network::shared_client::BoxBody;
 use once_cell::sync::Lazy;
+use std::convert::Infallible;
 use thiserror::Error;
 use tokio::time::timeout;
 
@@ -20,17 +25,18 @@ pub enum ForwardError {
     #[error("503 Service Unavailable")]
     AllBackendsFailed,
 
+    // hyper_util::client::legacy::Error au lieu de hyper::Error
     #[error(transparent)]
-    Hyper(#[from] hyper::Error),
+    Client(#[from] hyper_util::client::legacy::Error),
 }
 
 type AHasherDashMap<K, V> = DashMap<K, V, RandomState>;
 
-type ArcClient = Arc<Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>>;
+type ArcClient = Arc<Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody>>;
 type ClientPool = DashMap<String, ArcClient, RandomState>;
 static CLIENT_POOL: Lazy<ClientPool> = Lazy::new(ClientPool::default);
 
-type ProxyArcClient = Arc<Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, Body>>;
+type ProxyArcClient = Arc<Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, BoxBody>>;
 type ProxyClientPool = DashMap<(String, String), ProxyArcClient, RandomState>;
 static PROXY_CLIENT_POOL: Lazy<ProxyClientPool> = Lazy::new(ProxyClientPool::default);
 
@@ -58,29 +64,15 @@ pub fn lb() -> &'static LbTuning {
     })
 }
 
-fn backend_valid_duration() -> Duration {
-    Duration::from_secs(lb().backend_valid_duration_secs)
-}
+fn backend_valid_duration() -> Duration { Duration::from_secs(lb().backend_valid_duration_secs) }
+pub fn cooldown_base() -> Duration { Duration::from_secs(lb().cooldown_base_secs) }
+fn cooldown_max() -> Duration { Duration::from_secs(lb().cooldown_max_secs) }
+fn backend_reset_threshold() -> Duration { Duration::from_secs(lb().backend_reset_threshold_secs) }
 
-pub fn cooldown_base() -> Duration {
-    Duration::from_secs(lb().cooldown_base_secs)
-}
-
-fn cooldown_max() -> Duration {
-    Duration::from_secs(lb().cooldown_max_secs)
-}
-
-fn backend_reset_threshold() -> Duration {
-    Duration::from_secs(lb().backend_reset_threshold_secs)
-}
-
-// --------- Cooldown helper ---------
 pub fn is_in_cooldown(url: &str) -> bool {
     if let Some(entry) = BACKEND_COOLDOWN.get(url) {
         let mut delay = cooldown_base() * entry.failures.min(10);
-        if delay > cooldown_max() {
-            delay = cooldown_max();
-        }
+        if delay > cooldown_max() { delay = cooldown_max(); }
         return entry.last_failed.elapsed() < delay;
     }
     false
@@ -101,9 +93,7 @@ pub static SWRR_STATE: Lazy<DashMap<String, SwrrState, RandomState>> =
 Lazy::new(Default::default);
 
 pub fn build_swrr_order<'a>(cands: &[&'a BackendConfig]) -> Vec<&'a BackendConfig> {
-    if cands.is_empty() {
-        return Vec::new();
-    }
+    if cands.is_empty() { return Vec::new(); }
 
     let mut unique = AHashSet::default();
     let mut total_weight: i32 = 0;
@@ -125,9 +115,7 @@ pub fn build_swrr_order<'a>(cands: &[&'a BackendConfig]) -> Vec<&'a BackendConfi
         let mut best_val: i32 = i32::MIN;
 
         for (i, b) in cands.iter().enumerate() {
-            if picked.contains(&b.url) {
-                continue;
-            }
+            if picked.contains(&b.url) { continue; }
             if let Some(mut st) = SWRR_STATE.get_mut(&b.url) {
                 st.current += st.effective;
                 if st.current > best_val {
@@ -152,9 +140,7 @@ pub fn build_swrr_order<'a>(cands: &[&'a BackendConfig]) -> Vec<&'a BackendConfi
     let len = order.len();
     if len > 0 {
         let shift = ROUND_ROBIN_COUNTER.fetch_add(1, Ordering::Relaxed) % len;
-        if shift != 0 {
-            order.rotate_left(shift);
-        }
+        if shift != 0 { order.rotate_left(shift); }
     }
 
     order
@@ -171,15 +157,17 @@ pub async fn get_or_build_client(backend: &str) -> ArcClient {
     connector.set_reuse_address(true);
     connector.set_keepalive(Some(Duration::from_secs(lb().keep_alive_secs)));
 
+    // hyper-rustls 0.27 : with_native_roots() retourne Result → .expect()
     let https = HttpsConnectorBuilder::new()
     .with_native_roots()
+    .expect("Failed to load native roots")
     .https_or_http()
     .enable_http1()
     .wrap_connector(connector);
 
-    let client = Client::builder()
+    let client = Client::builder(TokioExecutor::new())
     .pool_max_idle_per_host(lb().pool_max_idle_per_host)
-    .build::<_, Body>(https);
+    .build::<_, BoxBody>(https);
 
     let arc_client = Arc::new(client);
     CLIENT_POOL.insert(key, Arc::clone(&arc_client));
@@ -200,8 +188,10 @@ pub async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> 
     connector.set_reuse_address(true);
     connector.set_keepalive(Some(Duration::from_secs(lb().keep_alive_secs)));
 
+    // hyper-rustls 0.27 : with_native_roots() retourne Result → .expect()
     let https = HttpsConnectorBuilder::new()
     .with_native_roots()
+    .expect("Failed to load native roots")
     .https_or_http()
     .enable_http1()
     .wrap_connector(connector);
@@ -209,7 +199,7 @@ pub async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> 
     let proxy_connector =
     ProxyConnector::from_proxy(https, proxy).expect("Failed to create proxy connector");
 
-    let client = Client::builder()
+    let client = Client::builder(TokioExecutor::new())
     .pool_max_idle_per_host(lb().pool_max_idle_per_host)
     .build(proxy_connector);
 
@@ -219,16 +209,21 @@ pub async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> 
 }
 
 pub async fn forward_failover(
-    req: Request<Body>,
+    req: Request<BoxBody>,
     backends: &[BackendConfig],
     proxy_addr: Option<&str>,
-) -> Result<Response<Body>, ForwardError> {
+) -> Result<Response<BoxBody>, ForwardError> {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let body_bytes = to_bytes(req.into_body()).await?;
 
-    // Purge soft cooldowns
+    let body_bytes = req
+    .into_body()
+    .collect()
+    .await
+    .map_err(|_| ForwardError::AllBackendsFailed)?
+    .to_bytes();
+
     let now = Instant::now();
     BACKEND_COOLDOWN.retain(|_, entry| now.duration_since(entry.last_failed) < backend_reset_threshold());
 
@@ -250,32 +245,13 @@ pub async fn forward_failover(
 
     let active: Vec<&BackendConfig> = backends.iter().filter(|b| b.weight != -1).collect();
     let disabled: Vec<&BackendConfig> = backends.iter().filter(|b| b.weight == -1).collect();
-
     let order_active = build_swrr_order(&active);
-
     let mut already_checked = AHashSet::default();
 
-    if let Some(resp) = try_backends(
-        &order_active,
-        &mut already_checked,
-        &body_bytes,
-        &method,
-        &uri,
-        &headers,
-        proxy_addr,
-    ).await {
+    if let Some(resp) = try_backends(&order_active, &mut already_checked, &body_bytes, &method, &uri, &headers, proxy_addr).await {
         return Ok(resp);
     }
-
-    if let Some(resp) = try_backends(
-        &disabled,
-        &mut already_checked,
-        &body_bytes,
-        &method,
-        &uri,
-        &headers,
-        proxy_addr,
-    ).await {
+    if let Some(resp) = try_backends(&disabled, &mut already_checked, &body_bytes, &method, &uri, &headers, proxy_addr).await {
         return Ok(resp);
     }
 
@@ -285,18 +261,16 @@ pub async fn forward_failover(
 async fn try_backends(
     backends: &[&BackendConfig],
     already_checked: &mut AHashSet<String>,
-    body_bytes: &[u8],
+    body_bytes: &Bytes,
     method: &Method,
     uri: &Uri,
     headers: &hyper::HeaderMap,
     proxy_addr: Option<&str>,
-) -> Option<Response<Body>> {
+) -> Option<Response<BoxBody>> {
     for backend in backends {
         let url = &backend.url;
 
-        if !already_checked.insert(url.clone()) {
-            continue;
-        }
+        if !already_checked.insert(url.clone()) { continue; }
 
         if is_in_cooldown(url) {
             tracing::warn!("Skipping backend {} (cooldown active)", url);
@@ -312,14 +286,8 @@ async fn try_backends(
             Err(_) => {
                 BACKEND_COOLDOWN
                 .entry(url.clone())
-                .and_modify(|e| {
-                    e.failures += 1;
-                    e.last_failed = Instant::now();
-                })
-                .or_insert(CooldownEntry {
-                    failures: 1,
-                    last_failed: Instant::now(),
-                });
+                .and_modify(|e| { e.failures += 1; e.last_failed = Instant::now(); })
+                .or_insert(CooldownEntry { failures: 1, last_failed: Instant::now() });
             }
         }
     }
@@ -329,11 +297,11 @@ async fn try_backends(
 async fn try_forward_to_backend(
     backend: &str,
     proxy_addr: Option<&str>,
-    body_bytes: &[u8],
+    body_bytes: &Bytes,
     method: &Method,
     uri: &Uri,
     headers: &hyper::HeaderMap,
-) -> Result<Response<Body>, ForwardError> {
+) -> Result<Response<BoxBody>, ForwardError> {
     let uri_backend: Uri = backend.parse().map_err(|_| ForwardError::AllBackendsFailed)?;
 
     let mut parts = uri.clone().into_parts();
@@ -352,16 +320,13 @@ async fn try_forward_to_backend(
 
     builder = builder.header(
         "Host",
-        uri_backend
-        .authority()
-        .map(|a| a.as_str())
-        .unwrap_or("127.0.0.1"),
+        uri_backend.authority().map(|a| a.as_str()).unwrap_or("127.0.0.1"),
     );
 
     let new_req = if *method == Method::GET || *method == Method::HEAD {
-        builder.body(Body::empty()).expect("Failed to build GET/HEAD request")
+        builder.body(Empty::<Bytes>::new().boxed()).expect("Failed to build GET/HEAD request")
     } else {
-        builder.body(Body::from(body_bytes.to_vec())).expect("Failed to build request with body")
+        builder.body(Full::new(body_bytes.clone()).boxed()).expect("Failed to build request with body")
     };
 
     let response_result = match proxy_addr {
@@ -376,18 +341,26 @@ async fn try_forward_to_backend(
     };
 
     match response_result {
-        Ok(Ok(resp)) if resp.status().is_success() => Ok(resp),
         Ok(Ok(resp)) => {
-            tracing::warn!(
-                "Failover: backend {} returned non-success status {}",
-                backend,
-                resp.status()
-            );
-            Err(ForwardError::AllBackendsFailed)
+            let status = resp.status();
+            if status.is_success() {
+                // Collecter le body Incoming et reconstruire en BoxBody<Bytes, Infallible>
+                // body.boxed() donnerait BoxBody<Bytes, hyper::Error> — incompatible
+                let (parts, body) = resp.into_parts();
+                let bytes = body.collect().await
+                .map_err(|_| ForwardError::AllBackendsFailed)?
+                .to_bytes();
+                let boxed: BoxBody = Full::new(bytes).map_err(|e: Infallible| e).boxed();
+                Ok(Response::from_parts(parts, boxed))
+            } else {
+                tracing::warn!("Failover: backend {} returned non-success status {}", backend, status);
+                Err(ForwardError::AllBackendsFailed)
+            }
         }
         Ok(Err(e)) => {
             tracing::warn!("Failover: backend {} failed: {}", backend, e);
-            Err(ForwardError::Hyper(e))
+            // e est hyper_util::client::legacy::Error — converti via #[from]
+            Err(ForwardError::Client(e))
         }
         Err(_) => {
             tracing::warn!("Failover: backend {} timed out", backend);
