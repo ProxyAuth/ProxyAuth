@@ -125,6 +125,11 @@ async fn create_listener(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    rustls::crypto::ring::default_provider()
+    .install_default()
+    .expect("Failed to install rustls crypto provider");
+
     let _ = prompt().await;
 
     // launch as user proxyauth
