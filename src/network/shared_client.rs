@@ -22,7 +22,6 @@ thread_local! {
     static THREAD_CLIENT_CACHE: RefCell<ThreadCache> = RefCell::new(AHashMap::with_capacity(8));
 }
 
-#[allow(dead_code)]
 static CLIENT_CACHE: Lazy<AHashDashMap<ClientKey, Client<HttpsConnector<HttpConnector>, BoxBody>>> =
 Lazy::new(AHashDashMap::default);
 static CLIENT_CACHE_PROXY: Lazy<AHashDashMap<ClientKey, Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>>> =
@@ -182,19 +181,15 @@ pub fn build_hyper_client_cert(
         }
     };
 
-    // Utiliser rustls 0.23 explicitement via son chemin complet
-    // pour éviter le conflit avec rustls 0.21 tiré par d'autres dépendances
     let tls_cfg = match rustls::ClientConfig::builder()
     .with_root_certificates({
         let mut store = rustls::RootCertStore::empty();
         // Charger les racines natives via rustls-native-certs
         if let Ok(native) = rustls_native_certs::load_native_certs() {
             for cert in native {
-                let _ = store.add(cert);  // rustls_native_certs 0.7 retourne CertificateDer directement
+                let _ = store.add(cert);
             }
         }
-        // Ajouter les racines WebPKI
-        // rustls 0.23 + webpki_roots 0.26 : TrustAnchor implémente Into<TrustAnchor>
         for ta in webpki_roots::TLS_SERVER_ROOTS.iter() {
             store.roots.push(rustls_pki_types::TrustAnchor {
                 subject: rustls_pki_types::Der::from_slice(ta.subject.as_ref()),
@@ -229,9 +224,8 @@ pub fn build_hyper_client_proxy(
     opts: ClientOptions,
     state: &Arc<AppConfig>,
 ) -> Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody> {
-    let keep = Duration::from_secs(state.keep_alive);
+    let keep = Duration::from_millis(state.keep_alive);
 
-    // Utiliser with_native_roots() directement — pas de rustls::ClientConfig manuel
     let https = build_https_connector_no_auth(keep);
 
     let proxy_addr = opts
@@ -250,9 +244,7 @@ pub fn build_hyper_client_proxy(
 }
 
 pub fn build_hyper_client_normal(state: &Arc<AppConfig>) -> Client<HttpsConnector<HttpConnector>, BoxBody> {
-    let keep = Duration::from_secs(state.keep_alive);
-
-    // with_native_roots() — hyper-rustls 0.27 gère rustls 0.23 en interne
+    let keep = Duration::from_millis(state.keep_alive);
     let https = build_https_connector_no_auth(keep);
 
     Client::builder(TokioExecutor::new())

@@ -26,7 +26,6 @@ use std::sync::RwLock;
 
 static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock::new(None));
 
-// Convertit hyper::StatusCode (http 1.x) en actix_web::http::StatusCode (http 0.2)
 fn to_actix_status(s: hyper::StatusCode) -> actix_web::http::StatusCode {
     actix_web::http::StatusCode::from_u16(s.as_u16()).unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -35,7 +34,6 @@ fn norm_len(prefix: &str) -> usize {
     if prefix == "/" { 0 } else { prefix.trim_end_matches('/').len() }
 }
 
-// method: &str pour éviter le conflit reqwest::Method vs hyper::Method
 fn is_method_allowed(allowed: Option<&[String]>, method: &str) -> bool {
     match allowed {
         None => true,
@@ -193,13 +191,13 @@ pub fn client_ip(req: &HttpRequest) -> Option<IpAddr> {
     .or_else(|| req.peer_addr().map(|addr| addr.ip()))
 }
 
-// Convertit Response<Incoming> en Response<BoxBody> en collectant le body
 async fn incoming_to_boxbody(res: hyper::Response<Incoming>) -> Result<hyper::Response<BoxBody>, hyper::Error> {
     let (parts, body) = res.into_parts();
     let bytes = body.collect().await?.to_bytes();
     let boxed: BoxBody = Full::new(bytes).map_err(|e: Infallible| e).boxed();
     Ok(hyper::Response::from_parts(parts, boxed))
 }
+
 
 pub async fn global_proxy(
     req: HttpRequest,
@@ -253,7 +251,6 @@ pub async fn proxy_with_proxy(
 ) -> Result<HttpResponse, Error> {
     let path = req.path();
     let ip = client_ip(&req).unwrap_or(IpAddr::from([127, 0, 0, 1])).to_string();
-    // .as_str() pour obtenir &str — évite le conflit reqwest::Method vs hyper::Method
     let method_str = req.method().as_str();
     let user_agent = req.headers().get("User-Agent").and_then(|h| h.to_str().ok()).unwrap_or("-");
 
@@ -282,7 +279,6 @@ pub async fn proxy_with_proxy(
             return Ok(resp.body("403 Forbidden"));
         }
 
-        // Passer method_str (&str) à is_method_allowed — plus de conflit de types
         if !is_method_allowed(rule.allow_methods.as_deref(), method_str) {
             let allow = build_allow_header(rule.allow_methods.as_deref());
             let mut resp = HttpResponse::build(StatusCode::METHOD_NOT_ALLOWED);
@@ -341,9 +337,9 @@ pub async fn proxy_with_proxy(
             ClientOptions {
                 use_proxy: true,
                 proxy_addr: Some(rule.proxy_config.clone()),
-                                               use_cert: false,
-                                               cert_path: Some("".to_string()),
-                                               key_path: Some("".to_string()),
+                use_cert: false,
+                cert_path: Some("".to_string()),
+                key_path: Some("".to_string()),
             },
             data.config.clone(),
         );
@@ -379,12 +375,25 @@ pub async fn proxy_with_proxy(
 
             let (username, token_id, _expiry) = match validate_token(token_header, &data, &data.config, &ip).await {
                 Ok(result) => result,
-                Err(err) => {
-                    warn!(client_ip = %ip, "Unauthorized token attempt: {}", err);
+                Err(_err) => {
+
+                    warn!("[{}] {} {} 401 Unauthorized token attempt {} {}", ip, path, method_str, user_agent, _err);
+
                     let mut resp = HttpResponse::Unauthorized();
                     resp.append_header(("server", "ProxyAuth"));
+
+                    resp.append_header((
+                        "Set-Cookie",
+                        "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
+                    ));
+
+                    resp.append_header(("server", "ProxyAuth"));
+                    if req.uri() != "/" || req.uri() != "" {
+                        resp.append_header(("location", "/"));
+                    }
+
                     add_cors_headers(&mut resp, &req);
-                    return Ok(resp.body("403 Forbidden"));
+                    return Ok(resp.body("401 Unauthorized"));
                 }
             };
 
@@ -395,15 +404,22 @@ pub async fn proxy_with_proxy(
                 add_cors_headers(&mut resp, &req);
                 return Ok(resp.body("403 Forbidden"));
             }
+
+            if req.uri() == "/" || req.uri() == "" {
+                let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+
+                return Ok(HttpResponse::SeeOther()
+                .append_header(("server", "ProxyAuth"))
+                .append_header(("location", redirect_target))
+                .finish());
+            }
+
             (username, token_id)
         } else {
             (String::new(), String::new())
         };
 
-        // Construire la requête hyper avec Method::from_bytes depuis le &str actix
-        // pour éviter le conflit de types entre reqwest::Method et hyper::Method
-        let hyper_method = Method::from_bytes(method_str.as_bytes())
-        .unwrap_or(Method::GET);
+        let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
 
         let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
 
@@ -413,7 +429,6 @@ pub async fn proxy_with_proxy(
                 user_agent_fwd = value.to_str().unwrap_or("");
             }
             if key_str != "authorization" && key_str != "user-agent" {
-                // Passer par &str pour éviter le conflit HeaderName http 0.2 vs http 1.x
                 if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
                     request_builder = request_builder.header(key_str, hv);
                 }
@@ -450,7 +465,7 @@ pub async fn proxy_with_proxy(
         let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
             let backends: Vec<BackendConfig> = rule.backends.iter().map(|b| match b {
                 BackendInput::Simple(url) => BackendConfig { url: url.clone(), weight: 1 },
-                                                                        BackendInput::Detailed(cfg) => cfg.clone(),
+                BackendInput::Detailed(cfg) => cfg.clone(),
             }).collect();
 
             forward_failover(hyper_req, &backends, Some(&rule.proxy_config))
@@ -460,8 +475,7 @@ pub async fn proxy_with_proxy(
                     error::ErrorServiceUnavailable("503 Service Unavailable")
                 })?
         } else {
-            // client.request() retourne Response<Incoming> — convertir en Response<BoxBody>
-            match timeout(Duration::from_millis(2000), client.request(hyper_req)).await {
+            match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
                 Ok(Ok(res)) => incoming_to_boxbody(res).await.map_err(|e| {
                     warn!(client_ip = %ip, target = %full_url, "Body collect error: {}", e);
                     error::ErrorServiceUnavailable("503 Service Unavailable")
@@ -494,7 +508,6 @@ pub async fn proxy_with_proxy(
 
         let mut client_resp = HttpResponse::build(to_actix_status(status));
 
-        // Annoter le type explicitement pour lever l'ambiguïté HeaderName
         for (key, value) in response_result.headers() as &hyper::HeaderMap {
             let k = key.as_str();
             if k != "user-agent" && k != "authorization" && k != "server" {
@@ -504,7 +517,6 @@ pub async fn proxy_with_proxy(
 
         let headers = response_result.headers().clone();
 
-        // body est BoxBody<Bytes, Infallible> — collect() non-ambigu
         let mut body_bytes: Bytes = response_result
         .into_body()
         .collect()
@@ -553,7 +565,6 @@ pub async fn proxy_without_proxy(
 ) -> Result<HttpResponse, Error> {
     let path = req.path();
     let ip = client_ip(&req).unwrap_or(IpAddr::from([127, 0, 0, 1])).to_string();
-    // .as_str() pour éviter le conflit reqwest::Method vs hyper::Method
     let method_str = req.method().as_str();
     let user_agent = req.headers().get("User-Agent").and_then(|h| h.to_str().ok()).unwrap_or("-");
 
@@ -640,13 +651,13 @@ pub async fn proxy_without_proxy(
             get_or_build_thread_client(&ClientOptions {
                 use_proxy: false, proxy_addr: None, use_cert: true,
                 cert_path: rule.cert.get("file").cloned(),
-                                       key_path: rule.cert.get("key").cloned(),
+                key_path: rule.cert.get("key").cloned(),
             }, &data.config.clone())
         } else {
             get_or_build_thread_client(&ClientOptions {
                 use_proxy: false, proxy_addr: None, use_cert: false,
                 cert_path: rule.cert.get("file").cloned(),
-                                       key_path: rule.cert.get("key").cloned(),
+                key_path: rule.cert.get("key").cloned(),
             }, &data.config.clone())
         };
 
@@ -683,9 +694,22 @@ pub async fn proxy_without_proxy(
             let (username, token_id, _expiry) = match validate_token(token_header, &data, &data.config, &ip).await {
                 Ok(result) => result,
                 Err(_err) => {
-                    info!("[{}] {} {} 401 Unauthorized token attempt {}", ip, path, method_str, user_agent);
+
+                    warn!("[{}] {} {} 401 Unauthorized token attempt {} {}", ip, path, method_str, user_agent, _err);
+
                     let mut resp = HttpResponse::Unauthorized();
                     resp.append_header(("server", "ProxyAuth"));
+
+                    resp.append_header((
+                        "Set-Cookie",
+                        "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
+                    ));
+
+                    resp.append_header(("server", "ProxyAuth"));
+                    if req.uri() != "/" || req.uri() != "" {
+                        resp.append_header(("location", "/"));
+                    }
+
                     add_cors_headers(&mut resp, &req);
                     return Ok(resp.body("401 Unauthorized"));
                 }
@@ -695,15 +719,29 @@ pub async fn proxy_without_proxy(
                 info!("[{}] {} {} 401 Unauthorized token attempt {}", ip, path, method_str, user_agent);
                 let mut resp = HttpResponse::Unauthorized();
                 resp.append_header(("server", "ProxyAuth"));
+                resp.append_header((
+                    "Set-Cookie",
+                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
+                ));
                 add_cors_headers(&mut resp, &req);
                 return Ok(resp.body("401 Unauthorized"));
             }
+
+            if req.uri() == "/" || req.uri() == "" {
+
+                let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+
+                return Ok(HttpResponse::SeeOther()
+                .append_header(("server", "ProxyAuth"))
+                .append_header(("location", redirect_target))
+                .finish());
+            }
+
             (username, token_id)
         } else {
             (String::new(), String::new())
         };
 
-        // Construire la méthode hyper depuis &str pour éviter le conflit de types
         let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
 
         let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
@@ -714,7 +752,6 @@ pub async fn proxy_without_proxy(
                 user_agent_fwd = value.to_str().unwrap_or("");
             }
             if key_str != "authorization" && key_str != "user-agent" {
-                // Passer par &str / bytes pour éviter le conflit HeaderName http 0.2 vs http 1.x
                 if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
                     request_builder = request_builder.header(key_str, hv);
                 }
@@ -751,7 +788,7 @@ pub async fn proxy_without_proxy(
         let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
             let backends: Vec<BackendConfig> = rule.backends.iter().map(|b| match b {
                 BackendInput::Simple(url) => BackendConfig { url: url.clone(), weight: 1 },
-                                                                        BackendInput::Detailed(cfg) => cfg.clone(),
+                BackendInput::Detailed(cfg) => cfg.clone(),
             }).collect();
 
             match forward_failover(hyper_req, &backends, None).await {
@@ -765,8 +802,7 @@ pub async fn proxy_without_proxy(
                 }
             }
         } else {
-            // client.request() retourne Response<Incoming> — convertir en Response<BoxBody>
-            match timeout(Duration::from_millis(2000), client.request(hyper_req)).await {
+            match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
                 Ok(Ok(res)) => incoming_to_boxbody(res).await.map_err(|e| {
                     warn!(client_ip = %ip, target = %full_url, "Body collect error: {}", e);
                     error::ErrorServiceUnavailable("503 Service Unavailable")
@@ -803,7 +839,6 @@ pub async fn proxy_without_proxy(
 
         let mut client_resp = HttpResponse::build(to_actix_status(status));
 
-        // Itérer avec annotation de type explicite pour éviter l'ambiguïté
         for (key, value) in &headers as &hyper::HeaderMap {
             let k = key.as_str();
             if k != "user-agent" && k != "authorization" && k != "server" {
@@ -811,7 +846,6 @@ pub async fn proxy_without_proxy(
             }
         }
 
-        // resp_body est BoxBody<Bytes, Infallible> — collect() non-ambigu
         let mut body_bytes: Bytes = resp_body
         .collect()
         .await

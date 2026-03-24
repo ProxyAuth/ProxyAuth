@@ -343,18 +343,16 @@ async fn try_forward_to_backend(
     match response_result {
         Ok(Ok(resp)) => {
             let status = resp.status();
-            if status.is_success() {
-                // Collecter le body Incoming et reconstruire en BoxBody<Bytes, Infallible>
-                // body.boxed() donnerait BoxBody<Bytes, hyper::Error> — incompatible
+            if status.is_server_error() {
+                tracing::warn!("Failover: backend {} returned server error {}", backend, status);
+                Err(ForwardError::AllBackendsFailed)
+            } else {
                 let (parts, body) = resp.into_parts();
                 let bytes = body.collect().await
                 .map_err(|_| ForwardError::AllBackendsFailed)?
                 .to_bytes();
                 let boxed: BoxBody = Full::new(bytes).map_err(|e: Infallible| e).boxed();
                 Ok(Response::from_parts(parts, boxed))
-            } else {
-                tracing::warn!("Failover: backend {} returned non-success status {}", backend, status);
-                Err(ForwardError::AllBackendsFailed)
             }
         }
         Ok(Err(e)) => {
