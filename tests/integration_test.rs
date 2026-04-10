@@ -123,3 +123,5 @@ async fn test_auth_route() {
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 }
+
+
