@@ -10,41 +10,40 @@ mod tests {
     use actix_web::{test, http::header, HttpResponse, Responder, web};
     use std::sync::Arc;
     use dashmap::DashMap;
-    use hyper::{Body, Client, client::HttpConnector};
-    use hyper_rustls::HttpsConnectorBuilder;
-    use hyper_proxy::ProxyConnector;
-    use hyper_proxy::Proxy;
-    use hyper_proxy::Intercept;
 
+    // hyper 1.x
+    use hyper_util::client::legacy::Client;
+    use hyper_util::client::legacy::connect::HttpConnector;
+    use hyper_util::rt::TokioExecutor;
+    use hyper_rustls::HttpsConnectorBuilder;
+    use http_body_util::{Full, BodyExt, combinators::BoxBody};
+    use std::convert::Infallible;
+    use hyper::body::Bytes;
+    use hyper_http_proxy::{Proxy, ProxyConnector, Intercept};
 
     type RoutesWrapper = RouteConfig;
 
-    fn dummy_https_client() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, Body> {
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
+    fn dummy_https_client() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
+        .unwrap()
         .https_or_http()
         .enable_http1()
-        .wrap_connector(http);
-        Client::builder().build::<_, Body>(https)
+        .build();
+        Client::builder(TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(https)
     }
 
-    fn dummy_proxy_client(
-    ) -> Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, Body> {
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
+    fn dummy_proxy_client() -> Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
+        .unwrap()
         .https_or_http()
         .enable_http1()
-        .wrap_connector(http);
-
-        let proxy = Proxy::new(Intercept::None, "http://127.0.0.1:8888".parse().unwrap());
-        let px = ProxyConnector::from_proxy(https, proxy).expect("proxy connector");
-        Client::builder().build(px)
+        .build();
+        let proxy = Proxy::new(Intercept::All, "http://127.0.0.1:1".parse().unwrap());
+        let connector = ProxyConnector::from_proxy(https, proxy).unwrap();
+        Client::builder(TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(connector)
     }
-
 
     fn make_state(stats_enabled: bool) -> web::Data<AppState> {
         let mut cfg = AppConfig::default();
@@ -52,21 +51,16 @@ mod tests {
         cfg.token_admin = "adm-token".to_string();
 
         let routes = Arc::new(RoutesWrapper { routes: vec![] });
-
         let counter = Arc::new(CounterToken::new());
         let revoked_tokens = Arc::new(DashMap::<String, u64>::new());
-
-        let client_normal     = dummy_https_client();
-        let client_with_cert  = dummy_https_client();
-        let client_with_proxy = dummy_proxy_client();
 
         web::Data::new(AppState {
             config: Arc::new(cfg),
                        routes,
                        counter,
-                       client_normal,
-                       client_with_cert,
-                       client_with_proxy,
+                       client_normal:     dummy_https_client(),
+                       client_with_cert:  dummy_https_client(),
+                       client_with_proxy: dummy_proxy_client(),
                        revoked_tokens,
         })
     }

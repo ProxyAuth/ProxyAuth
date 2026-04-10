@@ -24,70 +24,76 @@ mod tests {
     use proxyauth::token::csrf::make_csrf_token;
     use rand_chacha::rand_core;
     use dashmap::DashMap;
-    use hyper::Body;
 
+    // hyper 1.x
+    use hyper::body::Incoming;
+    use hyper_util::rt::TokioIo;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_rustls::HttpsConnectorBuilder;
-    use hyper::client::HttpConnector;
+    use http_body_util::{Full, BodyExt, combinators::BoxBody};
+    use std::convert::Infallible;
+    use hyper_http_proxy::{Proxy, ProxyConnector, Intercept};
+    use hyper::body::Bytes;
 
     use std::sync::Arc;
+    use std::net::TcpListener;
+    use tokio::net::TcpListener as TokioTcpListener;
     use argon2::{Argon2, password_hash::{PasswordHasher, SaltString}};
-
-    use hyper_proxy::{Proxy, ProxyConnector, Intercept};
 
     // --------- Helpers -------------------------------------------------------
 
-    fn https_client() -> hyper::Client<hyper_rustls::HttpsConnector<HttpConnector>, Body> {
+    fn https_client() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
+        .unwrap()
         .https_or_http()
         .enable_http1()
         .build();
-        hyper::Client::builder().build::<_, Body>(https)
+        Client::builder(hyper_util::rt::TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(https)
     }
 
-    fn proxy_client() -> hyper::Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, Body> {
+    fn proxy_client() -> Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
+        .unwrap()
         .https_or_http()
         .enable_http1()
         .build();
         let proxy = Proxy::new(Intercept::All, "http://127.0.0.1:1".parse().unwrap());
-        let pc = ProxyConnector::from_proxy(https, proxy).unwrap();
-        hyper::Client::builder().build(pc)
+        let connector = ProxyConnector::from_proxy(https, proxy).unwrap();
+        Client::builder(hyper_util::rt::TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(connector)
     }
 
     fn start_backend(html: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        use std::net::TcpListener;
-        use hyper::{Body, Response, Server};
-        use hyper::service::{make_service_fn, service_fn};
-        use actix_web::http::header;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::Response;
 
-        // listener std
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let local_addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
-
-        let make = make_service_fn(move |_conn| {
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |_req| {
-                    let body = Body::from(html.as_bytes().to_vec());
-                    async move {
-                        Ok::<_, hyper::Error>(
-                            Response::builder()
-                            .status(200)
-                            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                            .body(body)
-                            .unwrap()
-                        )
-                    }
-                }))
-            }
-        });
-
-        let server = Server::from_tcp(listener).unwrap().serve(make);
+        let tokio_listener = TokioTcpListener::from_std(listener).unwrap();
 
         let join = tokio::spawn(async move {
-            let _ = server.await;
+            loop {
+                let Ok((stream, _)) = tokio_listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: hyper::Request<Incoming>| async move {
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                            .status(200)
+                            // Utiliser &str au lieu de header::CONTENT_TYPE (actix http 0.2)
+                            // pour éviter le conflit de versions du crate `http`
+                            .header("content-type", "text/html; charset=utf-8")
+                            .body(Full::new(Bytes::from(html)))
+                            .unwrap(),
+                        )
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
         });
 
         (local_addr, join)
@@ -170,7 +176,6 @@ mod tests {
 
     #[tokio::test]
     async fn either_auth_json_and_form_and_unsupported() {
-        // JSON
         let payload = r#"{"username":"u","password":"p","csrf_token":"t"}"#;
         let (req, mut pl) = test::TestRequest::default()
         .insert_header((header::CONTENT_TYPE, "application/json"))
@@ -187,7 +192,6 @@ mod tests {
             _ => panic!("attendu Json"),
         }
 
-        // Form
         let (req, mut pl) = test::TestRequest::default()
         .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
         .set_payload("username=u&password=p&csrf_token=t2")
@@ -203,7 +207,6 @@ mod tests {
             _ => panic!("attendu Form"),
         }
 
-        // Unsupported
         let (req, mut pl) = test::TestRequest::default()
         .insert_header((header::CONTENT_TYPE, "text/plain"))
         .set_payload("x")
@@ -217,29 +220,38 @@ mod tests {
     async fn validate_csrf_allows_safe_and_checks_post() {
         let secret = "s3cr3t";
 
-        // GET allow no token
         let req_get = test::TestRequest::default()
         .method(actix_web::http::Method::GET)
         .to_http_request();
-        let ok = proxyauth::token::auth::validate_csrf(&req_get, &proxyauth::token::auth::EitherAuth::Json(AuthRequest{
-            username:"".into(), password:"".into(), totp_code:None, csrf_token:None
-        }), secret);
+        let ok = proxyauth::token::auth::validate_csrf(
+            &req_get,
+            &proxyauth::token::auth::EitherAuth::Json(AuthRequest {
+                username: "".into(), password: "".into(), totp_code: None, csrf_token: None,
+            }),
+            secret,
+        );
         assert!(ok);
 
-        // POST no token => false
         let req_post = test::TestRequest::default()
         .method(actix_web::http::Method::POST)
         .to_http_request();
-        let bad = proxyauth::token::auth::validate_csrf(&req_post, &proxyauth::token::auth::EitherAuth::Json(AuthRequest{
-            username:"".into(), password:"".into(), totp_code:None, csrf_token:None
-        }), secret);
+        let bad = proxyauth::token::auth::validate_csrf(
+            &req_post,
+            &proxyauth::token::auth::EitherAuth::Json(AuthRequest {
+                username: "".into(), password: "".into(), totp_code: None, csrf_token: None,
+            }),
+            secret,
+        );
         assert!(!bad);
 
-        // POST token valid
         let tok = make_csrf_token(secret);
-        let good = proxyauth::token::auth::validate_csrf(&req_post, &proxyauth::token::auth::EitherAuth::Json(AuthRequest{
-            username:"".into(), password:"".into(), totp_code:None, csrf_token:Some(tok)
-        }), secret);
+        let good = proxyauth::token::auth::validate_csrf(
+            &req_post,
+            &proxyauth::token::auth::EitherAuth::Json(AuthRequest {
+                username: "".into(), password: "".into(), totp_code: None, csrf_token: Some(tok),
+            }),
+            secret,
+        );
         assert!(good);
     }
 
@@ -247,10 +259,12 @@ mod tests {
 
     #[test]
     async fn is_ip_allowed_variants() {
-        let base = || User { username:"u".into(), password:"h".into(), otpkey:None, allow:None, roles:None, email: None, };
+        let base = || User {
+            username: "u".into(), password: "h".into(),
+            otpkey: None, allow: None, roles: None, email: None,
+        };
 
-        let user_none = base();
-        assert!(proxyauth::token::auth::is_ip_allowed("203.0.113.7", &user_none));
+        assert!(proxyauth::token::auth::is_ip_allowed("203.0.113.7", &base()));
 
         let user_empty = User { allow: Some(vec![]), ..base() };
         assert!(proxyauth::token::auth::is_ip_allowed("203.0.113.7", &user_empty));
@@ -264,7 +278,7 @@ mod tests {
         assert!(!proxyauth::token::auth::is_ip_allowed("2001:dead::1", &user_ipv6));
     }
 
-    // --------- verify_password ----------------------------------------------
+    // --------- verify_password -----------------------------------------------
 
     #[test]
     async fn verify_password_ok_bad() {
@@ -273,7 +287,7 @@ mod tests {
         assert!(!proxyauth::token::auth::verify_password("wrong", &hashed));
     }
 
-    // --------- generate_random_string ---------------------------------------
+    // --------- generate_random_string ----------------------------------------
 
     #[test]
     async fn generate_random_string_is_hex64() {
@@ -300,11 +314,10 @@ mod tests {
         assert!(fmt.len() >= 10);
     }
 
-    // --------- auth_options (CORS) ------------------------------------------
+    // --------- auth_options (CORS) -------------------------------------------
 
     #[tokio::test]
     async fn auth_options_cors_ok_and_forbidden() {
-        // OK
         let mut cfg_ok = base_config();
         cfg_ok.cors_origins = Some(vec!["https://app.example.com".into()]);
         let state_ok = mk_state(vec![], cfg_ok);
@@ -316,11 +329,9 @@ mod tests {
         let resp = proxyauth::token::auth::auth_options(req, state_ok).await
         .respond_to(&test::TestRequest::default().to_http_request());
         assert_eq!(resp.status(), StatusCode::OK);
-        let b_res = actix_to_bytes(resp.into_body()).await;
-        let b = b_res.unwrap_or_else(|_| bytes::Bytes::new());
+        let b = actix_to_bytes(resp.into_body()).await.unwrap_or_default();
         assert!(b.is_empty());
 
-        // Forbidden
         let state_ko = mk_state(vec![], base_config());
         let req2 = test::TestRequest::default()
         .insert_header((header::ORIGIN, "https://not-allowed.example"))
@@ -337,8 +348,7 @@ mod tests {
         let user = User {
             username: "alice".into(),
             password: hash_pwd("passw0rd"),
-            otpkey: None,
-            allow: None,
+            otpkey: None, allow: None,
             roles: Some(vec!["user".into()]),
             email: None,
         };
@@ -358,27 +368,20 @@ mod tests {
         .set_payload(r#"{"username":"alice","password":"passw0rd","csrf_token":""}"#)
         .to_http_request();
 
-        let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest{
-            username:"alice".into(),
-                                              password:"passw0rd".into(),
-                                              totp_code: None,
-                                              csrf_token: Some(tok),
+        let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
+            username: "alice".into(),
+                                                               password: "passw0rd".into(),
+                                                               totp_code: None,
+                                                               csrf_token: Some(tok),
         });
 
         let resp = proxyauth::token::auth::auth(req, data.clone(), payload).await
         .respond_to(&test::TestRequest::default().to_http_request());
 
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-
-        let mut has_cookie = false;
-        for v in resp.headers().get_all(header::SET_COOKIE).into_iter() {
-            if v.to_str().unwrap_or("").starts_with("session_token=") {
-                has_cookie = true;
-                break;
-            }
-        }
+        let has_cookie = resp.headers().get_all(header::SET_COOKIE).into_iter()
+        .any(|v| v.to_str().unwrap_or("").starts_with("session_token="));
         assert!(has_cookie);
-
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/home");
     }
 
@@ -395,19 +398,15 @@ mod tests {
 
         let (addr, _join) = start_backend(HTML);
 
-        let logout_url = format!("http://{}/logout", addr);
-        let routes = vec![ rr("/logout", &format!("http://{}/logout", addr)) ];
+        let routes = vec![rr("/logout", &format!("http://{}/logout", addr))];
 
         let mut cfg = base_config();
-        cfg.users = vec![ User {
+        cfg.users = vec![User {
             username: "bob".into(),
             password: hash_pwd("correct"),
-            otpkey: None,
-            allow: None,
-            roles: None,
-            email: None,
+            otpkey: None, allow: None, roles: None, email: None,
         }];
-        cfg.logout_redirect_url = Some(logout_url);
+        cfg.logout_redirect_url = Some(format!("http://{}/logout", addr));
         let data = mk_state(routes, cfg);
 
         let tok = make_csrf_token(&data.config.secret);
@@ -416,19 +415,18 @@ mod tests {
         .insert_header(("x-forwarded-for", "198.51.100.9"))
         .to_http_request();
 
-        let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest{
-            username:"bob".into(),
-                                              password:"wrong".into(),
-                                              totp_code: None,
-                                              csrf_token: Some(tok),
+        let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
+            username: "bob".into(),
+                                                               password: "wrong".into(),
+                                                               totp_code: None,
+                                                               csrf_token: Some(tok),
         });
 
         let resp = proxyauth::token::auth::auth(req, data.clone(), payload).await
         .respond_to(&test::TestRequest::default().to_http_request());
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let body_res = actix_to_bytes(resp.into_body()).await;
-        let body = body_res.unwrap_or_else(|_| bytes::Bytes::new());
+        let body = actix_to_bytes(resp.into_body()).await.unwrap_or_default();
         let s = String::from_utf8_lossy(&body);
         assert!(s.contains("err"));
     }
@@ -441,34 +439,25 @@ mod tests {
     ) -> String {
         use chrono::Utc;
         let user = &data.config.users[index_user];
-        let expiry_ts = (Utc::now() + chrono::Duration::seconds(seconds_from_now)).timestamp().to_string();
+        let expiry_ts = (Utc::now() + chrono::Duration::seconds(seconds_from_now))
+        .timestamp()
+        .to_string();
 
-        // même token applicatif que validate_token attend
         let token_plain = generate_token(&user.username, &data.config, &expiry_ts, token_id);
-
-        // pré-hash appli « transport »
         let cipher_part = calcul_cipher(token_plain);
-
-        // concatène les 4 segments
         let clear = format!("{cipher_part}|{expiry_ts}|{index_user}|{token_id}");
-
-        // chiffre avec la clé dérivée du secret (exactement comme dans le handler)
         let key = derive_key_from_secret(&data.config.secret);
         encrypt(&clear, &key)
     }
 
-    // ---------- EitherAuth::Form end-to-end ----------
+    // ---------- EitherAuth::Form end-to-end ----------------------------------
 
     #[tokio::test]
     async fn either_auth_form_end_to_end_with_csrf_ok_redirects_and_sets_cookie() {
-        // Config de base avec un user « alice »
         let user = User {
             username: "alice".into(),
             password: hash_pwd("passw0rd"),
-            otpkey: None,
-            allow: None,
-            roles: None,
-            email: None,
+            otpkey: None, allow: None, roles: None, email: None,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -477,55 +466,40 @@ mod tests {
         cfg.login_redirect_url = Some("/home".into());
         let data = mk_state(vec![], cfg);
 
-        // CSRF
         let tok = make_csrf_token(&data.config.secret);
+        let form = format!("username=alice&password=passw0rd&csrf_token={}", urlencoding::encode(&tok));
 
-        // Requête Form
-        let form = format!(
-            "username=alice&password=passw0rd&csrf_token={}",
-            urlencoding::encode(&tok)
-        );
         let req = test::TestRequest::default()
         .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
         .insert_header(("x-forwarded-for", "203.0.113.7"))
         .set_payload(form)
         .to_http_request();
 
-        // EitherAuth::Form
         let payload = proxyauth::token::auth::EitherAuth::Form(AuthRequest {
             username: "alice".into(),
-                                              password: "passw0rd".into(),
-                                              totp_code: None,
-                                              csrf_token: Some(tok),
+                                                               password: "passw0rd".into(),
+                                                               totp_code: None,
+                                                               csrf_token: Some(tok),
         });
 
-        let resp = proxyauth::token::auth::auth(req, data.clone(), payload)
-        .await
+        let resp = proxyauth::token::auth::auth(req, data.clone(), payload).await
         .respond_to(&test::TestRequest::default().to_http_request());
 
-        // On est redirigé et un cookie session est posé
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/home");
-        let has_cookie = resp
-        .headers()
-        .get_all(header::SET_COOKIE)
-        .into_iter() // <- IMPORTANT: pas `.iter()`
+        let has_cookie = resp.headers().get_all(header::SET_COOKIE).into_iter()
         .any(|v| v.to_str().unwrap_or("").starts_with("session_token="));
         assert!(has_cookie);
     }
 
-    // ---------- Session cookie déjà présent (early return) + CORS reflété ----------
+    // ---------- Session cookie déjà présent ----------------------------------
 
     #[tokio::test]
     async fn auth_with_valid_session_cookie_short_circuits_and_reflects_cors() {
-        // User + CORS autorisé
         let user = User {
             username: "alice".into(),
             password: hash_pwd("irrelevant"),
-            otpkey: None,
-            allow: None,
-            roles: None,
-            email: None,
+            otpkey: None, allow: None, roles: None, email: None,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -545,42 +519,34 @@ mod tests {
 
         let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
             username: "alice".into(),
-                                              password: "does-not-matter".into(),
-                                              totp_code: None,
-                                              csrf_token: Some(make_csrf_token(&data.config.secret)),
+                                                               password: "does-not-matter".into(),
+                                                               totp_code: None,
+                                                               csrf_token: Some(make_csrf_token(&data.config.secret)),
         });
 
-        let resp = proxyauth::token::auth::auth(req, data.clone(), payload)
-        .await
+        let resp = proxyauth::token::auth::auth(req, data.clone(), payload).await
         .respond_to(&test::TestRequest::default().to_http_request());
 
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/dashboard");
         assert_eq!(
-            resp.headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .and_then(|v| v.to_str().ok()),
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).and_then(|v| v.to_str().ok()),
                    Some("https://app.example.com")
         );
         assert_eq!(
-            resp.headers()
-            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
-            .and_then(|v| v.to_str().ok()),
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).and_then(|v| v.to_str().ok()),
                    Some("true")
         );
     }
 
-    // ---------- Session cookie: redirect URL invalide (pas un chemin relatif) ----------
+    // ---------- Redirect URL invalide ----------------------------------------
 
     #[tokio::test]
     async fn auth_session_cookie_redirect_url_must_be_relative() {
         let user = User {
             username: "alice".into(),
             password: hash_pwd("passw0rd"),
-            otpkey: None,
-            allow: None,
-            roles: None,
-            email: None,
+            otpkey: None, allow: None, roles: None, email: None,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -595,24 +561,21 @@ mod tests {
 
         let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
             username: "alice".into(),
-                                              password: "passw0rd".into(),
-                                              totp_code: None,
-                                              csrf_token: Some(make_csrf_token(&data.config.secret)),
+                                                               password: "passw0rd".into(),
+                                                               totp_code: None,
+                                                               csrf_token: Some(make_csrf_token(&data.config.secret)),
         });
 
-        let resp = proxyauth::token::auth::auth(req, data.clone(), payload)
-        .await
+        let resp = proxyauth::token::auth::auth(req, data.clone(), payload).await
         .respond_to(&test::TestRequest::default().to_http_request());
-
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    // ---------- TOTP: succès ----------
+    // ---------- TOTP ---------------------------------------------------------
 
     #[tokio::test]
     async fn auth_totp_success_sets_cookie_and_redirects() {
         use base32::Alphabet;
-        // secret TOTP aléatoire RFC4648 (sans padding)
         let raw_secret: [u8; 20] = *b"0123456789ABCDEFGHIJ";
         let b32 = base32::encode(Alphabet::Rfc4648 { padding: false }, &raw_secret);
 
@@ -620,9 +583,7 @@ mod tests {
             username: "carol".into(),
             password: hash_pwd("otp-pass"),
             otpkey: Some(b32.clone()),
-            allow: None,
-            roles: None,
-            email: None,
+            allow: None, roles: None, email: None,
         };
 
         let mut cfg = base_config();
@@ -633,13 +594,9 @@ mod tests {
         cfg.login_redirect_url = Some("/after-otp".into());
         let data = mk_state(vec![], cfg);
 
-        let secret_bytes =
-        base32::decode(Alphabet::Rfc4648 { padding: false }, &b32).expect("decode b32");
-        let totp = TOTP::new(Algorithm::SHA512, 6, 0, 30, secret_bytes).expect("totp");
-        let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+        let secret_bytes = base32::decode(Alphabet::Rfc4648 { padding: false }, &b32).unwrap();
+        let totp = TOTP::new(Algorithm::SHA512, 6, 0, 30, secret_bytes).unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let code = totp.generate(now);
 
         let tok = make_csrf_token(&data.config.secret);
@@ -651,36 +608,29 @@ mod tests {
 
         let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
             username: "carol".into(),
-                                              password: "otp-pass".into(),
-                                              totp_code: Some(code),
-                                              csrf_token: Some(tok),
+                                                               password: "otp-pass".into(),
+                                                               totp_code: Some(code),
+                                                               csrf_token: Some(tok),
         });
 
-        let resp = proxyauth::token::auth::auth(req, data.clone(), payload)
-        .await
+        let resp = proxyauth::token::auth::auth(req, data.clone(), payload).await
         .respond_to(&test::TestRequest::default().to_http_request());
 
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/after-otp");
-        let has_cookie = resp
-        .headers()
-        .get_all(header::SET_COOKIE)
-        .into_iter() // <- IMPORTANT: pas `.iter()`
+        let has_cookie = resp.headers().get_all(header::SET_COOKIE).into_iter()
         .any(|v| v.to_str().unwrap_or("").starts_with("session_token="));
         assert!(has_cookie);
     }
 
-    // ---------- CORS dans le flux « nouvelle session » (pas cookie existant) ----------
+    // ---------- CORS nouvelle session ----------------------------------------
 
     #[tokio::test]
     async fn auth_sets_cors_headers_when_origin_allowed_on_new_session() {
         let user = User {
             username: "erin".into(),
             password: hash_pwd("pw"),
-            otpkey: None,
-            allow: None,
-            roles: None,
-            email: None,
+            otpkey: None, allow: None, roles: None, email: None,
         };
 
         let mut cfg = base_config();
@@ -701,32 +651,25 @@ mod tests {
 
         let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
             username: "erin".into(),
-                                              password: "pw".into(),
-                                              totp_code: None,
-                                              csrf_token: Some(tok),
+                                                               password: "pw".into(),
+                                                               totp_code: None,
+                                                               csrf_token: Some(tok),
         });
 
-        let resp = proxyauth::token::auth::auth(req, data.clone(), payload)
-        .await
+        let resp = proxyauth::token::auth::auth(req, data.clone(), payload).await
         .respond_to(&test::TestRequest::default().to_http_request());
 
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(
-            resp.headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .and_then(|v| v.to_str().ok()),
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).and_then(|v| v.to_str().ok()),
                    Some("https://front.example")
         );
         assert_eq!(
-            resp.headers()
-            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
-            .and_then(|v| v.to_str().ok()),
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).and_then(|v| v.to_str().ok()),
                    Some("true")
         );
         assert_eq!(
-            resp.headers()
-            .get(header::ACCESS_CONTROL_MAX_AGE)
-            .and_then(|v| v.to_str().ok()),
+            resp.headers().get(header::ACCESS_CONTROL_MAX_AGE).and_then(|v| v.to_str().ok()),
                    Some("3600")
         );
     }
@@ -738,33 +681,45 @@ mod render_error_page_tests {
     use actix_web::{test, http::header};
     use bytes::Bytes as ActixBytes;
     use std::sync::Arc;
+    use std::net::TcpListener;
+    use tokio::net::TcpListener as TokioTcpListener;
     use dashmap::DashMap;
-    use hyper::{Body, Response, Server};
-    use hyper::client::HttpConnector;
-    use hyper::service::{make_service_fn, service_fn};
+
+    // hyper 1.x
+    use hyper::body::Incoming;
+    use hyper::Response;
+    use hyper_util::rt::TokioIo;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_rustls::HttpsConnectorBuilder;
-    use hyper_proxy::{Proxy, ProxyConnector, Intercept};
+    use http_body_util::{Full, BodyExt, combinators::BoxBody};
+    use std::convert::Infallible;
+    use hyper::body::Bytes;
+    use hyper_http_proxy::{Proxy, ProxyConnector, Intercept};
+
     use proxyauth::config::config::{AppConfig, RouteConfig, RouteRule};
     use proxyauth::revoke::db::RevokedTokenMap;
 
-    // ------------ helpers clients ------------
-    fn https_client() -> hyper::Client<hyper_rustls::HttpsConnector<HttpConnector>, Body> {
+    fn https_client() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
+        .unwrap()
         .https_or_http()
         .enable_http1()
         .build();
-        hyper::Client::builder().build::<_, Body>(https)
+        Client::builder(hyper_util::rt::TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(https)
     }
-    fn proxy_client() -> hyper::Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, Body> {
+
+    fn proxy_client() -> Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
+        .unwrap()
         .https_or_http()
         .enable_http1()
         .build();
         let proxy = Proxy::new(Intercept::All, "http://127.0.0.1:1".parse().unwrap());
-        let pc = ProxyConnector::from_proxy(https, proxy).unwrap();
-        hyper::Client::builder().build(pc)
+        let connector = ProxyConnector::from_proxy(https, proxy).unwrap();
+        Client::builder(hyper_util::rt::TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(connector)
     }
 
     fn mk_state(routes: Vec<RouteRule>, mut cfg: AppConfig) -> actix_web::web::Data<AppState> {
@@ -837,39 +792,44 @@ mod render_error_page_tests {
         }
     }
 
-    // ------------ backend util (hyper) ------------
     fn start_backend(html: &'static str, status: u16) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        use std::net::TcpListener;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let local_addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
+        let tokio_listener = TokioTcpListener::from_std(listener).unwrap();
 
-        let make = make_service_fn(move |_conn| {
-            let html = html.to_string();
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |_req| {
-                    let html = html.clone();
-                    async move {
-                        let mut builder = Response::builder().status(status);
-                        // on renvoie HTML compressable
-                        builder = builder.header(header::CONTENT_TYPE, "text/html; charset=utf-8");
-                        Ok::<_, hyper::Error>(builder.body(Body::from(html)).unwrap())
-                    }
-                }))
+        let join = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = tokio_listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: hyper::Request<Incoming>| async move {
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                            .status(status)
+                            // &str pour éviter le conflit http 0.2 / http 1.x
+                            .header("content-type", "text/html; charset=utf-8")
+                            .body(Full::new(Bytes::from(html)))
+                            .unwrap(),
+                        )
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
             }
         });
 
-        let server = Server::from_tcp(listener).unwrap().serve(make);
-        let j = tokio::spawn(async move { let _ = server.await; });
-        (local_addr, j)
+        (local_addr, join)
     }
 
-    // ------------ tests ------------
+    // ------------ tests ------------------------------------------------------
 
     #[tokio::test]
     async fn render_error_page_missing_logout_config_returns_400() {
         let mut cfg = base_cfg();
-        cfg.logout_redirect_url = None; // <- manquant
+        cfg.logout_redirect_url = None;
         let data = mk_state(vec![], cfg);
 
         let req = test::TestRequest::default().to_http_request();
@@ -883,8 +843,8 @@ mod render_error_page_tests {
     #[tokio::test]
     async fn render_error_page_no_matching_route_returns_400() {
         let mut cfg = base_cfg();
-        cfg.logout_redirect_url = Some("/logout".into()); // pas de règle /logout
-        let data = mk_state(vec![ rr("/only", "http://127.0.0.1:9") ], cfg);
+        cfg.logout_redirect_url = Some("/logout".into());
+        let data = mk_state(vec![rr("/only", "http://127.0.0.1:9")], cfg);
 
         let req = test::TestRequest::default().to_http_request();
         let resp = proxyauth::network::error::render_error_page(&req, data, "x").await;
@@ -902,7 +862,7 @@ mod render_error_page_tests {
 
         let mut cfg = base_cfg();
         cfg.logout_redirect_url = Some(url);
-        let routes = vec![ rr("/logout", &format!("http://{}/logout", addr)) ];
+        let routes = vec![rr("/logout", &format!("http://{}/logout", addr))];
         let data = mk_state(routes, cfg);
 
         let req = test::TestRequest::default().to_http_request();
@@ -912,10 +872,9 @@ mod render_error_page_tests {
 
     #[tokio::test]
     async fn render_error_page_upstream_client_error_maps_to_503() {
-        // cible invalide: port 1 → connection refused => branche Upstream client error
         let mut cfg = base_cfg();
         cfg.logout_redirect_url = Some("http://127.0.0.1:1/logout".into());
-        let routes = vec![ rr("/logout", "http://127.0.0.1:1/logout") ];
+        let routes = vec![rr("/logout", "http://127.0.0.1:1/logout")];
         let data = mk_state(routes, cfg);
 
         let req = test::TestRequest::default().to_http_request();
@@ -936,8 +895,8 @@ mod render_error_page_tests {
         let url = format!("http://{}/logout?x=1", addr);
 
         let mut cfg = base_cfg();
-        cfg.logout_redirect_url = Some(url.clone());
-        let routes = vec![ rr("/logout", &format!("http://{}/logout", addr)) ];
+        cfg.logout_redirect_url = Some(url);
+        let routes = vec![rr("/logout", &format!("http://{}/logout", addr))];
         let data = mk_state(routes, cfg);
 
         let req = test::TestRequest::default()
@@ -953,7 +912,7 @@ mod render_error_page_tests {
 
         let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap_or_else(|_| ActixBytes::new());
         let s = String::from_utf8_lossy(&body);
-        assert!(s.contains("Invalid credentials")); // bloc d’erreur injecté
+        assert!(s.contains("Invalid credentials"));
         assert!(!s.contains("{{ csrf_token }}"));
     }
 
@@ -962,9 +921,8 @@ mod render_error_page_tests {
         static HTML_OK: &str = "<html><!-- BEGIN_BLOCK_ERROR -->{{ error }}<!-- END_BLOCK_ERROR -->OK</html>";
         let (addr, _j) = start_backend(HTML_OK, 200);
 
-        // URL ABSOLUE avec query
         let logout = format!("http://{}/logout/path?q=42", addr);
-        let routes = vec![ rr("/logout", &format!("http://{}/logout", addr)) ];
+        let routes = vec![rr("/logout", &format!("http://{}/logout", addr))];
 
         let mut cfg = base_cfg();
         cfg.logout_redirect_url = Some(logout);
@@ -977,29 +935,36 @@ mod render_error_page_tests {
 
     #[tokio::test]
     async fn render_error_page_forces_html_content_type_when_backend_non_html() {
-        use std::net::TcpListener;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
+        let tokio_listener = TokioTcpListener::from_std(listener).unwrap();
 
-        let make = make_service_fn(move |_conn| {
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |_req| async move {
-                    Ok::<_, hyper::Error>(
-                        Response::builder()
-                        .status(200)
-                        .header(header::CONTENT_TYPE, "text/plain") // <- non HTML
-                        .body(Body::from("NOT HTML {{ csrf_token }}"))
-                        .unwrap()
-                    )
-                }))
+        let _j = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = tokio_listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(|_req: hyper::Request<Incoming>| async move {
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                            .status(200)
+                            // &str pour éviter le conflit http 0.2 / http 1.x
+                            .header("content-type", "text/plain")
+                            .body(Full::new(Bytes::from("NOT HTML {{ csrf_token }}")))
+                            .unwrap(),
+                        )
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
             }
         });
-        let server = Server::from_tcp(listener).unwrap().serve(make);
-        let _j = tokio::spawn(async move { let _ = server.await; });
 
         let abs = format!("http://{}/logout", addr);
-        let routes = vec![ rr("/logout", &format!("http://{}/logout", addr)) ];
+        let routes = vec![rr("/logout", &format!("http://{}/logout", addr))];
 
         let mut cfg = base_cfg();
         cfg.logout_redirect_url = Some(abs);

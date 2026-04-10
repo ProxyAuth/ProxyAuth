@@ -17,13 +17,18 @@ fn reset_lb_state_for_tests() {
     ROUND_ROBIN_COUNTER.store(0, Ordering::Relaxed);
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::{Body, Request, Response, StatusCode, Server};
-    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Request, Response, StatusCode};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::body::Incoming;
+    use hyper_util::rt::TokioIo;
+    use http_body_util::{Full, Empty, BodyExt};
+    use hyper::body::Bytes;
     use std::net::SocketAddr;
+    use tokio::net::TcpListener;
     use serial_test::serial;
     use proxyauth::network::loadbalancing::ROUND_ROBIN_COUNTER;
     use proxyauth::network::loadbalancing::LAST_GOOD_BACKEND;
@@ -35,11 +40,11 @@ mod tests {
     use proxyauth::network::loadbalancing::{is_in_cooldown, cooldown_base, build_swrr_order, lb};
 
     use std::sync::atomic::Ordering;
+    use std::convert::Infallible;
 
     fn be(url: &str, weight: i32) -> BackendConfig {
         BackendConfig { url: url.to_string(), weight: weight.try_into().unwrap() }
     }
-
 
     #[test]
     fn lb_defaults_are_used_when_not_set() {
@@ -82,14 +87,12 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn swrr_order_prefers_higher_weight_first() {
-        // Reset
         reset_lb_state_for_tests();
         ROUND_ROBIN_COUNTER.store(0, Ordering::Relaxed);
 
         let a = be("A", 3);
         let b = be("B", 1);
         let c = be("C", 1);
-
         let cands: Vec<&BackendConfig> = vec![&a, &b, &c];
 
         let order = build_swrr_order(&cands);
@@ -100,7 +103,6 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn swrr_rotation_changes_head_when_counter_is_nonzero() {
-        // Reset
         reset_lb_state_for_tests();
 
         let a = be("A", 3);
@@ -141,10 +143,10 @@ mod tests {
         let req = Request::builder()
         .method(Method::GET)
         .uri("https://service.local/foo")
-        .body(Body::empty())
+        .body(Empty::<Bytes>::new().boxed())
         .unwrap();
 
-        let backends: Vec<BackendConfig> = vec![]; // aucun backend
+        let backends: Vec<BackendConfig> = vec![];
         let res = forward_failover(req, &backends, None).await;
 
         match res {
@@ -153,24 +155,29 @@ mod tests {
         }
     }
 
+    // Lance un serveur stub hyper 1.x qui répond toujours avec le même status/body.
     async fn spawn_stub(status: StatusCode, body: &'static [u8]) -> SocketAddr {
-        let make_svc = make_service_fn(move |_| {
-            let body = body.to_vec();
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |_req| {
-                    let mut resp = Response::new(Body::from(body.clone()));
-                    *resp.status_mut() = status;
-                    async move { Ok::<_, hyper::Error>(resp) }
-                }))
-            }
-        });
-
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
+        let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let listener = TcpListener::from_std(std_listener).unwrap();
 
         tokio::spawn(async move {
-            let _ = Server::from_tcp(listener).unwrap().serve(make_svc).await;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                            .status(status)
+                            .body(Full::new(Bytes::from(body)))
+                            .unwrap(),
+                        )
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
         });
 
         addr
@@ -190,7 +197,7 @@ mod tests {
         let req = Request::builder()
         .method(Method::GET)
         .uri("/v1/health")
-        .body(Body::empty())
+        .body(Empty::<Bytes>::new().boxed())
         .unwrap();
 
         let resp = forward_failover(req, &backends, None)
@@ -212,13 +219,13 @@ mod tests {
         let req = Request::builder()
         .method(Method::GET)
         .uri("/v1/check")
-        .body(Body::empty())
+        .body(Empty::<Bytes>::new().boxed())
         .unwrap();
 
-        let err = forward_failover(req, &backends, None).await
+        let err = forward_failover(req, &backends, None)
+        .await
         .err()
         .expect("expect error when all backends fail");
         assert!(matches!(err, ForwardError::AllBackendsFailed));
     }
-
 }

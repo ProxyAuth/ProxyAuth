@@ -171,24 +171,24 @@ mod tests {
         assert!(ok);
     }
 
-    // ---------- Method --------------------------------------------------------
+    // ---------- Method -------------------------------------------------------
 
     #[test]
     async fn cond_matches_method_exact() {
         let cond = RegexCond::Method { re: Regex::new("^POST$").unwrap() };
         assert!(cond_matches_strict(
-            &cond, &Method::POST, "/p",
+            &cond, &Method::POST, "/",
             actix_web::http::header::HeaderMap::new(),
                                     &std::collections::HashMap::new(), None, None, ""
         ));
         assert!(!cond_matches_strict(
-            &cond, &Method::GET, "/p",
+            &cond, &Method::GET, "/",
             actix_web::http::header::HeaderMap::new(),
                                      &std::collections::HashMap::new(), None, None, ""
         ));
     }
 
-    // ---------- Header(name, value) ------------------------------------------
+    // ---------- Header -------------------------------------------------------
 
     #[test]
     async fn cond_matches_header_name_and_values() {
@@ -210,7 +210,7 @@ mod tests {
 
         let req_bad = TestRequest::default()
         .insert_header(("x-client", "ok"))
-        .insert_header(("x-client", "NO!")) // invalide
+        .insert_header(("x-client", "NO!"))
         .to_http_request();
 
         assert!(!cond_matches_strict(
@@ -219,7 +219,6 @@ mod tests {
                                      None, None, ""
         ));
 
-        // Nom d’en-tête introuvable => false
         let cond_name_missing = RegexCond::Header {
             name_re: Regex::new("^x-missing$").unwrap(),
             re: Regex::new(".*").unwrap(),
@@ -231,7 +230,7 @@ mod tests {
         ));
     }
 
-    // ---------- Query(name, values) ------------------------------------------
+    // ---------- Query --------------------------------------------------------
 
     #[test]
     async fn cond_matches_query_all_values_must_match() {
@@ -239,31 +238,33 @@ mod tests {
 
         let cond_ok = RegexCond::Query {
             name_re: Regex::new("^foo$").unwrap(),
-            re: Regex::new("^[ab]+$").unwrap(), // "a", "ab" OK
+            re: Regex::new("^[ab]+$").unwrap(),
         };
         assert!(cond_matches_strict(
-            &cond_ok, &Method::GET, "/", actix_web::http::header::HeaderMap::new(), &q, None, None, ""
+            &cond_ok, &Method::GET, "/",
+            actix_web::http::header::HeaderMap::new(), &q, None, None, ""
         ));
 
         let cond_bad = RegexCond::Query {
             name_re: Regex::new("^foo$").unwrap(),
-            re: Regex::new("^a$").unwrap(), // "ab" casse la règle
+            re: Regex::new("^a$").unwrap(),
         };
         assert!(!cond_matches_strict(
-            &cond_bad, &Method::GET, "/", actix_web::http::header::HeaderMap::new(), &q, None, None, ""
+            &cond_bad, &Method::GET, "/",
+            actix_web::http::header::HeaderMap::new(), &q, None, None, ""
         ));
 
-        // clé query absente => false
         let cond_missing = RegexCond::Query {
             name_re: Regex::new("^qux$").unwrap(),
             re: Regex::new(".*").unwrap(),
         };
         assert!(!cond_matches_strict(
-            &cond_missing, &Method::GET, "/", actix_web::http::header::HeaderMap::new(), &q, None, None, ""
+            &cond_missing, &Method::GET, "/",
+            actix_web::http::header::HeaderMap::new(), &q, None, None, ""
         ));
     }
 
-    // ---------- BodyRaw -------------------------------------------------------
+    // ---------- BodyRaw ------------------------------------------------------
 
     #[test]
     async fn cond_matches_body_raw_utf8() {
@@ -280,7 +281,7 @@ mod tests {
         ));
     }
 
-    // ---------- BodyJson(key, value) -----------------------------------------
+    // ---------- BodyJson -----------------------------------------------------
 
     #[test]
     async fn cond_matches_body_json_with_ct_guard() {
@@ -336,35 +337,15 @@ mod tests {
 
     #[test]
     async fn generate_token_is_sha256_hex() {
-        #[allow(dead_code)]
-        #[derive(Default)]
-        struct MiniUser {
-            username: String,
-            roles: Option<Vec<String>>,
-        }
-
-        #[allow(dead_code)]
-        #[derive(Default)]
-        struct MiniAppConfig {
-            secret: String,
-            token_expiry_seconds: i64,
-            users: Vec<MiniUser>,
-            timezone: String,
-            stats: bool,
-        }
-
         fn looks_like_sha256_hex(s: &str) -> bool {
             s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
         }
 
         use sha2::{Digest, Sha256};
-
         let mut hasher = Sha256::new();
         hasher.update(b"some deterministic input");
-
         let digest = hasher.finalize();
         let hex = hex::encode(digest);
-
         assert!(looks_like_sha256_hex(&hex));
     }
 }
@@ -400,11 +381,9 @@ mod more_unit_tests {
 
     #[test]
     fn check_date_token_accepts_future_iso_in_tz() {
-        // dans 10 minutes
         let exp = (Utc::now() + chrono::Duration::minutes(10))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
-
         let res = check_date_token(&exp, "alice", "127.0.0.1", "UTC");
         assert!(res.is_ok());
         assert!(res.unwrap() > 0);
@@ -438,8 +417,6 @@ mod more_unit_tests {
     #[test]
     fn format_long_date_formats_components() {
         assert_eq!(format_long_date(0), "+00000000-01-01T00:00:00Z");
-
-        // 3661s => 01:01:01
         assert_eq!(format_long_date(3661), "+00000000-01-01T01:01:01Z");
     }
 
@@ -474,7 +451,7 @@ mod more_unit_tests {
         let cfg = AppConfig {
             secret: "topsecret".into(),
             token_expiry_seconds: 3600,
-            users: vec![], // inutilisé ici
+            users: vec![],
             timezone: "UTC".into(),
             stats: false,
             ..Default::default()
@@ -523,7 +500,7 @@ pub(super) fn validate_token_from_decrypted(
             return Err("Bad time token".to_string());
         }
 
-        let token_generated = generate_token(&user.username, &config, data[1], data[3]);
+        let token_generated = generate_token(&user.username, config, data[1], data[3]);
         let token_hash = calcul_factorhash(token_generated);
         if blake3::hash(token_hash.as_bytes()).to_hex().to_string() != token_hash_decrypt {
             warn!("[{}] Invalid token", ip);
@@ -539,8 +516,7 @@ pub(super) fn validate_token_from_decrypted(
         }
 
         if config.stats {
-            let count =
-            data_app
+            let count = data_app
             .counter
             .record_and_get(&user.username, data[3], &time_expire.to_string());
             tracing::info!(
@@ -562,52 +538,50 @@ mod validate_token_path_tests {
     use super::*;
     use actix_web::web;
     use chrono::Utc;
-
-    // ====== Clients Hyper tests ======
-    use hyper::{Body, Client};
-    use hyper::client::HttpConnector;
-    use hyper_rustls::HttpsConnectorBuilder;
-    use hyper_proxy::{Proxy, ProxyConnector, Intercept};
-    use std::str::FromStr;
     use std::sync::Arc;
     use dashmap::DashMap;
+
+    // hyper 1.x
+    use hyper_util::client::legacy::Client;
+    use hyper_util::client::legacy::connect::HttpConnector;
+    use hyper_util::rt::TokioExecutor;
+    use hyper_rustls::HttpsConnectorBuilder;
+    use http_body_util::{Full, BodyExt, combinators::BoxBody};
+    use std::convert::Infallible;
+    use hyper::body::Bytes;
+    use hyper_http_proxy::{Proxy, ProxyConnector, Intercept};
 
     use proxyauth::config::config::RouteConfig;
     use proxyauth::stats::tokencount::CounterToken;
     use proxyauth::token::crypto::calcul_factorhash;
 
-    fn build_https_client_for_tests() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, Body> {
+    fn build_https_client_for_tests() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
+        .unwrap()
         .https_or_http()
         .enable_http1()
         .build();
-        Client::builder().build::<_, Body>(https)
+        Client::builder(TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(https)
     }
 
+    // hyper 1.x n'a plus de support proxy natif via hyper_proxy.
+    // Pour les tests qui n'exercent pas réellement le proxy, on réutilise le client https.
     fn build_proxy_client_for_tests(
-        proxy_addr: &str,
-    ) -> Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, Body> {
+        _proxy_addr: &str,
+    ) -> Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
+        .unwrap()
         .https_or_http()
         .enable_http1()
         .build();
-
-        let proxy_uri = hyper::Uri::from_str(proxy_addr).expect("Invalid proxy URI");
-        let proxy = Proxy::new(Intercept::All, proxy_uri);
-        let proxy_connector =
-        ProxyConnector::from_proxy(https, proxy).expect("Failed to create ProxyConnector");
-
-        Client::builder().build::<_, Body>(proxy_connector)
+        let proxy = Proxy::new(Intercept::All, _proxy_addr.parse().unwrap());
+        let connector = ProxyConnector::from_proxy(https, proxy).unwrap();
+        Client::builder(TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(connector)
     }
 
-    // ====== AppState complet pour tests ======
     fn make_test_app_state() -> web::Data<proxyauth::AppState> {
-        let client_normal     = build_https_client_for_tests();
-        let client_with_cert  = build_https_client_for_tests();
-        let client_with_proxy = build_proxy_client_for_tests("http://127.0.0.1:8080");
-
         let cfg = AppConfig {
             secret: "super-secret".into(),
             timezone: "UTC".into(),
@@ -620,16 +594,15 @@ mod validate_token_path_tests {
 
         web::Data::new(AppState {
             counter,
-            client_normal,
-            client_with_cert,
-            client_with_proxy,
-            revoked_tokens: revoked.into(),
+            client_normal:     build_https_client_for_tests(),
+                       client_with_cert:  build_https_client_for_tests(),
+                       client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
+                       revoked_tokens: revoked.into(),
                        config: Arc::new(cfg),
                        routes: Arc::new(routes),
         })
     }
 
-    // ====== helpers de config & hash ======
     fn mk_config(token_expiry_seconds: i64, stats: bool) -> AppConfig {
         let mut cfg = AppConfig {
             secret: "super-secret".into(),
@@ -667,7 +640,7 @@ mod validate_token_path_tests {
         blake3::hash(token_hash.as_bytes()).to_hex().to_string()
     }
 
-    // ==================== Cas d’erreur / bords ====================
+    // ==================== Cas d'erreur / bords ====================
 
     #[test]
     fn vt_invalid_format_less_parts() {
@@ -706,13 +679,12 @@ mod validate_token_path_tests {
     #[test]
     fn vt_timezone_invalide_mappe_vers_expired_message() {
         let mut cfg = mk_config(3600, false);
-        cfg.timezone = "BAD/TZ".into(); // force une erreur dans check_date_token
+        cfg.timezone = "BAD/TZ".into();
         let st = mk_state();
 
         let future = (Utc::now() + chrono::Duration::minutes(10))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let dec = format!("deadbeef|{}|0|tid", future);
-        // l’erreur coté check_date_token est mappée sur "Your token is expired"
         let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
         assert_eq!(err, "Your token is expired");
     }
@@ -731,7 +703,7 @@ mod validate_token_path_tests {
 
     #[test]
     fn vt_bad_time_token_when_expiry_too_far() {
-        let cfg = mk_config(60, false); // fenêtre config 60s
+        let cfg = mk_config(60, false);
         let st = mk_state();
 
         let far = (Utc::now() + chrono::Duration::days(1))
@@ -804,11 +776,9 @@ mod validate_token_path_tests {
 
     #[test]
     fn vt_success_with_unix_timestamp_expire_field() {
-        // couvre la branche parse i64 -> timestamp Unix dans check_date_token()
         let cfg = mk_config(3600, false);
         let st = mk_state();
 
-        // expire dans ~5 minutes, en secondes Unix
         let expires = (Utc::now() + chrono::Duration::minutes(5)).timestamp().to_string();
         let h = make_valid_hash("alice", &cfg, &expires, "tid-unix");
         let dec = format!("{}|{}|0|tid-unix", h, expires);
@@ -819,7 +789,7 @@ mod validate_token_path_tests {
         assert_eq!(tid, "tid-unix");
     }
 
-    // ==================== Vérifs spécifiques hashing ====================
+    // ==================== Vérifs hashing ====================
 
     #[test]
     fn blake3_hash_matches_on_valid_data() {
@@ -828,9 +798,9 @@ mod validate_token_path_tests {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let tid = "tid-ok";
-        let token_hash_decrypt = compute_transport_hash("alice", &cfg, &future, tid);
-        let again = compute_transport_hash("alice", &cfg, &future, tid);
-        assert_eq!(token_hash_decrypt, again);
+        let h1 = compute_transport_hash("alice", &cfg, &future, tid);
+        let h2 = compute_transport_hash("alice", &cfg, &future, tid);
+        assert_eq!(h1, h2);
     }
 
     #[test]
@@ -852,17 +822,17 @@ mod validate_token_path_tests {
 
     #[test]
     fn whole_block_detects_tamper_on_hash() {
+        let cfg = mk_config(3600, false);
         let st = web::Data::new(AppState {
             config: Arc::new(AppConfig::default()),
                                 routes: Arc::new(RouteConfig { routes: vec![] }),
                                 counter: Arc::new(CounterToken::new()),
-                                client_normal: build_https_client_for_tests(),
-                                client_with_cert: build_https_client_for_tests(),
+                                client_normal:     build_https_client_for_tests(),
+                                client_with_cert:  build_https_client_for_tests(),
                                 client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
                                 revoked_tokens: DashMap::<String, u64>::new().into(),
         });
 
-        let cfg = mk_config(3600, false);
         let future = (Utc::now() + chrono::Duration::minutes(5))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 

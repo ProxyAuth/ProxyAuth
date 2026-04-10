@@ -8,8 +8,11 @@ use proxyauth::token::csrf::verify_csrf_token;
 use proxyauth::token::csrf::validate_csrf_token;
 use proxyauth::token::csrf::inject_csrf_token;
 use proxyauth::token::csrf::is_static_asset;
-use hyper::header::{CONTENT_ENCODING, CONTENT_TYPE};
-use actix_web::http::{header::CONTENT_TYPE as CONTENT_TYPE_ACTIX, StatusCode};
+// Importer CONTENT_TYPE et CONTENT_ENCODING depuis hyper uniquement pour les HyperHeaderMap
+use hyper::header::{CONTENT_ENCODING, CONTENT_TYPE as HYPER_CONTENT_TYPE};
+// Importer CONTENT_TYPE depuis actix pour les TestRequest
+use actix_web::http::header::CONTENT_TYPE as CONTENT_TYPE_ACTIX;
+use actix_web::http::StatusCode;
 use proxyauth::token::csrf::fix_mime_actix;
 use std::io::Read;
 use rand::RngCore;
@@ -19,13 +22,12 @@ use rand::RngCore;
 mod tests {
     use super::*;
     use serial_test::serial;
-    use actix_web::http::{Method};
+    use actix_web::http::Method;
     use actix_web::test::TestRequest;
     use bytes::Bytes;
     use flate2::{Compression, write::GzEncoder};
     use hyper::HeaderMap as HyperHeaderMap;
     use std::io::Write;
-
 
     // ------------ CsrfNonceStore ------------
     #[test]
@@ -110,12 +112,13 @@ mod tests {
     }
 
     // ------------ inject_csrf_token ------------
+    // Note: inject_csrf_token prend un HyperHeaderMap, donc on utilise HYPER_CONTENT_TYPE
     #[test]
     #[serial]
     fn inject_replaces_placeholder_in_plain_html() {
         let secret = "s3cr3t";
         let mut headers = HyperHeaderMap::new();
-        headers.insert(CONTENT_TYPE, "text/html".parse().unwrap());
+        headers.insert(HYPER_CONTENT_TYPE, "text/html".parse().unwrap());
 
         let html = b"<html>{{ csrf_token }}</html>";
         let (out, _len) = inject_csrf_token(&headers, &Bytes::from_static(html), secret)
@@ -123,7 +126,6 @@ mod tests {
 
         let s = String::from_utf8(out.to_vec()).unwrap();
         assert!(!s.contains("{{ csrf_token }}"));
-        let _token = s.trim_matches(|c| c == '<' || c == '>' || c == 'h' || c == 't' || c == 'm' || c == 'l' || c == '/' || c == ' ');
         let tok = s.split('>').nth(1).unwrap().split('<').next().unwrap().trim();
         assert!(verify_csrf_token(secret, tok));
     }
@@ -132,7 +134,7 @@ mod tests {
     fn inject_replaces_compact_placeholder() {
         let secret = "s3cr3t";
         let mut headers = HyperHeaderMap::new();
-        headers.insert(CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+        headers.insert(HYPER_CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
 
         let html = b"<!doctype html>{{csrf_token}}";
         let (out, _len) = inject_csrf_token(&headers, &Bytes::from_static(html), secret)
@@ -148,9 +150,8 @@ mod tests {
     #[serial]
     fn inject_handles_gzip_encoded_html() {
         let secret = "s3cr3t";
-        // headers HTML + gzip
         let mut headers = HyperHeaderMap::new();
-        headers.insert(CONTENT_TYPE, "text/html".parse().unwrap());
+        headers.insert(HYPER_CONTENT_TYPE, "text/html".parse().unwrap());
         headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
 
         let html = b"<b>{{ csrf_token }}</b>";
@@ -175,29 +176,28 @@ mod tests {
     fn inject_skips_non_html() {
         let secret = "s3cr3t";
         let mut headers = HyperHeaderMap::new();
-        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(HYPER_CONTENT_TYPE, "application/json".parse().unwrap());
 
         let body = br#"{"x":"{{ csrf_token }}"}"#;
         assert!(inject_csrf_token(&headers, &Bytes::from_static(body), secret).is_none());
     }
 
     // ------------ validate_csrf_token (chemins & formats) ------------
+    // Note: validate_csrf_token prend un actix HttpRequest,
+    // donc on utilise CONTENT_TYPE_ACTIX ou des &str pour insert_header
     #[test]
     fn validate_allows_static_assets_and_safe_methods() {
         let secret = "s3cr3t";
-        // static asset
+
         let req = TestRequest::get().uri("/assets/app.js").to_http_request();
         assert!(validate_csrf_token(&Method::GET, &req, &Bytes::new(), secret));
 
-        // GET générique
         let req2 = TestRequest::get().uri("/api").to_http_request();
         assert!(validate_csrf_token(&Method::GET, &req2, &Bytes::new(), secret));
 
-        // HEAD
         let req3 = TestRequest::default().method(Method::HEAD).uri("/api").to_http_request();
         assert!(validate_csrf_token(&Method::HEAD, &req3, &Bytes::new(), secret));
 
-        // OPTIONS
         let req4 = TestRequest::default().method(Method::OPTIONS).uri("/api").to_http_request();
         assert!(validate_csrf_token(&Method::OPTIONS, &req4, &Bytes::new(), secret));
     }
@@ -213,7 +213,8 @@ mod tests {
         let req = TestRequest::post()
         .uri("/api")
         .insert_header(("X-CSRF-Token", tok.clone()))
-        .insert_header((CONTENT_TYPE, "application/json"))
+        // &str évite le conflit http 0.2 / http 1.x dans actix TestRequest
+        .insert_header(("content-type", "application/json"))
         .set_payload(r#"{"a":1}"#)
         .to_http_request();
 
@@ -228,7 +229,7 @@ mod tests {
 
         let req = TestRequest::post()
         .uri("/api")
-        .insert_header((CONTENT_TYPE, "application/x-www-form-urlencoded"))
+        .insert_header(("content-type", "application/x-www-form-urlencoded"))
         .set_payload(body.clone())
         .to_http_request();
 
@@ -243,7 +244,7 @@ mod tests {
 
         let req = TestRequest::post()
         .uri("/api")
-        .insert_header((CONTENT_TYPE, "application/json"))
+        .insert_header(("content-type", "application/json"))
         .set_payload(body.clone())
         .to_http_request();
 
@@ -257,7 +258,7 @@ mod tests {
 
         let req = TestRequest::post()
         .uri("/api")
-        .insert_header((CONTENT_TYPE, "application/json"))
+        .insert_header(("content-type", "application/json"))
         .set_payload(body)
         .to_http_request();
 
@@ -269,7 +270,7 @@ mod tests {
         let secret = "s3cr3t";
         let req = TestRequest::post()
         .uri("/upload")
-        .insert_header((CONTENT_TYPE, "multipart/form-data; boundary=XXX"))
+        .insert_header(("content-type", "multipart/form-data; boundary=XXX"))
         .set_payload("--XXX\r\n...")
         .to_http_request();
 
@@ -321,12 +322,12 @@ mod tests {
 #[cfg(test)]
 mod tests_spawn_purger {
     use super::*;
-    
+
     #[tokio::test(start_paused = true, flavor = "current_thread")]
     async fn spawn_csrf_purger_tokio_branch_purges() {
         use tokio::time::advance;
         use std::time::Duration;
-         use std::sync::atomic::Ordering;
+        use std::sync::atomic::Ordering;
         use proxyauth::token::csrf::{PURGE_HOOK, spawn_csrf_purger_for_tests_with_notify};
 
         PURGE_HOOK.store(0, Ordering::SeqCst);
@@ -337,17 +338,14 @@ mod tests_spawn_purger {
         let (tx, rx) = tokio::sync::oneshot::channel();
         spawn_csrf_purger_for_tests_with_notify(store, Duration::from_millis(5), Some(tx));
 
-        // Déclenche le tick virtuel
         advance(Duration::from_millis(5)).await;
 
-        // Synchronise sur la notification (pas de sleep arbitraire)
         let purged = rx.await.expect("first cycle");
         assert!(purged >= 1);
 
         let n = PURGE_HOOK.load(Ordering::SeqCst);
         assert!(n >= 1, "purge_expired (n={n})");
     }
-
 
     #[test]
     fn spawn_csrf_purger_thread_branch_purges() {
