@@ -81,25 +81,25 @@ pub fn ensure_user_proxyauth_exists() -> io::Result<()> {
 
         let status_user = if alpine {
             Command::new("adduser")
-                .args([
-                    "-S", // small/system account
-                    "-G",
-                    "proxyauth", // associate group
-                    "proxyauth",
-                ])
-                .status()?
+            .args([
+                "-S",
+                "-G",
+                "proxyauth",
+                "proxyauth",
+            ])
+            .status()?
         } else {
             Command::new("useradd")
-                .args([
-                    "--system",
-                    "--no-create-home",
-                    "--shell",
-                    "/usr/sbin/nologin",
-                    "--gid",
-                    "proxyauth",
-                    "proxyauth",
-                ])
-                .status()?
+            .args([
+                "--system",
+                "--no-create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                "--gid",
+                "proxyauth",
+                "proxyauth",
+            ])
+            .status()?
         };
 
         if !status_user.success() {
@@ -120,30 +120,25 @@ pub fn ensure_user_proxyauth_exists() -> io::Result<()> {
 pub fn setup_proxyauth_directory() -> io::Result<()> {
     let path = Path::new("/etc/proxyauth");
 
-    // verify path exist
     if !path.exists() {
         println!("Creating /etc/proxyauth directory...");
-
-        // Create directory if no exist
         fs::create_dir_all(path)?;
     } else {
         println!("Directory /etc/proxyauth already exists.");
     }
 
-    // Change owner
     let status_chown = Command::new("chown")
-        .args(["-R", "proxyauth:proxyauth", "/etc/proxyauth"])
-        .status()?;
+    .args(["-R", "proxyauth:proxyauth", "/etc/proxyauth"])
+    .status()?;
 
     if !status_chown.success() {
         eprintln!("Failed to change owner of /etc/proxyauth.");
         std::process::exit(1);
     }
 
-    // Change permission directory
     let status_chmod = Command::new("chmod")
-        .args(["750", "/etc/proxyauth"])
-        .status()?;
+    .args(["750", "/etc/proxyauth"])
+    .status()?;
 
     if !status_chmod.success() {
         eprintln!("Failed to set permissions on /etc/proxyauth.");
@@ -165,8 +160,8 @@ pub fn setup_proxyauth_db_directory(insecure: bool) -> io::Result<()> {
     }
 
     let status_chown = Command::new("chown")
-        .args(["-R", "proxyauth:proxyauth", "/opt/proxyauth"])
-        .status()?;
+    .args(["-R", "proxyauth:proxyauth", "/opt/proxyauth"])
+    .status()?;
 
     if !status_chown.success() {
         eprintln!("Failed to change owner of /opt/proxyauth.");
@@ -176,8 +171,8 @@ pub fn setup_proxyauth_db_directory(insecure: bool) -> io::Result<()> {
     let chmod_mode = if insecure { "777" } else { "700" };
 
     let status_chmod = Command::new("chmod")
-        .args([chmod_mode, "/opt/proxyauth"])
-        .status()?;
+    .args([chmod_mode, "/opt/proxyauth"])
+    .status()?;
 
     if !status_chmod.success() {
         eprintln!("Failed to set permissions on /opt/proxyauth.");
@@ -233,36 +228,32 @@ mod tests {
     use std::{fs, net::SocketAddr, path::PathBuf};
     use tokio::task::JoinHandle;
 
-    use hyper::{Body, Request, Response, Server, StatusCode};
-    use hyper::service::{make_service_fn, service_fn};
+    use actix_web::{web, App, HttpServer, HttpResponse};
 
     // --- Helpers -------------------------------------------------------------
 
-    async fn start_test_server(status: StatusCode, body: &'static [u8]) -> (SocketAddr, JoinHandle<()>) {
-        let make_svc = make_service_fn(move |_| {
-            let body = body.to_vec();
-            let status = status;
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |_req: Request<Body>| {
-                    let body = body.clone();
-                    async move {
-                        let mut resp = Response::new(Body::from(body));
-                        *resp.status_mut() = status;
-                        Ok::<_, hyper::Error>(resp)
-                    }
-                }))
-            }
-        });
-
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    async fn start_test_server(status: u16, body: &'static [u8]) -> (SocketAddr, JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).unwrap();
         let local_addr = listener.local_addr().unwrap();
 
-        let server = Server::from_tcp(listener).unwrap().serve(make_svc);
         let handle = tokio::spawn(async move {
-            let _ = server.await;
+            HttpServer::new(move || {
+                App::new().default_service(web::to(move || async move {
+                    HttpResponse::build(
+                        actix_web::http::StatusCode::from_u16(status).unwrap()
+                    )
+                    .body(body)
+                }))
+            })
+            .listen(listener).unwrap()
+            .run()
+            .await
+            .unwrap();
         });
 
+        // Laisser le serveur démarrer
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         (local_addr, handle)
     }
 
@@ -283,18 +274,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn create_config_downloads_when_missing() {
         let expected = b"CONFIG_CONTENT";
-        let (addr, _h) = start_test_server(StatusCode::OK, expected).await;
+        let (addr, _h) = start_test_server(200, expected).await;
         let url = format!("http://{}/config.json", addr);
 
         let path = tmp_path("dl_ok").join("cfg/config.json");
         let _ = fs::remove_file(&path);
 
-        // Appel
         create_config(&url, path.to_str().unwrap())
         .await
         .expect("download OK");
 
-        // Vérif : fichier créé avec le bon contenu
         let got = fs::read(&path).expect("file exists");
         assert_eq!(got, expected);
     }
@@ -302,7 +291,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn create_config_is_noop_when_file_exists() {
         let server_body = b"SHOULD_NOT_OVERWRITE";
-        let (addr, _h) = start_test_server(StatusCode::OK, server_body).await;
+        let (addr, _h) = start_test_server(200, server_body).await;
         let url = format!("http://{}/conf.json", addr);
 
         let path = tmp_path("noop").join("already/exists/config.json");
@@ -320,7 +309,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn create_config_returns_error_on_non_200() {
-        let (addr, _h) = start_test_server(StatusCode::NOT_FOUND, b"nope").await;
+        let (addr, _h) = start_test_server(404, b"nope").await;
         let url = format!("http://{}/missing.json", addr);
 
         let path = tmp_path("err").join("cfg/config.json");

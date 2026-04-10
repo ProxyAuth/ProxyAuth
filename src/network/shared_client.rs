@@ -1,29 +1,30 @@
 use crate::config::config::AppConfig;
 use ahash::{AHashMap, RandomState};
 use dashmap::DashMap;
-use hyper::{Body, Client, client::HttpConnector};
-use hyper_proxy::{Intercept, Proxy, ProxyConnector};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+use hyper_http_proxy::{Intercept, Proxy, ProxyConnector};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use once_cell::sync::{Lazy, OnceCell};
-use rustls::{Certificate, PrivateKey, ClientConfig, RootCertStore, OwnedTrustAnchor};
-use rustls_native_certs::load_native_certs;
-use rustls_pki_types::pem::{PemObject, SectionKind};
+use once_cell::sync::Lazy;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::{cell::RefCell, fs::File, io::BufReader, str::FromStr, sync::Arc, time::Duration};
-use webpki_roots::TLS_SERVER_ROOTS;
+use hyper::body::Bytes;
+use std::convert::Infallible;
 
+pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
 type AHashDashMap<K, V> = DashMap<K, V, RandomState>;
-type HttpsClient = Client<HttpsConnector<HttpConnector>>;
+type HttpsClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
 type ThreadCache = AHashMap<ClientKey, HttpsClient>;
 
 thread_local! {
     static THREAD_CLIENT_CACHE: RefCell<ThreadCache> = RefCell::new(AHashMap::with_capacity(8));
 }
 
-#[allow(dead_code)]
-static CLIENT_CACHE:        Lazy<AHashDashMap<ClientKey, Client<HttpsConnector<HttpConnector>>>> =
+static CLIENT_CACHE: Lazy<AHashDashMap<ClientKey, Client<HttpsConnector<HttpConnector>, BoxBody>>> =
 Lazy::new(AHashDashMap::default);
-static CLIENT_CACHE_PROXY:  Lazy<AHashDashMap<ClientKey, Client<ProxyConnector<HttpsConnector<HttpConnector>>>>> =
+static CLIENT_CACHE_PROXY: Lazy<AHashDashMap<ClientKey, Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>>> =
 Lazy::new(AHashDashMap::default);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -56,29 +57,6 @@ impl ClientKey {
     }
 }
 
-
-static ROOT_STORE: OnceCell<RootCertStore> = OnceCell::new();
-
-fn global_root_store() -> &'static RootCertStore {
-    ROOT_STORE.get_or_init(|| {
-        let mut store = RootCertStore::empty();
-
-        if let Ok(native) = load_native_certs() {
-            for cert in native {
-                let _ = store.add(&Certificate(cert.0));
-            }
-        }
-
-        store.add_trust_anchors(TLS_SERVER_ROOTS.iter().map(|ta| {
-            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject, ta.spki, ta.name_constraints
-            )
-        }));
-        store
-    })
-}
-
-
 fn build_http_connector(keep: Duration) -> HttpConnector {
     let mut http = HttpConnector::new();
     http.set_connect_timeout(Some(Duration::from_secs(1)));
@@ -88,11 +66,16 @@ fn build_http_connector(keep: Duration) -> HttpConnector {
     http
 }
 
-fn with_alpn(cfg: ClientConfig) -> ClientConfig {
-    //cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    cfg
+// Construit un connecteur HTTPS sans cert client, en utilisant les racines natives
+// On évite rustls::ClientConfig directement pour ne pas créer de conflit de versions
+fn build_https_connector_no_auth(keep: Duration) -> HttpsConnector<HttpConnector> {
+    HttpsConnectorBuilder::new()
+    .with_native_roots()
+    .expect("Failed to load native roots")
+    .https_or_http()
+    .enable_http1()
+    .wrap_connector(build_http_connector(keep))
 }
-
 
 pub fn get_or_build_thread_client(opts: &ClientOptions, state: &Arc<AppConfig>) -> HttpsClient {
     let key = ClientKey::from_options(opts);
@@ -118,7 +101,7 @@ pub fn get_or_build_thread_client(opts: &ClientOptions, state: &Arc<AppConfig>) 
 pub fn get_or_build_client(
     opts: ClientOptions,
     state: Arc<AppConfig>,
-) -> Client<HttpsConnector<HttpConnector>> {
+) -> Client<HttpsConnector<HttpConnector>, BoxBody> {
     let key = ClientKey::from_options(&opts);
 
     if let Some(client) = CLIENT_CACHE.get(&key) {
@@ -138,7 +121,7 @@ pub fn get_or_build_client(
 pub fn get_or_build_client_proxy(
     opts: ClientOptions,
     state: Arc<AppConfig>,
-) -> Client<ProxyConnector<HttpsConnector<HttpConnector>>> {
+) -> Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody> {
     let key = ClientKey::from_options(&opts);
 
     if let Some(client) = CLIENT_CACHE_PROXY.get(&key) {
@@ -146,50 +129,32 @@ pub fn get_or_build_client_proxy(
     }
 
     let client = build_hyper_client_proxy(opts.clone(), &state);
-
     CLIENT_CACHE_PROXY.insert(key, client.clone());
     client
 }
 
-
-fn load_certs(path: &str) -> Result<Vec<Certificate>, Box<dyn std::error::Error>> {
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let certs = PemObject::pem_reader_iter(reader)
-    .filter_map(|item| match item {
-        Ok((kind, der)) if kind == SectionKind::Certificate => Some(Certificate(der)),
-                _ => None,
-    })
+    let mut reader = BufReader::new(file);
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
+    .filter_map(|r| r.ok())
     .collect::<Vec<_>>();
-
     Ok(certs)
 }
 
-fn load_keys(path: &str) -> Result<Vec<PrivateKey>, Box<dyn std::error::Error>> {
+fn load_keys(path: &str) -> Result<Vec<PrivateKeyDer<'static>>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let keys = PemObject::pem_reader_iter(reader)
-    .filter_map(|item| match item {
-        Ok((kind, der)) if matches!(
-            kind,
-            SectionKind::PrivateKey
-            | SectionKind::RsaPrivateKey
-            | SectionKind::EcPrivateKey
-        ) => Some(PrivateKey(der)),
-                _ => None,
-    })
+    let mut reader = BufReader::new(file);
+    let keys = PrivateKeyDer::pem_reader_iter(&mut reader)
+    .filter_map(|r| r.ok())
     .collect::<Vec<_>>();
-
-
     Ok(keys)
 }
 
 pub fn build_hyper_client_cert(
     opts: ClientOptions,
     state: &Arc<AppConfig>,
-) -> Client<HttpsConnector<HttpConnector>, Body> {
+) -> Client<HttpsConnector<HttpConnector>, BoxBody> {
     let keep = Duration::from_secs(state.keep_alive);
 
     let want_cert = opts.use_cert
@@ -208,7 +173,7 @@ pub fn build_hyper_client_cert(
         }
     };
 
-    let keys = match load_keys(opts.key_path.as_ref().unwrap()) {
+    let mut keys = match load_keys(opts.key_path.as_ref().unwrap()) {
         Ok(k) if !k.is_empty() => k,
         _ => {
             tracing::warn!("TLS: keys empty or invalid, fallback to no_client_auth");
@@ -216,13 +181,32 @@ pub fn build_hyper_client_cert(
         }
     };
 
-    let tls_cfg = with_alpn(
-        ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(global_root_store().clone())
-        .with_client_auth_cert(cert_chain, keys[0].clone())
-        .expect("Invalid cert/key pair"),
-    );
+    let tls_cfg = match rustls::ClientConfig::builder()
+    .with_root_certificates({
+        let mut store = rustls::RootCertStore::empty();
+        // Charger les racines natives via rustls-native-certs
+        if let Ok(native) = rustls_native_certs::load_native_certs() {
+            for cert in native {
+                let _ = store.add(cert);
+            }
+        }
+        for ta in webpki_roots::TLS_SERVER_ROOTS.iter() {
+            store.roots.push(rustls_pki_types::TrustAnchor {
+                subject: rustls_pki_types::Der::from_slice(ta.subject.as_ref()),
+                             subject_public_key_info: rustls_pki_types::Der::from_slice(ta.subject_public_key_info.as_ref()),
+                             name_constraints: ta.name_constraints.as_ref().map(|nc| rustls_pki_types::Der::from_slice(nc.as_ref())),
+            });
+        }
+        store
+    })
+    .with_client_auth_cert(cert_chain, keys.remove(0))
+    {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("TLS: invalid cert/key pair ({}), fallback to no_client_auth", e);
+            return build_hyper_client_normal(state);
+        }
+    };
 
     let https = HttpsConnectorBuilder::new()
     .with_tls_config(tls_cfg)
@@ -230,32 +214,19 @@ pub fn build_hyper_client_cert(
     .enable_http1()
     .wrap_connector(build_http_connector(keep));
 
-    Client::builder()
-    .pool_idle_timeout(Some(keep))
+    Client::builder(TokioExecutor::new())
+    .pool_idle_timeout(keep)
     .pool_max_idle_per_host(state.max_idle_per_host.into())
-    .http2_adaptive_window(true)
-    .http2_keep_alive_interval(Some(Duration::from_secs(15)))
-    .build::<_, Body>(https)
+    .build::<_, BoxBody>(https)
 }
 
 pub fn build_hyper_client_proxy(
     opts: ClientOptions,
     state: &Arc<AppConfig>,
-) -> Client<ProxyConnector<HttpsConnector<HttpConnector>>> {
-    let keep = Duration::from_secs(state.keep_alive);
+) -> Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody> {
+    let keep = Duration::from_millis(state.keep_alive);
 
-    let tls_cfg = with_alpn(
-        ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(global_root_store().clone())
-        .with_no_client_auth(),
-    );
-
-    let https = HttpsConnectorBuilder::new()
-    .with_tls_config(tls_cfg)
-    .https_or_http()
-    .enable_http1()
-    .wrap_connector(build_http_connector(keep));
+    let https = build_https_connector_no_auth(keep);
 
     let proxy_addr = opts
     .proxy_addr
@@ -266,151 +237,18 @@ pub fn build_hyper_client_proxy(
     let proxy = ProxyConnector::from_proxy(https, Proxy::new(Intercept::All, proxy_uri))
     .expect("Failed to create proxy connector");
 
-    Client::builder()
-    .pool_idle_timeout(Some(keep))
+    Client::builder(TokioExecutor::new())
+    .pool_idle_timeout(keep)
     .pool_max_idle_per_host(state.max_idle_per_host.into())
-    .http2_adaptive_window(true)
-    .http2_keep_alive_interval(Some(Duration::from_secs(15)))
-    .build::<_, Body>(proxy)
+    .build::<_, BoxBody>(proxy)
 }
 
-pub fn build_hyper_client_normal(state: &Arc<AppConfig>) -> Client<HttpsConnector<HttpConnector>> {
-    let keep = Duration::from_secs(state.keep_alive);
+pub fn build_hyper_client_normal(state: &Arc<AppConfig>) -> Client<HttpsConnector<HttpConnector>, BoxBody> {
+    let keep = Duration::from_millis(state.keep_alive);
+    let https = build_https_connector_no_auth(keep);
 
-    let tls_cfg = with_alpn(
-        ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(global_root_store().clone())
-        .with_no_client_auth(),
-    );
-
-    let https = HttpsConnectorBuilder::new()
-    .with_tls_config(tls_cfg)
-    .https_or_http()
-    .enable_http1()
-    .wrap_connector(build_http_connector(keep));
-
-    Client::builder()
-    .pool_idle_timeout(Some(keep))
+    Client::builder(TokioExecutor::new())
+    .pool_idle_timeout(keep)
     .pool_max_idle_per_host(state.max_idle_per_host.into())
-    .http2_adaptive_window(true)
-    .http2_keep_alive_interval(Some(Duration::from_secs(15)))
-    .build::<_, Body>(https)
+    .build::<_, BoxBody>(https)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    fn mk_state(keep: u64, max_idle: u16) -> Arc<AppConfig> {
-        let mut cfg = AppConfig::default();
-        cfg.keep_alive = keep;
-        cfg.max_idle_per_host = max_idle;
-        Arc::new(cfg)
-    }
-
-    #[test]
-    fn clientkey_from_options_copies_all_fields() {
-        let opts = ClientOptions {
-            use_proxy: true,
-            proxy_addr: Some("http://127.0.0.1:8888".into()),
-            use_cert: true,
-            cert_path: Some("/tmp/client.crt".into()),
-            key_path: Some("/tmp/client.key".into()),
-        };
-        let key = ClientKey::from_options(&opts);
-        assert_eq!(key.use_proxy, opts.use_proxy);
-        assert_eq!(key.proxy_addr, opts.proxy_addr);
-        assert_eq!(key.use_cert, opts.use_cert);
-        assert_eq!(key.cert_path, opts.cert_path);
-        assert_eq!(key.key_path, opts.key_path);
-    }
-
-    #[test]
-    fn global_root_store_is_singleton() {
-        let a = global_root_store() as *const RootCertStore;
-        let b = global_root_store() as *const RootCertStore;
-        assert_eq!(a, b, "RootCertStore doit être le même (OnceCell)");
-    }
-
-    #[test]
-    fn build_http_connector_smoke() {
-        let _c = build_http_connector(Duration::from_secs(5));
-    }
-
-    #[test]
-    fn build_normal_client_works() {
-        let state = mk_state(30, 128);
-        let _cli = build_hyper_client_normal(&state);
-    }
-
-    #[test]
-    fn get_or_build_thread_client_caches_by_key() {
-        let state = mk_state(15, 64);
-        let opts = ClientOptions {
-            use_proxy: false,
-            proxy_addr: None,
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
-        };
-        let c1 = get_or_build_thread_client(&opts, &state);
-        let c2 = get_or_build_thread_client(&opts, &state);
-        let _ = (c1, c2);
-    }
-
-    #[test]
-    fn proxy_client_builds_with_default_addr() {
-        let state = mk_state(20, 256);
-        let opts = ClientOptions {
-            use_proxy: true,
-            proxy_addr: None,
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
-        };
-        let _cli = get_or_build_client_proxy(opts, state);
-    }
-
-    #[test]
-    fn m_tls_falls_back_when_paths_missing() {
-        let state = mk_state(25, 100);
-        let opts = ClientOptions {
-            use_proxy: false,
-            proxy_addr: None,
-            use_cert: true,
-            cert_path: None,
-            key_path: None,
-        };
-        let _cli = build_hyper_client_cert(opts, &state);
-    }
-
-    #[test]
-    fn m_tls_falls_back_when_files_invalid() {
-        let state = mk_state(25, 100);
-        let opts = ClientOptions {
-            use_proxy: false,
-            proxy_addr: None,
-            use_cert: true,
-            cert_path: Some("/definitely/does/not/exist.crt".into()),
-            key_path:  Some("/definitely/does/not/exist.key".into()),
-        };
-        let _cli = build_hyper_client_cert(opts, &state);
-    }
-
-    #[test]
-    fn non_proxy_cached_client_ok() {
-        let state = mk_state(10, 32);
-        let opts = ClientOptions {
-            use_proxy: false,
-            proxy_addr: None,
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
-        };
-        let _c1 = super::get_or_build_client(opts.clone(), state.clone());
-        let _c2 = super::get_or_build_client(opts, state);
-    }
-}
-

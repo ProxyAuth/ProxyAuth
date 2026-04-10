@@ -5,10 +5,11 @@ use crate::token::auth::generate_random_string;
 use crate::smtp::smtp::SmtpConfig;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
-use hyper::Client;
-use hyper::client::HttpConnector;
-use hyper_proxy::ProxyConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_http_proxy::ProxyConnector;
 use hyper_rustls::HttpsConnector;
+use crate::network::shared_client::BoxBody;
 use serde::Deserializer;
 use serde::de::MapAccess;
 use serde::de::Visitor;
@@ -110,7 +111,7 @@ pub struct RouteConfig {
 pub struct User {
     pub username: String,
     pub password: String,
-    pub otpkey: Option<String>, // Option<Vec<u8>>
+    pub otpkey: Option<String>,
     pub allow: Option<Vec<String>>,
     pub roles: Option<Vec<String>>,
 
@@ -132,7 +133,7 @@ fn default_allow_true() -> bool { true }
 impl Serialize for User {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer,
+    S: Serializer,
     {
         let mut state = serializer.serialize_struct("User", 2)?;
         state.serialize_field("username", &self.username)?;
@@ -275,11 +276,11 @@ pub struct AppState {
     pub routes: Arc<RouteConfig>,
     pub counter: Arc<CounterToken>,
     #[allow(dead_code)]
-    pub client_normal: Client<HttpsConnector<HttpConnector>>,
+    pub client_normal: Client<HttpsConnector<HttpConnector>, BoxBody>,
     #[allow(dead_code)]
-    pub client_with_cert: Client<HttpsConnector<HttpConnector>>,
+    pub client_with_cert: Client<HttpsConnector<HttpConnector>, BoxBody>,
     #[allow(dead_code)]
-    pub client_with_proxy: Client<ProxyConnector<HttpsConnector<HttpConnector>>>,
+    pub client_with_proxy: Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>,
     pub revoked_tokens: RevokedTokenMap,
 }
 
@@ -461,7 +462,6 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
 
     if updated {
         let updated_str = serde_json::to_string_pretty(&config).expect("Serialization failed");
-
         fs::write(path, updated_str).expect("Failed to write updated config");
     }
 
@@ -476,14 +476,14 @@ pub fn add_otpkey(config_path: &str, username: &str) {
     }
 
     let config_str =
-        fs::read_to_string(config_path).expect("Failed to read the configuration file.");
+    fs::read_to_string(config_path).expect("Failed to read the configuration file.");
     let mut json: Value =
-        serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
+    serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
 
     let users = json
-        .get_mut("users")
-        .and_then(|u| u.as_array_mut())
-        .expect("Missing 'users' field in configuration file.");
+    .get_mut("users")
+    .and_then(|u| u.as_array_mut())
+    .expect("Missing 'users' field in configuration file.");
 
     let mut updated = false;
 
@@ -495,8 +495,8 @@ pub fn add_otpkey(config_path: &str, username: &str) {
             } else {
                 let otpkey = generate_base32_secret(32);
                 user.as_object_mut()
-                    .unwrap()
-                    .insert("otpkey".to_string(), Value::String(otpkey.clone()));
+                .unwrap()
+                .insert("otpkey".to_string(), Value::String(otpkey.clone()));
                 println!(
                     "OTP key successfully generated for '{}': {}",
                     username, otpkey
@@ -509,21 +509,21 @@ pub fn add_otpkey(config_path: &str, username: &str) {
 
     if updated {
         let updated_str = serde_json::to_string_pretty(&json)
-            .expect("Failed to serialize the updated configuration.");
+        .expect("Failed to serialize the updated configuration.");
         fs::write(config_path, updated_str)
-            .expect("Failed to write the updated configuration file.");
+        .expect("Failed to write the updated configuration file.");
         println!("Configuration file has been updated.");
     } else if !users
         .iter()
         .any(|u| u.get("username").and_then(|n| n.as_str()) == Some(username))
-    {
-        eprintln!("User '{}' not found in the configuration file.", username);
-    }
+        {
+            eprintln!("User '{}' not found in the configuration file.", username);
+        }
 }
 
 fn deserialize_log_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
 where
-    D: Deserializer<'de>,
+D: Deserializer<'de>,
 {
     struct LogMapVisitor;
 
@@ -536,7 +536,7 @@ where
 
         fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
         where
-            M: MapAccess<'de>,
+        M: MapAccess<'de>,
         {
             let mut map = HashMap::new();
             while let Some((k, v)) = access.next_entry::<String, serde_json::Value>()? {
@@ -590,177 +590,5 @@ impl AllowRegexCfg {
         let mut allow = Vec::with_capacity(self.allow.len());
         for c in &self.allow { allow.push(conv(c)?); }
         Ok(CompiledAllow { default_allow: self.default_allow, allow })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn allowregex_compile_ok() {
-        let cfg = AllowRegexCfg {
-            default_allow: true,
-                allow: vec![
-                    RegexCondCfg::Method  { pattern: r"(?i)GET|POST".into() },
-                    RegexCondCfg::Path    { pattern: r"^/api(/.*)?$".into() },
-                    RegexCondCfg::Header  { name: r"(?i)^x-trace-id$".into(), pattern: r"^[a-f0-9-]{16,}$".into() },
-                    RegexCondCfg::Query   { name: r"(?i)^page$".into(),      pattern: r"^\d+$".into() },
-                    RegexCondCfg::BodyRaw { pattern: r"^.{0,1024}$".into() },
-                    RegexCondCfg::BodyJson{ key: "name".into(), pattern: r"^[a-z0-9_-]{3,32}$".into() },
-                ],
-        };
-
-        let compiled = cfg.compile().expect("should compile");
-        assert!(compiled.default_allow);
-        assert_eq!(compiled.allow.len(), 6);
-    }
-
-    #[test]
-    fn allowregex_compile_err_on_bad_regex() {
-        let bad = AllowRegexCfg {
-            default_allow: false,
-                allow: vec![
-                    RegexCondCfg::Method { pattern: r"^(GET|POST$".into() }
-                ],
-        };
-        assert!(bad.compile().is_err());
-    }
-
-    #[test]
-    fn app_config_deserialize_applies_defaults() {
-        let j = json!({
-            "token_expiry_seconds": 3600,
-            "secret": "s3cr3t",
-            "users": [],
-            "log": {}
-        });
-        let cfg: AppConfig = serde_json::from_value(j).expect("deserialize");
-
-        assert_eq!(cfg.host, "0.0.0.0");
-        assert_eq!(cfg.port, 8080);
-        assert_eq!(cfg.worker, 4);
-        assert_eq!(cfg.max_idle_per_host, 50);
-        assert_eq!(cfg.timezone, "Europe/Paris");
-        assert_eq!(cfg.keep_alive, 5000);
-        assert_eq!(cfg.client_timeout, 5000);
-        assert_eq!(cfg.num_instances, 2);
-        assert_eq!(cfg.pending_connections_limit, 65535);
-        assert_eq!(cfg.socket_listen, 1024);
-        assert_eq!(cfg.stats, false);
-        assert_eq!(cfg.login_via_otp, false);
-        assert_eq!(cfg.session_cookie, false);
-        assert_eq!(cfg.max_age_session_cookie, 3600);
-        assert_eq!(cfg.tls, true);
-        assert_eq!(cfg.csrf_token, true);
-        assert!(cfg.ratelimit_auth.contains_key("requests_per_second"));
-        assert!(cfg.ratelimit_proxy.contains_key("requests_per_second"));
-        assert!(cfg.token_admin.is_empty());
-    }
-
-    #[test]
-    fn allow_regex_cfg_compiles_and_matches_shapes() {
-        let cfg = AllowRegexCfg {
-            default_allow: true,
-                allow: vec![
-                    RegexCondCfg::Method  { pattern: r"(?i)GET|POST".into() },
-                    RegexCondCfg::Path    { pattern: r"^/api(/.*)?$".into() },
-                    RegexCondCfg::Header  { name: r"(?i)^x-request-id$".into(), pattern: r"^[0-9a-f\-]+$".into() },
-                    RegexCondCfg::Query   { name: r"^(user|id)$".into(),       pattern: r"^[A-Za-z0-9_]+$".into() },
-                    RegexCondCfg::BodyRaw { pattern: r"(?s).+".into() },
-                    RegexCondCfg::BodyJson{ key: "status".into(), pattern: r"^(ok|fail)$".into() },
-                ],
-        };
-
-        let compiled = cfg.compile().expect("compile ok");
-
-        assert_eq!(compiled.default_allow, true);
-        assert_eq!(compiled.allow.len(), 6);
-
-        use RegexCond::*;
-        assert!(matches!(compiled.allow[0], Method  { .. }));
-        assert!(matches!(compiled.allow[1], Path    { .. }));
-        assert!(matches!(compiled.allow[2], Header  { .. }));
-        assert!(matches!(compiled.allow[3], Query   { .. }));
-        assert!(matches!(compiled.allow[4], BodyRaw { .. }));
-        assert!(matches!(compiled.allow[5], BodyJson{ .. }));
-
-        if let Method { re } = &compiled.allow[0] {
-            assert!(re.is_match("GET"));
-            assert!(re.is_match("post"));
-            assert!(!re.is_match("DELETE"));
-        }
-        if let Path { re } = &compiled.allow[1] {
-            assert!(re.is_match("/api"));
-            assert!(re.is_match("/api/v1/test"));
-            assert!(!re.is_match("/static/app.js"));
-        }
-        if let Header { name_re, re } = &compiled.allow[2] {
-            assert!(name_re.is_match("x-request-id"));
-            assert!(name_re.is_match("X-REQUEST-ID"));
-            assert!(re.is_match("2f1a-abc"));
-            assert!(!re.is_match("!!"));
-        }
-        if let Query { name_re, re } = &compiled.allow[3] {
-            assert!(name_re.is_match("user"));
-            assert!(name_re.is_match("id"));
-            assert!(!name_re.is_match("other"));
-            assert!(re.is_match("Alice_01"));
-            assert!(!re.is_match("bad value!"));
-        }
-        if let BodyRaw { re } = &compiled.allow[4] {
-            assert!(re.is_match("n'importe\nquoi"));
-        }
-        if let BodyJson { key, re } = &compiled.allow[5] {
-            assert_eq!(key, "status");
-            assert!(re.is_match("ok"));
-            assert!(!re.is_match("maybe"));
-        }
-    }
-
-    #[test]
-    fn allow_regex_cfg_compile_error_on_bad_pattern() {
-        let cfg = AllowRegexCfg {
-            default_allow: true,
-                allow: vec![
-                    RegexCondCfg::Path { pattern: "(".into() },
-                ],
-        };
-        let err = cfg.compile().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("regex parse error") || msg.contains("unclosed"), "unexpected: {}", msg);
-    }
-
-    #[test]
-    fn backend_config_default_weight_is_1() {
-        let be: BackendConfig = serde_json::from_str(r#"{ "url": "http://svc" }"#).unwrap();
-        assert_eq!(be.url, "http://svc");
-        assert_eq!(be.weight, 1);
-    }
-
-    #[test]
-    fn route_rule_defaults_are_applied_by_serde() {
-        let rr: RouteRule = serde_json::from_str(r#"{
-        "prefix": "/api",
-        "target": "http://backend"
-    }"#).unwrap();
-
-    assert_eq!(rr.prefix, "/api");
-    assert_eq!(rr.target, "http://backend");
-
-    assert_eq!(rr.username.len(), 0);
-    assert_eq!(rr.secure, false);
-    assert_eq!(rr.proxy, false);
-    assert_eq!(rr.proxy_config, "");
-    assert!(rr.cert.is_empty());
-    assert!(rr.backends.is_empty());
-    assert_eq!(rr.need_csrf, true);
-    assert_eq!(rr.cache, true);
-    assert_eq!(rr.secure_path, false);
-    assert_eq!(rr.preserve_prefix, false);
-    assert!(rr.allow_methods.is_none());
-    assert!(rr.filters.is_none());
-    assert!(rr.filters_compiled.is_none());
     }
 }

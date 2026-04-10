@@ -43,20 +43,20 @@ impl FromRequest for EitherAuth {
 
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
         let content_type = req
-            .headers()
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_lowercase();
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
 
         if content_type.contains("application/json") {
             Json::<AuthRequest>::from_request(req, payload)
-                .map(|res| res.map(|json| EitherAuth::Json(json.into_inner())))
-                .boxed_local()
+            .map(|res| res.map(|json| EitherAuth::Json(json.into_inner())))
+            .boxed_local()
         } else if content_type.contains("application/x-www-form-urlencoded") {
             Form::<AuthRequest>::from_request(req, payload)
-                .map(|res| res.map(|form| EitherAuth::Form(form.into_inner())))
-                .boxed_local()
+            .map(|res| res.map(|form| EitherAuth::Form(form.into_inner())))
+            .boxed_local()
         } else {
             ready(Err(ErrorBadRequest("Unsupported Content-Type"))).boxed_local()
         }
@@ -68,8 +68,8 @@ pub fn validate_csrf(req: &HttpRequest, payload: &EitherAuth, secret: &str) -> b
     if matches!(
         m,
         &actix_web::http::Method::GET
-            | &actix_web::http::Method::HEAD
-            | &actix_web::http::Method::OPTIONS
+        | &actix_web::http::Method::HEAD
+        | &actix_web::http::Method::OPTIONS
     ) {
         return true;
     }
@@ -96,8 +96,8 @@ pub fn is_ip_allowed(ip_str: &str, user: &User) -> bool {
         Some(list) if list.is_empty() => true,
         Some(list) => list.iter().any(|net_str| {
             net_str
-                .parse::<IpNet>()
-                .map_or(false, |net| net.contains(&ip))
+            .parse::<IpNet>()
+            .map_or(false, |net| net.contains(&ip))
         }),
     }
 }
@@ -105,32 +105,32 @@ pub fn is_ip_allowed(ip_str: &str, user: &User) -> bool {
 pub fn verify_password(input: &str, stored_hash: &str) -> bool {
     match PasswordHash::new(stored_hash) {
         Ok(parsed) => Argon2::default()
-            .verify_password(input.as_bytes(), &parsed)
-            .is_ok(),
+        .verify_password(input.as_bytes(), &parsed)
+        .is_ok(),
         Err(_) => false,
     }
 }
 
 pub fn generate_random_string(len: usize) -> String {
     let charset: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^*()+-=";
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^*()+-=";
     let mut rng = OsRng;
 
     let base: Vec<u8> = (0..len)
-        .map(|_| *charset.choose(&mut rng).unwrap())
-        .collect();
+    .map(|_| *charset.choose(&mut rng).unwrap())
+    .collect();
 
     let now = Utc::now().timestamp() as u64;
     let shift: u8 = (now ^ (now >> 3) ^ (now << 1)).wrapping_rem(97) as u8;
 
     let random_char: Vec<u8> = base
-        .into_iter()
-        .map(|byte| {
-            let idx = charset.iter().position(|&c| c == byte).unwrap_or(0);
-            let new_idx = (idx as u8 + shift) as usize % charset.len();
-            charset[new_idx]
-        })
-        .collect();
+    .into_iter()
+    .map(|byte| {
+        let idx = charset.iter().position(|&c| c == byte).unwrap_or(0);
+        let new_idx = (idx as u8 + shift) as usize % charset.len();
+        charset[new_idx]
+    })
+    .collect();
 
     let mut full_input = random_char.clone();
     full_input.extend_from_slice(&now.to_le_bytes());
@@ -147,12 +147,12 @@ pub fn get_expiry_with_timezone(
     let tz: Tz = config.timezone.parse().expect("Invalid timezone in config");
 
     let utc_now = optional_timestamp
-        .map(|ts| {
-            Utc.timestamp_opt(ts, 0)
-                .single()
-                .expect("Invalid timestamp")
-        })
-        .unwrap_or_else(Utc::now);
+    .map(|ts| {
+        Utc.timestamp_opt(ts, 0)
+        .single()
+        .expect("Invalid timestamp")
+    })
+    .unwrap_or_else(Utc::now);
 
     let utc_expiry = utc_now + Duration::seconds(config.token_expiry_seconds);
     utc_expiry.with_timezone(&tz)
@@ -165,12 +165,12 @@ pub fn get_expiry_with_timezone_format(
     let tz: Tz = config.timezone.parse().expect("Invalid timezone in config");
 
     let utc_now = optional_timestamp
-        .map(|ts| {
-            Utc.timestamp_opt(ts, 0)
-                .single()
-                .expect("Invalid timestamp")
-        })
-        .unwrap_or_else(Utc::now);
+    .map(|ts| {
+        Utc.timestamp_opt(ts, 0)
+        .single()
+        .expect("Invalid timestamp")
+    })
+    .unwrap_or_else(Utc::now);
 
     let utc_expiry = utc_now + Duration::seconds(config.token_expiry_seconds);
 
@@ -189,22 +189,22 @@ pub async fn auth_options(req: HttpRequest, data: web::Data<AppState>) -> impl R
         (Some(o), Some(list)) => {
             let origin_normalized = o.trim_end_matches('/');
             list.iter()
-                .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
+            .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
         }
         _ => false,
     };
 
     if let (Some(origin_str), true) = (origin, is_allowed) {
         HttpResponse::Ok()
-            .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
-            .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS"))
-            .insert_header((
-                header::ACCESS_CONTROL_ALLOW_HEADERS,
-                "Authorization, Content-Type, Accept",
-            ))
-            .insert_header((header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true"))
-            .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
-            .finish()
+        .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
+        .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS"))
+        .insert_header((
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            "Authorization, Content-Type, Accept",
+        ))
+        .insert_header((header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true"))
+        .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
+        .finish()
     } else {
         HttpResponse::Forbidden().body("CORS origin not allowed")
     }
@@ -219,19 +219,18 @@ pub async fn auth(
     if data.config.session_cookie
         && data.config.csrf_token
         && !validate_csrf(&req, &payload, &data.config.secret)
-    {
-        return render_error_page(&req, data.clone(), "invalid csrf request").await;
-    }
+        {
+            return render_error_page(&req, data.clone(), "invalid csrf request").await;
+        }
 
-    let auth = match payload {
-        EitherAuth::Json(j) => j,
-        EitherAuth::Form(f) => f,
-    };
+        let auth = match payload {
+            EitherAuth::Json(j) => j,
+            EitherAuth::Form(f) => f,
+        };
 
     let ip = client_ip(&req)
     .map(|s| s.to_string())
     .or_else(|| {
-        // replis classiques en HTTP
         req.headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -245,17 +244,22 @@ pub async fn auth(
     if data.config.session_cookie {
         let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
 
-        match req.cookie("session_token") {
-            Some(cookie) => {
-                let session_token = cookie.value();
+        if let Some(existing_cookie) = req.cookie("session_token") {
+            let session_token = existing_cookie.value();
 
-                if let Ok((_username, _token_id, _expires_at)) =
-                    validate_token(session_token, &data, &data.config, &ip).await
-                {
-                    let mut resp = HttpResponse::Ok();
+            match validate_token(session_token, &data, &data.config, &ip).await {
+                Ok((username, _token_id, time_expire)) if time_expire > 0 => {
+
+                    // Cookie encore valide → redirect direct, pas besoin de re-auth
+                    info!(
+                        "[{}] user {} already authenticated ({}s remaining), forwarding to {}",
+                          ip, username, time_expire, redirect_target
+                    );
+
+                    let mut resp = HttpResponse::SeeOther();
                     resp.append_header(("server", "ProxyAuth"));
+                    resp.append_header(("location", redirect_target));
 
-                    // CORS headers
                     if let Some(origin_header) = req.headers().get(header::ORIGIN) {
                         if let Ok(origin_str) = origin_header.to_str() {
                             if let Some(cors_origins) = &data.config.cors_origins {
@@ -271,30 +275,38 @@ pub async fn auth(
                                         header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
                                         "true",
                                     ));
-                                    resp.append_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
                                 }
                             }
                         }
                     }
 
-                    let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
-
-                    if redirect_target.starts_with('/') {
-                        return resp
-                            .insert_header(("location", redirect_target))
-                            .insert_header(("server", "ProxyAuth"))
-                            .status(StatusCode::SEE_OTHER)
-                            .finish();
-                    }
+                    return resp.finish();
+                }
+                Ok(_) => {
+                    // time_expire == 0 : session expirée côté serveur
+                    warn!("[{}] session token expired, notifying user", ip);
+                    return render_error_page(
+                        &req,
+                        data.clone(),
+                        "Session expired, please re-authenticate",
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    // Token invalide ou révoqué
+                    warn!("[{}] session token invalid ({}), notifying user", ip, e);
+                    return render_error_page(
+                        &req,
+                        data.clone(),
+                        "Invalid credential, please re-authenticate",
+                    )
+                    .await;
                 }
             }
-            None => {
-                if !redirect_target.starts_with('/') {
-                    return HttpResponse::BadRequest()
-                        .append_header(("server", "ProxyAuth"))
-                        .body("Invalid redirect URL");
-                }
-            }
+        } else if !redirect_target.starts_with('/') {
+            return HttpResponse::BadRequest()
+            .append_header(("server", "ProxyAuth"))
+            .body("Invalid redirect URL");
         }
     }
 
@@ -307,112 +319,119 @@ pub async fn auth(
             user.username == auth.username && verify_password(&auth.password, &user.password)
         })
         .map(|(i, _)| i)
-    {
-        let user = &data.config.users[index_user];
+        {
+            let user = &data.config.users[index_user];
 
-        if !is_ip_allowed(&ip, &user) {
-            warn!("[{}] Access ip denied for user {}", ip, user.username);
-            return render_error_page(&req, data.clone(), "Access denied").await;
-        }
+            if !is_ip_allowed(&ip, &user) {
+                warn!("[{}] Access ip denied for user {}", ip, user.username);
+                return render_error_page(&req, data.clone(), "Access denied").await;
+            }
 
-        // totp method
-        if data.config.login_via_otp {
-            let totp_code = match &auth.totp_code {
-                Some(code) => code.trim(),
-                None => {
-                    warn!("[{}] Missing TOTP code for user {}", ip, user.username);
-                    return render_error_page(&req, data.clone(), "Missing TOTP code").await;
-                }
-            };
+            // totp method
+            if data.config.login_via_otp {
+                let totp_code = match &auth.totp_code {
+                    Some(code) => code.trim(),
+                    None => {
+                        warn!("[{}] Missing TOTP code for user {}", ip, user.username);
+                        return render_error_page(&req, data.clone(), "Missing TOTP code").await;
+                    }
+                };
 
-            let totp_key = match user.otpkey.as_deref() {
-                Some(key) => key,
-                None => {
-                    warn!("[{}] Missing TOTP secret for user {}", ip, user.username);
-                    return render_error_page(&req, data.clone(), "Missing TOTP secret").await;
+                let totp_key = match user.otpkey.as_deref() {
+                    Some(key) => key,
+                    None => {
+                        warn!("[{}] Missing TOTP secret for user {}", ip, user.username);
+                        return render_error_page(&req, data.clone(), "Missing TOTP secret").await;
+                    }
+                };
 
-                }
-            };
-
-            let decoded_secret =
+                let decoded_secret =
                 match base32::decode(base32::Alphabet::Rfc4648 { padding: false }, totp_key) {
                     Some(bytes) => bytes,
                     None => {
                         warn!("Invalid base32 TOTP secret for user {}", user.username);
                         return render_error_page(&req, data.clone(), "Internal TOTP error").await;
-
                     }
                 };
 
-            let totp = TOTP::new(Algorithm::SHA512, 6, 0, 30, decoded_secret)
+                let totp = TOTP::new(Algorithm::SHA512, 6, 0, 30, decoded_secret)
                 .expect("TOTP creation failed");
 
-            let now = SystemTime::now()
+                let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let generated_code = totp.generate(now);
+                let generated_code = totp.generate(now);
 
-            let is_valid = generated_code == totp_code;
-
-            if !is_valid {
-                warn!("Invalid TOTP code for user {}", user.username);
-                return render_error_page(&req, data.clone(), "Invalid TOTP code").await;
+                if generated_code != totp_code {
+                    warn!("Invalid TOTP code for user {}", user.username);
+                    return render_error_page(&req, data.clone(), "Invalid TOTP code").await;
+                }
             }
-        }
 
-        let expiry = get_expiry_with_timezone(data.config.clone(), None);
+            let expiry = get_expiry_with_timezone(data.config.clone(), None);
 
-        let id_token = generate_random_string(48);
+            let id_token = generate_random_string(48);
 
-        let expiry_ts = expiry.with_timezone(&Utc).timestamp().to_string();
-        let expires_at_str = get_expiry_with_timezone_format(data.config.clone(), None);
+            let expiry_ts = expiry.with_timezone(&Utc).timestamp().to_string();
+            let expires_at_str = get_expiry_with_timezone_format(data.config.clone(), None);
 
-        let token = generate_token(&auth.username, &data.config, &expiry_ts, &id_token);
-        let key = derive_key_from_secret(&data.config.secret);
+            let token = generate_token(&auth.username, &data.config, &expiry_ts, &id_token);
+            let key = derive_key_from_secret(&data.config.secret);
 
-        // mode fast token is more speed but less secure
-        // and fast is false token is more secure but it's slower
-        let token_generate = if data.config.fast {
-            token.clone()
-        } else {
-            calcul_cipher(token.clone())
-        };
+            // mode fast token is more speed but less secure
+            // and fast is false token is more secure but it's slower
+            let token_generate = if data.config.fast {
+                token.clone()
+            } else {
+                calcul_cipher(token.clone())
+            };
 
-        let cipher_token = format!(
-            "{}|{}|{}|{}",
-            token_generate,
-            expiry_ts,
-            index_user,
-            id_token
-        );
+            let cipher_token = format!(
+                "{}|{}|{}|{}",
+                token_generate,
+                expiry_ts,
+                index_user,
+                id_token
+            );
 
-        let token_encrypt = encrypt(&cipher_token, &key);
+            let token_encrypt = encrypt(&cipher_token, &key);
 
-        info!(
-            "[{}] new token generated for user {} expirated at {}",
-            ip, user.username, expires_at_str
-        );
+            info!(
+                "[{}] new token generated for user {} expirated at {}",
+                ip, user.username, expires_at_str
+            );
 
-        let mut resp = HttpResponse::Ok();
-        resp.append_header(("server", "ProxyAuth"));
+            let mut resp = HttpResponse::Ok();
+            resp.append_header(("server", "ProxyAuth"));
 
-        if data.config.session_cookie {
-            let session_max_age = data
+            if data.config.session_cookie {
+                let session_max_age = data
                 .config
                 .max_age_session_cookie
                 .min(data.config.token_expiry_seconds);
 
-            let seconds = expiry
+                let seconds = expiry
                 .signed_duration_since(Utc::now())
                 .num_seconds()
                 .clamp(60, session_max_age);
 
-            let cookie_expiry = Utc::now() + Duration::seconds(seconds);
-            let cookie_expiry_time =
+                let cookie_expiry = Utc::now() + Duration::seconds(seconds);
+                let cookie_expiry_time =
                 OffsetDateTime::from_unix_timestamp(cookie_expiry.timestamp()).unwrap();
 
-            let cookie = Cookie::build("session_token", token_encrypt.clone())
+                if req.cookie("session_token").is_some() {
+                    let expired_cookie = Cookie::build("session_token", "")
+                    .path("/")
+                    .secure(true)
+                    .http_only(true)
+                    .same_site(SameSite::Strict)
+                    .expires(OffsetDateTime::UNIX_EPOCH)
+                    .finish();
+                    resp.cookie(expired_cookie);
+                }
+
+                let new_cookie = Cookie::build("session_token", token_encrypt.clone())
                 .path("/")
                 .secure(true)
                 .http_only(true)
@@ -420,43 +439,43 @@ pub async fn auth(
                 .expires(cookie_expiry_time)
                 .finish();
 
-            // check cors
-            if let Some(origin_header) = req.headers().get(header::ORIGIN) {
-                if let Ok(origin_str) = origin_header.to_str() {
-                    if let Some(cors_origins) = &data.config.cors_origins {
-                        let origin_normalized = origin_str.trim_end_matches('/');
+                // check cors
+                if let Some(origin_header) = req.headers().get(header::ORIGIN) {
+                    if let Ok(origin_str) = origin_header.to_str() {
+                        if let Some(cors_origins) = &data.config.cors_origins {
+                            let origin_normalized = origin_str.trim_end_matches('/');
 
-                        if cors_origins
-                            .iter()
-                            .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
-                        {
-                            resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str));
-                            resp.insert_header((header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true"));
-                            resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                            if cors_origins
+                                .iter()
+                                .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
+                                {
+                                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str));
+                                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true"));
+                                    resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                                }
                         }
                     }
                 }
-            }
 
-            resp.cookie(cookie);
+                resp.cookie(new_cookie);
 
-            let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+                let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
 
-            if redirect_target.starts_with('/') {
-                return resp
+                if redirect_target.starts_with('/') {
+                    return resp
                     .insert_header(("location", redirect_target))
                     .insert_header(("server", "ProxyAuth"))
                     .status(StatusCode::SEE_OTHER)
                     .finish();
+                }
             }
-        }
 
-        resp.json(serde_json::json!({
-            "token": token_encrypt,
-            "expires_at": expires_at_str,
-        }))
-    } else {
-        let ip = req
+            resp.json(serde_json::json!({
+                "token": token_encrypt,
+                "expires_at": expires_at_str,
+            }))
+        } else {
+            let ip = req
             .headers()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
@@ -464,25 +483,25 @@ pub async fn auth(
             .map(|s| s.trim().to_string())
             .or_else(|| {
                 req.connection_info()
-                    .realip_remote_addr()
-                    .map(|s| s.to_string())
+                .realip_remote_addr()
+                .map(|s| s.to_string())
             })
             .unwrap_or_else(|| "-".to_string());
 
-        let user_agent = req
+            let user_agent = req
             .headers()
             .get("User-Agent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("-");
 
-        let method = req.method().as_str();
-        let path = req.path();
+            let method = req.method().as_str();
+            let path = req.path();
 
-        warn!(
-            "[{}] - {} {} Invalid {} credentials provided {}",
-            ip, path, method, auth.username, user_agent
-        );
+            warn!(
+                "[{}] - {} {} Invalid {} credentials provided {}",
+                ip, path, method, auth.username, user_agent
+            );
 
-        return render_error_page(&req, data.clone(), "Invalid credentials").await;
-    }
+            return render_error_page(&req, data.clone(), "Invalid credentials").await;
+        }
 }
