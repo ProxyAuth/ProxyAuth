@@ -23,7 +23,6 @@ jobs:
       - run: cargo audit
 
   coverage:
-    needs: audit
     runs-on: ubuntu-latest
 
     steps:
@@ -47,7 +46,6 @@ jobs:
         continue-on-error: true
 
   ci:
-    needs: coverage
     runs-on: ubuntu-latest
 
     steps:
