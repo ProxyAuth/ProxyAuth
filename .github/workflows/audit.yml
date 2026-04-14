@@ -24,7 +24,6 @@ jobs:
 
   coverage:
     needs: audit
-    if: always()
     runs-on: ubuntu-latest
 
     steps:
