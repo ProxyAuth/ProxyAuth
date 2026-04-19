@@ -546,7 +546,7 @@ mod validate_token_path_tests {
     use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_util::rt::TokioExecutor;
     use hyper_rustls::HttpsConnectorBuilder;
-    use http_body_util::{Full, BodyExt, combinators::BoxBody};
+    use http_body_util::combinators::BoxBody;
     use std::convert::Infallible;
     use hyper::body::Bytes;
     use hyper_http_proxy::{Proxy, ProxyConnector, Intercept};

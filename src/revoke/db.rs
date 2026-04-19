@@ -22,7 +22,9 @@ pub async fn start_revoked_token_ttl(
     every: Duration,
     redis_url: Option<String>,
 ) {
-    let opt_path = Some("/opt/proxyauth/db/".to_string());
+    let opt_path = Some(
+        std::env::var("LMDB_PATH").unwrap_or_else(|_| "/opt/proxyauth/db/".to_string()),
+    );
 
     // Init LMDB
     if let Some(path) = opt_path {
