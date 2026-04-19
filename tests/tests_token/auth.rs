@@ -31,7 +31,7 @@ mod tests {
     use hyper_util::client::legacy::Client;
     use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_rustls::HttpsConnectorBuilder;
-    use http_body_util::{Full, BodyExt, combinators::BoxBody};
+    use http_body_util::{Full, combinators::BoxBody};
     use std::convert::Infallible;
     use hyper_http_proxy::{Proxy, ProxyConnector, Intercept};
     use hyper::body::Bytes;
@@ -692,7 +692,7 @@ mod render_error_page_tests {
     use hyper_util::client::legacy::Client;
     use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_rustls::HttpsConnectorBuilder;
-    use http_body_util::{Full, BodyExt, combinators::BoxBody};
+    use http_body_util::{Full, combinators::BoxBody};
     use std::convert::Infallible;
     use hyper::body::Bytes;
     use hyper_http_proxy::{Proxy, ProxyConnector, Intercept};
