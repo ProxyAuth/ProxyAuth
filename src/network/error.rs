@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::network::shared_client::get_or_build_thread_client;
+use crate::network::shared_client::get_or_build_client;
 use crate::network::shared_client::ClientOptions;
 use crate::token::csrf::inject_csrf_token;
 use crate::config::config::BackendConfig;
@@ -101,29 +101,25 @@ pub async fn render_error_page(
         format!("http://{}", target_url)
     };
 
-    let client = if !rule.cert.is_empty() {
-        get_or_build_thread_client(
-            &ClientOptions {
-                use_proxy: false,
-                proxy_addr: None,
-                use_cert: true,
-                cert_path: rule.cert.get("file").cloned(),
-                                   key_path:  rule.cert.get("key").cloned(),
-            },
-            &data.config.clone(),
-        )
+    // ── Client : on passe par le cache global, pas de thread-local ──────────
+    let client_opts = if !rule.cert.is_empty() {
+        ClientOptions {
+            use_proxy:  false,
+            proxy_addr: None,
+            use_cert:   true,
+            cert_path:  rule.cert.get("file").cloned(),
+            key_path:   rule.cert.get("key").cloned(),
+        }
     } else {
-        get_or_build_thread_client(
-            &ClientOptions {
-                use_proxy: false,
-                proxy_addr: None,
-                use_cert: false,
-                cert_path: rule.cert.get("file").cloned(),
-                                   key_path:  rule.cert.get("key").cloned(),
-            },
-            &data.config.clone(),
-        )
+        ClientOptions {
+            use_proxy:  false,
+            proxy_addr: None,
+            use_cert:   false,
+            cert_path:  None,
+            key_path:   None,
+        }
     };
+    let client = get_or_build_client(client_opts, &data.config);
 
     let backend_host = match full_url
     .split_once("://")
@@ -164,7 +160,7 @@ pub async fn render_error_page(
         .iter()
         .map(|b| match b {
             BackendInput::Simple(url) => BackendConfig { url: url.clone(), weight: 1 },
-             BackendInput::Detailed(cfg) => cfg.clone(),
+            BackendInput::Detailed(cfg) => cfg.clone(),
         })
         .collect();
 
@@ -177,8 +173,6 @@ pub async fn render_error_page(
             }
         }
     } else {
-        // client.request() retourne Response<Incoming> avec erreur hyper::Error
-        // On collecte le body d'abord pour le convertir en BoxBody<Bytes, Infallible>
         match timeout(Duration::from_millis(500), client.request(hyper_req)).await {
             Ok(Ok(res)) => {
                 let (parts, body) = res.into_parts();
@@ -190,7 +184,6 @@ pub async fn render_error_page(
                         .body("Upstream body error");
                     }
                 };
-                // Reconstruire avec Full<Bytes> qui a Infallible comme erreur
                 let boxed: BoxBody = Full::new(bytes).map_err(|e: Infallible| e).boxed();
                 hyper::Response::from_parts(parts, boxed)
             }
@@ -221,7 +214,6 @@ pub async fn render_error_page(
     .and_then(|v: &hyper::header::HeaderValue| v.to_str().ok())
     .map(|s: &str| s.to_lowercase());
 
-    // body est maintenant BoxBody<Bytes, Infallible> — collect() est non-ambigu
     let body_bytes: Bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => return HttpResponse::InternalServerError().body("Failed to read backend body"),
@@ -265,49 +257,49 @@ pub async fn render_error_page(
         .get("content-type")
         .and_then(|v: &hyper::header::HeaderValue| v.to_str().ok())
         .map(|s: &str| s.to_ascii_lowercase())
-        {
-            if !ct.contains("html") {
-                inj_headers.insert(
-                    CONTENT_TYPE,
-                    HeaderValue::from_static("text/html; charset=utf-8"),
-                );
-            }
+    {
+        if !ct.contains("html") {
+            inj_headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
         }
+    }
 
-        if data.config.session_cookie && data.config.csrf_token {
-            if let Some((new_body, _)) = inject_csrf_token(&inj_headers, &plain, &data.config.secret) {
-                plain = new_body;
-            }
+    if data.config.session_cookie && data.config.csrf_token {
+        if let Some((new_body, _)) = inject_csrf_token(&inj_headers, &plain, &data.config.secret) {
+            plain = new_body;
         }
+    }
 
-        let (final_body, final_ce_opt) = match encoding.as_deref() {
-            Some("gzip") => {
-                let mut e = GzEncoder::new(Vec::new(), Compression::default());
-                e.write_all(plain.as_ref()).ok();
-                (e.finish().unwrap_or_default(), Some("gzip"))
-            }
-            Some("deflate") => {
-                let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
-                e.write_all(plain.as_ref()).ok();
-                (e.finish().unwrap_or_default(), Some("deflate"))
-            }
-            Some("br") => {
-                let mut e = CompressorWriter::new(Vec::new(), 4096, 5, 22);
-                e.write_all(plain.as_ref()).ok();
-                (e.into_inner(), Some("br"))
-            }
-            _ => (plain.to_vec(), None),
-        };
-
-        let mut resp = HttpResponse::Unauthorized();
-        resp.insert_header(("server", "ProxyAuth"));
-        resp.insert_header(("cache-control", "no-store, no-cache, must-revalidate, max-age=0"));
-        resp.insert_header(("pragma", "no-cache"));
-        resp.insert_header(("expires", "0"));
-        resp.insert_header(("content-type", "text/html; charset=utf-8"));
-        if let Some(enc) = final_ce_opt {
-            resp.insert_header(("content-encoding", enc));
+    let (final_body, final_ce_opt) = match encoding.as_deref() {
+        Some("gzip") => {
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            e.write_all(plain.as_ref()).ok();
+            (e.finish().unwrap_or_default(), Some("gzip"))
         }
-        resp.insert_header(("content-length", final_body.len().to_string()));
-        resp.body(final_body)
+        Some("deflate") => {
+            let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
+            e.write_all(plain.as_ref()).ok();
+            (e.finish().unwrap_or_default(), Some("deflate"))
+        }
+        Some("br") => {
+            let mut e = CompressorWriter::new(Vec::new(), 4096, 5, 22);
+            e.write_all(plain.as_ref()).ok();
+            (e.into_inner(), Some("br"))
+        }
+        _ => (plain.to_vec(), None),
+    };
+
+    let mut resp = HttpResponse::Unauthorized();
+    resp.insert_header(("server", "ProxyAuth"));
+    resp.insert_header(("cache-control", "no-store, no-cache, must-revalidate, max-age=0"));
+    resp.insert_header(("pragma", "no-cache"));
+    resp.insert_header(("expires", "0"));
+    resp.insert_header(("content-type", "text/html; charset=utf-8"));
+    if let Some(enc) = final_ce_opt {
+        resp.insert_header(("content-encoding", enc));
+    }
+    resp.insert_header(("content-length", final_body.len().to_string()));
+    resp.body(final_body)
 }
