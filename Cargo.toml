@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.0.0-beta1"
+version = "1.0.0-beta2"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -122,7 +122,7 @@ cookie = "0.18"
 lettre = { version = "0.11", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
 
 [dependencies.rustls-webpki]
-version = ">=0.103.12, <0.104.0"
+version = ">=0.103.13, <0.104.0-alpha.1"
 
 [profile.release]
 opt-level = 3

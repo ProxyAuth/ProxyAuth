@@ -4,7 +4,7 @@ use crate::config::config::RouteRule;
 use crate::network::loadbalancing::forward_failover;
 use crate::network::canonical_url::canonicalize_path_for_match;
 use crate::network::shared_client::{
-    ClientOptions, get_or_build_client_proxy, get_or_build_thread_client, BoxBody
+    ClientOptions, get_or_build_client, get_or_build_client_proxy, BoxBody
 };
 use crate::token::security::apply_filters_regex_allow_only;
 use crate::token::csrf::{inject_csrf_token, validate_csrf_token, fix_mime_actix};
@@ -95,12 +95,12 @@ pub fn init_routes_order(routes: &[RouteRule]) {
         let rj = pj == "/";
         match (ri, rj) {
             (true,  false) => std::cmp::Ordering::Greater,
-                (false, true ) => std::cmp::Ordering::Less,
-                _ => {
-                    let li = norm_len(pi);
-                    let lj = norm_len(pj);
-                    if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-                }
+            (false, true ) => std::cmp::Ordering::Less,
+            _ => {
+                let li = norm_len(pi);
+                let lj = norm_len(pj);
+                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+            }
         }
     });
     *ORDERED_ROUTE_IDX.write().unwrap() = Some(idx);
@@ -141,12 +141,12 @@ pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
         let rj = pj == "/";
         match (ri, rj) {
             (true,  false) => std::cmp::Ordering::Greater,
-                (false, true ) => std::cmp::Ordering::Less,
-                _ => {
-                    let li = norm_len(pi);
-                    let lj = norm_len(pj);
-                    if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-                }
+            (false, true ) => std::cmp::Ordering::Less,
+            _ => {
+                let li = norm_len(pi);
+                let lj = norm_len(pj);
+                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+            }
         }
     });
     for &i in &idx {
@@ -347,13 +347,13 @@ pub async fn proxy_with_proxy(
 
     let client = get_or_build_client_proxy(
         ClientOptions {
-            use_proxy: true,
+            use_proxy:  true,
             proxy_addr: Some(rule.proxy_config.clone()),
-                                           use_cert: false,
-                                           cert_path: Some("".to_string()),
-                                           key_path: Some("".to_string()),
+            use_cert:   false,
+            cert_path:  None,
+            key_path:   None,
         },
-        data.config.clone(),
+        &data.config,
     );
 
     let uri = Uri::from_str(&full_url)
@@ -393,7 +393,6 @@ pub async fn proxy_with_proxy(
                 let mut resp = HttpResponse::Unauthorized();
                 resp.append_header(("server", "ProxyAuth"));
                 resp.append_header(("Set-Cookie", "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"));
-                resp.append_header(("server", "ProxyAuth"));
                 if req.uri() != "/" || req.uri() != "" {
                     resp.append_header(("location", "/"));
                 }
@@ -470,7 +469,7 @@ pub async fn proxy_with_proxy(
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule.backends.iter().map(|b| match b {
             BackendInput::Simple(url) => BackendConfig { url: url.clone(), weight: 1 },
-                                                                    BackendInput::Detailed(cfg) => cfg.clone(),
+            BackendInput::Detailed(cfg) => cfg.clone(),
         }).collect();
 
         forward_failover(hyper_req, &backends, Some(&rule.proxy_config))
@@ -511,7 +510,6 @@ pub async fn proxy_with_proxy(
         return Ok(resp.finish());
     }
 
-    // ── Build request client ───────────────────────────────────
     let mut client_resp = HttpResponse::build(to_actix_status(status));
 
     for (key, value) in response_result.headers() as &hyper::HeaderMap {
@@ -654,19 +652,25 @@ pub async fn proxy_without_proxy(
         format!("http://{}", target_url)
     };
 
-    let client = if !rule.cert.is_empty() {
-        get_or_build_thread_client(&ClientOptions {
-            use_proxy: false, proxy_addr: None, use_cert: true,
-            cert_path: rule.cert.get("file").cloned(),
-                                   key_path: rule.cert.get("key").cloned(),
-        }, &data.config.clone())
+    // ── Client : cache global partagé, pas de thread-local ──────────────────
+    let client_opts = if !rule.cert.is_empty() {
+        ClientOptions {
+            use_proxy:  false,
+            proxy_addr: None,
+            use_cert:   true,
+            cert_path:  rule.cert.get("file").cloned(),
+            key_path:   rule.cert.get("key").cloned(),
+        }
     } else {
-        get_or_build_thread_client(&ClientOptions {
-            use_proxy: false, proxy_addr: None, use_cert: false,
-            cert_path: rule.cert.get("file").cloned(),
-                                   key_path: rule.cert.get("key").cloned(),
-        }, &data.config.clone())
+        ClientOptions {
+            use_proxy:  false,
+            proxy_addr: None,
+            use_cert:   false,
+            cert_path:  None,
+            key_path:   None,
+        }
     };
+    let client = get_or_build_client(client_opts, &data.config);
 
     let uri = Uri::from_str(&full_url)
     .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
@@ -706,7 +710,6 @@ pub async fn proxy_without_proxy(
                 let mut resp = HttpResponse::Unauthorized();
                 resp.append_header(("server", "ProxyAuth"));
                 resp.append_header(("Set-Cookie", "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"));
-                resp.append_header(("server", "ProxyAuth"));
                 if req.uri() != "/" || req.uri() != "" {
                     resp.append_header(("location", "/"));
                 }
@@ -784,7 +787,7 @@ pub async fn proxy_without_proxy(
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule.backends.iter().map(|b| match b {
             BackendInput::Simple(url) => BackendConfig { url: url.clone(), weight: 1 },
-                                                                    BackendInput::Detailed(cfg) => cfg.clone(),
+            BackendInput::Detailed(cfg) => cfg.clone(),
         }).collect();
 
         match forward_failover(hyper_req, &backends, None).await {
@@ -829,7 +832,6 @@ pub async fn proxy_without_proxy(
         return Ok(resp.finish());
     }
 
-    // ── build client request ───────────────────────────────────
     let (parts, resp_body) = response_result.into_parts();
     let status = parts.status;
     let headers: hyper::HeaderMap = parts.headers;
