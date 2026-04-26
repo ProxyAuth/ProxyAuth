@@ -2621,7 +2621,15 @@ dependencies = [
 
 [[package]]
 name = "proxyauth"
+<<<<<<< HEAD
 version = "1.0.0-beta3"
+=======
+<<<<<<< HEAD
+version = "1.0.0-beta2"
+=======
+version = "1.0.0-beta1"
+>>>>>>> 052aa85 (ad cargo.lock)
+>>>>>>> ca8d737 (ad cargo.lock)
 dependencies = [
  "actix-governor",
  "actix-http",
