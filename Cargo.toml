@@ -119,10 +119,13 @@ http = "1"
 hyper-tls = "0.5"
 hmac = "0.13.0-rc.2"
 cookie = "0.18"
-lettre = { version = "0.11", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
+lettre = { version = "0.11.22", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
 
 [dependencies.rustls-webpki]
 version = ">=0.103.13, <0.104.0-alpha.1"
+
+[dependencies.quinn-proto]
+version = ">=0.11.15"
 
 [profile.release]
 opt-level = 3
