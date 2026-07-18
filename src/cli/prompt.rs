@@ -35,7 +35,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(0);
                 }
                 Some("export") => {
-                    let _ = export_as_file();
+                    let _ = export_as_file(None);
                     std::process::exit(0);
                 }
                 Some(_host) => Ok(()),
