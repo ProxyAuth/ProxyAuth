@@ -51,9 +51,6 @@ jobs:
   ci:
     runs-on: ubuntu-latest
 
-    outputs:
-      version: ${{ steps.get_version.outputs.version }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -72,12 +69,6 @@ jobs:
 
       - name: Build the binary
         run: cargo build --release
-
-      - name: Get version
-        id: get_version
-        run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Prepare User for run proxyauth
         run: sudo ./target/release/proxyauth prepare --insecure
