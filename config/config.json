@@ -8,7 +8,7 @@
   "stats": false,
   "max_idle_per_host": 500,
   "ratelimit_auth": {
-    "burst": 10,
+    "burst": 100,
     "block_delay": 5000,
     "requests_per_second": 5
   },
