@@ -1,33 +1,19 @@
 name: Deploy
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: ["CI/CD ProxyAuth"]
+    types: [completed]
+    branches: [main]
 
 jobs:
-  check-audit:
-    runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.check.outputs.conclusion }}
-    steps:
-      - id: check
-        env:
-          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
-          FORGEJO_URL: ${{ github.server_url }}
-          REPO: ${{ github.repository }}
-        run: |
-          # Fetch the latest run of the audit.yml workflow on the current branch
-          response=$(curl -s -H "Authorization: token $FORGEJO_TOKEN" \
-            "$FORGEJO_URL/api/v1/repos/$REPO/actions/workflows/audit.yml/runs?branch=${{ github.ref_name }}&limit=1")
-
-          conclusion=$(echo "$response" | jq -r '.workflow_runs[0].conclusion')
-          echo "Found result: $conclusion"
-          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
-
   publish:
-    needs: check-audit
-    if: ${{ needs.check-audit.outputs.status == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: theoparis/rust-toolchain@stable
         with:
           toolchain: stable
