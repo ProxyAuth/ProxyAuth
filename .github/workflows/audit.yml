@@ -5,8 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  workflow_call:
 
 jobs:
+
   audit:
     runs-on: ubuntu-latest
     steps:
@@ -48,6 +51,9 @@ jobs:
   ci:
     runs-on: ubuntu-latest
 
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -66,6 +72,12 @@ jobs:
 
       - name: Build the binary
         run: cargo build --release
+
+      - name: Get version
+        id: get_version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Prepare User for run proxyauth
         run: sudo ./target/release/proxyauth prepare --insecure
@@ -100,3 +112,17 @@ jobs:
         run: |
           cat proxyauth.pid | xargs kill || true
 
+  notify:
+    needs: [audit, coverage, ci]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on Pull Request
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -X POST \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            -H "Authorization: token $FORGEJO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"body": "✅ All checks passed — version Proxyauth v${{ needs.ci.outputs.version }} is ready to be published."}'

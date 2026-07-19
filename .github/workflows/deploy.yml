@@ -1,0 +1,23 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    uses: ./.github/workflows/audit.yml
+
+  publish:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: theoparis/rust-toolchain@stable
+        with:
+          toolchain: stable
+          override: true
+      - name: Publish crate to crates.proxyauth.app
+        env:
+          CARGO_REGISTRIES_PROXYAUTH_INDEX: sparse+https://crates.proxyauth.app/api/v1/crates/
+          CARGO_REGISTRIES_PROXYAUTH_TOKEN: ${{ secrets.PROXYAUTH_TOKEN_REPO }}
+        run: cargo publish --registry proxyauth
