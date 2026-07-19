@@ -115,8 +115,8 @@ jobs:
 
       - name: Install jq
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
+          apt-get update
+          apt-get install -y jq
 
       - name: Get local version
         id: local_version
