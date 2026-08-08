@@ -153,3 +153,4 @@ jobs:
             -H "Authorization: token $FORGEJO_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg body "$BODY" '{body: $body}')"
+
