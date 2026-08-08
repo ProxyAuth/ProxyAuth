@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 name: Deploy
 on:
   workflow_dispatch:
@@ -19,33 +18,8 @@ jobs:
         with:
           toolchain: stable
           override: true
-=======
-name: Publish to crates.proxyauth.app
- 
-on:
-  workflow_run:
-    workflows: ["audit"]
-    types:
-      - completed
-    branches:
-      - main
- 
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
- 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
- 
       - name: Publish crate to crates.proxyauth.app
         env:
           CARGO_REGISTRIES_PROXYAUTH_INDEX: sparse+https://crates.proxyauth.app/api/v1/crates/
           CARGO_REGISTRIES_PROXYAUTH_TOKEN: ${{ secrets.PROXYAUTH_TOKEN_REPO }}
         run: cargo publish --registry proxyauth
-

@@ -5,7 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+<<<<<<< HEAD
   workflow_dispatch:
+=======
+>>>>>>> 7e60f5a (Actualiser .github/workflows/audit.yml)
   workflow_call:
 
 jobs:
@@ -103,6 +106,7 @@ jobs:
         run: |
           cat proxyauth.pid | xargs kill || true
 
+<<<<<<< HEAD
   notify:
     needs: [audit, coverage, ci]
 
@@ -153,4 +157,24 @@ jobs:
             -H "Authorization: token $FORGEJO_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg body "$BODY" '{body: $body}')"
+=======
+  publish:
+    needs: [audit, coverage, ci]
+
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: theoparis/rust-toolchain@stable
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Publish crate to crates.proxyauth.app
+        env:
+          CARGO_REGISTRIES_PROXYAUTH_INDEX: sparse+https://crates.proxyauth.app/api/v1/crates/
+          CARGO_REGISTRIES_PROXYAUTH_TOKEN: ${{ secrets.PROXYAUTH_TOKEN_REPO }}
+        run: cargo publish --registry proxyauth
+
+>>>>>>> 7e60f5a (Actualiser .github/workflows/audit.yml)
 
