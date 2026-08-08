@@ -1,6 +1,7 @@
 use crate::adm::method_otp::generate_base32_secret;
 use crate::revoke::db::RevokedTokenMap;
 use crate::stats::tokencount::CounterToken;
+use crate::network::stats::RequestStats;
 use crate::token::auth::generate_random_string;
 use crate::smtp::smtp::SmtpConfig;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
@@ -282,7 +283,10 @@ pub struct AppState {
     #[allow(dead_code)]
     pub client_with_proxy: Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>,
     pub revoked_tokens: RevokedTokenMap,
+    pub stats: Arc<RequestStats>,
+
 }
+
 
 #[derive(Deserialize)]
 pub struct AuthRequest {
