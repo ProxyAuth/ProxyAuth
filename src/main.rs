@@ -184,7 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .install_default()
     .expect("Failed to install rustls crypto provider");
 
-    let _ = prompt().await;
+    if let Err(e) = prompt().await {
+      eprintln!("Error: {}", e);
+      std::process::exit(1);
+    }
 
     // launch as user proxyauth
     let _ = switch_to_user("proxyauth");
