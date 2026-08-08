@@ -5,6 +5,7 @@ use proxyauth::network::shared_client::{
 };
 use proxyauth::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use proxyauth::{AppConfig, AppState, CounterToken, RouteConfig, auth as auth_handler};
+use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::fs;
@@ -35,6 +36,10 @@ macro_rules! build_app {
     () => {
         async {
             setup_crypto();
+
+            let stats = RequestStats::new();
+            spawn_stats_ticker(stats.clone());
+
             let config: Arc<AppConfig> = Arc::new(load_config("config/config.json"));
             let routes: RouteConfig = serde_yaml::from_str(
                 &fs::read_to_string("config/routes.yml").expect("Failed to read routes.yml"),
@@ -84,12 +89,13 @@ macro_rules! build_app {
 
             let state = web::Data::new(AppState {
                 config: Arc::clone(&config),
-                                       routes: Arc::new(routes),
-                                       counter: Arc::new(counter_token.into()),
-                                       client_normal,
-                                       client_with_cert,
-                                       client_with_proxy,
-                                       revoked_tokens,
+                routes: Arc::new(routes),
+                counter: Arc::new(counter_token.into()),
+                client_normal,
+                client_with_cert,
+                client_with_proxy,
+                revoked_tokens,
+                stats,
             });
 
             test::init_service(

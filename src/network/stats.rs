@@ -35,16 +35,22 @@ impl RequestStats {
 }
 
 pub fn spawn_stats_ticker(stats: Arc<RequestStats>) {
-    tokio::spawn(async move {
-        let mut tick = interval(TokioDuration::from_secs(1));
-        loop {
-            tick.tick().await;
-            let current = stats.counter.swap(0, Ordering::Relaxed);
-            let mut hist = stats.history.write().await;
-            if hist.len() >= 60 { hist.pop_front(); }
-            hist.push_back(current);
-        }
-    });
+    // Only spawn if we're actually inside a Tokio runtime (e.g. not in sync unit tests
+    // that build AppState without a runtime context).
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(async move {
+            let mut tick = interval(TokioDuration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let current = stats.counter.swap(0, Ordering::Relaxed);
+                let mut hist = stats.history.write().await;
+                if hist.len() >= 60 {
+                    hist.pop_front();
+                }
+                hist.push_back(current);
+            }
+        });
+    }
 }
 
 #[derive(Serialize)]
