@@ -26,7 +26,7 @@ fn cors_response(mut resp: HttpResponseBuilder, req: &HttpRequest) -> HttpRespon
     resp
 }
 
-/// Verifies the `Authorization: Bearer <token>` header against the configured admin token.
+/// Verifies the `X-Auth-Token: <token>` header against the configured admin token.
 /// Uses constant-time comparison to prevent timing attacks.
 fn is_valid_admin_token(req: &HttpRequest, data: &web::Data<AppState>) -> bool {
     let expected = &data.config.token_admin;
@@ -37,9 +37,8 @@ fn is_valid_admin_token(req: &HttpRequest, data: &web::Data<AppState>) -> bool {
 
     let provided = req
     .headers()
-    .get(header::AUTHORIZATION)
-    .and_then(|v| v.to_str().ok())
-    .and_then(|s| s.strip_prefix("Bearer "));
+    .get("X-Auth-Token")
+    .and_then(|v| v.to_str().ok());
 
     match provided {
         Some(token) => token.as_bytes().ct_eq(expected.as_bytes()).into(),
