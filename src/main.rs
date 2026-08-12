@@ -156,6 +156,7 @@ macro_rules! build_app {
         let state = $state.clone();
         App::new()
         .app_data(state.clone())
+        .app_data(web::PayloadConfig::new(state.config.max_body_size))
         .wrap(RateLimitLogger)
         .wrap(CorsMiddleware { config: state.clone() })
         .service(

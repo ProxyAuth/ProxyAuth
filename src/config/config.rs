@@ -179,6 +179,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub trust_proxy_forward_for: Option<Vec<String>>,
 
+    #[serde(default = "default_max_body_size")]
+    pub max_body_size: usize,
+
     #[serde(default = "default_max_idle_per_host")]
     pub max_idle_per_host: u16,
 
@@ -405,6 +408,10 @@ fn default_login_via_otp() -> bool {
 
 fn default_session_cookie() -> bool {
     false
+}
+
+fn default_max_body_size() -> usize {
+    10 * 1024 * 1024 // 10 MB default if not set in config file
 }
 
 fn default_log() -> HashMap<String, String> {
