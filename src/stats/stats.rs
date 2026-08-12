@@ -1,6 +1,7 @@
 use crate::AppState;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 
+#[allow(dead_code)]
 pub async fn stats(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     let expected_token = &data.config.token_admin;
     let auth_header = req.headers().get("X-Auth-Token");

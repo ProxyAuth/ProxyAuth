@@ -54,7 +54,6 @@ use network::shared_client::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use start_actix::mode_actix_web;
-use stats::stats::stats as metric_stats;
 pub use stats::tokencount::CounterToken;
 use std::net::TcpListener;
 use std::{fs, process, sync::Arc, time::Duration};

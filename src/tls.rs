@@ -170,6 +170,7 @@ async fn watch_cert_key(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn check_port(addr: &str) -> bool {
     TcpListener::bind(addr).is_ok()
 }

@@ -169,6 +169,7 @@ pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
     None
 }
 
+#[allow(dead_code)]
 pub fn match_route<'a>(raw_path: &str, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
     match_route_idx(raw_path, routes).map(|i| &routes[i])
 }
