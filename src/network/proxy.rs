@@ -179,19 +179,40 @@ pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -
     builder
 }
 
-pub fn client_ip(req: &HttpRequest) -> Option<IpAddr> {
-    req.headers()
-    .get("x-forwarded-for")
-    .and_then(|forwarded| forwarded.to_str().ok())
-    .and_then(|forwarded_str| forwarded_str.split(',').next())
-    .and_then(|ip_str| ip_str.trim().parse::<IpAddr>().ok())
-    .or_else(|| {
-        req.headers()
-        .get("x-real-ip")
-        .and_then(|real_ip| real_ip.to_str().ok())
-        .and_then(|ip_str| ip_str.trim().parse::<IpAddr>().ok())
-    })
-    .or_else(|| req.peer_addr().map(|addr| addr.ip()))
+fn is_trusted_peer(req: &HttpRequest, config: &AppConfig) -> bool {
+    let Some(peer_ip) = req.peer_addr().map(|addr| addr.ip()) else {
+        return false;
+    };
+    match &config.trust_proxy_forward_for {
+        None => false,
+        Some(trusted) => trusted.iter().any(|entry| {
+            entry.parse::<IpAddr>().map(|ip| ip == peer_ip).unwrap_or(false)
+        }),
+    }
+}
+
+pub fn client_ip(req: &HttpRequest, config: &AppConfig) -> Option<IpAddr> {
+    let peer_ip = req.peer_addr().map(|addr| addr.ip());
+
+    if is_trusted_peer(req, config) {
+        if let Some(ip) = req.headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.trim().parse::<IpAddr>().ok())
+            {
+                return Some(ip);
+            }
+            if let Some(ip) = req.headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                {
+                    return Some(ip);
+                }
+    }
+
+    peer_ip
 }
 
 async fn incoming_to_boxbody(res: hyper::Response<Incoming>) -> Result<hyper::Response<BoxBody>, hyper::Error> {
@@ -262,7 +283,7 @@ pub async fn proxy_with_proxy(
     let rule = &data.routes.routes[route_idx];
 
     let path = req.path();
-    let ip = client_ip(&req).unwrap_or(IpAddr::from([127, 0, 0, 1])).to_string();
+    let ip = client_ip(&req, &data.config).unwrap_or(IpAddr::from([127, 0, 0, 1])).to_string();
     let method_str = req.method().as_str();
     let user_agent = req.headers().get("User-Agent").and_then(|h| h.to_str().ok()).unwrap_or("-");
 
@@ -569,7 +590,7 @@ pub async fn proxy_without_proxy(
     let rule = &data.routes.routes[route_idx];
 
     let path = req.path();
-    let ip = client_ip(&req).unwrap_or(IpAddr::from([127, 0, 0, 1])).to_string();
+    let ip = client_ip(&req, &data.config).unwrap_or(IpAddr::from([127, 0, 0, 1])).to_string();
     let method_str = req.method().as_str();
     let user_agent = req.headers().get("User-Agent").and_then(|h| h.to_str().ok()).unwrap_or("-");
 

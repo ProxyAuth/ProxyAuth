@@ -176,6 +176,9 @@ pub struct AppConfig {
     #[serde(default = "default_stats")]
     pub stats: bool,
 
+    #[serde(default)]
+    pub trust_proxy_forward_for: Option<Vec<String>>,
+
     #[serde(default = "default_max_idle_per_host")]
     pub max_idle_per_host: u16,
 

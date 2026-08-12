@@ -228,7 +228,7 @@ pub async fn auth(
             EitherAuth::Form(f) => f,
         };
 
-    let ip = client_ip(&req)
+    let ip = client_ip(&req,  &data.config)
     .map(|s| s.to_string())
     .or_else(|| {
         req.headers()
