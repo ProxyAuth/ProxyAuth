@@ -23,6 +23,7 @@ use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
+use ipnet::IpNet;
 
 static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock::new(None));
 
@@ -45,6 +46,17 @@ fn is_method_allowed(allowed: Option<&[String]>, method: &str) -> bool {
         }
     }
 }
+
+// Localhost is always trusted, regardless of config — this covers the
+// common case where nginx runs on the same host as proxyauth, and avoids
+// a misconfiguration (empty/missing trust_proxy_forward_for) from silently
+// breaking local setups.
+static ALWAYS_TRUSTED: Lazy<Vec<IpNet>> = Lazy::new(|| {
+    vec![
+        "127.0.0.0/8".parse().unwrap(), // IPv4 loopback range
+        "::1/128".parse().unwrap(),     // IPv6 loopback
+    ]
+});
 
 fn build_allow_header(allowed: Option<&[String]>) -> String {
     const ALL: &str = "GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS";
@@ -195,10 +207,19 @@ fn is_trusted_peer(req: &HttpRequest, config: &AppConfig) -> bool {
     let Some(peer_ip) = req.peer_addr().map(|addr| addr.ip()) else {
         return false;
     };
+
+    // Always trust loopback, no matter what the config says
+    if ALWAYS_TRUSTED.iter().any(|net| net.contains(&peer_ip)) {
+        return true;
+    }
+
+    // Then check the configurable list for anything beyond localhost
+    // (e.g. an internal LB/nginx host on a different machine)
     match &config.trust_proxy_forward_for {
         None => false,
         Some(trusted) => trusted.iter().any(|entry| {
-            entry.parse::<IpAddr>().map(|ip| ip == peer_ip).unwrap_or(false)
+            entry.parse::<IpAddr>().map_or(false, |ip| ip == peer_ip)
+            || entry.parse::<IpNet>().map_or(false, |net| net.contains(&peer_ip))
         }),
     }
 }
