@@ -179,6 +179,18 @@ pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -
     builder
 }
 
+fn is_secure_request(req: &HttpRequest, config: &AppConfig) -> bool {
+    if is_trusted_peer(req, config) {
+        // Trusted proxy (e.g. local nginx) already terminated TLS and is
+        // telling us the original scheme was https — trust it.
+        req.connection_info().scheme() == "https"
+    } else {
+        // Untrusted / direct connection: ignore all forwarding headers.
+        // Use the actual TLS state of the socket proxyauth is listening on.
+        req.app_config().secure()
+    }
+}
+
 fn is_trusted_peer(req: &HttpRequest, config: &AppConfig) -> bool {
     let Some(peer_ip) = req.peer_addr().map(|addr| addr.ip()) else {
         return false;
@@ -388,8 +400,7 @@ pub async fn proxy_with_proxy(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .or_else(|| {
-            let is_https = req.connection_info().scheme() == "https";
-            if !is_https { return None; }
+            if !is_secure_request(&req, &data.config) { return None; }
             req.headers().get(header::COOKIE)
             .and_then(|val| val.to_str().ok())
             .and_then(|cookie_str| {
@@ -708,8 +719,7 @@ pub async fn proxy_without_proxy(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .or_else(|| {
-            let is_https = req.connection_info().scheme() == "https";
-            if !is_https { return None; }
+            if !is_secure_request(&req, &data.config) { return None; }
             req.headers().get(header::COOKIE)
             .and_then(|val| val.to_str().ok())
             .and_then(|cookie_str| {
