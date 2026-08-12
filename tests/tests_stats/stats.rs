@@ -3,6 +3,7 @@ use proxyauth::AppState;
 use proxyauth::CounterToken;
 use proxyauth::AppConfig;
 use proxyauth::RouteConfig;
+use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 
 #[cfg(test)]
 mod tests {
@@ -54,6 +55,9 @@ mod tests {
         let counter = Arc::new(CounterToken::new());
         let revoked_tokens = Arc::new(DashMap::<String, u64>::new());
 
+        let stats = RequestStats::new();
+        spawn_stats_ticker(stats.clone());
+
         web::Data::new(AppState {
             config: Arc::new(cfg),
                        routes,
@@ -62,6 +66,7 @@ mod tests {
                        client_with_cert:  dummy_https_client(),
                        client_with_proxy: dummy_proxy_client(),
                        revoked_tokens,
+                       stats,
         })
     }
 

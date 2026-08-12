@@ -218,6 +218,7 @@ pub async fn global_proxy(
             }
             _ => false,
         };
+
         if let (Some(origin_str), true) = (origin, is_allowed) {
             return Ok(HttpResponse::Ok()
             .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
@@ -234,6 +235,7 @@ pub async fn global_proxy(
     let method = req.method().as_str();
     let ip = req.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "-".to_string());
     let user_agent = req.headers().get("User-Agent").and_then(|h| h.to_str().ok()).unwrap_or("-");
+    data.stats.incr();
 
     if let Some(idx) = match_route_idx(path, &data.routes.routes) {
         let use_proxy = data.routes.routes[idx].proxy;

@@ -13,6 +13,8 @@ use proxyauth::token::crypto::encrypt;
 use proxyauth::token::crypto::derive_key_from_secret;
 use proxyauth::token::crypto::calcul_cipher;
 use proxyauth::token::security::generate_token;
+use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
+
 
 #[cfg(test)]
 mod tests {
@@ -140,6 +142,9 @@ mod tests {
     }
 
     fn mk_state(routes: Vec<RouteRule>, cfg: AppConfig) -> actix_web::web::Data<AppState> {
+        let stats = RequestStats::new();
+        spawn_stats_ticker(stats.clone());
+
         let state = AppState {
             config: Arc::new(cfg),
             routes: Arc::new(RouteConfig { routes }),
@@ -148,6 +153,7 @@ mod tests {
             client_with_cert: https_client(),
             client_with_proxy: proxy_client(),
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
+            stats,
         };
         actix_web::web::Data::new(state)
     }
@@ -725,6 +731,10 @@ mod render_error_page_tests {
     fn mk_state(routes: Vec<RouteRule>, mut cfg: AppConfig) -> actix_web::web::Data<AppState> {
         cfg.session_cookie = true;
         cfg.csrf_token = true;
+
+        let stats = RequestStats::new();
+        spawn_stats_ticker(stats.clone());
+
         let state = AppState {
             config: Arc::new(cfg),
             routes: Arc::new(RouteConfig { routes }),
@@ -733,6 +743,7 @@ mod render_error_page_tests {
             client_with_cert: https_client(),
             client_with_proxy: proxy_client(),
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
+            stats,
         };
         actix_web::web::Data::new(state)
     }

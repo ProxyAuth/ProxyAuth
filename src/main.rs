@@ -28,6 +28,7 @@ mod smtp;
 
 use crate::adm::registry_otp::{get_otpauth_uri, get_otpauth_uri_option};
 use crate::adm::revoke::revoke_route;
+use crate::adm::stats::{get_proxy_stats, get_proxy_sessions};
 use crate::build::build_info::update_build_info;
 use crate::cli::prompt::prompt;
 use crate::keystore::import::decrypt_keystore;
@@ -35,6 +36,7 @@ use crate::network::cors::CorsMiddleware;
 use crate::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use crate::network::proxy::init_routes;
 use crate::network::config::init_loadbalancer;
+use crate::network::stats::{RequestStats, spawn_stats_ticker};
 use crate::smtp::template::ensure_reset_template_exists;
 use crate::smtp::smtp::SmtpClient;
 use actix_governor::{Governor, GovernorConfigBuilder};
@@ -161,7 +163,8 @@ macro_rules! build_app {
             .route(web::post().to(auth))
             .route(web::method(Method::OPTIONS).to(auth_options)),
         )
-        .service(web::resource("/adm/stats").route(web::get().to(metric_stats)))
+        .service(web::resource("/adm/stats").route(web::get().to(get_proxy_stats)))
+        .service(web::resource("/adm/stats/sessions").route(web::get().to(get_proxy_sessions)))
         .service(web::resource("/adm/logs").route(web::get().to(get_logs)))
         .service(web::resource("/adm/revoke").route(web::post().to(revoke_route)))
         .service(
@@ -221,6 +224,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let counter_token = Arc::new(CounterToken::new());
 
+    // ── Stats ────────────────────────────────────────────────
+    let stats = RequestStats::new();
+    spawn_stats_ticker(stats.clone());
+
+    // ── remove periodic CounterToken ────────────────────
+    {
+        let counter_clone = Arc::clone(&counter_token);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 min
+            loop {
+                tick.tick().await;
+                let removed = counter_clone.purge_expired();
+                if removed > 0 {
+                    tracing::info!("purged {} expired tokens", removed);
+                }
+            }
+        });
+    }
+
     let revoked_tokens = match load_revoked_tokens() {
         Ok(tokens) => tokens,
         Err(e) => {
@@ -234,19 +256,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     start_revoked_token_ttl(
         revoked_tokens.clone(),
-                            std::time::Duration::from_secs(15),
-                            config.redis.clone(),
+        std::time::Duration::from_secs(15),
+        config.redis.clone(),
     )
     .await;
 
     let client_normal = build_hyper_client_normal(&config);
     let client_with_cert = build_hyper_client_cert(
         ClientOptions {
-            use_proxy: false,
-            proxy_addr: None,
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
+        use_proxy: false,
+        proxy_addr: None,
+        use_cert: false,
+        cert_path: None,
+        key_path: None,
         },
         &config,
     );
@@ -255,9 +277,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ClientOptions {
             use_proxy: true,
             proxy_addr: Some("http://127.0.0.1:8888".to_string()),
-                                                     use_cert: false,
-                                                     cert_path: None,
-                                                     key_path: None,
+            use_cert: false,
+            cert_path: None,
+            key_path: None,
         },
         &config,
     );
@@ -266,12 +288,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = web::Data::new(AppState {
         config: Arc::clone(&config),
-                               routes: Arc::new(routes),
-                               counter: counter_token,
-                               client_normal,
-                               client_with_cert,
-                               client_with_proxy,
-                               revoked_tokens,
+        routes: Arc::new(routes),
+        counter: counter_token,
+        client_normal,
+        client_with_cert,
+        client_with_proxy,
+        revoked_tokens,
+        stats,
     });
 
     init_derived_key(&config.secret);

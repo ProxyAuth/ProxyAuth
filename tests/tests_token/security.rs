@@ -16,6 +16,7 @@ use proxyauth::token::security::generate_secret;
 use proxyauth::token::crypto::derive_key_from_secret;
 use proxyauth::token::security::check_date_token;
 use proxyauth::network::canonical_url::canonicalize_path_for_match;
+use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 use serde_json::Value as JsonValue;
 use proxyauth::AppConfig;
 use proxyauth::AppState;
@@ -592,6 +593,9 @@ mod validate_token_path_tests {
         let counter = Arc::new(CounterToken::new());
         let revoked = DashMap::<String, u64>::new();
 
+        let stats = RequestStats::new();
+        spawn_stats_ticker(stats.clone());
+
         web::Data::new(AppState {
             counter,
             client_normal:     build_https_client_for_tests(),
@@ -600,6 +604,7 @@ mod validate_token_path_tests {
                        revoked_tokens: revoked.into(),
                        config: Arc::new(cfg),
                        routes: Arc::new(routes),
+                       stats,
         })
     }
 
@@ -823,6 +828,10 @@ mod validate_token_path_tests {
     #[test]
     fn whole_block_detects_tamper_on_hash() {
         let cfg = mk_config(3600, false);
+
+        let stats = RequestStats::new();
+        spawn_stats_ticker(stats.clone());
+
         let st = web::Data::new(AppState {
             config: Arc::new(AppConfig::default()),
                                 routes: Arc::new(RouteConfig { routes: vec![] }),
@@ -831,6 +840,7 @@ mod validate_token_path_tests {
                                 client_with_cert:  build_https_client_for_tests(),
                                 client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
                                 revoked_tokens: DashMap::<String, u64>::new().into(),
+                                stats,
         });
 
         let future = (Utc::now() + chrono::Duration::minutes(5))
