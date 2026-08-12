@@ -454,11 +454,15 @@ pub async fn proxy_with_proxy(
         if key_str == "user-agent" {
             user_agent_fwd = value.to_str().unwrap_or("");
         }
-        if key_str != "authorization" && key_str != "user-agent" {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+        if key_str != "authorization"
+            && key_str != "user-agent"
+            && key_str != "x-user"
+            && key_str != "x-user-roles"
+            {
+                if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    request_builder = request_builder.header(key_str, hv);
+                }
             }
-        }
     }
 
     request_builder = request_builder.header("Connection", "close").header(USER_AGENT, "ProxyAuth");
@@ -772,11 +776,15 @@ pub async fn proxy_without_proxy(
         if key_str == "user-agent" {
             user_agent_fwd = value.to_str().unwrap_or("");
         }
-        if key_str != "authorization" && key_str != "user-agent" {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+        if key_str != "authorization"
+            && key_str != "user-agent"
+            && key_str != "x-user"
+            && key_str != "x-user-roles"
+            {
+                if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    request_builder = request_builder.header(key_str, hv);
+                }
             }
-        }
     }
 
     request_builder = request_builder.header(USER_AGENT, "ProxyAuth");
