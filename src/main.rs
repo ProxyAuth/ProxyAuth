@@ -188,8 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .expect("Failed to install rustls crypto provider");
 
     if let Err(e) = prompt().await {
-      eprintln!("Error: {}", e);
-      std::process::exit(1);
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 
     // launch as user proxyauth
@@ -264,11 +264,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_normal = build_hyper_client_normal(&config);
     let client_with_cert = build_hyper_client_cert(
         ClientOptions {
-        use_proxy: false,
-        proxy_addr: None,
-        use_cert: false,
-        cert_path: None,
-        key_path: None,
+            use_proxy: false,
+            proxy_addr: None,
+            use_cert: false,
+            cert_path: None,
+            key_path: None,
         },
         &config,
     );
@@ -446,9 +446,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _instance_id in 0..num_instances {
         let listener = create_listener(
             &format!("{}:{}", config.host, config.port),
-                                       64 * 1024,
-                                       64 * 1024,
-                                       config.socket_listen.try_into().unwrap(),
+            64 * 1024,
+            64 * 1024,
+            config.socket_listen.try_into().unwrap(),
         )
         .await?;
 
@@ -499,6 +499,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .route(web::method(Method::OPTIONS).to(auth_options)),
                         )
+                        .service(
+                            web::resource("/adm/auth/totp/get")
+                            .route(
+                                web::post()
+                                .to(get_otpauth_uri)
+                                .wrap(Governor::new(&governor_auth_conf)),
+                            )
+                            .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
+                        )
                         .default_service(web::to(global_proxy))
                     },
                     listener,
@@ -536,6 +545,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .wrap(Governor::new(&governor_auth_conf)),
                             )
                             .route(web::method(Method::OPTIONS).to(auth_options)),
+                        )
+                        .service(
+                            web::resource("/adm/auth/totp/get")
+                            .route(
+                                web::post()
+                                .to(get_otpauth_uri)
+                                .wrap(Governor::new(&governor_auth_conf)),
+                            )
+                            .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
                         )
                         .default_service(
                             web::to(global_proxy).wrap(Governor::new(&governor_proxy_conf)),
@@ -642,5 +660,3 @@ mod tests {
         wait_for_port("127.0.0.1:0", 3, Duration::from_millis(100)).await;
     }
 }
-
-
