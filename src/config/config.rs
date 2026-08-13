@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use dashmap::DashMap;
 use std::sync::Arc;
 use regex::Regex;
 
@@ -291,6 +292,34 @@ pub struct AppState {
     pub revoked_tokens: RevokedTokenMap,
     pub stats: Arc<RequestStats>,
 
+    /// Hot-reloadable overlay for per-user TOTP secrets. `AppState.config`
+    /// is an immutable `Arc<AppConfig>` snapshot loaded once at startup —
+    /// writing a new/cleared `otpkey` to config.json on disk (via
+    /// `add_otpkey`/`clear_otpkey`, used by `/adm/auth/totp/get` and
+    /// `/adm/auth/totp/reset`) does NOT update that snapshot in any
+    /// already-running worker. Without this overlay: a freshly enrolled
+    /// user couldn't log in, and — worse — a freshly *reset* (e.g.
+    /// compromised) OTP key would keep working, until every worker
+    /// process was restarted. `None` means "explicitly cleared"; a
+    /// missing entry means "use whatever config.json said at startup".
+    /// See `resolve_otpkey`.
+    pub otp_overrides: Arc<DashMap<String, Option<String>>>,
+
+}
+
+/// Resolves the OTP secret to actually use for `username`, checking the
+/// live `otp_overrides` overlay before falling back to whatever
+/// `AppConfig` loaded from disk at startup. See `AppState::otp_overrides`
+/// for why this indirection exists.
+pub fn resolve_otpkey(
+    state: &AppState,
+    username: &str,
+    config_otpkey: Option<&str>,
+) -> Option<String> {
+    if let Some(entry) = state.otp_overrides.get(username) {
+        return entry.clone();
+    }
+    config_otpkey.map(|s| s.to_string())
 }
 
 
@@ -480,6 +509,63 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
     }
 
     Arc::new(config)
+}
+
+/// Clears a user's TOTP secret, so they can re-enroll via
+/// `/adm/auth/totp/get`. This is the counterpart admins are told to use
+/// (see the 409 response in `adm/registry_otp.rs::get_otpauth_uri`) when a
+/// user is locked out of an already-provisioned OTP key (lost device,
+/// botched enrollment, suspected compromise, etc.).
+///
+/// Returns `Ok(true)` if a key was cleared, `Ok(false)` if the user had no
+/// key set (nothing to do), and `Err(_)` on I/O/parse failure or an
+/// unknown username. Never panics — this is reachable from a network
+/// request (`/adm/auth/totp/reset`), and a panic anywhere in a request
+/// path is worth avoiding regardless of the release profile's panic
+/// strategy.
+pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
+    if !Path::new(config_path).exists() {
+        return Err(format!("Config file not found: {}", config_path));
+    }
+
+    let config_str = fs::read_to_string(config_path)
+    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+    let mut json: Value = serde_json::from_str(&config_str)
+    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+
+    let users = json
+    .get_mut("users")
+    .and_then(|u| u.as_array_mut())
+    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+
+    let mut found = false;
+    let mut cleared = false;
+
+    for user in users.iter_mut() {
+        let name = user.get("username").and_then(|u| u.as_str());
+        if name == Some(username) {
+            found = true;
+            if let Some(obj) = user.as_object_mut() {
+                if obj.remove("otpkey").is_some() {
+                    cleared = true;
+                }
+            }
+            break;
+        }
+    }
+
+    if !found {
+        return Err(format!("User '{}' not found in the configuration file.", username));
+    }
+
+    if cleared {
+        let updated_str = serde_json::to_string_pretty(&json)
+        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+        fs::write(config_path, updated_str)
+        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+    }
+
+    Ok(cleared)
 }
 
 #[allow(dead_code)]

@@ -1,6 +1,7 @@
 use crate::AppState;
 use crate::adm::method_otp::generate_otpauth_uri;
-use crate::config::config::add_otpkey;
+use crate::adm::stats::is_valid_admin_token;
+use crate::config::config::{add_otpkey, clear_otpkey};
 use crate::token::auth::{is_ip_allowed, verify_credentials_constant_time};
 use actix_web::{HttpRequest, HttpResponse, HttpResponseBuilder, Responder, http::header, web};
 use serde::{Deserialize, Serialize};
@@ -141,7 +142,7 @@ pub async fn get_otpauth_uri(
         );
         return HttpResponse::Conflict().body(
             "OTP is already enrolled for this account. Ask an administrator to reset it \
-            if you need to re-provision your authenticator app.",
+if you need to re-provision your authenticator app.",
         );
     }
 
@@ -175,6 +176,14 @@ let otpkey = json
 .map(|s| s.to_string());
 
 if let Some(secret) = otpkey {
+    // CORRECTNESS: without this, the newly written otpkey only exists in
+    // config.json on disk — the already-running AppState.config snapshot
+    // still has otpkey = None for this user, so login would fail with
+    // "Missing TOTP secret" until the whole service was restarted. See
+    // AppState::otp_overrides / resolve_otpkey.
+    data.otp_overrides
+    .insert(auth.username.clone(), Some(secret.clone()));
+
     let uri = generate_otpauth_uri(
         &auth.username,
         "ProxyAuth",
@@ -191,4 +200,57 @@ if let Some(secret) = otpkey {
 }
 
 HttpResponse::InternalServerError().body("OTP generation failed")
+}
+
+#[derive(Deserialize)]
+pub struct OtpResetRequest {
+    pub username: String,
+}
+
+/// Admin-only: clears a user's TOTP secret so they can re-enroll from
+/// scratch via `/adm/auth/totp/get`. This is the mechanism the 409
+/// response in `get_otpauth_uri` refers to when it says "ask an
+/// administrator to reset it" — without this route that message was a
+/// dead end and the only way to unstick a user was to hand-edit
+/// config.json on the server.
+///
+/// Protected by the admin token (`X-Auth-Token`), checked with the same
+/// constant-time comparison used by `/adm/revoke` and `/adm/logs`.
+pub async fn reset_otp_route(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+    body: web::Json<OtpResetRequest>,
+) -> impl Responder {
+    if !is_valid_admin_token(&req, &data) {
+        return HttpResponse::Unauthorized().body("Invalid or missing token");
+    }
+
+    match clear_otpkey("/etc/proxyauth/config/config.json", &body.username) {
+        Ok(true) => {
+            // CORRECTNESS/SECURITY: this is the critical half of the fix —
+            // without updating the live overlay too, the OLD (e.g.
+            // compromised) OTP secret would keep working for login until
+            // every worker process was restarted, defeating the entire
+            // point of an incident-response reset endpoint. See
+            // AppState::otp_overrides / resolve_otpkey.
+            data.otp_overrides.insert(body.username.clone(), None);
+
+            warn!(
+                "OTP key reset for user {} by admin request",
+                body.username
+            );
+            HttpResponse::Ok().body(format!(
+                "OTP key cleared for '{}'. They can now re-enroll via /adm/auth/totp/get.",
+                body.username
+            ))
+        }
+        Ok(false) => HttpResponse::Ok().body(format!(
+            "User '{}' had no OTP key set — nothing to reset.",
+            body.username
+        )),
+        Err(e) => {
+            warn!("Failed to reset OTP key for {}: {}", body.username, e);
+            HttpResponse::InternalServerError().body("Failed to reset OTP key")
+        }
+    }
 }

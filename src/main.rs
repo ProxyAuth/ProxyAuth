@@ -26,7 +26,7 @@ mod tls;
 mod token;
 mod smtp;
 
-use crate::adm::registry_otp::{get_otpauth_uri, get_otpauth_uri_option};
+use crate::adm::registry_otp::{get_otpauth_uri, get_otpauth_uri_option, reset_otp_route};
 use crate::adm::revoke::revoke_route;
 use crate::adm::stats::{get_proxy_stats, get_proxy_sessions};
 use crate::build::build_info::update_build_info;
@@ -168,6 +168,10 @@ macro_rules! build_app {
         .service(web::resource("/adm/logs").route(web::get().to(get_logs)))
         .service(web::resource("/adm/revoke").route(web::post().to(revoke_route)))
         .service(
+            web::resource("/adm/auth/totp/reset")
+            .route(web::post().to(reset_otp_route)),
+        )
+        .service(
             web::resource("/logout")
             .route(web::get().to(logout_session))
             .route(web::method(Method::OPTIONS).to(logout_options)),
@@ -256,8 +260,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     start_revoked_token_ttl(
         revoked_tokens.clone(),
-        std::time::Duration::from_secs(15),
-        config.redis.clone(),
+                            std::time::Duration::from_secs(15),
+                            config.redis.clone(),
     )
     .await;
 
@@ -277,9 +281,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ClientOptions {
             use_proxy: true,
             proxy_addr: Some("http://127.0.0.1:8888".to_string()),
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
+                                                     use_cert: false,
+                                                     cert_path: None,
+                                                     key_path: None,
         },
         &config,
     );
@@ -288,13 +292,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = web::Data::new(AppState {
         config: Arc::clone(&config),
-        routes: Arc::new(routes),
-        counter: counter_token,
-        client_normal,
-        client_with_cert,
-        client_with_proxy,
-        revoked_tokens,
-        stats,
+                               routes: Arc::new(routes),
+                               counter: counter_token,
+                               client_normal,
+                               client_with_cert,
+                               client_with_proxy,
+                               revoked_tokens,
+                               stats,
+                               otp_overrides: Arc::new(DashMap::new()),
     });
 
     init_derived_key(&config.secret);
@@ -446,9 +451,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _instance_id in 0..num_instances {
         let listener = create_listener(
             &format!("{}:{}", config.host, config.port),
-            64 * 1024,
-            64 * 1024,
-            config.socket_listen.try_into().unwrap(),
+                                       64 * 1024,
+                                       64 * 1024,
+                                       config.socket_listen.try_into().unwrap(),
         )
         .await?;
 

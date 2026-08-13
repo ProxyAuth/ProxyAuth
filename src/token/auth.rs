@@ -1,6 +1,6 @@
 use crate::AppConfig;
 use crate::AppState;
-use crate::config::config::{AuthRequest, User};
+use crate::config::config::{AuthRequest, User, resolve_otpkey};
 use crate::network::proxy::client_ip;
 use crate::network::error::render_error_page;
 use crate::token::crypto::{calcul_cipher, derive_key_from_secret, encrypt};
@@ -401,7 +401,16 @@ pub async fn auth(
                     }
                 };
 
-                let totp_key = match user.otpkey.as_deref() {
+                // SECURITY/CORRECTNESS: was `user.otpkey.as_deref()`, which
+                // only ever sees the otpkey as it was at process startup.
+                // Enrollment/reset (/adm/auth/totp/get,
+                // /adm/auth/totp/reset) write to config.json on disk but
+                // can't cheaply mutate the already-loaded Arc<AppConfig>
+                // snapshot — resolve_otpkey checks the live otp_overrides
+                // map first so a freshly enrolled user can log in, and a
+                // freshly reset key stops working, without a restart.
+                let totp_key = match resolve_otpkey(&data, &user.username, user.otpkey.as_deref())
+                {
                     Some(key) => key,
                     None => {
                         warn!("[{}] Missing TOTP secret for user {}", ip, user.username);
@@ -410,7 +419,7 @@ pub async fn auth(
                 };
 
                 let decoded_secret =
-                match base32::decode(base32::Alphabet::Rfc4648 { padding: false }, totp_key) {
+                match base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &totp_key) {
                     Some(bytes) => bytes,
                     None => {
                         warn!("Invalid base32 TOTP secret for user {}", user.username);
