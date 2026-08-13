@@ -15,7 +15,7 @@ use actix_web::{
     web::{self, Form, Json},
 };
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordVerifier};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use blake3;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -27,7 +27,7 @@ use rand::rngs::OsRng;
 use rand::seq::SliceRandom;
 use subtle::ConstantTimeEq;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use totp_rs::{Algorithm, TOTP};
@@ -109,6 +109,63 @@ pub fn verify_password(input: &str, stored_hash: &str) -> bool {
         .verify_password(input.as_bytes(), &parsed)
         .is_ok(),
         Err(_) => false,
+    }
+}
+
+/// A syntactically valid Argon2id hash with no correspondence to any real
+/// account password. Computed once (lazily, at the same cost as hashing a
+/// real user's password) and cached for the life of the process.
+///
+/// SECURITY: used to verify against *something* with the same Argon2 cost
+/// even when the supplied username doesn't match any account, so that
+/// login response time doesn't reveal which usernames exist. Without this,
+/// `verify_password` (expensive) only ran for known usernames, giving an
+/// attacker a timing oracle for username enumeration.
+pub fn dummy_password_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+        Argon2::default()
+        .hash_password(b"proxyauth-constant-time-placeholder", &salt)
+        .map(|h| h.to_string())
+        // Fallback (should never trigger): a fixed, syntactically
+        // valid Argon2id PHC hash, still forces real Argon2 work on
+        // verification even if it can't be generated at runtime.
+        .unwrap_or_else(|_| {
+            "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR2YWx1ZQ$\
+3lJ8m5vRHkNfhVn8wq6qF7z0h9k0m3qkQeQwzE9pM4"
+.to_string()
+        })
+    })
+}
+
+/// Runs an Argon2 verification against either the matched user's real
+/// password hash, or the dummy hash if no user matched — always doing the
+/// same amount of expensive work either way. Returns `true` only if a
+/// user actually matched *and* the password was correct.
+///
+/// SECURITY: replaces the old `user.username == auth.username &&
+/// verify_password(...)` short-circuit pattern, which skipped the
+/// expensive Argon2 check entirely for unknown usernames and thereby leaked
+/// account existence through response timing.
+pub fn verify_credentials_constant_time<'a>(
+    users: &'a [User],
+    username: &str,
+    password: &str,
+) -> Option<&'a User> {
+    match users.iter().find(|u| u.username == username) {
+        Some(user) => {
+            if verify_password(password, &user.password) {
+                Some(user)
+            } else {
+                None
+            }
+        }
+        None => {
+            // Burn the same Argon2 cost as a real check; result discarded.
+            let _ = verify_password(password, dummy_password_hash());
+            None
+        }
     }
 }
 
@@ -311,16 +368,22 @@ pub async fn auth(
         }
     }
 
-    if let Some(index_user) = data
-        .config
-        .users
-        .iter()
-        .enumerate()
-        .find(|(_, user)| {
-            user.username == auth.username && verify_password(&auth.password, &user.password)
-        })
-        .map(|(i, _)| i)
+    // SECURITY: was `.find(|(_, user)| user.username == auth.username &&
+    // verify_password(...))`, which short-circuits on the username check
+    // and skips the expensive Argon2 verification entirely for unknown
+    // usernames — an attacker could enumerate valid usernames purely by
+    // measuring response latency. verify_credentials_constant_time always
+    // burns the same Argon2 cost, against a dummy hash when no user
+    // matches, so response time no longer reveals account existence.
+    if let Some(matched_user) =
+        verify_credentials_constant_time(&data.config.users, &auth.username, &auth.password)
         {
+            let index_user = data
+            .config
+            .users
+            .iter()
+            .position(|u| std::ptr::eq(u, matched_user))
+            .expect("matched user must be present in data.config.users");
             let user = &data.config.users[index_user];
 
             if !is_ip_allowed(&ip, &user) {

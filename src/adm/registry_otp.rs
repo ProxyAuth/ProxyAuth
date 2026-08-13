@@ -1,7 +1,7 @@
 use crate::AppState;
 use crate::adm::method_otp::generate_otpauth_uri;
 use crate::config::config::add_otpkey;
-use crate::token::auth::{is_ip_allowed, verify_password};
+use crate::token::auth::{is_ip_allowed, verify_credentials_constant_time};
 use actix_web::{HttpRequest, HttpResponse, HttpResponseBuilder, Responder, http::header, web};
 use serde::{Deserialize, Serialize};
 use totp_rs::Algorithm;
@@ -104,11 +104,13 @@ pub async fn get_otpauth_uri(
         return HttpResponse::UnsupportedMediaType().body("Unsupported content type");
     };
 
-    let user = data
-    .config
-    .users
-    .iter()
-    .find(|u| u.username == auth.username && verify_password(&auth.password, &u.password));
+    // SECURITY: was `.find(|u| u.username == auth.username &&
+    // verify_password(...))`, which short-circuits on the username check
+    // and skips the expensive Argon2 verification entirely for unknown
+    // usernames, leaking account existence through response timing (same
+    // issue and same fix as token/auth.rs's login handler).
+    let user =
+    verify_credentials_constant_time(&data.config.users, &auth.username, &auth.password);
 
     if user.is_none() {
         return HttpResponse::Unauthorized().body("Invalid username or password");
@@ -139,7 +141,7 @@ pub async fn get_otpauth_uri(
         );
         return HttpResponse::Conflict().body(
             "OTP is already enrolled for this account. Ask an administrator to reset it \
-if you need to re-provision your authenticator app.",
+            if you need to re-provision your authenticator app.",
         );
     }
 

@@ -107,12 +107,12 @@ pub fn init_routes_order(routes: &[RouteRule]) {
         let rj = pj == "/";
         match (ri, rj) {
             (true,  false) => std::cmp::Ordering::Greater,
-            (false, true ) => std::cmp::Ordering::Less,
-            _ => {
-                let li = norm_len(pi);
-                let lj = norm_len(pj);
-                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-            }
+                (false, true ) => std::cmp::Ordering::Less,
+                _ => {
+                    let li = norm_len(pi);
+                    let lj = norm_len(pj);
+                    if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+                }
         }
     });
     *ORDERED_ROUTE_IDX.write().unwrap() = Some(idx);
@@ -153,12 +153,12 @@ pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
         let rj = pj == "/";
         match (ri, rj) {
             (true,  false) => std::cmp::Ordering::Greater,
-            (false, true ) => std::cmp::Ordering::Less,
-            _ => {
-                let li = norm_len(pi);
-                let lj = norm_len(pj);
-                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-            }
+                (false, true ) => std::cmp::Ordering::Less,
+                _ => {
+                    let li = norm_len(pi);
+                    let lj = norm_len(pj);
+                    if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+                }
         }
     });
     for &i in &idx {
@@ -202,6 +202,28 @@ fn is_secure_request(req: &HttpRequest, config: &AppConfig) -> bool {
         // Use the actual TLS state of the socket proxyauth is listening on.
         req.app_config().secure()
     }
+}
+
+/// RFC 9110 §7.6.1 hop-by-hop / connection-framing headers. These must
+/// never be relayed as-is across a proxy boundary — each hop is expected
+/// to generate its own framing headers based on how it actually sends the
+/// message, not copy them from the previous hop. Comparison is
+/// case-insensitive by construction since callers already pass
+/// `HeaderName::as_str()`, which is always lowercase.
+pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+        | "content-length"
+        | "transfer-encoding"
+        | "te"
+        | "trailer"
+        | "upgrade"
+        | "keep-alive"
+        | "proxy-connection"
+        | "proxy-authenticate"
+        | "proxy-authorization"
+    )
 }
 
 fn is_trusted_peer(req: &HttpRequest, config: &AppConfig) -> bool {
@@ -406,9 +428,9 @@ pub async fn proxy_with_proxy(
         ClientOptions {
             use_proxy:  true,
             proxy_addr: Some(rule.proxy_config.clone()),
-            use_cert:   false,
-            cert_path:  None,
-            key_path:   None,
+                                           use_cert:   false,
+                                           cert_path:  None,
+                                           key_path:   None,
         },
         &data.config,
     );
@@ -482,12 +504,26 @@ pub async fn proxy_with_proxy(
     let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
     let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
 
+    // SECURITY: hop-by-hop / connection-framing headers (RFC 9110 §7.6.1)
+    // must never be relayed across a proxy boundary as-is. Forwarding them
+    // verbatim (previously only `authorization`/`user-agent`/`x-user*` were
+    // excluded) let a client's own Content-Length/Transfer-Encoding/TE/
+    // Trailer/Upgrade/Keep-Alive/Proxy-* headers ride along with a request
+    // whose body we always re-serialize as fixed-length — inconsistent
+    // framing metadata is exactly the kind of thing that enables HTTP
+    // request/response smuggling between two independent HTTP
+    // implementations that disagree on how to interpret it. It also let a
+    // client-supplied `Connection` header get copied here and then
+    // *duplicated* by the `.header("Connection", "close")` call below,
+    // since `http::request::Builder::header()` appends rather than
+    // replaces.
     for (key, value) in req.headers() {
         let key_str = key.as_str();
         if key_str == "user-agent" {
             user_agent_fwd = value.to_str().unwrap_or("");
         }
-        if key_str != "authorization"
+        if !is_hop_by_hop_header(key_str)
+            && key_str != "authorization"
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
@@ -529,7 +565,7 @@ pub async fn proxy_with_proxy(
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule.backends.iter().map(|b| match b {
             BackendInput::Simple(url) => BackendConfig { url: url.clone(), weight: 1 },
-            BackendInput::Detailed(cfg) => cfg.clone(),
+                                                                    BackendInput::Detailed(cfg) => cfg.clone(),
         }).collect();
 
         forward_failover(hyper_req, &backends, Some(&rule.proxy_config))
@@ -850,7 +886,7 @@ pub async fn proxy_without_proxy(
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule.backends.iter().map(|b| match b {
             BackendInput::Simple(url) => BackendConfig { url: url.clone(), weight: 1 },
-            BackendInput::Detailed(cfg) => cfg.clone(),
+                                                                    BackendInput::Detailed(cfg) => cfg.clone(),
         }).collect();
 
         match forward_failover(hyper_req, &backends, None).await {
