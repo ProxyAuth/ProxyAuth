@@ -61,9 +61,9 @@ macro_rules! build_app {
                 ClientOptions {
                     use_proxy: true,
                     proxy_addr: Some("http://127.0.0.1:8888".to_string()),
-                                                             use_cert: false,
-                                                             cert_path: None,
-                                                             key_path: None,
+                    use_cert: false,
+                    cert_path: None,
+                    key_path: None,
                 },
                 &config,
             );
@@ -96,6 +96,7 @@ macro_rules! build_app {
                 client_with_proxy,
                 revoked_tokens,
                 stats,
+                otp_overrides: Arc::new(DashMap::new()),
             });
 
             test::init_service(

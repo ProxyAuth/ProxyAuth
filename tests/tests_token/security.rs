@@ -605,6 +605,7 @@ mod validate_token_path_tests {
                        config: Arc::new(cfg),
                        routes: Arc::new(routes),
                        stats,
+                       otp_overrides: DashMap::<String, Option<String>>::new().into(),
         })
     }
 
@@ -841,6 +842,7 @@ mod validate_token_path_tests {
                                 client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
                                 revoked_tokens: DashMap::<String, u64>::new().into(),
                                 stats,
+                                otp_overrides: DashMap::<String, Option<String>>::new().into(),
         });
 
         let future = (Utc::now() + chrono::Duration::minutes(5))

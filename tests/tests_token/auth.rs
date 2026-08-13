@@ -154,6 +154,7 @@ mod tests {
             client_with_proxy: proxy_client(),
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
             stats,
+            otp_overrides: Arc::new(DashMap::new()),
         };
         actix_web::web::Data::new(state)
     }
@@ -744,6 +745,7 @@ mod render_error_page_tests {
             client_with_proxy: proxy_client(),
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
             stats,
+            otp_overrides: Arc::new(DashMap::new()),
         };
         actix_web::web::Data::new(state)
     }
