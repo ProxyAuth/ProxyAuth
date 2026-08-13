@@ -32,7 +32,7 @@ fn cors_response(mut resp: HttpResponseBuilder, req: &HttpRequest) -> HttpRespon
 
 /// Verifies the `X-Auth-Token: <token>` header against the configured admin token.
 /// Uses constant-time comparison to prevent timing attacks.
-fn is_valid_admin_token(req: &HttpRequest, data: &web::Data<AppState>) -> bool {
+pub(crate) fn is_valid_admin_token(req: &HttpRequest, data: &web::Data<AppState>) -> bool {
     let expected = &data.config.token_admin;
     if expected.is_empty() {
         return false;

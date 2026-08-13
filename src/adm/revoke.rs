@@ -2,6 +2,7 @@ use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use serde::Deserialize;
 
 use crate::AppState;
+use crate::adm::stats::is_valid_admin_token;
 use crate::revoke::load::revoke_token;
 
 #[derive(Deserialize)]
@@ -15,28 +16,27 @@ pub async fn revoke_route(
     data: web::Data<AppState>,
     body: web::Json<RevokeRequest>,
 ) -> impl Responder {
-    let expected_token = &data.config.token_admin;
-    let auth_header = req.headers().get("X-Auth-Token");
+    // SECURITY: constant-time comparison (was a plain `==` on the raw
+    // header, vulnerable to a timing side-channel on this very sensitive
+    // admin token — same pattern already used correctly in adm/stats.rs).
+    if !is_valid_admin_token(&req, &data) {
+        return HttpResponse::Unauthorized().body("Invalid or missing token");
+    }
 
-    match auth_header {
-        Some(token) if *token == *expected_token => {
-            let token_id = &body.token_id;
-            let exp = body.exp;
+    let token_id = &body.token_id;
+    let exp = body.exp;
 
-            match revoke_token(token_id, exp, &data.revoked_tokens).await {
-                Ok(_) => {
-                    if exp.is_some() {
-                        HttpResponse::Ok().body("Token revoked with expiration.")
-                    } else {
-                        HttpResponse::Ok().body("Token permanently revoked.")
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[revoke_route] Failed to revoke token: {}", e);
-                    HttpResponse::InternalServerError().body("Failed to revoke token.")
-                }
+    match revoke_token(token_id, exp, &data.revoked_tokens).await {
+        Ok(_) => {
+            if exp.is_some() {
+                HttpResponse::Ok().body("Token revoked with expiration.")
+            } else {
+                HttpResponse::Ok().body("Token permanently revoked.")
             }
         }
-        _ => HttpResponse::Unauthorized().body("Invalid or missing token"),
+        Err(e) => {
+            eprintln!("[revoke_route] Failed to revoke token: {}", e);
+            HttpResponse::InternalServerError().body("Failed to revoke token.")
+        }
     }
 }

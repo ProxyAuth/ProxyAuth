@@ -25,6 +25,7 @@ use hex;
 use ipnet::IpNet;
 use rand::rngs::OsRng;
 use rand::seq::SliceRandom;
+use subtle::ConstantTimeEq;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -288,7 +289,7 @@ pub async fn auth(
                     return render_error_page(
                         &req,
                         data.clone(),
-                        "Session expired, please re-authenticate",
+                                             "Session expired, please re-authenticate",
                     )
                     .await;
                 }
@@ -298,7 +299,7 @@ pub async fn auth(
                     return render_error_page(
                         &req,
                         data.clone(),
-                        "Invalid credential, please re-authenticate",
+                                             "Invalid credential, please re-authenticate",
                     )
                     .await;
                 }
@@ -363,7 +364,10 @@ pub async fn auth(
                 .as_secs();
                 let generated_code = totp.generate(now);
 
-                if generated_code != totp_code {
+                // SECURITY: constant-time comparison — a plain `!=` on the
+                // 6-digit code leaks timing information about how many
+                // leading digits matched.
+                if !bool::from(generated_code.as_bytes().ct_eq(totp_code.as_bytes())) {
                     warn!("Invalid TOTP code for user {}", user.username);
                     return render_error_page(&req, data.clone(), "Invalid TOTP code").await;
                 }
