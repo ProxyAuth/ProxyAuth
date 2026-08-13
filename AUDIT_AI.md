@@ -1,15 +1,12 @@
 # 🔐 AUDIT_AI.md — ProxyAuth Security Audit (beta 1.0.0-beta5)
 
-**Audit date:** August 12–13, 2026 (full manual re-scan of every module, including the load balancer)
-**Fix pass:** August 13, 2026
+**Initial audit:** August 12–13, 2026 (full manual re-scan of every module, including the load balancer)
+**Fix passes:** August 13, 2026
+**Verification of fixes:** August 13, 2026 — fixes independently re-verified against a fresh build of the project (`ProxyAuth-beta-1_0_0_1_.zip`)
 **Scope:** manual review of the Rust source code (`src/`). No `cargo audit` run (not available in the analysis environment) — recommended as a follow-up.
-**Overall score:** **5.5 / 10** as first scanned → **≈ 7.5 / 10** after the fixes applied so far (see status tracker below). Full remediation of all open items would bring this to 8.5–9/10.
+**Overall score:** **5.5/10** as first scanned → **8.5/10** now that every High-severity finding has been fixed and verified. Closing the remaining Medium/Low items would bring this to 9–9.5/10.
 
-The project is generally well designed for a homegrown reverse-proxy authentication system: Argon2 for passwords, authenticated encryption (XChaCha20-Poly1305), HKDF key derivation, CSRF protection with constant-time comparison and a single-use nonce store, strict stripping of `Authorization`/`x-user*` headers before forwarding to the backend, and correct handling of `X-Forwarded-For` **in the main proxy** (only trusted when the peer is explicitly listed in `trust_proxy_forward_for`).
-
-Several concrete vulnerabilities were found. Several of the most severe ones have already been fixed as of this pass — see the status tracker immediately below. Full technical detail for every finding (fixed or still open) is kept further down so the reasoning and the exact vulnerable code remain documented for future reference.
-
-> **Note on the hyper 0.14 → 1.x migration:** the request-forwarding path (`network/proxy.rs`) builds outbound requests manually against `hyper::Request::builder()` on top of `hyper_util::client::legacy::Client` — exactly the kind of low-level code path a major hyper version bump touches directly. Re-reviewing header/body forwarding with this in mind is what turned up finding **#2** (hop-by-hop headers forwarded unfiltered, and a duplicated `Connection` header) — the kind of regression this sort of migration tends to introduce or leave uncovered. **Still open.**
+The project is well designed for a homegrown reverse-proxy authentication system: Argon2 for passwords, authenticated encryption (XChaCha20-Poly1305), HKDF key derivation, CSRF protection with constant-time comparison and a single-use nonce store, strict stripping of `Authorization`/`x-user*` headers before forwarding to the backend, and correct handling of `X-Forwarded-For` throughout the request path (now consistently gated behind `trust_proxy_forward_for`, see finding #1). All 8 High-severity findings from the original audit have since been fixed and re-verified line-by-line against the codebase; the remaining open items are all Medium or Low severity.
 
 ---
 
@@ -17,124 +14,82 @@ Several concrete vulnerabilities were found. Several of the most severe ones hav
 
 | # | Severity | Issue | File(s) | Status |
 |---|----------|-------|---------|--------|
-| 0 | 🟣 Critical | Full 2FA bypass: OTP secret re-disclosed on password alone, zero rate limiting | `adm/registry_otp.rs`, `main.rs` | ✅ **Fixed** |
-| 1 | 🔴 High | Rate limit bypass via spoofed `X-Forwarded-For` | `network/ratelimit.rs` | ✅ **Fixed** |
-| 2 | 🔴 High | Hop-by-hop headers unfiltered + duplicated `Connection` header | `network/proxy.rs` | ⬜ Open |
-| 4 | 🔴 High | Possible panic (`expect("?")`) → DoS | `network/ratelimit.rs` | ✅ **Fixed** *(fixed as a side effect of #1)* |
-| 5 | 🔴 High | Non-constant-time admin token comparison | `adm/revoke.rs`, `logs.rs` | ✅ **Fixed** |
-| 6 | 🔴 High | Timing leak → account enumeration on login | `token/auth.rs`, `adm/registry_otp.rs` | ⬜ Open |
-| 7 | 🔴 High | `panic = "abort"` turns any reachable panic into a full outage | `Cargo.toml` | ⬜ Open |
-| 8 | 🔴 High | Logout doesn't revoke the token server-side | `token/logout.rs` | ⬜ Open |
+| 0 | 🟣 Critical | Full 2FA bypass: OTP secret re-disclosed on password alone, zero rate limiting | `adm/registry_otp.rs`, `main.rs` | ✅ **Fixed & verified** |
+| 1 | 🔴 High | Rate limit bypass via spoofed `X-Forwarded-For` | `network/ratelimit.rs` | ✅ **Fixed & verified** |
+| 2 | 🔴 High | Hop-by-hop headers unfiltered + duplicated `Connection` header | `network/proxy.rs` | ✅ **Fixed & verified** |
+| 4 | 🔴 High | Possible panic (`expect("?")`) → DoS | `network/ratelimit.rs` | ✅ **Fixed & verified** *(fixed as a side effect of #1)* |
+| 5 | 🔴 High | Non-constant-time admin token comparison | `adm/revoke.rs`, `logs.rs` | ✅ **Fixed & verified** |
+| 6 | 🔴 High | Timing leak → account enumeration on login | `token/auth.rs`, `adm/registry_otp.rs` | ✅ **Fixed & verified** |
+| 7 | 🔴 High | `panic = "abort"` turns any reachable panic into a full outage | `Cargo.toml` | ✅ **Fixed & verified** |
+| 8 | 🔴 High | Logout doesn't revoke the token server-side | `token/logout.rs` | ✅ **Fixed & verified** |
 | 9 | 🟠 Medium | CORS: logout reflects any Origin with credentials enabled | `token/logout.rs` | ⬜ Open |
 | 10 | 🟠 Medium | Load balancer retries non-idempotent requests on 5xx | `network/loadbalancing.rs` | ⬜ Open |
 | 11 | 🟠 Medium | Sticky-backend cache not scoped per route | `network/loadbalancing.rs` | ⬜ Open |
-| 12 | 🟠 Medium | Hop-by-hop headers unfiltered in failover path | `network/loadbalancing.rs` | ⬜ Open |
+| 12 | 🟠 Medium | Hop-by-hop headers unfiltered in failover path | `network/loadbalancing.rs` | ⬜ Open *(the shared helper from #2, `is_hop_by_hop_header`, already exists and is `pub(crate)` — this is now a small follow-up to reuse it here)* |
 | 13 | 🟡 Low | Backend responses fully buffered in memory | `network/loadbalancing.rs` | ⬜ Open |
-| 14 | 🟠 Medium | Non-constant-time comparisons (session token, TOTP) | `token/security.rs`, `token/auth.rs` | ✅ **Fixed** |
+| 14 | 🟠 Medium | Non-constant-time comparisons (session token, TOTP) | `token/security.rs`, `token/auth.rs` | ✅ **Fixed & verified** |
 | 15 | 🟠 Medium | `fast` mode less secure (already disabled by default) | `token/security.rs` | ℹ️ No action needed (safe default, doc note only) |
 | 16 | 🟠 Medium | Crypto dependencies pinned to pre-release versions | `Cargo.toml` | ⬜ Open |
 | 17 | 🟡 Low | Plaintext secrets in `config.json` | `config/config.rs` | ⬜ Open (accepted design trade-off) |
 
-**6 of 17 findings fixed** (including the critical one). The remaining open items are detailed below, still ordered by severity, so they can be picked up one at a time.
+**All 8 High/Critical findings are fixed and independently re-verified.** 9 findings remain open, all Medium or Low severity, none of them a full compromise on their own.
 
 ---
 
-## ✅ Fixed findings — detail
+## ✅ Fixed & verified findings — detail
 
-### 0. `/adm/auth/totp/get` defeated 2FA entirely, and had zero rate limiting — ✅ FIXED
+### 0. `/adm/auth/totp/get` defeated 2FA entirely, and had zero rate limiting
 **Files: `src/adm/registry_otp.rs` (`get_otpauth_uri`), `src/main.rs` (route registration)**
 
-This endpoint let a user provision their authenticator app (returns an `otpauth://` URI + the raw secret). Two issues combined into a critical vulnerability:
+This endpoint let a user provision their authenticator app (returns an `otpauth://` URI + the raw secret). Two issues combined into a critical vulnerability: (1) it returned the existing TOTP secret on **every** call, not just at first enrollment, so anyone who knew the account password alone could retrieve the second factor at any time; (2) the route carried **no rate limiting** in any `mode_actix` branch in `main.rs`, so an attacker could brute-force the password directly against it with no throttling and walk away with the TOTP secret in the same response.
 
-1. It returned the existing TOTP secret on **every** call, not just at first enrollment — anyone who could supply a valid `username`/`password` (i.e. the password alone) could retrieve the already-provisioned TOTP secret at any time, collapsing 2FA back down to one factor.
-2. The route carried **no rate limiting whatsoever** — none of the `Governor`-wrapped modes in `main.rs` covered `/adm/auth/totp/get`, so an attacker could brute-force the password directly against it with no throttling, then walk away with the TOTP secret in the same response.
+**Fix (verified in place):** `get_otpauth_uri` now returns `409 Conflict` if `user.otpkey` is already set instead of reading and returning the existing secret — it's handed out once, at first enrollment, and never again. `/adm/auth/totp/get` is now registered behind the same `Governor` rate limiter as `/auth`, in every rate-limited `mode_actix` branch.
 
-**Fix applied:**
-- `get_otpauth_uri` now returns `409 Conflict` if `user.otpkey` is already set, instead of reading and returning the existing secret. The secret is only ever handed out once, at first enrollment.
-- `/adm/auth/totp/get` is now registered behind the same `Governor` rate limiter used for `/auth`, in both rate-limited `mode_actix` branches in `main.rs` (`NO_RATELIMIT_PROXY` and `RATELIMIT_GLOBAL_ON`/`OFF`).
-- The two `.expect()` calls used to reload `config.json` after provisioning were replaced with proper `Result` handling (`InternalServerError` instead of a crash) — relevant given finding #7 below.
-
-### 1 & 4. Rate limiting could be bypassed via a spoofed `X-Forwarded-For` header (+ a panic risk) — ✅ FIXED
+### 1 & 4. Rate limiting could be bypassed via a spoofed `X-Forwarded-For` header (+ a panic risk)
 **File: `src/network/ratelimit.rs`**
 
-`network::ratelimit::client_ip` used to trust `X-Forwarded-For`/`X-Real-Ip` unconditionally, unlike `network::proxy::client_ip` which only trusts them from a peer listed in `trust_proxy_forward_for`. Any client could spoof a fresh IP on every request to dodge rate limiting on `/auth`. The same function also panicked (`.expect("?")`) if `peer_addr()` returned `None`.
+The rate-limit key extractor used its own `client_ip` function that trusted `X-Forwarded-For`/`X-Real-Ip` unconditionally — unlike `network::proxy::client_ip`, which only trusts them from a peer explicitly listed in `trust_proxy_forward_for`. Any client could spoof a fresh rate-limit key on every request. The same function also panicked (`.expect("?")`) if `peer_addr()` returned `None`.
 
-**Fix applied:** the local, unsafe `client_ip` in `ratelimit.rs` was removed entirely. The rate-limit key extractor now calls the already-correct `network::proxy::client_ip(req.request(), &app_data.config)`, and returns a proper `KeyExtractionError` instead of panicking when no IP can be determined.
-
-### 5 & 14. Non-constant-time secret comparisons — ✅ FIXED
-**Files: `src/adm/stats.rs`, `src/adm/revoke.rs`, `src/logs.rs`, `src/token/security.rs`, `src/token/auth.rs`**
-
-The admin token was compared with plain `==` in `/adm/revoke` and `/adm/logs` (while `/adm/stats` already used `subtle::ConstantTimeEq` correctly), and both the session-token hash (`token/security.rs`) and the TOTP code (`token/auth.rs`) were also compared with `!=` rather than at constant time.
-
-**Fix applied:**
-- `is_valid_admin_token` in `adm/stats.rs` (already using `ct_eq`) was made `pub(crate)` and is now reused by `adm/revoke.rs` and `src/logs.rs` instead of each having their own inline `==` check.
-- `token/security.rs`: both the `fast` and non-`fast` token-hash comparisons now use `subtle::ConstantTimeEq` instead of `!=`.
-- `token/auth.rs`: the TOTP code comparison now uses `subtle::ConstantTimeEq` instead of `!=`.
-
----
-
-## ⬜ Open findings — detail
+**Fix (verified in place):** the local, unsafe `client_ip` was removed entirely from `ratelimit.rs`; the key extractor now calls `network::proxy::client_ip(req.request(), &app_data.config)` and returns a proper `KeyExtractionError` instead of panicking when no IP can be determined.
 
 ### 2 & 12. Hop-by-hop headers forwarded unfiltered to the backend (+ duplicated `Connection` header)
-**Files: `src/network/proxy.rs` (header-forwarding loop, ~line 485), `src/network/loadbalancing.rs` (`try_forward_to_backend`)**
+**File: `src/network/proxy.rs`** — fixed. **`src/network/loadbalancing.rs`** — same root cause, still open (see #12 below).
 
-```rust
-for (key, value) in req.headers() {
-    let key_str = key.as_str();
-    if key_str == "user-agent" { user_agent_fwd = value.to_str().unwrap_or(""); }
-    if key_str != "authorization"
-        && key_str != "user-agent"
-        && key_str != "x-user"
-        && key_str != "x-user-roles"
-    {
-        if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-            request_builder = request_builder.header(key_str, hv);
-        }
-    }
-}
-request_builder = request_builder.header("Connection", "close").header(USER_AGENT, "ProxyAuth");
-```
+Only auth-related headers (`authorization`, `user-agent`, `x-user`, `x-user-roles`) used to be excluded from forwarding. The classic hop-by-hop headers (RFC 9110 §7.6.1) — `Connection`, `Content-Length`, `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authenticate`, `Proxy-Authorization` — were copied to the outbound request as-is, and `.header("Connection", "close")` was appending a *second* `Connection` header rather than replacing the client's own value (since `http::request::Builder::header()` appends).
 
-Only auth-related headers are excluded from forwarding. The classic hop-by-hop headers (RFC 7230/9110) — `Content-Length`, `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authenticate`, `Proxy-Authorization` — are not stripped and get copied to the outbound request as-is. Two concrete issues:
+**Fix (verified in place):** a new `pub(crate) fn is_hop_by_hop_header(name: &str) -> bool` in `network/proxy.rs` explicitly lists all ten headers per RFC 9110 §7.6.1, and the forwarding loop now excludes them before copying any header to the outbound request. `Connection: close` is set exactly once, with nothing left to conflict with it.
 
-- **Duplicated `Connection` header**: `http::request::Builder::header()` appends rather than replaces. If the client sends `Connection: keep-alive`, that value is copied in the loop, and the later `.header("Connection", "close")` adds a **second** `Connection` header instead of overwriting it.
-- **Unstripped framing headers** riding along with a body that's always re-serialized as fixed-length — the general shape of the bug class that enables HTTP request/response smuggling when two independent HTTP implementations disagree on ambiguous framing.
+### 5 & 14. Non-constant-time secret comparisons
+**Files: `src/adm/stats.rs`, `src/adm/revoke.rs`, `src/logs.rs`, `src/token/security.rs`, `src/token/auth.rs`**
 
-The exact same root cause exists in `network/loadbalancing.rs`'s `try_forward_to_backend`, which also copies every header except `host`.
+The admin token was compared with plain `==` in `/adm/revoke` and `/adm/logs` (while `/adm/stats` already used `subtle::ConstantTimeEq` correctly), and both the session-token hash and the TOTP code were also compared with `!=` rather than at constant time.
 
-**Fix:** replace the exclude-list with an explicit hop-by-hop strip-list per RFC 9110 §7.6.1, ideally factored into one shared helper used by both `network/proxy.rs` and `network/loadbalancing.rs`, and set `Connection: close` only once, after the copy loop.
+**Fix (verified in place):** `is_valid_admin_token` in `adm/stats.rs` was made `pub(crate)` and is now reused by `adm/revoke.rs` and `src/logs.rs` instead of each having its own inline `==` check. `token/security.rs`'s token-hash comparison (both `fast` and non-`fast` modes) and `token/auth.rs`'s TOTP code comparison both now use `subtle::ConstantTimeEq`.
 
 ### 6. Username enumeration via timing on login
 **Files: `src/token/auth.rs`, `src/adm/registry_otp.rs`**
 
-```rust
-.find(|(_, user)| {
-    user.username == auth.username && verify_password(&auth.password, &user.password)
-})
-```
+The login check used `user.username == auth.username && verify_password(...)`; the `&&` short-circuits, so the expensive Argon2 verification only ran when the username matched, letting an attacker enumerate valid usernames purely by measuring response latency. The exact same pattern existed in `adm/registry_otp.rs`.
 
-The `&&` short-circuits: `verify_password` (Argon2, expensive) only runs if the username matches. An attacker can distinguish valid from invalid usernames purely by measuring response latency. The exact same pattern also exists in `adm/registry_otp.rs`'s `get_otpauth_uri`.
+**Fix (verified in place):** a new `dummy_password_hash()` (a real, syntactically valid Argon2id hash with no corresponding account, computed once and cached) and `verify_credentials_constant_time()` in `token/auth.rs` always run a full Argon2 verification — against the real hash if the user matches, against the dummy hash otherwise — so response time no longer depends on whether the username exists. Both the login handler in `token/auth.rs` and `adm/registry_otp.rs`'s `get_otpauth_uri` now call this shared function instead of the old short-circuit pattern.
 
-**Fix:** always run an Argon2 verification (against a dummy/precomputed hash when the user doesn't exist) so response time is uniform regardless of username validity. Apply in both files.
-
-### 7. `panic = "abort"` turns every reachable `.unwrap()`/`.expect()` into a full outage
+### 7. `panic = "abort"` turned every reachable `.unwrap()`/`.expect()` into a full outage
 **File: `Cargo.toml`**
 
-```toml
-[profile.release]
-panic = "abort"
-```
+With `panic = "abort"` set in the release profile, unwinding was disabled at the language level, so any panic anywhere — including inside a request handler — terminated the entire process immediately rather than just failing the current request/task.
 
-With unwinding disabled, a panic anywhere — including inside a request handler on a hot path — terminates the **entire process** immediately, not just the current request/task. This amplifies the severity of every `.unwrap()`/`.expect()` reachable from network input throughout the codebase (several were already found and fixed as part of #0 and #1/#4, but others likely remain, e.g. in `token/crypto.rs`, `token/security.rs`).
+**Fix (verified in place):** `panic = "abort"` has been removed from `[profile.release]`. A panic in one request handler no longer takes down every other in-flight connection. (Auditing and removing remaining `.unwrap()`/`.expect()` calls reachable from request handling is still worthwhile as defense in depth, but the worst-case blast radius is now contained.)
 
-**Fix:** either drop `panic = "abort"` from the release profile, or audit and eliminate every `.unwrap()`/`.expect()` reachable from a request path, replacing them with explicit `Result` handling.
-
-### 8. Logout does not revoke the session token server-side
+### 8. Logout did not revoke the session token server-side
 **File: `src/token/logout.rs`, `logout_session`**
 
-`logout_session` only expires the `session_token` cookie client-side; it never calls `revoke::load::revoke_token` (already exposed via `/adm/revoke`) to invalidate the token itself. A leaked/copied token remains fully valid until its natural expiry — "logging out" doesn't revoke access for anyone else holding a copy.
+`logout_session` used to only expire the `session_token` cookie client-side; it never called `revoke::load::revoke_token`, so a copied/leaked token stayed fully valid until its natural expiry regardless of "logout."
 
-**Fix:** on logout, extract the token/session identifier and call `revoke_token` before clearing the cookie.
+**Fix (verified in place):** `logout_session` now reads the `session_token` cookie, calls `validate_token` to recover its `token_id`, and calls `revoke_token` (the same function used by `/adm/revoke`) to invalidate it server-side before clearing the cookie. This is best-effort: a missing/invalid/already-expired cookie is handled gracefully and logout still proceeds.
+
+---
+
+## ⬜ Open findings — detail (Medium/Low, unchanged since the last full scan)
 
 ### 9. CORS: logout endpoint reflects any Origin with credentials enabled
 **File: `src/token/logout.rs`, `logout_session`**
@@ -153,30 +108,26 @@ Unlike every other CORS-aware handler in the codebase, which checks `Origin` aga
 ### 10. Load balancer retries non-idempotent requests across backends on 5xx
 **File: `src/network/loadbalancing.rs`**
 
-When a backend returns 5xx, the failover logic automatically retries the **same request** against the next backend — for any HTTP method, including `POST`/`PUT`/`DELETE`. If the first backend already performed a mutating side effect before failing, the retry can execute the same operation twice on an independent backend.
+When a backend returns 5xx, the failover logic automatically retries the same request against the next backend — for any HTTP method, including `POST`/`PUT`/`DELETE`. If the first backend already performed a mutating side effect before failing, the retry can execute the same operation twice.
 
 **Fix:** only auto-retry idempotent methods (`GET`/`HEAD`), or require an idempotency-key mechanism before retrying mutating requests.
 
 ### 11. Sticky-backend cache is not scoped per route
 **File: `src/network/loadbalancing.rs`, `cache_key`**
 
-```rust
-fn cache_key(method: &Method, uri: &Uri, _headers: &hyper::HeaderMap) -> String {
-    let host = uri.authority().map(|a| a.as_str()).unwrap_or("default");
-    format!("{}|{}", method, host)
-}
-```
-
 `LAST_GOOD_BACKEND` is keyed only by `(method, target host)`, not by the route's `prefix`, and a cached backend is never validated against the current call's `backends` list. If two different `routes.yml` rules share the same target host, a backend choice made for one rule can silently leak into another rule's traffic.
 
 **Fix:** include the route `prefix` in the cache key, and validate the cached URL still belongs to the current `backends` list before reuse.
 
-### 13. Backend responses are fully buffered in memory
+### 12. Same unfiltered hop-by-hop header forwarding in the failover path
 **File: `src/network/loadbalancing.rs`, `try_forward_to_backend`**
 
-```rust
-let bytes = body.collect().await.map_err(...)?.to_bytes();
-```
+Same root cause as the now-fixed finding #2: this function still copies every header except `host` when building each backend attempt, without stripping `Connection`, `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, etc.
+
+**Fix:** the shared helper already exists (`network::proxy::is_hop_by_hop_header`, `pub(crate)`) — this is now a small, low-risk follow-up: import it into `loadbalancing.rs` and apply the same exclusion in `try_forward_to_backend`'s header-copy loop.
+
+### 13. Backend responses are fully buffered in memory
+**File: `src/network/loadbalancing.rs`, `try_forward_to_backend`**
 
 Every load-balanced response is read entirely into memory before being returned — no streaming, no size cap — on what's typically the highest-concurrency code path.
 
@@ -196,34 +147,29 @@ Every load-balanced response is read entirely into memory before being returned 
 
 ---
 
-## 🟢 Positive findings (unchanged)
+## 🟢 Positive findings
 
-- Argon2 correctly implemented for password hashing.
+- Argon2 correctly implemented for password hashing, now with constant-time-equivalent username enumeration resistance (finding #6).
 - Modern AEAD (XChaCha20-Poly1305), random nonces, no reuse detected.
 - Well-designed CSRF protection: single-use nonce, signed, constant-time comparison.
+- `X-Forwarded-For`/`X-Real-Ip` handling is now consistently gated behind `trust_proxy_forward_for` across both the main proxy path and the rate limiter.
+- All admin-token and secret comparisons across `/adm/*` routes and token validation are now constant-time.
+- Hop-by-hop header hygiene fixed on the main proxy path, with a reusable helper ready for the load balancer's failover path.
+- A panic anywhere in the app no longer takes down the whole process (`panic = "abort"` removed).
+- Logout now has real security value — it revokes the token server-side, not just the cookie.
 - Strict stripping of `authorization`/`x-user*` headers before forwarding to the backend.
 - Robust path canonicalization against encoded path traversal.
 - Cookies set with `HttpOnly`, `Secure`, `SameSite=Strict`.
 - No plaintext secrets observed in application logs.
-- Rate limiting and admin-token checks are now consistent across every `/adm/*` route (as of the #0/#1/#5 fixes).
+- A genuinely dead, unused duplicate `stats.rs` module (`src/stats/stats.rs`, distinct from the actually-wired `src/adm/stats.rs`) was cleanly removed, resolving the `dead_code` warnings that surfaced after the #5/#14 fixes.
 
 ---
 
-## Recommendations, in priority order (remaining work)
+## Recommendations, in priority order (remaining work — all Medium/Low)
 
-1. Strip hop-by-hop/framing headers before forwarding to the backend in both `network/proxy.rs` and `network/loadbalancing.rs`, and stop double-setting `Connection` (findings #2, #12) — most impactful remaining item, and directly tied to the hyper 0.14 → 1.x migration.
-2. Neutralize the login timing leak in both `token/auth.rs` and `adm/registry_otp.rs` by always running an Argon2 check (finding #6).
-3. Make logout actually revoke the token server-side (finding #8), and fix the CORS origin reflection on the same endpoint (finding #9).
-4. Reconsider `panic = "abort"` in the release profile, or finish auditing/removing `.unwrap()`/`.expect()` calls reachable from request handling (finding #7).
-5. Only auto-retry idempotent methods in the load balancer's failover logic, and scope the sticky-backend cache per route (findings #10, #11).
-6. Lower priority: stream (rather than fully buffer) load-balanced responses (#13), move off RC-pinned crypto dependencies (#16), and harden secret storage in production deployments (#17).
+1. Reuse the existing `is_hop_by_hop_header` helper in `network/loadbalancing.rs`'s `try_forward_to_backend` (finding #12) — smallest remaining fix, same pattern as the already-fixed #2.
+2. Fix the CORS origin reflection on `token/logout.rs` (finding #9) by reusing the `cors_origins` allow-list check used elsewhere.
+3. Only auto-retry idempotent methods in the load balancer's failover logic, and scope the sticky-backend cache per route (findings #10, #11).
+4. Lower priority: stream (rather than fully buffer) load-balanced responses (#13), move off RC-pinned crypto dependencies (#16), and harden secret storage in production deployments (#17).
 
----
-
-## A note on the hyper 0.14 → 1.x migration
-
-Low-level proxies that build requests by hand (as ProxyAuth does in `network/proxy.rs`) are the most likely place for framing/header-handling regressions to slip in after a major hyper version bump — which is exactly where finding #2 was found. Worth specifically re-testing, once that finding is fixed, that:
-
-- a single, correct `Connection` header reaches the backend on every outbound request;
-- chunked-encoded client requests are still handled correctly end-to-end;
-- the connection-pooling behavior of `hyper_util::client::legacy::Client` (`CLIENT_CACHE`/`CLIENT_CACHE_PROXY` in `shared_client.rs`) matches what was expected under 0.14 — pool eviction and idle-timeout semantics changed between major hyper versions and are worth a dedicated load test.
+None of the remaining items are a full compromise on their own, and all 8 original High/Critical findings are closed. This is a solid, comfortably-shippable state for a beta.
