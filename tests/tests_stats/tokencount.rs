@@ -32,17 +32,13 @@ mod tests {
 
         let all = c.get_all_tokens_json();
         let entry = all
-        .iter()
-        .find(|u| u.user == "bob")
-        .and_then(|u| u.tokens.iter().find(|t| t.token_id == "tok"))
-        .expect("token non trouvé");
+            .iter()
+            .find(|u| u.user == "bob")
+            .and_then(|u| u.tokens.iter().find(|t| t.token_id == "tok"))
+            .expect("token non trouvé");
 
         let diff = (entry.expire_at - entry.delivery_at).num_seconds();
-        assert!(
-            (55..=65).contains(&diff),
-                "diff={}s attendu ~60s",
-                diff
-        );
+        assert!((55..=65).contains(&diff), "diff={}s attendu ~60s", diff);
     }
 
     #[test]
@@ -56,20 +52,19 @@ mod tests {
 
         let all = c.get_all_tokens_json();
 
-        let users: std::collections::HashSet<_> =
-        all.iter().map(|u| u.user.as_str()).collect();
+        let users: std::collections::HashSet<_> = all.iter().map(|u| u.user.as_str()).collect();
         assert!(users.contains("alice"));
         assert!(users.contains("charlie"));
 
         let alice = all.iter().find(|u| u.user == "alice").unwrap();
         let alice_tokens: std::collections::HashSet<_> =
-        alice.tokens.iter().map(|t| t.token_id.as_str()).collect();
+            alice.tokens.iter().map(|t| t.token_id.as_str()).collect();
         assert!(alice_tokens.contains("t1"));
         assert!(alice_tokens.contains("t2"));
 
         let charlie = all.iter().find(|u| u.user == "charlie").unwrap();
         let charlie_tokens: std::collections::HashSet<_> =
-        charlie.tokens.iter().map(|t| t.token_id.as_str()).collect();
+            charlie.tokens.iter().map(|t| t.token_id.as_str()).collect();
         assert!(charlie_tokens.contains("t9"));
     }
 
@@ -105,7 +100,10 @@ mod tests {
             }
         });
 
-        assert_eq!(c.get_count("load", "tok"), (threads * iters_per_thread) as u64);
+        assert_eq!(
+            c.get_count("load", "tok"),
+            (threads * iters_per_thread) as u64
+        );
     }
 
     #[test]
@@ -127,7 +125,6 @@ mod tests {
 
         let n = c.record_and_get("ok", "tok", "2");
         assert_eq!(n, 1);
-
     }
 
     #[test]
@@ -141,8 +138,8 @@ mod tests {
         let diff = (tok.expire_at - tok.delivery_at).num_seconds();
         assert!(
             (1..=3).contains(&diff),
-                "diff={}s attendu proche de 2s",
-                diff
+            "diff={}s attendu proche de 2s",
+            diff
         );
     }
 }

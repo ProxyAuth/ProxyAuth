@@ -18,21 +18,21 @@ pub async fn logout_options(
         (Some(o), Some(list)) => {
             let origin_normalized = o.trim_end_matches('/');
             list.iter()
-            .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
+                .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
         }
         _ => false,
     };
 
     if let (Some(origin_str), true) = (origin, is_allowed) {
         HttpResponse::Ok()
-        .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
-        .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"))
-        .insert_header((
-            header::ACCESS_CONTROL_ALLOW_HEADERS,
-            "Authorization, Content-Type, Accept",
-        ))
-        .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
-        .finish()
+            .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
+            .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"))
+            .insert_header((
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "Authorization, Content-Type, Accept",
+            ))
+            .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
+            .finish()
     } else {
         HttpResponse::Forbidden().body("CORS origin not allowed")
     }
@@ -47,17 +47,17 @@ pub async fn logout_session(req: HttpRequest, data: web::Data<AppState>) -> Http
     // via the same revoke_token() used by /adm/revoke.
     if let Some(cookie) = req.cookie("session_token") {
         let ip = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .or_else(|| {
-            req.connection_info()
-            .realip_remote_addr()
-            .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "-".to_string());
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                req.connection_info()
+                    .realip_remote_addr()
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "-".to_string());
 
         match validate_token(cookie.value(), &data, &data.config, &ip).await {
             Ok((username, token_id, _)) => {
@@ -101,19 +101,19 @@ pub async fn logout_session(req: HttpRequest, data: web::Data<AppState>) -> Http
         .headers()
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
-        {
-            resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
-        }
+    {
+        resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
+    }
 
-        if data
-            .config
-            .logout_redirect_url
-            .as_ref()
-            .map_or(true, |s| s.is_empty())
-            {
-                resp.insert_header(ContentType::plaintext());
-                resp.body("Session cookie cleared")
-            } else {
-                resp.finish()
-            }
+    if data
+        .config
+        .logout_redirect_url
+        .as_ref()
+        .map_or(true, |s| s.is_empty())
+    {
+        resp.insert_header(ContentType::plaintext());
+        resp.body("Session cookie cleared")
+    } else {
+        resp.finish()
+    }
 }

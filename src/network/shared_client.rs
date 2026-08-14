@@ -1,16 +1,16 @@
 use crate::config::config::AppConfig;
 use ahash::RandomState;
 use dashmap::DashMap;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper::body::Bytes;
 use hyper_http_proxy::{Intercept, Proxy, ProxyConnector};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use once_cell::sync::Lazy;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use std::{fs::File, io::BufReader, str::FromStr, sync::Arc, time::Duration};
-use hyper::body::Bytes;
 use std::convert::Infallible;
+use std::{fs::File, io::BufReader, str::FromStr, sync::Arc, time::Duration};
 
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
@@ -24,37 +24,35 @@ static CLIENT_CACHE: Lazy<AHashDashMap<ClientKey, HttpsClient>> =
 static CLIENT_CACHE_PROXY: Lazy<AHashDashMap<ClientKey, ProxyClient>> =
     Lazy::new(|| DashMap::with_hasher(RandomState::default()));
 
-
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ClientOptions {
-    pub use_proxy:  bool,
+    pub use_proxy: bool,
     pub proxy_addr: Option<String>,
-    pub use_cert:   bool,
-    pub cert_path:  Option<String>,
-    pub key_path:   Option<String>,
+    pub use_cert: bool,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct ClientKey {
-    pub use_proxy:  bool,
+    pub use_proxy: bool,
     pub proxy_addr: Option<String>,
-    pub use_cert:   bool,
-    pub cert_path:  Option<String>,
-    pub key_path:   Option<String>,
+    pub use_cert: bool,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
 }
 
 impl ClientKey {
     pub fn from_options(opts: &ClientOptions) -> Self {
         ClientKey {
-            use_proxy:  opts.use_proxy,
+            use_proxy: opts.use_proxy,
             proxy_addr: opts.proxy_addr.clone(),
-            use_cert:   opts.use_cert,
-            cert_path:  opts.cert_path.clone(),
-            key_path:   opts.key_path.clone(),
+            use_cert: opts.use_cert,
+            cert_path: opts.cert_path.clone(),
+            key_path: opts.key_path.clone(),
         }
     }
 }
-
 
 fn build_http_connector(keep: Duration) -> HttpConnector {
     let mut http = HttpConnector::new();
@@ -73,7 +71,6 @@ fn build_https_connector_no_auth(keep: Duration) -> HttpsConnector<HttpConnector
         .enable_http1()
         .wrap_connector(build_http_connector(keep))
 }
-
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
@@ -132,13 +129,20 @@ pub fn build_hyper_client_normal(state: &Arc<AppConfig>) -> HttpsClient {
         .build::<_, BoxBody>(https)
 }
 
-
 pub fn build_hyper_client_cert(opts: ClientOptions, state: &Arc<AppConfig>) -> HttpsClient {
     let keep = Duration::from_millis(state.keep_alive);
 
     let want_cert = opts.use_cert
-        && opts.cert_path.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
-        && opts.key_path.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+        && opts
+            .cert_path
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+        && opts
+            .key_path
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
 
     if !want_cert {
         return build_hyper_client_normal(state);
@@ -187,7 +191,10 @@ pub fn build_hyper_client_cert(opts: ClientOptions, state: &Arc<AppConfig>) -> H
     {
         Ok(cfg) => cfg,
         Err(e) => {
-            tracing::warn!("TLS: paire cert/key invalide ({}), fallback sans client auth", e);
+            tracing::warn!(
+                "TLS: paire cert/key invalide ({}), fallback sans client auth",
+                e
+            );
             return build_hyper_client_normal(state);
         }
     };

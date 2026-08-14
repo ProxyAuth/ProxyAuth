@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing_subscriber::fmt::MakeWriter;
 
 pub static LOG_BUFFER: Lazy<Arc<Mutex<Vec<String>>>> =
-Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
 #[derive(Clone)]
 pub struct ChannelWriter {
@@ -61,6 +61,6 @@ pub async fn get_logs(req: HttpRequest, data: web::Data<AppState>) -> impl Respo
 
     let logs = LOG_BUFFER.lock().unwrap();
     HttpResponse::Ok()
-    .content_type("text/plain")
-    .body(logs.join(""))
+        .content_type("text/plain")
+        .body(logs.join(""))
 }

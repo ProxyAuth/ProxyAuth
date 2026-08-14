@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::time::{interval, Duration as TokioDuration};
 use serde::Serialize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use tokio::time::{Duration as TokioDuration, interval};
 
 const HISTORY_LEN: usize = 60;
 const NUM_SHARDS: usize = 16; // puissance de 2, >= nombre de cœurs typiques
@@ -25,11 +25,11 @@ impl RequestStats {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             shards: std::array::from_fn(|_| PaddedCounter(AtomicU64::new(0))),
-                 total: AtomicU64::new(0),
-                 history: std::array::from_fn(|_| AtomicU64::new(0)),
-                 history_idx: std::sync::atomic::AtomicUsize::new(0),
-                 history_filled: std::sync::atomic::AtomicUsize::new(0),
-                 started_at: Instant::now(),
+            total: AtomicU64::new(0),
+            history: std::array::from_fn(|_| AtomicU64::new(0)),
+            history_idx: std::sync::atomic::AtomicUsize::new(0),
+            history_filled: std::sync::atomic::AtomicUsize::new(0),
+            started_at: Instant::now(),
         })
     }
 
@@ -68,9 +68,9 @@ impl RequestStats {
     /// with the extra reads, since it's off the hot path.
     fn drain_and_sum(&self) -> u64 {
         self.shards
-        .iter()
-        .map(|s| s.0.swap(0, Ordering::Relaxed))
-        .sum()
+            .iter()
+            .map(|s| s.0.swap(0, Ordering::Relaxed))
+            .sum()
     }
 
     fn push_sample(&self, value: u64) {
@@ -135,8 +135,16 @@ pub fn build_stats_response(stats: &RequestStats, active_sessions: usize) -> Pro
     let last = stats.last_sample();
     let (sum10, n10) = stats.recent_sum(10);
     let (sum60, n60) = stats.recent_sum(HISTORY_LEN);
-    let avg10 = if n10 == 0 { 0.0 } else { sum10 as f64 / n10 as f64 };
-    let avg60 = if n60 == 0 { 0.0 } else { sum60 as f64 / n60 as f64 };
+    let avg10 = if n10 == 0 {
+        0.0
+    } else {
+        sum10 as f64 / n10 as f64
+    };
+    let avg60 = if n60 == 0 {
+        0.0
+    } else {
+        sum60 as f64 / n60 as f64
+    };
 
     ProxyStatsResponse {
         requests_per_second: last,

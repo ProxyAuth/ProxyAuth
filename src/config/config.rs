@@ -1,16 +1,18 @@
 use crate::adm::method_otp::generate_base32_secret;
-use crate::revoke::db::RevokedTokenMap;
-use crate::stats::tokencount::CounterToken;
+use crate::network::shared_client::BoxBody;
 use crate::network::stats::RequestStats;
-use crate::token::auth::generate_random_string;
+use crate::revoke::db::RevokedTokenMap;
 use crate::smtp::smtp::SmtpConfig;
+use crate::stats::tokencount::CounterToken;
+use crate::token::auth::generate_random_string;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
+use dashmap::DashMap;
 use hyper_http_proxy::ProxyConnector;
 use hyper_rustls::HttpsConnector;
-use crate::network::shared_client::BoxBody;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use regex::Regex;
 use serde::Deserializer;
 use serde::de::MapAccess;
 use serde::de::Visitor;
@@ -20,9 +22,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
-use dashmap::DashMap;
 use std::sync::Arc;
-use regex::Regex;
 
 #[derive(Debug, Clone)]
 pub struct CompiledAllow {
@@ -30,15 +30,14 @@ pub struct CompiledAllow {
     pub allow: Vec<RegexCond>,
 }
 
-
 #[derive(Debug, Clone)]
 pub enum RegexCond {
-    Method  { re: Regex },
-    Path    { re: Regex },
-    Header  { name_re: Regex, re: Regex },
-    Query   { name_re: Regex, re: Regex },
+    Method { re: Regex },
+    Path { re: Regex },
+    Header { name_re: Regex, re: Regex },
+    Query { name_re: Regex, re: Regex },
     BodyRaw { re: Regex },
-    BodyJson{ key: String, re: Regex },
+    BodyJson { key: String, re: Regex },
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -130,12 +129,14 @@ pub struct AllowRegexCfg {
     pub allow: Vec<RegexCondCfg>,
 }
 
-fn default_allow_true() -> bool { true }
+fn default_allow_true() -> bool {
+    true
+}
 
 impl Serialize for User {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-    S: Serializer,
+        S: Serializer,
     {
         let mut state = serializer.serialize_struct("User", 2)?;
         state.serialize_field("username", &self.username)?;
@@ -243,7 +244,7 @@ pub struct AppConfig {
 impl Serialize for AppConfig {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-    S: Serializer,
+        S: Serializer,
     {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
@@ -304,7 +305,6 @@ pub struct AppState {
     /// missing entry means "use whatever config.json said at startup".
     /// See `resolve_otpkey`.
     pub otp_overrides: Arc<DashMap<String, Option<String>>>,
-
 }
 
 /// Resolves the OTP secret to actually use for `username`, checking the
@@ -321,7 +321,6 @@ pub fn resolve_otpkey(
     }
     config_otpkey.map(|s| s.to_string())
 }
-
 
 #[derive(Deserialize)]
 pub struct AuthRequest {
@@ -474,7 +473,7 @@ fn default_cert() -> HashMap<String, String> {
 pub fn load_config(path: &str) -> Arc<AppConfig> {
     let config_str = fs::read_to_string(path).expect("Could not read config.json file");
     let mut config: AppConfig =
-    serde_json::from_str(&config_str).expect("Invalid config format config.json");
+        serde_json::from_str(&config_str).expect("Invalid config format config.json");
 
     let mut updated = false;
 
@@ -482,16 +481,21 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
         if !user.password.starts_with("$argon2") {
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
-            .hash_password(user.password.as_bytes(), &salt)
-            .expect(&format!("Password hashing failed for user {}", user.username))
-            .to_string();
+                .hash_password(user.password.as_bytes(), &salt)
+                .expect(&format!(
+                    "Password hashing failed for user {}",
+                    user.username
+                ))
+                .to_string();
             user.password = hash;
             updated = true;
         }
     }
 
     let original_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
-    config.users.sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
+    config
+        .users
+        .sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
 
     let sorted_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
     if original_order != sorted_order {
@@ -529,14 +533,14 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
     }
 
     let config_str = fs::read_to_string(config_path)
-    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
     let mut json: Value = serde_json::from_str(&config_str)
-    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+        .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
 
     let mut found = false;
     let mut cleared = false;
@@ -555,14 +559,17 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
     }
 
     if !found {
-        return Err(format!("User '{}' not found in the configuration file.", username));
+        return Err(format!(
+            "User '{}' not found in the configuration file.",
+            username
+        ));
     }
 
     if cleared {
         let updated_str = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+            .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
         fs::write(config_path, updated_str)
-        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+            .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
     }
 
     Ok(cleared)
@@ -576,14 +583,14 @@ pub fn add_otpkey(config_path: &str, username: &str) {
     }
 
     let config_str =
-    fs::read_to_string(config_path).expect("Failed to read the configuration file.");
+        fs::read_to_string(config_path).expect("Failed to read the configuration file.");
     let mut json: Value =
-    serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
+        serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .expect("Missing 'users' field in configuration file.");
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .expect("Missing 'users' field in configuration file.");
 
     let mut updated = false;
 
@@ -595,8 +602,8 @@ pub fn add_otpkey(config_path: &str, username: &str) {
             } else {
                 let otpkey = generate_base32_secret(32);
                 user.as_object_mut()
-                .unwrap()
-                .insert("otpkey".to_string(), Value::String(otpkey.clone()));
+                    .unwrap()
+                    .insert("otpkey".to_string(), Value::String(otpkey.clone()));
                 println!(
                     "OTP key successfully generated for '{}': {}",
                     username, otpkey
@@ -609,21 +616,21 @@ pub fn add_otpkey(config_path: &str, username: &str) {
 
     if updated {
         let updated_str = serde_json::to_string_pretty(&json)
-        .expect("Failed to serialize the updated configuration.");
+            .expect("Failed to serialize the updated configuration.");
         fs::write(config_path, updated_str)
-        .expect("Failed to write the updated configuration file.");
+            .expect("Failed to write the updated configuration file.");
         println!("Configuration file has been updated.");
     } else if !users
         .iter()
         .any(|u| u.get("username").and_then(|n| n.as_str()) == Some(username))
-        {
-            eprintln!("User '{}' not found in the configuration file.", username);
-        }
+    {
+        eprintln!("User '{}' not found in the configuration file.", username);
+    }
 }
 
 fn deserialize_log_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
 where
-D: Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     struct LogMapVisitor;
 
@@ -636,7 +643,7 @@ D: Deserializer<'de>,
 
         fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
         where
-        M: MapAccess<'de>,
+            M: MapAccess<'de>,
         {
             let mut map = HashMap::new();
             while let Some((k, v)) = access.next_entry::<String, serde_json::Value>()? {
@@ -662,33 +669,48 @@ D: Deserializer<'de>,
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "field", rename_all = "snake_case")]
 pub enum RegexCondCfg {
-    Method  { pattern: String },
-    Path    { pattern: String },
-    Header  { name: String,  pattern: String },
-    Query   { name: String,  pattern: String },
+    Method { pattern: String },
+    Path { pattern: String },
+    Header { name: String, pattern: String },
+    Query { name: String, pattern: String },
     BodyRaw { pattern: String },
-    BodyJson{ key: String,   pattern: String },
+    BodyJson { key: String, pattern: String },
 }
-
 
 impl AllowRegexCfg {
     pub fn compile(&self) -> Result<CompiledAllow, regex::Error> {
         fn conv(c: &RegexCondCfg) -> Result<RegexCond, regex::Error> {
             match c {
-                RegexCondCfg::Method  { pattern } => Ok(RegexCond::Method  { re: Regex::new(pattern)? }),
-                RegexCondCfg::Path    { pattern } => Ok(RegexCond::Path    { re: Regex::new(pattern)? }),
-                RegexCondCfg::Header  { name, pattern } =>
-                Ok(RegexCond::Header { name_re: Regex::new(name)?, re: Regex::new(pattern)? }),
-                RegexCondCfg::Query   { name, pattern } =>
-                Ok(RegexCond::Query  { name_re: Regex::new(name)?, re: Regex::new(pattern)? }),
-                RegexCondCfg::BodyRaw { pattern } =>
-                Ok(RegexCond::BodyRaw{ re: Regex::new(pattern)? }),
-                RegexCondCfg::BodyJson{ key, pattern } =>
-                Ok(RegexCond::BodyJson{ key: key.clone(), re: Regex::new(pattern)? }),
+                RegexCondCfg::Method { pattern } => Ok(RegexCond::Method {
+                    re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::Path { pattern } => Ok(RegexCond::Path {
+                    re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::Header { name, pattern } => Ok(RegexCond::Header {
+                    name_re: Regex::new(name)?,
+                    re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::Query { name, pattern } => Ok(RegexCond::Query {
+                    name_re: Regex::new(name)?,
+                    re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::BodyRaw { pattern } => Ok(RegexCond::BodyRaw {
+                    re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::BodyJson { key, pattern } => Ok(RegexCond::BodyJson {
+                    key: key.clone(),
+                    re: Regex::new(pattern)?,
+                }),
             }
         }
         let mut allow = Vec::with_capacity(self.allow.len());
-        for c in &self.allow { allow.push(conv(c)?); }
-        Ok(CompiledAllow { default_allow: self.default_allow, allow })
+        for c in &self.allow {
+            allow.push(conv(c)?);
+        }
+        Ok(CompiledAllow {
+            default_allow: self.default_allow,
+            allow,
+        })
     }
 }

@@ -87,17 +87,17 @@ fn encrypt(cert: &Cert, text: &str, path: &str) -> anyhow::Result<()> {
     let policy = &StandardPolicy::new();
 
     let recipient_key = cert
-    .keys()
-    .with_policy(policy, None)
-    .supported()
-    .alive()
-    .revoked(false)
-    .for_transport_encryption()
-    .next()
-    .ok_or_else(|| anyhow::anyhow!("No suitable encryption key"))?;
+        .keys()
+        .with_policy(policy, None)
+        .supported()
+        .alive()
+        .revoked(false)
+        .for_transport_encryption()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No suitable encryption key"))?;
 
     let file =
-    File::create(path).with_context(|| format!("Failed to create output file: {}", path))?;
+        File::create(path).with_context(|| format!("Failed to create output file: {}", path))?;
     let mut armor = ArmorWriter::new(file, ArmorKind::Message)?;
 
     let message = Message::new(&mut armor);

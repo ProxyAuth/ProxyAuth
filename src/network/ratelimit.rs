@@ -1,6 +1,6 @@
 use crate::AppState;
-use crate::network::ratelimit::governor::clock::DefaultClock;
 use crate::network::proxy::client_ip;
+use crate::network::ratelimit::governor::clock::DefaultClock;
 use crate::token::security::extract_token_user;
 use actix_governor::governor::clock::Clock;
 use actix_governor::{KeyExtractor, SimpleKeyExtractionError, governor};
@@ -29,7 +29,7 @@ impl KeyExtractor for UserToken {
     fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError> {
         let app_data = req.app_data::<web::Data<AppState>>().ok_or_else(|| {
             Self::KeyExtractionError::new("Missing app state")
-            .set_status_code(StatusCode::INTERNAL_SERVER_ERROR)
+                .set_status_code(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
 
         // SECURITY: reuse network::proxy::client_ip, which only trusts
@@ -41,48 +41,50 @@ impl KeyExtractor for UserToken {
         let ip = match client_ip(req.request(), &app_data.config) {
             Some(ip) => ip.to_string(),
             None => {
-                return Err(Self::KeyExtractionError::new("Unable to determine client IP")
-                .set_status_code(StatusCode::INTERNAL_SERVER_ERROR));
+                return Err(
+                    Self::KeyExtractionError::new("Unable to determine client IP")
+                        .set_status_code(StatusCode::INTERNAL_SERVER_ERROR),
+                );
             }
         };
 
         // key ratelimite: user extract inside the token
         let user_or_ip = req
-        .headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .and_then(|token| {
-            //info!("Authorization header found: {}", token);
-            extract_token_user(token, &app_data.config, ip.clone()).ok()
-        })
-        .or_else(|| {
-            if app_data.config.session_cookie {
-                match req.cookie("session_token") {
-                    Some(cookie) => {
-                        let value = cookie.value();
-                        //info!("Cookie 'session_token' found: {}", value);
-                        match extract_token_user(value, &app_data.config, ip.clone()) {
-                            Ok(user) => Some(user),
-                 Err(_err) => {
-                     //warn!("Failed to extract user from cookie: {:?}", err);
-                     None
-                 }
+            .headers()
+            .get("Authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .and_then(|token| {
+                //info!("Authorization header found: {}", token);
+                extract_token_user(token, &app_data.config, ip.clone()).ok()
+            })
+            .or_else(|| {
+                if app_data.config.session_cookie {
+                    match req.cookie("session_token") {
+                        Some(cookie) => {
+                            let value = cookie.value();
+                            //info!("Cookie 'session_token' found: {}", value);
+                            match extract_token_user(value, &app_data.config, ip.clone()) {
+                                Ok(user) => Some(user),
+                                Err(_err) => {
+                                    //warn!("Failed to extract user from cookie: {:?}", err);
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            //warn!("No 'session_token' cookie found");
+                            None
                         }
                     }
-                    None => {
-                        //warn!("No 'session_token' cookie found");
-                        None
-                    }
+                } else {
+                    None
                 }
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            //warn!("Falling back to IP: {}", ip);
-            ip.clone()
-        });
+            })
+            .unwrap_or_else(|| {
+                //warn!("Falling back to IP: {}", ip);
+                ip.clone()
+            });
 
         // key ratelimit: path request
         let path = req.path().to_string();
@@ -95,8 +97,8 @@ impl KeyExtractor for UserToken {
         mut response: HttpResponseBuilder,
     ) -> HttpResponse {
         let wait_time = negative
-        .wait_time_from(DefaultClock::default().now())
-        .as_secs();
+            .wait_time_from(DefaultClock::default().now())
+            .as_secs();
 
         response.content_type(ContentType::json())
         .insert_header(("Retry-After", wait_time.to_string()))
@@ -113,7 +115,7 @@ pub struct RateLimitLogger;
 
 impl<S> Transform<S, ServiceRequest> for RateLimitLogger
 where
-S: Service<ServiceRequest, Response = ServiceResponse, Error = Error> + 'static,
+    S: Service<ServiceRequest, Response = ServiceResponse, Error = Error> + 'static,
 {
     type Response = ServiceResponse;
     type Error = Error;
@@ -132,7 +134,7 @@ pub struct RateLimitLoggerMiddleware<S> {
 
 impl<S> Service<ServiceRequest> for RateLimitLoggerMiddleware<S>
 where
-S: Service<ServiceRequest, Response = ServiceResponse, Error = Error> + 'static,
+    S: Service<ServiceRequest, Response = ServiceResponse, Error = Error> + 'static,
 {
     type Response = ServiceResponse;
     type Error = Error;
@@ -146,15 +148,15 @@ S: Service<ServiceRequest, Response = ServiceResponse, Error = Error> + 'static,
         let method = req.method().clone();
         let path = req.path().to_string();
         let user_agent = req
-        .headers()
-        .get("User-Agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+            .headers()
+            .get("User-Agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
         let ip = req
-        .peer_addr()
-        .map(|a| a.ip().to_string())
-        .unwrap_or("-".to_string());
+            .peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or("-".to_string());
 
         let fut = self.service.call(req);
 

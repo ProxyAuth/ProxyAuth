@@ -19,12 +19,11 @@ pub mod config;
 pub mod keystore;
 pub mod network;
 pub mod revoke;
+pub mod smtp;
 pub mod stats;
 pub mod token;
-pub mod smtp;
 
 pub use config::config::{AppConfig, AppState, RouteConfig};
 pub use network::proxy::global_proxy;
 pub use stats::tokencount::CounterToken;
 pub use token::auth::auth;
-

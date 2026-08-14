@@ -1,4 +1,3 @@
-
 #[inline]
 fn hex_val(b: u8) -> u8 {
     match b {
