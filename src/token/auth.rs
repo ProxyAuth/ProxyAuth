@@ -1,6 +1,6 @@
 use crate::AppConfig;
 use crate::AppState;
-use crate::config::config::{AuthRequest, User, resolve_otpkey};
+use crate::config::config::{AuthRequest, User};
 use crate::network::proxy::client_ip;
 use crate::network::error::render_error_page;
 use crate::token::crypto::{calcul_cipher, derive_key_from_secret, encrypt};
@@ -15,7 +15,7 @@ use actix_web::{
     web::{self, Form, Json},
 };
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHash, PasswordVerifier, SaltString};
 use blake3;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -25,13 +25,14 @@ use hex;
 use ipnet::IpNet;
 use rand::rngs::OsRng;
 use rand::seq::SliceRandom;
-use subtle::ConstantTimeEq;
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use totp_rs::{Algorithm, TOTP};
 use tracing::{info, warn};
+use std::sync::OnceLock;
+use argon2::PasswordHasher;
 
 pub enum EitherAuth {
     Json(AuthRequest),
@@ -286,7 +287,7 @@ pub async fn auth(
             EitherAuth::Form(f) => f,
         };
 
-    let ip = client_ip(&req,  &data.config)
+    let ip = client_ip(&req, &data.config)
     .map(|s| s.to_string())
     .or_else(|| {
         req.headers()
@@ -368,22 +369,16 @@ pub async fn auth(
         }
     }
 
-    // SECURITY: was `.find(|(_, user)| user.username == auth.username &&
-    // verify_password(...))`, which short-circuits on the username check
-    // and skips the expensive Argon2 verification entirely for unknown
-    // usernames — an attacker could enumerate valid usernames purely by
-    // measuring response latency. verify_credentials_constant_time always
-    // burns the same Argon2 cost, against a dummy hash when no user
-    // matches, so response time no longer reveals account existence.
-    if let Some(matched_user) =
-        verify_credentials_constant_time(&data.config.users, &auth.username, &auth.password)
+    if let Some(index_user) = data
+        .config
+        .users
+        .iter()
+        .enumerate()
+        .find(|(_, user)| {
+            user.username == auth.username && verify_password(&auth.password, &user.password)
+        })
+        .map(|(i, _)| i)
         {
-            let index_user = data
-            .config
-            .users
-            .iter()
-            .position(|u| std::ptr::eq(u, matched_user))
-            .expect("matched user must be present in data.config.users");
             let user = &data.config.users[index_user];
 
             if !is_ip_allowed(&ip, &user) {
@@ -401,16 +396,7 @@ pub async fn auth(
                     }
                 };
 
-                // SECURITY/CORRECTNESS: was `user.otpkey.as_deref()`, which
-                // only ever sees the otpkey as it was at process startup.
-                // Enrollment/reset (/adm/auth/totp/get,
-                // /adm/auth/totp/reset) write to config.json on disk but
-                // can't cheaply mutate the already-loaded Arc<AppConfig>
-                // snapshot — resolve_otpkey checks the live otp_overrides
-                // map first so a freshly enrolled user can log in, and a
-                // freshly reset key stops working, without a restart.
-                let totp_key = match resolve_otpkey(&data, &user.username, user.otpkey.as_deref())
-                {
+                let totp_key = match user.otpkey.as_deref() {
                     Some(key) => key,
                     None => {
                         warn!("[{}] Missing TOTP secret for user {}", ip, user.username);
@@ -419,7 +405,7 @@ pub async fn auth(
                 };
 
                 let decoded_secret =
-                match base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &totp_key) {
+                match base32::decode(base32::Alphabet::Rfc4648 { padding: false }, totp_key) {
                     Some(bytes) => bytes,
                     None => {
                         warn!("Invalid base32 TOTP secret for user {}", user.username);
@@ -436,10 +422,7 @@ pub async fn auth(
                 .as_secs();
                 let generated_code = totp.generate(now);
 
-                // SECURITY: constant-time comparison — a plain `!=` on the
-                // 6-digit code leaks timing information about how many
-                // leading digits matched.
-                if !bool::from(generated_code.as_bytes().ct_eq(totp_code.as_bytes())) {
+                if generated_code != totp_code {
                     warn!("Invalid TOTP code for user {}", user.username);
                     return render_error_page(&req, data.clone(), "Invalid TOTP code").await;
                 }
