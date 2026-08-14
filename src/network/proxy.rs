@@ -54,7 +54,7 @@ fn is_method_allowed(allowed: Option<&[String]>, method: &str) -> bool {
 static ALWAYS_TRUSTED: Lazy<Vec<IpNet>> = Lazy::new(|| {
     vec![
         "127.0.0.0/8".parse().unwrap(), // IPv4 loopback range
-        "::1/128".parse().unwrap(),     // IPv6 loopback
+                                                    "::1/128".parse().unwrap(),     // IPv6 loopback
     ]
 });
 
@@ -312,6 +312,24 @@ pub async fn global_proxy(
     let method = req.method().as_str();
     let ip = req.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "-".to_string());
     let user_agent = req.headers().get("User-Agent").and_then(|h| h.to_str().ok()).unwrap_or("-");
+
+    // UX: session_cookie mode only. If the visitor already has a valid
+    // session and lands on the home page or wherever logout_redirect_url
+    // points, skip straight into the app instead of showing that page as
+    // if they were logged out — landing on a "logged out"/home page while
+    // still actually authenticated is confusing. Any other path is left
+    // completely untouched (still goes through normal routes.yml matching
+    // below), so this only affects these two specific landing pages.
+    if data.config.session_cookie {
+        let is_home_or_logout_page = path == "/"
+        || data.config.logout_redirect_url.as_deref() == Some(path);
+        if is_home_or_logout_page {
+            if let Some(resp) = crate::token::auth::existing_session_response(&req, &data, &ip).await {
+                return Ok(resp);
+            }
+        }
+    }
+
     data.stats.incr();
 
     if let Some(idx) = match_route_idx(path, &data.routes.routes) {
