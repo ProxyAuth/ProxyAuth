@@ -17,11 +17,11 @@ use sha2::Sha256;
 use std::fmt::Write;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use crate::build::build_info;
 
 const KEY_LEN: usize = 32;
 const TAG_V1: u8 = 1;
 pub const TAG_V1_PW: u8 = 0xE1;
-const HKDF_SALT_CONST: &[u8] = b"proxyauth.hkdf.v1";
 const HKDF_INFO_DERIVE: &[u8] = b"derive_key_from_secret.v1";
 const HKDF_INFO_PW: &[u8] = b"encrypt_base64.password.v1";
 
@@ -39,7 +39,8 @@ pub fn derive_key_from_secret(secret: &str) -> [u8; 32] {
         return k;
     }
 
-    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT_CONST), secret.as_bytes());
+    let salt = build_info::get().build_hk;
+    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), secret.as_bytes());
     let mut okm = [0u8; KEY_LEN];
     hk.expand(HKDF_INFO_DERIVE, &mut okm).expect("HKDF expand");
 

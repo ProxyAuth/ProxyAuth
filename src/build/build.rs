@@ -55,14 +55,16 @@ fn main() {
         .to_string();
 
     let random_epoch: i64 = rng.gen_range(0..999_999_999_999);
-    let identity = identity(rng.gen_range(1..999_999_999));
+    let identity_str = identity(rng.gen_range(1..999_999_999_999));
+    let hk = identity(rng.gen_range(1..999_999_999_999));
 
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);
     println!("cargo:rustc-env=BUILD_RAND={}", build_rand);
     println!("cargo:rustc-env=BUILD_SEED={}", build_seed);
     println!("cargo:rustc-env=BUILD_SEED2={}", build_seed2);
     println!("cargo:rustc-env=BUILD_EPOCH_DATE={}", random_epoch);
-    println!("cargo:rustc-env=id={}", identity);
+    println!("cargo:rustc-env=BUILD_HK={}", hk);
+    println!("cargo:rustc-env=id={}", identity_str);
 
     // SHUFFLE BUILD
     let mut fields = vec![
@@ -72,6 +74,7 @@ fn main() {
         "time_expire".to_string(),
         "build_rand".to_string(),
         "token_id".to_string(),
+        "hk".to_string(),
     ];
 
     let mut shuffle_rng = ChaCha8Rng::seed_from_u64(build_seed);
