@@ -1,8 +1,7 @@
-
 <div align="center">
 <h1>ProxyAuth (Community Edition)</h1>
 <br>
-<img src='images/logo.jpg' width="300px" height="250px"/>
+<img src='images/logo.png' width="350px" height="350px"/>
 </div>
 <br>
 
