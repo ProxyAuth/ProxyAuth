@@ -108,7 +108,7 @@ pub struct RouteConfig {
     pub routes: Vec<RouteRule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct User {
     pub username: String,
     pub password: String,
@@ -161,6 +161,18 @@ pub struct DatabaseConfig {
     pub user: String,
     #[serde(default)]
     pub password: String,
+
+    /// How often (in seconds) to re-scan the database and refresh the
+    /// in-memory user list, so users added/edited directly in the DB
+    /// eventually take effect without restarting the process. Defaults
+    /// to 30s. Set to 0 to disable periodic refresh (DB is only read
+    /// once, at startup).
+    #[serde(default = "default_db_refresh_interval")]
+    pub refresh_interval_secs: u64,
+}
+
+fn default_db_refresh_interval() -> u64 {
+    30
 }
 
 impl DatabaseConfig {
@@ -269,6 +281,15 @@ pub struct AppConfig {
     pub fast: bool,
 
     pub smtp: Option<SmtpConfig>,
+
+    /// Users loaded from `databases` (if configured), refreshed
+    /// periodically by a background task so DB-side changes (users
+    /// added/edited directly in the database) eventually take effect
+    /// without a restart. Not deserialized from config.json — populated
+    /// at startup and kept in sync afterwards. Combine with `users` via
+    /// `combined_users()` rather than reading either list alone.
+    #[serde(skip)]
+    pub db_users: std::sync::RwLock<Vec<User>>,
 }
 
 impl Serialize for AppConfig {
@@ -543,6 +564,69 @@ pub fn check_deprecated_secure_key(routes_str: &str) -> Result<(), String> {
     }
 }
 
+impl AppConfig {
+    /// Returns a snapshot combining file-based `users` with the current
+    /// database-loaded users (if `databases` is configured), in a stable
+    /// concatenation: `users` first (unchanged order), then `db_users`
+    /// (unchanged order). This order matters — issued tokens embed a
+    /// numeric index into this combined list (see `user_by_index`), so
+    /// nothing here may ever reorder or remove entries, only append or
+    /// update in place (see `refresh_db_users`).
+    pub fn combined_users(&self) -> Vec<User> {
+        let mut combined = self.users.clone();
+        if let Ok(db_users) = self.db_users.read() {
+            combined.extend(db_users.iter().cloned());
+        }
+        combined
+    }
+
+    /// Resolves a user by its position in the same index space
+    /// `combined_users()` produces, without cloning the whole list.
+    /// Indices `0..self.users.len()` map to file users; indices at or
+    /// past that map into `db_users`. Used when validating a token's
+    /// embedded user index.
+    pub fn user_by_index(&self, index: usize) -> Option<User> {
+        if let Some(u) = self.users.get(index) {
+            return Some(u.clone());
+        }
+        let db_index = index.checked_sub(self.users.len())?;
+        self.db_users.read().ok()?.get(db_index).cloned()
+    }
+
+    /// Re-reads `databases` (if configured) and refreshes the in-memory
+    /// `db_users` snapshot. Never panics — a DB outage just leaves the
+    /// previous snapshot in place.
+    ///
+    /// SECURITY: existing users are updated *in place* and new users are
+    /// only ever *appended* — never removed or reordered — so a
+    /// previously issued token's embedded index (see `user_by_index`)
+    /// keeps resolving to the same user across refreshes. A user removed
+    /// from the database is therefore left in place (stale) rather than
+    /// dropped, to avoid shifting every index after it.
+    pub fn refresh_db_users(&self) {
+        let Some(db_cfg) = &self.databases else {
+            return;
+        };
+
+        let fresh = crate::databases::db::load_users_from_config(db_cfg);
+
+        match self.db_users.write() {
+            Ok(mut guard) => {
+                for new_user in fresh {
+                    if let Some(existing) =
+                        guard.iter_mut().find(|u| u.username == new_user.username)
+                        {
+                            *existing = new_user;
+                        } else {
+                            guard.push(new_user);
+                        }
+                }
+            }
+            Err(e) => eprintln!("[databases] failed to acquire db_users lock: {e}"),
+        }
+    }
+}
+
 pub fn load_config(path: &str) -> Arc<AppConfig> {
     let config_str = fs::read_to_string(path).expect("Could not read config.json file");
     let mut config: AppConfig =
@@ -585,23 +669,13 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
         fs::write(path, updated_str).expect("Failed to write updated config");
     }
 
-    // Merge in users stored in the database (if `databases` is configured).
-    // Done *after* the file write-back above so DB-sourced users are never
-    // persisted into config.json. DB users take precedence over file users
-    // with the same username (last-write-wins on the merge).
-    if let Some(db_cfg) = &config.databases {
-        let db_users = crate::databases::db::load_users_from_config(db_cfg);
-        if !db_users.is_empty() {
-            for db_user in db_users {
-                config
-                .users
-                .retain(|u| u.username != db_user.username);
-                config.users.push(db_user);
-            }
-        }
-    }
-
-    Arc::new(config)
+    // Load users stored in the database (if `databases` is configured)
+    // into `db_users`, refreshed periodically afterwards by a background
+    // task (see main.rs). Done *after* the file write-back above so
+    // DB-sourced users are never persisted into config.json.
+    let app_config = Arc::new(config);
+    app_config.refresh_db_users();
+    app_config
 }
 
 /// Clears a user's TOTP secret, so they can re-enroll via

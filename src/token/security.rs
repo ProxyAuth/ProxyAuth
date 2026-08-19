@@ -219,7 +219,9 @@ pub async fn validate_token(
     let token_hash_decrypt = data[0];
 
     let index_user = data[2].parse::<usize>().map_err(|_| "Index invalide")?;
-    let user = config.users.get(index_user).ok_or("User not found")?;
+    let user = config
+    .user_by_index(index_user)
+    .ok_or("User not found")?;
 
     let time_expire = check_date_token(data[1], &user.username, ip, &config.timezone)
     .map_err(|_| "Your token is expired")?;
@@ -320,7 +322,7 @@ pub fn extract_token_user(token: &str, config: &AppConfig, ip: String) -> Result
         }
     };
 
-    if let Some(user) = config.users.get(index_user) {
+    if let Some(user) = config.user_by_index(index_user) {
         Ok(user.username.clone())
     } else {
         warn!("[{}] User index out of bounds: {}", ip, index_user);

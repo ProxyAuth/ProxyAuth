@@ -193,7 +193,8 @@ pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -
     if let Ok(val) = hyper::header::HeaderValue::from_str(username) {
         builder = builder.header("x-user", val);
     }
-    if let Some(user) = config.users.iter().find(|u| u.username == username) {
+    let combined_users = config.combined_users();
+    if let Some(user) = combined_users.iter().find(|u| u.username == username) {
         if let Some(roles) = &user.roles {
             let roles_str = roles.join(",");
             if let Ok(val) = hyper::header::HeaderValue::from_str(&roles_str) {

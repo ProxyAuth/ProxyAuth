@@ -215,6 +215,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
 
+    // Periodically re-scan `databases` (if configured) so users added or
+    // edited directly in the database eventually take effect without a
+    // restart. `refresh_interval_secs: 0` disables this (DB is only read
+    // once, at startup, inside load_config).
+    if let Some(db_cfg) = &config.databases {
+        if db_cfg.refresh_interval_secs > 0 {
+            let refresh_config = Arc::clone(&config);
+            let interval_secs = db_cfg.refresh_interval_secs;
+            tokio::spawn(async move {
+                let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                // First tick fires immediately; skip it since load_config
+                // already did an initial load.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    refresh_config.refresh_db_users();
+                }
+            });
+        }
+    }
+
     init_loadbalancer(&config);
 
     let routes_str =
