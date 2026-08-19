@@ -470,6 +470,48 @@ fn default_cert() -> HashMap<String, String> {
     cert
 }
 
+/// Checks a raw `routes.yml` for the deprecated `secure` key, which was
+/// renamed to `required_login`. Unlike a normal unknown field, `secure`
+/// used to control whether a route required authentication — silently
+/// ignoring it would leave routes unauthenticated without warning anyone,
+/// so we fail loudly instead of falling back to the `required_login`
+/// default.
+pub fn check_deprecated_secure_key(routes_str: &str) -> Result<(), String> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(routes_str)
+    .map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
+
+    let routes = doc
+    .get("routes")
+    .and_then(|r| r.as_sequence())
+    .cloned()
+    .unwrap_or_default();
+
+    let offenders: Vec<String> = routes
+    .iter()
+    .filter_map(|route| {
+        let map = route.as_mapping()?;
+        if map.contains_key(serde_yaml::Value::String("secure".to_string())) {
+            let prefix = map
+            .get(serde_yaml::Value::String("prefix".to_string()))
+            .and_then(|p| p.as_str())
+            .unwrap_or("<unknown prefix>");
+            Some(prefix.to_string())
+        } else {
+            None
+        }
+    })
+    .collect();
+
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "routes.yml: 'secure' key is deprecated, rename it to 'required_login' (route(s): {}).",
+                    offenders.join(", ")
+        ))
+    }
+}
+
 pub fn load_config(path: &str) -> Arc<AppConfig> {
     let config_str = fs::read_to_string(path).expect("Could not read config.json file");
     let mut config: AppConfig =
