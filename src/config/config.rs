@@ -148,6 +148,33 @@ impl Serialize for User {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DatabaseConfig {
+    /// "postgres" or "mysql"
+    #[serde(rename = "type")]
+    pub db_type: String,
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    pub db_name: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+impl DatabaseConfig {
+    /// Returns the configured port, or the standard default port for
+    /// `type` (3306 for mysql/mariadb, 5432 otherwise/postgres) when
+    /// `port` wasn't set.
+    pub fn effective_port(&self) -> u16 {
+        self.port.unwrap_or_else(|| match self.db_type.to_lowercase().as_str() {
+            "mysql" | "mariadb" => 3306,
+            _ => 5432,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct AppConfig {
     pub token_expiry_seconds: i64,
@@ -217,6 +244,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub cors_origins: Option<Vec<String>>,
 
+    #[serde(default)]
+    pub databases: Option<DatabaseConfig>,
+
     #[serde(default = "default_session_cookie")]
     pub session_cookie: bool,
 
@@ -249,6 +279,7 @@ impl Serialize for AppConfig {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
         state.serialize_field("cors_origins", &self.cors_origins)?;
+        state.serialize_field("databases", &self.databases)?;
         state.serialize_field("fast", &self.fast)?;
         state.serialize_field("host", &self.host)?;
         state.serialize_field("keep_alive", &self.keep_alive)?;
@@ -552,6 +583,22 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
     if updated {
         let updated_str = serde_json::to_string_pretty(&config).expect("Serialization failed");
         fs::write(path, updated_str).expect("Failed to write updated config");
+    }
+
+    // Merge in users stored in the database (if `databases` is configured).
+    // Done *after* the file write-back above so DB-sourced users are never
+    // persisted into config.json. DB users take precedence over file users
+    // with the same username (last-write-wins on the merge).
+    if let Some(db_cfg) = &config.databases {
+        let db_users = crate::databases::db::load_users_from_config(db_cfg);
+        if !db_users.is_empty() {
+            for db_user in db_users {
+                config
+                .users
+                .retain(|u| u.username != db_user.username);
+                config.users.push(db_user);
+            }
+        }
     }
 
     Arc::new(config)

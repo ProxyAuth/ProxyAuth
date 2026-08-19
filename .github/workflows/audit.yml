@@ -39,7 +39,7 @@ jobs:
           override: true
 
       - name: Install dependancy
-        run: apt update && apt install -y nettle-dev
+        run: apt update && apt install -y nettle-dev pkg-config libssl-dev libpq-dev default-libmysqlclient-dev
 
       - name: install tarpaulin for coverage
         run: cargo install cargo-tarpaulin
@@ -62,7 +62,7 @@ jobs:
           override: true
 
       - name: Install dependancy
-        run: apt update && apt install -y nettle-dev sudo
+        run: apt update && apt install -y nettle-dev sudo pkg-config libssl-dev libpq-dev default-libmysqlclient-dev
 
       - name: install nextest
         run: cargo install --locked cargo-nextest

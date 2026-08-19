@@ -19,4 +19,12 @@ pub enum Commands {
     Sync {
         target: Option<String>,
     },
+    /// Create or update a user directly in the configured database
+    /// (requires `databases` to be set in config.json).
+    DbAddUser {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+    },
 }

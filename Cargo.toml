@@ -114,7 +114,7 @@ regex = "1"
 serial_test = "3" # it's for coverage code
 notify = "6"
 arc-swap = "1.8.0"
-
+diesel = { version = "2.1", features = ["postgres", "mysql"] }
 http = "1"
 hyper-tls = "0.5"
 hmac = "0.13.0-rc.2"

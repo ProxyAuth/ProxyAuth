@@ -16,6 +16,7 @@ mod adm;
 mod build;
 mod cli;
 mod config;
+mod databases;
 mod keystore;
 mod logs;
 mod network;

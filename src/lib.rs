@@ -22,6 +22,7 @@ pub mod revoke;
 pub mod smtp;
 pub mod stats;
 pub mod token;
+pub mod databases;
 
 pub use config::config::{AppConfig, AppState, RouteConfig};
 pub use network::proxy::global_proxy;
