@@ -32,7 +32,7 @@ static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock
 
 fn to_actix_status(s: hyper::StatusCode) -> actix_web::http::StatusCode {
     actix_web::http::StatusCode::from_u16(s.as_u16())
-        .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)
+    .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn norm_len(prefix: &str) -> usize {
@@ -60,7 +60,7 @@ fn is_method_allowed(allowed: Option<&[String]>, method: &str) -> bool {
 static ALWAYS_TRUSTED: Lazy<Vec<IpNet>> = Lazy::new(|| {
     vec![
         "127.0.0.0/8".parse().unwrap(), // IPv4 loopback range
-        "::1/128".parse().unwrap(),     // IPv6 loopback
+                                                    "::1/128".parse().unwrap(),     // IPv6 loopback
     ]
 });
 
@@ -73,10 +73,10 @@ fn build_allow_header(allowed: Option<&[String]>) -> String {
                 return ALL.to_string();
             }
             let mut v: Vec<String> = list
-                .iter()
-                .map(|s| s.trim().to_ascii_uppercase())
-                .filter(|s| !s.is_empty())
-                .collect();
+            .iter()
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
             v.sort();
             v.dedup();
             if !v.iter().any(|s| s == "OPTIONS") {
@@ -117,12 +117,12 @@ pub fn init_routes_order(routes: &[RouteRule]) {
         let rj = pj == "/";
         match (ri, rj) {
             (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => {
-                let li = norm_len(pi);
-                let lj = norm_len(pj);
-                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-            }
+                (false, true) => std::cmp::Ordering::Less,
+                _ => {
+                    let li = norm_len(pi);
+                    let lj = norm_len(pj);
+                    if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+                }
         }
     });
     *ORDERED_ROUTE_IDX.write().unwrap() = Some(idx);
@@ -165,12 +165,12 @@ pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
         let rj = pj == "/";
         match (ri, rj) {
             (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => {
-                let li = norm_len(pi);
-                let lj = norm_len(pj);
-                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-            }
+                (false, true) => std::cmp::Ordering::Less,
+                _ => {
+                    let li = norm_len(pi);
+                    let lj = norm_len(pj);
+                    if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+                }
         }
     });
     for &i in &idx {
@@ -226,15 +226,15 @@ pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
     matches!(
         name,
         "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "te"
-            | "trailer"
-            | "upgrade"
-            | "keep-alive"
-            | "proxy-connection"
-            | "proxy-authenticate"
-            | "proxy-authorization"
+        | "content-length"
+        | "transfer-encoding"
+        | "te"
+        | "trailer"
+        | "upgrade"
+        | "keep-alive"
+        | "proxy-connection"
+        | "proxy-authenticate"
+        | "proxy-authorization"
     )
 }
 
@@ -254,9 +254,9 @@ fn is_trusted_peer(req: &HttpRequest, config: &AppConfig) -> bool {
         None => false,
         Some(trusted) => trusted.iter().any(|entry| {
             entry.parse::<IpAddr>().map_or(false, |ip| ip == peer_ip)
-                || entry
-                    .parse::<IpNet>()
-                    .map_or(false, |net| net.contains(&peer_ip))
+            || entry
+            .parse::<IpNet>()
+            .map_or(false, |net| net.contains(&peer_ip))
         }),
     }
 }
@@ -271,17 +271,17 @@ pub fn client_ip(req: &HttpRequest, config: &AppConfig) -> Option<IpAddr> {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.split(',').next())
             .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        {
-            return Some(ip);
-        }
-        if let Some(ip) = req
-            .headers()
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        {
-            return Some(ip);
-        }
+            {
+                return Some(ip);
+            }
+            if let Some(ip) = req
+                .headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                {
+                    return Some(ip);
+                }
     }
 
     peer_ip
@@ -309,24 +309,24 @@ pub async fn global_proxy(
             (Some(o), Some(list)) => {
                 let origin_normalized = o.trim_end_matches('/');
                 list.iter()
-                    .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
+                .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
             }
             _ => false,
         };
 
         if let (Some(origin_str), true) = (origin, is_allowed) {
             return Ok(HttpResponse::Ok()
-                .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
-                .insert_header((
-                    header::ACCESS_CONTROL_ALLOW_METHODS,
-                    "GET, POST, PUT, DELETE, OPTIONS",
-                ))
-                .insert_header((
-                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Authorization, Content-Type, Accept",
-                ))
-                .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
-                .finish());
+            .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
+            .insert_header((
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                "GET, POST, PUT, DELETE, OPTIONS",
+            ))
+            .insert_header((
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "Authorization, Content-Type, Accept",
+            ))
+            .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
+            .finish());
         } else {
             return Ok(HttpResponse::Forbidden().body("CORS origin not allowed"));
         }
@@ -335,14 +335,14 @@ pub async fn global_proxy(
     let path = req.path();
     let method = req.method().as_str();
     let ip = req
-        .peer_addr()
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|| "-".to_string());
+    .peer_addr()
+    .map(|a| a.ip().to_string())
+    .unwrap_or_else(|| "-".to_string());
     let user_agent = req
-        .headers()
-        .get("User-Agent")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
+    .headers()
+    .get("User-Agent")
+    .and_then(|h| h.to_str().ok())
+    .unwrap_or("-");
 
     // UX: session_cookie mode only. If the visitor already has a valid
     // session and lands on the home page or wherever logout_redirect_url
@@ -353,13 +353,13 @@ pub async fn global_proxy(
     // below), so this only affects these two specific landing pages.
     if data.config.session_cookie {
         let is_home_or_logout_page =
-            path == "/" || data.config.logout_redirect_url.as_deref() == Some(path);
+        path == "/" || data.config.logout_redirect_url.as_deref() == Some(path);
         if is_home_or_logout_page {
             if let Some(resp) =
                 crate::token::auth::existing_session_response(&req, &data, &ip).await
-            {
-                return Ok(resp);
-            }
+                {
+                    return Ok(resp);
+                }
         }
     }
 
@@ -375,8 +375,8 @@ pub async fn global_proxy(
     } else {
         info!("{} 404 {} {} {}", ip, method, path, user_agent);
         Ok(HttpResponse::NotFound()
-            .append_header(("server", "ProxyAuth"))
-            .body("404 Not Found"))
+        .append_header(("server", "ProxyAuth"))
+        .body("404 Not Found"))
     }
 }
 
@@ -393,41 +393,41 @@ pub async fn proxy_with_proxy(
 
     let path = req.path();
     let ip = client_ip(&req, &data.config)
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
-        .to_string();
+    .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+    .to_string();
     let method_str = req.method().as_str();
     let user_agent = req
-        .headers()
-        .get("User-Agent")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
+    .headers()
+    .get("User-Agent")
+    .and_then(|h| h.to_str().ok())
+    .unwrap_or("-");
 
     let add_cors_headers = |resp: &mut HttpResponseBuilder, req: &HttpRequest| {
         if let Some(origin) = req
             .headers()
             .get(header::ORIGIN)
             .and_then(|v| v.to_str().ok())
-        {
-            let origin_trimmed = origin.trim_end_matches('/');
-            let is_allowed = data
+            {
+                let origin_trimmed = origin.trim_end_matches('/');
+                let is_allowed = data
                 .config
                 .cors_origins
                 .as_ref()
                 .map(|list| {
                     list.iter()
-                        .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
+                    .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
                 })
                 .unwrap_or(false);
-            if is_allowed {
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, req.method().as_str()));
-                resp.insert_header((
-                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Authorization, Content-Type, Accept",
-                ));
-                resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                if is_allowed {
+                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
+                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, req.method().as_str()));
+                    resp.insert_header((
+                        header::ACCESS_CONTROL_ALLOW_HEADERS,
+                        "Authorization, Content-Type, Accept",
+                    ));
+                    resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                }
             }
-        }
     };
 
     // ── ACL ─────────────────────────────────────────────────────────
@@ -485,8 +485,8 @@ pub async fn proxy_with_proxy(
     let path_no_query = original_uri.path();
     let prefix_norm = rule.prefix.trim_end_matches('/');
     let raw_forward = path_no_query
-        .strip_prefix(prefix_norm)
-        .unwrap_or(path_no_query);
+    .strip_prefix(prefix_norm)
+    .unwrap_or(path_no_query);
     let cleaned_remainder = raw_forward.trim_start_matches('/').trim_end_matches('/');
 
     let forward_path = if !rule.secure_path {
@@ -528,70 +528,70 @@ pub async fn proxy_with_proxy(
         ClientOptions {
             use_proxy: true,
             proxy_addr: Some(rule.proxy_config.clone()),
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
+                                           use_cert: false,
+                                           cert_path: None,
+                                           key_path: None,
         },
         &data.config,
     );
 
     let uri = Uri::from_str(&full_url)
-        .map_err(|e| error::ErrorBadRequest(format!("Invalid proxy URI: {}", e)))?;
+    .map_err(|e| error::ErrorBadRequest(format!("Invalid proxy URI: {}", e)))?;
 
     // ── Auth ────────────────────────────────────────────────────
-    let (username, token_id) = if rule.secure {
+    let (username, token_id) = if rule.required_login {
         let token_header = req
-            .headers()
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| {
-                if !is_secure_request(&req, &data.config) {
-                    return None;
-                }
-                req.headers()
-                    .get(header::COOKIE)
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|cookie_str| {
-                        cookie_str.split(';').find_map(|cookie| {
-                            let cookie = cookie.trim();
-                            if let Some((key, value)) = cookie.split_once('=') {
-                                if key.trim() == "session_token" {
-                                    return Some(value.trim());
-                                }
-                            }
-                            None
-                        })
-                    })
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| {
+            if !is_secure_request(&req, &data.config) {
+                return None;
+            }
+            req.headers()
+            .get(header::COOKIE)
+            .and_then(|val| val.to_str().ok())
+            .and_then(|cookie_str| {
+                cookie_str.split(';').find_map(|cookie| {
+                    let cookie = cookie.trim();
+                    if let Some((key, value)) = cookie.split_once('=') {
+                        if key.trim() == "session_token" {
+                            return Some(value.trim());
+                        }
+                    }
+                    None
+                })
             })
-            .ok_or_else(|| {
-                let mut resp = HttpResponse::Unauthorized();
-                resp.append_header(("server", "ProxyAuth"));
-                add_cors_headers(&mut resp, &req);
-                error::InternalError::from_response("Missing token", resp.finish())
-            })?;
+        })
+        .ok_or_else(|| {
+            let mut resp = HttpResponse::Unauthorized();
+            resp.append_header(("server", "ProxyAuth"));
+            add_cors_headers(&mut resp, &req);
+            error::InternalError::from_response("Missing token", resp.finish())
+        })?;
 
         let (username, token_id, _expiry) =
-            match validate_token(token_header, &data, &data.config, &ip).await {
-                Ok(result) => result,
-                Err(_err) => {
-                    warn!(
-                        "[{}] {} {} 401 Unauthorized token attempt {} {}",
-                        ip, path, method_str, user_agent, _err
-                    );
-                    let mut resp = HttpResponse::Unauthorized();
-                    resp.append_header(("server", "ProxyAuth"));
-                    resp.append_header((
-                        "Set-Cookie",
-                        "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
-                    ));
-                    if req.uri() != "/" || req.uri() != "" {
-                        resp.append_header(("location", "/"));
-                    }
-                    add_cors_headers(&mut resp, &req);
-                    return Ok(resp.body("401 Unauthorized"));
+        match validate_token(token_header, &data, &data.config, &ip).await {
+            Ok(result) => result,
+            Err(_err) => {
+                warn!(
+                    "[{}] {} {} 401 Unauthorized token attempt {} {}",
+                    ip, path, method_str, user_agent, _err
+                );
+                let mut resp = HttpResponse::Unauthorized();
+                resp.append_header(("server", "ProxyAuth"));
+                resp.append_header((
+                    "Set-Cookie",
+                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+                ));
+                if req.uri() != "/" || req.uri() != "" {
+                    resp.append_header(("location", "/"));
                 }
-            };
+                add_cors_headers(&mut resp, &req);
+                return Ok(resp.body("401 Unauthorized"));
+            }
+        };
 
         if !rule.username.contains(&username) {
             warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
@@ -604,9 +604,9 @@ pub async fn proxy_with_proxy(
         if req.uri() == "/" || req.uri() == "" {
             let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
             return Ok(HttpResponse::SeeOther()
-                .append_header(("server", "ProxyAuth"))
-                .append_header(("location", redirect_target))
-                .finish());
+            .append_header(("server", "ProxyAuth"))
+            .append_header(("location", redirect_target))
+            .finish());
         }
 
         (username, token_id)
@@ -641,16 +641,16 @@ pub async fn proxy_with_proxy(
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
-        {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            {
+                if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    request_builder = request_builder.header(key_str, hv);
+                }
             }
-        }
     }
 
     request_builder = request_builder
-        .header("Connection", "close")
-        .header(USER_AGENT, "ProxyAuth");
+    .header("Connection", "close")
+    .header(USER_AGENT, "ProxyAuth");
     request_builder = inject_header(request_builder, &username, &data.config);
 
     let hyper_req = if hyper_method == Method::GET || hyper_method == Method::HEAD {
@@ -680,16 +680,16 @@ pub async fn proxy_with_proxy(
     // ── send upstream ───────────────────────────────────────────────
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
-            .backends
-            .iter()
-            .map(|b| match b {
-                BackendInput::Simple(url) => BackendConfig {
-                    url: url.clone(),
-                    weight: 1,
-                },
-                BackendInput::Detailed(cfg) => cfg.clone(),
-            })
-            .collect();
+        .backends
+        .iter()
+        .map(|b| match b {
+            BackendInput::Simple(url) => BackendConfig {
+                url: url.clone(),
+             weight: 1,
+            },
+            BackendInput::Detailed(cfg) => cfg.clone(),
+        })
+        .collect();
 
         forward_failover(hyper_req, &backends, Some(&rule.proxy_config))
             .await
@@ -741,17 +741,17 @@ pub async fn proxy_with_proxy(
     let headers = response_result.headers().clone();
 
     let mut body_bytes: Bytes = response_result
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| {
-            warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
-            let mut resp = HttpResponse::InternalServerError();
-            resp.append_header(("server", "ProxyAuth"));
-            add_cors_headers(&mut resp, &req);
-            error::InternalError::from_response("500 Internal Server Error", resp.finish())
-        })?
-        .to_bytes();
+    .into_body()
+    .collect()
+    .await
+    .map_err(|e| {
+        warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
+        let mut resp = HttpResponse::InternalServerError();
+        resp.append_header(("server", "ProxyAuth"));
+        add_cors_headers(&mut resp, &req);
+        error::InternalError::from_response("500 Internal Server Error", resp.finish())
+    })?
+    .to_bytes();
 
     if !rule.cache {
         client_resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
@@ -766,10 +766,10 @@ pub async fn proxy_with_proxy(
     if data.config.session_cookie && data.config.csrf_token {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
-        {
-            body_bytes = new_body;
-            client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
-        }
+            {
+                body_bytes = new_body;
+                client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
+            }
     }
 
     info!(
@@ -778,17 +778,17 @@ pub async fn proxy_with_proxy(
         path,
         method_str,
         status.as_u16(),
-        body_bytes.len(),
-        username,
-        token_id,
-        user_agent_fwd
+          body_bytes.len(),
+          username,
+          token_id,
+          user_agent_fwd
     );
 
     add_cors_headers(&mut client_resp, &req);
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
     Ok(client_resp
-        .append_header(("server", "ProxyAuth"))
-        .body(body_bytes))
+    .append_header(("server", "ProxyAuth"))
+    .body(body_bytes))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -804,41 +804,41 @@ pub async fn proxy_without_proxy(
 
     let path = req.path();
     let ip = client_ip(&req, &data.config)
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
-        .to_string();
+    .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+    .to_string();
     let method_str = req.method().as_str();
     let user_agent = req
-        .headers()
-        .get("User-Agent")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
+    .headers()
+    .get("User-Agent")
+    .and_then(|h| h.to_str().ok())
+    .unwrap_or("-");
 
     let add_cors_headers = |resp: &mut HttpResponseBuilder, req: &HttpRequest| {
         if let Some(origin) = req
             .headers()
             .get(header::ORIGIN)
             .and_then(|v| v.to_str().ok())
-        {
-            let origin_trimmed = origin.trim_end_matches('/');
-            let is_allowed = data
+            {
+                let origin_trimmed = origin.trim_end_matches('/');
+                let is_allowed = data
                 .config
                 .cors_origins
                 .as_ref()
                 .map(|list| {
                     list.iter()
-                        .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
+                    .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
                 })
                 .unwrap_or(false);
-            if is_allowed {
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, req.method().as_str()));
-                resp.insert_header((
-                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Authorization, Content-Type, Accept",
-                ));
-                resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                if is_allowed {
+                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
+                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, req.method().as_str()));
+                    resp.insert_header((
+                        header::ACCESS_CONTROL_ALLOW_HEADERS,
+                        "Authorization, Content-Type, Accept",
+                    ));
+                    resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                }
             }
-        }
     };
 
     // ── ACL ─────────────────────────────────────────────────────────
@@ -896,8 +896,8 @@ pub async fn proxy_without_proxy(
     let path_no_query = original_uri.path();
     let prefix_norm = rule.prefix.trim_end_matches('/');
     let raw_forward = path_no_query
-        .strip_prefix(prefix_norm)
-        .unwrap_or(path_no_query);
+    .strip_prefix(prefix_norm)
+    .unwrap_or(path_no_query);
     let cleaned_remainder = raw_forward.trim_start_matches('/').trim_end_matches('/');
 
     let forward_path = if !rule.secure_path {
@@ -956,66 +956,66 @@ pub async fn proxy_without_proxy(
     let client = get_or_build_client(client_opts, &data.config);
 
     let uri = Uri::from_str(&full_url)
-        .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
+    .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
 
     // ── Auth────────────────────────────────────────────────────
-    let (username, token_id) = if rule.secure {
+    let (username, token_id) = if rule.required_login {
         let token_header = req
-            .headers()
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| {
-                if !is_secure_request(&req, &data.config) {
-                    return None;
-                }
-                req.headers()
-                    .get(header::COOKIE)
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|cookie_str| {
-                        cookie_str.split(';').find_map(|cookie| {
-                            let cookie = cookie.trim();
-                            if let Some((key, value)) = cookie.split_once('=') {
-                                if key.trim() == "session_token" {
-                                    return Some(value.trim());
-                                }
-                            }
-                            None
-                        })
-                    })
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| {
+            if !is_secure_request(&req, &data.config) {
+                return None;
+            }
+            req.headers()
+            .get(header::COOKIE)
+            .and_then(|val| val.to_str().ok())
+            .and_then(|cookie_str| {
+                cookie_str.split(';').find_map(|cookie| {
+                    let cookie = cookie.trim();
+                    if let Some((key, value)) = cookie.split_once('=') {
+                        if key.trim() == "session_token" {
+                            return Some(value.trim());
+                        }
+                    }
+                    None
+                })
             })
-            .ok_or_else(|| {
-                info!(
-                    "[{}] {} {} 401 Unauthorized token attempt {}",
-                    ip, path, method_str, user_agent
+        })
+        .ok_or_else(|| {
+            info!(
+                "[{}] {} {} 401 Unauthorized token attempt {}",
+                ip, path, method_str, user_agent
+            );
+            let mut resp = HttpResponse::Unauthorized();
+            resp.append_header(("server", "ProxyAuth"));
+            add_cors_headers(&mut resp, &req);
+            error::InternalError::from_response("Missing token", resp.finish())
+        })?;
+
+        let (username, token_id, _expiry) =
+        match validate_token(token_header, &data, &data.config, &ip).await {
+            Ok(result) => result,
+            Err(_err) => {
+                warn!(
+                    "[{}] {} {} 401 Unauthorized token attempt {} {}",
+                    ip, path, method_str, user_agent, _err
                 );
                 let mut resp = HttpResponse::Unauthorized();
                 resp.append_header(("server", "ProxyAuth"));
-                add_cors_headers(&mut resp, &req);
-                error::InternalError::from_response("Missing token", resp.finish())
-            })?;
-
-        let (username, token_id, _expiry) =
-            match validate_token(token_header, &data, &data.config, &ip).await {
-                Ok(result) => result,
-                Err(_err) => {
-                    warn!(
-                        "[{}] {} {} 401 Unauthorized token attempt {} {}",
-                        ip, path, method_str, user_agent, _err
-                    );
-                    let mut resp = HttpResponse::Unauthorized();
-                    resp.append_header(("server", "ProxyAuth"));
-                    resp.append_header((
-                        "Set-Cookie",
-                        "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
-                    ));
-                    if req.uri() != "/" || req.uri() != "" {
-                        resp.append_header(("location", "/"));
-                    }
-                    add_cors_headers(&mut resp, &req);
-                    return Ok(resp.body("401 Unauthorized"));
+                resp.append_header((
+                    "Set-Cookie",
+                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+                ));
+                if req.uri() != "/" || req.uri() != "" {
+                    resp.append_header(("location", "/"));
                 }
-            };
+                add_cors_headers(&mut resp, &req);
+                return Ok(resp.body("401 Unauthorized"));
+            }
+        };
 
         if !rule.username.contains(&username) {
             info!(
@@ -1035,9 +1035,9 @@ pub async fn proxy_without_proxy(
         if req.uri() == "/" || req.uri() == "" {
             let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
             return Ok(HttpResponse::SeeOther()
-                .append_header(("server", "ProxyAuth"))
-                .append_header(("location", redirect_target))
-                .finish());
+            .append_header(("server", "ProxyAuth"))
+            .append_header(("location", redirect_target))
+            .finish());
         }
 
         (username, token_id)
@@ -1058,11 +1058,11 @@ pub async fn proxy_without_proxy(
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
-        {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            {
+                if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    request_builder = request_builder.header(key_str, hv);
+                }
             }
-        }
     }
 
     request_builder = request_builder.header(USER_AGENT, "ProxyAuth");
@@ -1095,16 +1095,16 @@ pub async fn proxy_without_proxy(
     // ── send upstream ───────────────────────────────────────────────
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
-            .backends
-            .iter()
-            .map(|b| match b {
-                BackendInput::Simple(url) => BackendConfig {
-                    url: url.clone(),
-                    weight: 1,
-                },
-                BackendInput::Detailed(cfg) => cfg.clone(),
-            })
-            .collect();
+        .backends
+        .iter()
+        .map(|b| match b {
+            BackendInput::Simple(url) => BackendConfig {
+                url: url.clone(),
+             weight: 1,
+            },
+            BackendInput::Detailed(cfg) => cfg.clone(),
+        })
+        .collect();
 
         match forward_failover(hyper_req, &backends, None).await {
             Ok(res) => res,
@@ -1162,13 +1162,13 @@ pub async fn proxy_without_proxy(
     }
 
     let mut body_bytes: Bytes = resp_body
-        .collect()
-        .await
-        .map_err(|e| {
-            warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
-            error::ErrorInternalServerError("500 Internal Server Error")
-        })?
-        .to_bytes();
+    .collect()
+    .await
+    .map_err(|e| {
+        warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
+        error::ErrorInternalServerError("500 Internal Server Error")
+    })?
+    .to_bytes();
 
     if !rule.cache {
         client_resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
@@ -1183,10 +1183,10 @@ pub async fn proxy_without_proxy(
     if data.config.session_cookie && data.config.csrf_token {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
-        {
-            body_bytes = new_body;
-            client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
-        }
+            {
+                body_bytes = new_body;
+                client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
+            }
     }
 
     info!(
@@ -1195,15 +1195,15 @@ pub async fn proxy_without_proxy(
         path,
         method_str,
         status.as_u16(),
-        body_bytes.len(),
-        username,
-        token_id,
-        user_agent_fwd
+          body_bytes.len(),
+          username,
+          token_id,
+          user_agent_fwd
     );
 
     add_cors_headers(&mut client_resp, &req);
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
     Ok(client_resp
-        .append_header(("server", "ProxyAuth"))
-        .body(body_bytes))
+    .append_header(("server", "ProxyAuth"))
+    .body(body_bytes))
 }
