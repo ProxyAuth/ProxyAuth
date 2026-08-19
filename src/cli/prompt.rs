@@ -86,6 +86,11 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             };
 
+            let password = match password {
+                Some(p) => p.clone(),
+                None => rpassword::prompt_password("password: ")?,
+            };
+
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
             .hash_password(password.as_bytes(), &salt)
