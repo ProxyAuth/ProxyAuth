@@ -85,7 +85,7 @@ pub fn connect(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
                 cfg.password,
                 cfg.host,
                 cfg.effective_port(),
-                              cfg.db_name
+                cfg.db_name
             );
             let conn = MysqlConnection::establish(&url)
             .map_err(|e| format!("MySQL connection failed: {e}"))?;
@@ -106,8 +106,8 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
                 "CREATE TABLE IF NOT EXISTS users (
                     id BIGSERIAL PRIMARY KEY,
                     username VARCHAR(255) NOT NULL UNIQUE,
-                            password TEXT NOT NULL,
-                            otpkey TEXT
+                    password TEXT NOT NULL,
+                    otpkey TEXT
             )",
             )
             .map_err(|e| format!("Failed to create users table (postgres): {e}"))?;
@@ -116,7 +116,7 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
                 "CREATE TABLE IF NOT EXISTS user_allow (
                     id BIGSERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                            cidr TEXT NOT NULL
+                    cidr TEXT NOT NULL
             )",
             )
             .map_err(|e| format!("Failed to create user_allow table (postgres): {e}"))?;
@@ -125,7 +125,7 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
                 "CREATE TABLE IF NOT EXISTS user_roles (
                     id BIGSERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                            role TEXT NOT NULL
+                    role TEXT NOT NULL
             )",
             )
             .map_err(|e| format!("Failed to create user_roles table (postgres): {e}"))?;
@@ -137,8 +137,8 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
                 "CREATE TABLE IF NOT EXISTS users (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     username VARCHAR(255) NOT NULL UNIQUE,
-                            password TEXT NOT NULL,
-                            otpkey TEXT
+                    password TEXT NOT NULL,
+                    otpkey TEXT
             )",
             )
             .map_err(|e| format!("Failed to create users table (mysql): {e}"))?;
@@ -182,23 +182,23 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
             sql_query("SELECT id, username, password, otpkey FROM users")
             .load(c)
             .map_err(|e| format!("Failed to load users (postgres): {e}"))?,
-                                      sql_query("SELECT user_id, cidr AS value FROM user_allow")
-                                      .load(c)
-                                      .map_err(|e| format!("Failed to load user_allow (postgres): {e}"))?,
-                                      sql_query("SELECT user_id, role AS value FROM user_roles")
-                                      .load(c)
-                                      .map_err(|e| format!("Failed to load user_roles (postgres): {e}"))?,
+            sql_query("SELECT user_id, cidr AS value FROM user_allow")
+            .load(c)
+            .map_err(|e| format!("Failed to load user_allow (postgres): {e}"))?,
+            sql_query("SELECT user_id, role AS value FROM user_roles")
+            .load(c)
+            .map_err(|e| format!("Failed to load user_roles (postgres): {e}"))?,
         ),
         DbConnection::MySql(c) => (
             sql_query("SELECT id, username, password, otpkey FROM users")
             .load(c)
             .map_err(|e| format!("Failed to load users (mysql): {e}"))?,
-                                   sql_query("SELECT user_id, cidr AS value FROM user_allow")
-                                   .load(c)
-                                   .map_err(|e| format!("Failed to load user_allow (mysql): {e}"))?,
-                                   sql_query("SELECT user_id, role AS value FROM user_roles")
-                                   .load(c)
-                                   .map_err(|e| format!("Failed to load user_roles (mysql): {e}"))?,
+            sql_query("SELECT user_id, cidr AS value FROM user_allow")
+            .load(c)
+            .map_err(|e| format!("Failed to load user_allow (mysql): {e}"))?,
+            sql_query("SELECT user_id, role AS value FROM user_roles")
+            .load(c)
+            .map_err(|e| format!("Failed to load user_roles (mysql): {e}"))?,
         ),
     };
 

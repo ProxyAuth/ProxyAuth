@@ -143,7 +143,7 @@ impl Serialize for User {
         state.serialize_field("password", &self.password)?;
         state.serialize_field("otpkey", &self.otpkey)?;
         state.serialize_field("allow", &self.allow)?;
-        state.serialize_field("roles", &self.roles)?;
+        state.serialize_field("roles", &self.allow)?;
         state.end()
     }
 }
@@ -290,6 +290,16 @@ pub struct AppConfig {
     /// `combined_users()` rather than reading either list alone.
     #[serde(skip)]
     pub db_users: std::sync::RwLock<Vec<User>>,
+
+    /// Raw indices (positions within `db_users`) that were removed from
+    /// the database on the last refresh. The slot itself is never
+    /// deleted/reordered (that would shift the index of every entry
+    /// after it, embedded in already-issued tokens) — instead its
+    /// password is poisoned (see `refresh_db_users`) so it can never
+    /// log in again, and `user_by_index` rejects any token pointing at
+    /// a revoked index outright, invalidating it immediately.
+    #[serde(skip)]
+    pub db_revoked: std::sync::RwLock<std::collections::HashSet<usize>>,
 }
 
 impl Serialize for AppConfig {
@@ -584,12 +594,21 @@ impl AppConfig {
     /// `combined_users()` produces, without cloning the whole list.
     /// Indices `0..self.users.len()` map to file users; indices at or
     /// past that map into `db_users`. Used when validating a token's
-    /// embedded user index.
+    /// embedded user index. Returns `None` — rejecting the token — for
+    /// an index whose database user was since deleted (see
+    /// `refresh_db_users`), even though the slot itself still exists.
     pub fn user_by_index(&self, index: usize) -> Option<User> {
         if let Some(u) = self.users.get(index) {
             return Some(u.clone());
         }
         let db_index = index.checked_sub(self.users.len())?;
+
+        if let Ok(revoked) = self.db_revoked.read() {
+            if revoked.contains(&db_index) {
+                return None;
+            }
+        }
+
         self.db_users.read().ok()?.get(db_index).cloned()
     }
 
@@ -600,29 +619,58 @@ impl AppConfig {
     /// SECURITY: existing users are updated *in place* and new users are
     /// only ever *appended* — never removed or reordered — so a
     /// previously issued token's embedded index (see `user_by_index`)
-    /// keeps resolving to the same user across refreshes. A user removed
-    /// from the database is therefore left in place (stale) rather than
-    /// dropped, to avoid shifting every index after it.
+    /// keeps resolving to the same slot across refreshes.
+    ///
+    /// A user removed from the database is detected here (its username
+    /// is no longer present in `fresh`) and its slot is *revoked*
+    /// in place, without ever deleting/reordering it:
+    /// - its `password` is overwritten with a sentinel that can never
+    ///   verify, so it immediately stops being able to log in again;
+    /// - its raw index is recorded in `db_revoked`, so `user_by_index`
+    ///   rejects any token already issued for it, invalidating that
+    ///   session immediately rather than waiting for it to expire.
+    ///
+    /// If a username reappears later (re-created), the slot is reused
+    /// and un-revoked automatically.
     pub fn refresh_db_users(&self) {
         let Some(db_cfg) = &self.databases else {
             return;
         };
 
         let fresh = crate::databases::db::load_users_from_config(db_cfg);
+        let fresh_usernames: std::collections::HashSet<&str> =
+        fresh.iter().map(|u| u.username.as_str()).collect();
 
-        match self.db_users.write() {
-            Ok(mut guard) => {
-                for new_user in fresh {
-                    if let Some(existing) =
-                        guard.iter_mut().find(|u| u.username == new_user.username)
-                        {
-                            *existing = new_user;
-                        } else {
-                            guard.push(new_user);
-                        }
-                }
+        let mut guard = match self.db_users.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[databases] failed to acquire db_users lock: {e}");
+                return;
             }
-            Err(e) => eprintln!("[databases] failed to acquire db_users lock: {e}"),
+        };
+
+        for new_user in &fresh {
+            if let Some(existing) = guard.iter_mut().find(|u| u.username == new_user.username) {
+                *existing = new_user.clone();
+            } else {
+                guard.push(new_user.clone());
+            }
+        }
+
+        let Ok(mut revoked) = self.db_revoked.write() else {
+            eprintln!("[databases] failed to acquire db_revoked lock");
+            return;
+        };
+
+        for (idx, user) in guard.iter_mut().enumerate() {
+            if fresh_usernames.contains(user.username.as_str()) {
+                revoked.remove(&idx);
+            } else if revoked.insert(idx) {
+                // Not a valid argon2 hash — PasswordHash::verify_password
+                // will fail to parse it and always return an error, so
+                // this account can never authenticate again.
+                user.password = "!revoked!".to_string();
+            }
         }
     }
 }
@@ -852,18 +900,18 @@ impl AllowRegexCfg {
                 }),
                 RegexCondCfg::Header { name, pattern } => Ok(RegexCond::Header {
                     name_re: Regex::new(name)?,
-                                                             re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::Query { name, pattern } => Ok(RegexCond::Query {
                     name_re: Regex::new(name)?,
-                                                            re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::BodyRaw { pattern } => Ok(RegexCond::BodyRaw {
                     re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::BodyJson { key, pattern } => Ok(RegexCond::BodyJson {
                     key: key.clone(),
-                                                              re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
             }
         }
