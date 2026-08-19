@@ -4,5 +4,6 @@ tarpaulin-report.html
 docker-compose.yml
 /config
 /coverag
-/.cargo
+/.cargo/*
+!/.cargo/audit.toml
 
