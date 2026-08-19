@@ -123,7 +123,7 @@ By default, users live in the `users` array of `config.json`, which means each i
 - On startup, ProxyAuth connects, creates the `users` table if it doesn't exist yet, and merges any users found there into the running config (DB users take precedence over file users with the same username). A database outage never blocks startup — file-based users still work.
 - Add or update a user directly in the database from the CLI:
   ```bash
-  proxyauth db-add-user --username admin --password supersecret
+  proxyauth db-add-user --username admin
   ```
 
 **Build requirements** — Diesel needs the client libraries for whichever backend(s) you use:
