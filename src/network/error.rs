@@ -1,28 +1,30 @@
 use crate::AppState;
-use crate::network::shared_client::get_or_build_client;
-use crate::network::shared_client::ClientOptions;
-use crate::token::csrf::inject_csrf_token;
 use crate::config::config::BackendConfig;
 use crate::config::config::BackendInput;
 use crate::network::loadbalancing::forward_failover;
 use crate::network::shared_client::BoxBody;
+use crate::network::shared_client::ClientOptions;
+use crate::network::shared_client::get_or_build_client;
+use crate::token::csrf::inject_csrf_token;
 use actix_web::rt::time::timeout;
 use actix_web::{HttpRequest, HttpResponse, web};
-use hyper::Request;
-use hyper::header::{
-    HeaderValue, USER_AGENT, COOKIE, ACCEPT_LANGUAGE, ORIGIN, CONTENT_TYPE,
+use brotli::{CompressorWriter, Decompressor};
+use flate2::{
+    Compression,
+    read::{DeflateDecoder, GzDecoder},
+    write::{DeflateEncoder, GzEncoder},
 };
-use http_body_util::{Empty, Full, BodyExt};
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::Request;
 use hyper::body::Bytes;
+use hyper::header::{ACCEPT_LANGUAGE, CONTENT_TYPE, COOKIE, HeaderValue, ORIGIN, USER_AGENT};
 use std::convert::Infallible;
-use std::time::Duration;
 use std::io::{Read, Write};
-use flate2::{read::{GzDecoder, DeflateDecoder}, write::{GzEncoder, DeflateEncoder}, Compression};
-use brotli::{Decompressor, CompressorWriter};
+use std::time::Duration;
 
 fn toggle_error_block(html: String, error_text: &str) -> String {
     let start_marker = "<!-- BEGIN_BLOCK_ERROR -->";
-    let end_marker   = "<!-- END_BLOCK_ERROR -->";
+    let end_marker = "<!-- END_BLOCK_ERROR -->";
 
     if error_text.is_empty() {
         return html;
@@ -33,7 +35,7 @@ fn toggle_error_block(html: String, error_text: &str) -> String {
     };
 
     let block_start = s + start_marker.len();
-    let block_end   = e;
+    let block_end = e;
 
     let mut block = html[block_start..block_end].to_string();
     block = block.replace("<!--", "").replace("-->", "");
@@ -55,31 +57,42 @@ pub async fn render_error_page(
     };
 
     let (path, query_opt) =
-    if logout_url.starts_with("http://") || logout_url.starts_with("https://") {
-        match logout_url.split_once("://").and_then(|(_, rest)| rest.split_once('/')) {
-            Some((_, tail)) => {
-                if let Some((p, q)) = tail.split_once('?') {
-                    (format!("/{}", p.trim_start_matches('/')), Some(q.to_string()))
-                } else {
-                    (format!("/{}", tail.trim_start_matches('/')), None)
+        if logout_url.starts_with("http://") || logout_url.starts_with("https://") {
+            match logout_url
+                .split_once("://")
+                .and_then(|(_, rest)| rest.split_once('/'))
+            {
+                Some((_, tail)) => {
+                    if let Some((p, q)) = tail.split_once('?') {
+                        (
+                            format!("/{}", p.trim_start_matches('/')),
+                            Some(q.to_string()),
+                        )
+                    } else {
+                        (format!("/{}", tail.trim_start_matches('/')), None)
+                    }
                 }
+                None => ("/".to_string(), None),
             }
-            None => ("/".to_string(), None),
-        }
-    } else if let Some((p, q)) = logout_url.split_once('?') {
-        (p.to_string(), Some(q.to_string()))
-    } else {
-        (logout_url.clone(), None)
-    };
+        } else if let Some((p, q)) = logout_url.split_once('?') {
+            (p.to_string(), Some(q.to_string()))
+        } else {
+            (logout_url.clone(), None)
+        };
 
-    let Some(rule) = data.routes.routes.iter().find(|r| path.starts_with(&r.prefix)) else {
+    let Some(rule) = data
+        .routes
+        .routes
+        .iter()
+        .find(|r| path.starts_with(&r.prefix))
+    else {
         return HttpResponse::BadRequest().body("No matching route for logout_redirect_url path");
     };
 
     let raw_forward = path
-    .strip_prefix(&rule.prefix)
-    .unwrap_or("")
-    .trim_start_matches('/');
+        .strip_prefix(&rule.prefix)
+        .unwrap_or("")
+        .trim_start_matches('/');
     let cleaned = raw_forward.trim_end_matches('/');
 
     let forward_path = if cleaned.is_empty() {
@@ -104,45 +117,56 @@ pub async fn render_error_page(
     // ── Client : on passe par le cache global, pas de thread-local ──────────
     let client_opts = if !rule.cert.is_empty() {
         ClientOptions {
-            use_proxy:  false,
+            use_proxy: false,
             proxy_addr: None,
-            use_cert:   true,
-            cert_path:  rule.cert.get("file").cloned(),
-            key_path:   rule.cert.get("key").cloned(),
+            use_cert: true,
+            cert_path: rule.cert.get("file").cloned(),
+            key_path: rule.cert.get("key").cloned(),
         }
     } else {
         ClientOptions {
-            use_proxy:  false,
+            use_proxy: false,
             proxy_addr: None,
-            use_cert:   false,
-            cert_path:  None,
-            key_path:   None,
+            use_cert: false,
+            cert_path: None,
+            key_path: None,
         }
     };
     let client = get_or_build_client(client_opts, &data.config);
 
     let backend_host = match full_url
-    .split_once("://")
-    .and_then(|(_, rest)| rest.split_once('/').map(|(h, _)| h))
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/').map(|(h, _)| h))
     {
         Some(h) => h,
         None => "",
     };
 
     let mut rb = Request::builder()
-    .method("GET")
-    .uri(&full_url)
-    .header("Host", backend_host)
-    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-    .header("Accept-Encoding", "gzip, deflate, br");
+        .method("GET")
+        .uri(&full_url)
+        .header("Host", backend_host)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Encoding", "gzip, deflate, br");
 
-    if let Some(ua) = req.headers().get("user-agent").and_then(|v| v.to_str().ok()) {
+    if let Some(ua) = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+    {
         rb = rb.header(USER_AGENT, ua);
     }
     if let Some(ck) = req.headers().get("cookie").and_then(|v| v.to_str().ok()) {
         rb = rb.header(COOKIE, ck);
     }
-    if let Some(al) = req.headers().get("accept-language").and_then(|v| v.to_str().ok()) {
+    if let Some(al) = req
+        .headers()
+        .get("accept-language")
+        .and_then(|v| v.to_str().ok())
+    {
         rb = rb.header(ACCEPT_LANGUAGE, al);
     }
     if let Some(ori) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
@@ -151,25 +175,30 @@ pub async fn render_error_page(
 
     let hyper_req = match rb.body(Empty::<Bytes>::new().boxed()) {
         Ok(r) => r,
-        Err(_) => return HttpResponse::InternalServerError().body("Failed to build backend request"),
+        Err(_) => {
+            return HttpResponse::InternalServerError().body("Failed to build backend request");
+        }
     };
 
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
-        .backends
-        .iter()
-        .map(|b| match b {
-            BackendInput::Simple(url) => BackendConfig { url: url.clone(), weight: 1 },
-            BackendInput::Detailed(cfg) => cfg.clone(),
-        })
-        .collect();
+            .backends
+            .iter()
+            .map(|b| match b {
+                BackendInput::Simple(url) => BackendConfig {
+                    url: url.clone(),
+                    weight: 1,
+                },
+                BackendInput::Detailed(cfg) => cfg.clone(),
+            })
+            .collect();
 
         match forward_failover(hyper_req, &backends, None).await {
             Ok(res) => res,
             Err(_e) => {
                 return HttpResponse::ServiceUnavailable()
-                .insert_header(("server", "ProxyAuth"))
-                .body("Failover failed");
+                    .insert_header(("server", "ProxyAuth"))
+                    .body("Failover failed");
             }
         }
     } else {
@@ -180,8 +209,8 @@ pub async fn render_error_page(
                     Ok(c) => c.to_bytes(),
                     Err(_) => {
                         return HttpResponse::ServiceUnavailable()
-                        .insert_header(("server", "ProxyAuth"))
-                        .body("Upstream body error");
+                            .insert_header(("server", "ProxyAuth"))
+                            .body("Upstream body error");
                     }
                 };
                 let boxed: BoxBody = Full::new(bytes).map_err(|e: Infallible| e).boxed();
@@ -189,30 +218,30 @@ pub async fn render_error_page(
             }
             Ok(Err(_e)) => {
                 return HttpResponse::ServiceUnavailable()
-                .insert_header(("server", "ProxyAuth"))
-                .body("Upstream client error");
+                    .insert_header(("server", "ProxyAuth"))
+                    .body("Upstream client error");
             }
             Err(_to) => {
                 return HttpResponse::ServiceUnavailable()
-                .insert_header(("server", "ProxyAuth"))
-                .body("Upstream timeout");
+                    .insert_header(("server", "ProxyAuth"))
+                    .body("Upstream timeout");
             }
         }
     };
 
     if response_result.status().is_client_error() || response_result.status().is_server_error() {
         return HttpResponse::BadRequest()
-        .insert_header(("server", "ProxyAuth"))
-        .body(format!("Backend status: {}", response_result.status()));
+            .insert_header(("server", "ProxyAuth"))
+            .body(format!("Backend status: {}", response_result.status()));
     }
 
     let (parts, body) = response_result.into_parts();
     let headers: hyper::HeaderMap = parts.headers;
 
     let encoding = headers
-    .get("content-encoding")
-    .and_then(|v: &hyper::header::HeaderValue| v.to_str().ok())
-    .map(|s: &str| s.to_lowercase());
+        .get("content-encoding")
+        .and_then(|v: &hyper::header::HeaderValue| v.to_str().ok())
+        .map(|s: &str| s.to_lowercase());
 
     let body_bytes: Bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
@@ -293,7 +322,10 @@ pub async fn render_error_page(
 
     let mut resp = HttpResponse::Unauthorized();
     resp.insert_header(("server", "ProxyAuth"));
-    resp.insert_header(("cache-control", "no-store, no-cache, must-revalidate, max-age=0"));
+    resp.insert_header((
+        "cache-control",
+        "no-store, no-cache, must-revalidate, max-age=0",
+    ));
     resp.insert_header(("pragma", "no-cache"));
     resp.insert_header(("expires", "0"));
     resp.insert_header(("content-type", "text/html; charset=utf-8"));

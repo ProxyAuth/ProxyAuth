@@ -1,16 +1,18 @@
 use crate::adm::method_otp::generate_base32_secret;
-use crate::revoke::db::RevokedTokenMap;
-use crate::stats::tokencount::CounterToken;
+use crate::network::shared_client::BoxBody;
 use crate::network::stats::RequestStats;
-use crate::token::auth::generate_random_string;
+use crate::revoke::db::RevokedTokenMap;
 use crate::smtp::smtp::SmtpConfig;
+use crate::stats::tokencount::CounterToken;
+use crate::token::auth::generate_random_string;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
+use dashmap::DashMap;
 use hyper_http_proxy::ProxyConnector;
 use hyper_rustls::HttpsConnector;
-use crate::network::shared_client::BoxBody;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use regex::Regex;
 use serde::Deserializer;
 use serde::de::MapAccess;
 use serde::de::Visitor;
@@ -21,7 +23,6 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use regex::Regex;
 
 #[derive(Debug, Clone)]
 pub struct CompiledAllow {
@@ -29,15 +30,14 @@ pub struct CompiledAllow {
     pub allow: Vec<RegexCond>,
 }
 
-
 #[derive(Debug, Clone)]
 pub enum RegexCond {
-    Method  { re: Regex },
-    Path    { re: Regex },
-    Header  { name_re: Regex, re: Regex },
-    Query   { name_re: Regex, re: Regex },
+    Method { re: Regex },
+    Path { re: Regex },
+    Header { name_re: Regex, re: Regex },
+    Query { name_re: Regex, re: Regex },
     BodyRaw { re: Regex },
-    BodyJson{ key: String, re: Regex },
+    BodyJson { key: String, re: Regex },
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -48,8 +48,8 @@ pub struct RouteRule {
     #[serde(default = "default_username")]
     pub username: Vec<String>,
 
-    #[serde(default = "default_secure")]
-    pub secure: bool,
+    #[serde(default = "default_required_login")]
+    pub required_login: bool,
 
     #[serde(default = "default_proxy")]
     pub proxy: bool,
@@ -108,7 +108,7 @@ pub struct RouteConfig {
     pub routes: Vec<RouteRule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct User {
     pub username: String,
     pub password: String,
@@ -129,7 +129,9 @@ pub struct AllowRegexCfg {
     pub allow: Vec<RegexCondCfg>,
 }
 
-fn default_allow_true() -> bool { true }
+fn default_allow_true() -> bool {
+    true
+}
 
 impl Serialize for User {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -141,8 +143,47 @@ impl Serialize for User {
         state.serialize_field("password", &self.password)?;
         state.serialize_field("otpkey", &self.otpkey)?;
         state.serialize_field("allow", &self.allow)?;
-        state.serialize_field("roles", &self.allow)?;
+        state.serialize_field("roles", &self.roles)?;
         state.end()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DatabaseConfig {
+    /// "postgres" or "mysql"
+    #[serde(rename = "type")]
+    pub db_type: String,
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    pub db_name: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+
+    /// How often (in seconds) to re-scan the database and refresh the
+    /// in-memory user list, so users added/edited directly in the DB
+    /// eventually take effect without restarting the process. Defaults
+    /// to 30s. Set to 0 to disable periodic refresh (DB is only read
+    /// once, at startup).
+    #[serde(default = "default_db_refresh_interval")]
+    pub refresh_interval_secs: u64,
+}
+
+fn default_db_refresh_interval() -> u64 {
+    30
+}
+
+impl DatabaseConfig {
+    /// Returns the configured port, or the standard default port for
+    /// `type` (3306 for mysql/mariadb, 5432 otherwise/postgres) when
+    /// `port` wasn't set.
+    pub fn effective_port(&self) -> u16 {
+        self.port.unwrap_or_else(|| match self.db_type.to_lowercase().as_str() {
+            "mysql" | "mariadb" => 3306,
+            _ => 5432,
+        })
     }
 }
 
@@ -175,6 +216,12 @@ pub struct AppConfig {
 
     #[serde(default = "default_stats")]
     pub stats: bool,
+
+    #[serde(default)]
+    pub trust_proxy_forward_for: Option<Vec<String>>,
+
+    #[serde(default = "default_max_body_size")]
+    pub max_body_size: usize,
 
     #[serde(default = "default_max_idle_per_host")]
     pub max_idle_per_host: u16,
@@ -209,6 +256,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub cors_origins: Option<Vec<String>>,
 
+    #[serde(default)]
+    pub databases: Option<DatabaseConfig>,
+
     #[serde(default = "default_session_cookie")]
     pub session_cookie: bool,
 
@@ -231,6 +281,15 @@ pub struct AppConfig {
     pub fast: bool,
 
     pub smtp: Option<SmtpConfig>,
+
+    /// Users loaded from `databases` (if configured), refreshed
+    /// periodically by a background task so DB-side changes (users
+    /// added/edited directly in the database) eventually take effect
+    /// without a restart. Not deserialized from config.json — populated
+    /// at startup and kept in sync afterwards. Combine with `users` via
+    /// `combined_users()` rather than reading either list alone.
+    #[serde(skip)]
+    pub db_users: std::sync::RwLock<Vec<User>>,
 }
 
 impl Serialize for AppConfig {
@@ -241,6 +300,7 @@ impl Serialize for AppConfig {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
         state.serialize_field("cors_origins", &self.cors_origins)?;
+        state.serialize_field("databases", &self.databases)?;
         state.serialize_field("fast", &self.fast)?;
         state.serialize_field("host", &self.host)?;
         state.serialize_field("keep_alive", &self.keep_alive)?;
@@ -285,8 +345,34 @@ pub struct AppState {
     pub revoked_tokens: RevokedTokenMap,
     pub stats: Arc<RequestStats>,
 
+    /// Hot-reloadable overlay for per-user TOTP secrets. `AppState.config`
+    /// is an immutable `Arc<AppConfig>` snapshot loaded once at startup —
+    /// writing a new/cleared `otpkey` to config.json on disk (via
+    /// `add_otpkey`/`clear_otpkey`, used by `/adm/auth/totp/get` and
+    /// `/adm/auth/totp/reset`) does NOT update that snapshot in any
+    /// already-running worker. Without this overlay: a freshly enrolled
+    /// user couldn't log in, and — worse — a freshly *reset* (e.g.
+    /// compromised) OTP key would keep working, until every worker
+    /// process was restarted. `None` means "explicitly cleared"; a
+    /// missing entry means "use whatever config.json said at startup".
+    /// See `resolve_otpkey`.
+    pub otp_overrides: Arc<DashMap<String, Option<String>>>,
 }
 
+/// Resolves the OTP secret to actually use for `username`, checking the
+/// live `otp_overrides` overlay before falling back to whatever
+/// `AppConfig` loaded from disk at startup. See `AppState::otp_overrides`
+/// for why this indirection exists.
+pub fn resolve_otpkey(
+    state: &AppState,
+    username: &str,
+    config_otpkey: Option<&str>,
+) -> Option<String> {
+    if let Some(entry) = state.otp_overrides.get(username) {
+        return entry.clone();
+    }
+    config_otpkey.map(|s| s.to_string())
+}
 
 #[derive(Deserialize)]
 pub struct AuthRequest {
@@ -364,7 +450,7 @@ fn default_need_csrf() -> bool {
     true
 }
 
-fn default_secure() -> bool {
+fn default_required_login() -> bool {
     false
 }
 
@@ -404,6 +490,10 @@ fn default_session_cookie() -> bool {
     false
 }
 
+fn default_max_body_size() -> usize {
+    10 * 1024 * 1024 // 10 MB default if not set in config file
+}
+
 fn default_log() -> HashMap<String, String> {
     let mut log = HashMap::new();
     log.insert("type".to_string(), "local".to_string());
@@ -432,6 +522,111 @@ fn default_cert() -> HashMap<String, String> {
     cert
 }
 
+/// Checks a raw `routes.yml` for the deprecated `secure` key, which was
+/// renamed to `required_login`. Unlike a normal unknown field, `secure`
+/// used to control whether a route required authentication — silently
+/// ignoring it would leave routes unauthenticated without warning anyone,
+/// so we fail loudly instead of falling back to the `required_login`
+/// default.
+pub fn check_deprecated_secure_key(routes_str: &str) -> Result<(), String> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(routes_str)
+    .map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
+
+    let routes = doc
+    .get("routes")
+    .and_then(|r| r.as_sequence())
+    .cloned()
+    .unwrap_or_default();
+
+    let offenders: Vec<String> = routes
+    .iter()
+    .filter_map(|route| {
+        let map = route.as_mapping()?;
+        if map.contains_key(serde_yaml::Value::String("secure".to_string())) {
+            let prefix = map
+            .get(serde_yaml::Value::String("prefix".to_string()))
+            .and_then(|p| p.as_str())
+            .unwrap_or("<unknown prefix>");
+            Some(prefix.to_string())
+        } else {
+            None
+        }
+    })
+    .collect();
+
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "routes.yml: 'secure' key is deprecated, rename it to 'required_login' (route(s): {}).",
+                    offenders.join(", ")
+        ))
+    }
+}
+
+impl AppConfig {
+    /// Returns a snapshot combining file-based `users` with the current
+    /// database-loaded users (if `databases` is configured), in a stable
+    /// concatenation: `users` first (unchanged order), then `db_users`
+    /// (unchanged order). This order matters — issued tokens embed a
+    /// numeric index into this combined list (see `user_by_index`), so
+    /// nothing here may ever reorder or remove entries, only append or
+    /// update in place (see `refresh_db_users`).
+    pub fn combined_users(&self) -> Vec<User> {
+        let mut combined = self.users.clone();
+        if let Ok(db_users) = self.db_users.read() {
+            combined.extend(db_users.iter().cloned());
+        }
+        combined
+    }
+
+    /// Resolves a user by its position in the same index space
+    /// `combined_users()` produces, without cloning the whole list.
+    /// Indices `0..self.users.len()` map to file users; indices at or
+    /// past that map into `db_users`. Used when validating a token's
+    /// embedded user index.
+    pub fn user_by_index(&self, index: usize) -> Option<User> {
+        if let Some(u) = self.users.get(index) {
+            return Some(u.clone());
+        }
+        let db_index = index.checked_sub(self.users.len())?;
+        self.db_users.read().ok()?.get(db_index).cloned()
+    }
+
+    /// Re-reads `databases` (if configured) and refreshes the in-memory
+    /// `db_users` snapshot. Never panics — a DB outage just leaves the
+    /// previous snapshot in place.
+    ///
+    /// SECURITY: existing users are updated *in place* and new users are
+    /// only ever *appended* — never removed or reordered — so a
+    /// previously issued token's embedded index (see `user_by_index`)
+    /// keeps resolving to the same user across refreshes. A user removed
+    /// from the database is therefore left in place (stale) rather than
+    /// dropped, to avoid shifting every index after it.
+    pub fn refresh_db_users(&self) {
+        let Some(db_cfg) = &self.databases else {
+            return;
+        };
+
+        let fresh = crate::databases::db::load_users_from_config(db_cfg);
+
+        match self.db_users.write() {
+            Ok(mut guard) => {
+                for new_user in fresh {
+                    if let Some(existing) =
+                        guard.iter_mut().find(|u| u.username == new_user.username)
+                        {
+                            *existing = new_user;
+                        } else {
+                            guard.push(new_user);
+                        }
+                }
+            }
+            Err(e) => eprintln!("[databases] failed to acquire db_users lock: {e}"),
+        }
+    }
+}
+
 pub fn load_config(path: &str) -> Arc<AppConfig> {
     let config_str = fs::read_to_string(path).expect("Could not read config.json file");
     let mut config: AppConfig =
@@ -444,7 +639,10 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
             .hash_password(user.password.as_bytes(), &salt)
-            .expect(&format!("Password hashing failed for user {}", user.username))
+            .expect(&format!(
+                "Password hashing failed for user {}",
+                user.username
+            ))
             .to_string();
             user.password = hash;
             updated = true;
@@ -452,7 +650,9 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
     }
 
     let original_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
-    config.users.sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
+    config
+    .users
+    .sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
 
     let sorted_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
     if original_order != sorted_order {
@@ -469,7 +669,73 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
         fs::write(path, updated_str).expect("Failed to write updated config");
     }
 
-    Arc::new(config)
+    // Load users stored in the database (if `databases` is configured)
+    // into `db_users`, refreshed periodically afterwards by a background
+    // task (see main.rs). Done *after* the file write-back above so
+    // DB-sourced users are never persisted into config.json.
+    let app_config = Arc::new(config);
+    app_config.refresh_db_users();
+    app_config
+}
+
+/// Clears a user's TOTP secret, so they can re-enroll via
+/// `/adm/auth/totp/get`. This is the counterpart admins are told to use
+/// (see the 409 response in `adm/registry_otp.rs::get_otpauth_uri`) when a
+/// user is locked out of an already-provisioned OTP key (lost device,
+/// botched enrollment, suspected compromise, etc.).
+///
+/// Returns `Ok(true)` if a key was cleared, `Ok(false)` if the user had no
+/// key set (nothing to do), and `Err(_)` on I/O/parse failure or an
+/// unknown username. Never panics — this is reachable from a network
+/// request (`/adm/auth/totp/reset`), and a panic anywhere in a request
+/// path is worth avoiding regardless of the release profile's panic
+/// strategy.
+pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
+    if !Path::new(config_path).exists() {
+        return Err(format!("Config file not found: {}", config_path));
+    }
+
+    let config_str = fs::read_to_string(config_path)
+    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+    let mut json: Value = serde_json::from_str(&config_str)
+    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+
+    let users = json
+    .get_mut("users")
+    .and_then(|u| u.as_array_mut())
+    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+
+    let mut found = false;
+    let mut cleared = false;
+
+    for user in users.iter_mut() {
+        let name = user.get("username").and_then(|u| u.as_str());
+        if name == Some(username) {
+            found = true;
+            if let Some(obj) = user.as_object_mut() {
+                if obj.remove("otpkey").is_some() {
+                    cleared = true;
+                }
+            }
+            break;
+        }
+    }
+
+    if !found {
+        return Err(format!(
+            "User '{}' not found in the configuration file.",
+            username
+        ));
+    }
+
+    if cleared {
+        let updated_str = serde_json::to_string_pretty(&json)
+        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+        fs::write(config_path, updated_str)
+        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+    }
+
+    Ok(cleared)
 }
 
 #[allow(dead_code)]
@@ -566,33 +832,48 @@ D: Deserializer<'de>,
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "field", rename_all = "snake_case")]
 pub enum RegexCondCfg {
-    Method  { pattern: String },
-    Path    { pattern: String },
-    Header  { name: String,  pattern: String },
-    Query   { name: String,  pattern: String },
+    Method { pattern: String },
+    Path { pattern: String },
+    Header { name: String, pattern: String },
+    Query { name: String, pattern: String },
     BodyRaw { pattern: String },
-    BodyJson{ key: String,   pattern: String },
+    BodyJson { key: String, pattern: String },
 }
-
 
 impl AllowRegexCfg {
     pub fn compile(&self) -> Result<CompiledAllow, regex::Error> {
         fn conv(c: &RegexCondCfg) -> Result<RegexCond, regex::Error> {
             match c {
-                RegexCondCfg::Method  { pattern } => Ok(RegexCond::Method  { re: Regex::new(pattern)? }),
-                RegexCondCfg::Path    { pattern } => Ok(RegexCond::Path    { re: Regex::new(pattern)? }),
-                RegexCondCfg::Header  { name, pattern } =>
-                Ok(RegexCond::Header { name_re: Regex::new(name)?, re: Regex::new(pattern)? }),
-                RegexCondCfg::Query   { name, pattern } =>
-                Ok(RegexCond::Query  { name_re: Regex::new(name)?, re: Regex::new(pattern)? }),
-                RegexCondCfg::BodyRaw { pattern } =>
-                Ok(RegexCond::BodyRaw{ re: Regex::new(pattern)? }),
-                RegexCondCfg::BodyJson{ key, pattern } =>
-                Ok(RegexCond::BodyJson{ key: key.clone(), re: Regex::new(pattern)? }),
+                RegexCondCfg::Method { pattern } => Ok(RegexCond::Method {
+                    re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::Path { pattern } => Ok(RegexCond::Path {
+                    re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::Header { name, pattern } => Ok(RegexCond::Header {
+                    name_re: Regex::new(name)?,
+                                                             re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::Query { name, pattern } => Ok(RegexCond::Query {
+                    name_re: Regex::new(name)?,
+                                                            re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::BodyRaw { pattern } => Ok(RegexCond::BodyRaw {
+                    re: Regex::new(pattern)?,
+                }),
+                RegexCondCfg::BodyJson { key, pattern } => Ok(RegexCond::BodyJson {
+                    key: key.clone(),
+                                                              re: Regex::new(pattern)?,
+                }),
             }
         }
         let mut allow = Vec::with_capacity(self.allow.len());
-        for c in &self.allow { allow.push(conv(c)?); }
-        Ok(CompiledAllow { default_allow: self.default_allow, allow })
+        for c in &self.allow {
+            allow.push(conv(c)?);
+        }
+        Ok(CompiledAllow {
+            default_allow: self.default_allow,
+                allow,
+        })
     }
 }

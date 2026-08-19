@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::adm::stats::is_valid_admin_token;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use once_cell::sync::Lazy;
 use std::io::{self, Write};
@@ -52,16 +53,14 @@ pub async fn log_collector(mut rx: UnboundedReceiver<String>, max_logs: usize) {
 }
 
 pub async fn get_logs(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    let expected_token = &data.config.token_admin;
-    let auth_header = req.headers().get("X-Auth-Token");
-
-    match auth_header {
-        Some(token) if token == expected_token => {
-            let logs = LOG_BUFFER.lock().unwrap();
-            HttpResponse::Ok()
-                .content_type("text/plain")
-                .body(logs.join(""))
-        }
-        _ => HttpResponse::Unauthorized().body("Invalid or missing token"),
+    // SECURITY: constant-time comparison (was a plain `==`, vulnerable to a
+    // timing side-channel on the admin token — same pattern as adm/stats.rs).
+    if !is_valid_admin_token(&req, &data) {
+        return HttpResponse::Unauthorized().body("Invalid or missing token");
     }
+
+    let logs = LOG_BUFFER.lock().unwrap();
+    HttpResponse::Ok()
+        .content_type("text/plain")
+        .body(logs.join(""))
 }

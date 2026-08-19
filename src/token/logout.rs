@@ -1,6 +1,9 @@
 use crate::AppState;
+use crate::revoke::load::revoke_token;
+use crate::token::security::validate_token;
 use actix_web::{HttpRequest, HttpResponse, http::header, http::header::ContentType, web};
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
+use tracing::warn;
 
 pub async fn logout_options(
     req: HttpRequest,
@@ -36,6 +39,42 @@ pub async fn logout_options(
 }
 
 pub async fn logout_session(req: HttpRequest, data: web::Data<AppState>) -> HttpResponse {
+    // SECURITY: previously this handler only cleared the client-side
+    // cookie — the token itself stayed fully valid server-side until its
+    // natural expiry. A copy of the token obtained before logout (XSS,
+    // shared/borrowed session, log exposure, etc.) kept working
+    // indefinitely. We now best-effort revoke the token server-side too,
+    // via the same revoke_token() used by /adm/revoke.
+    if let Some(cookie) = req.cookie("session_token") {
+        let ip = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                req.connection_info()
+                    .realip_remote_addr()
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        match validate_token(cookie.value(), &data, &data.config, &ip).await {
+            Ok((username, token_id, _)) => {
+                if let Err(e) = revoke_token(&token_id, None, &data.revoked_tokens).await {
+                    warn!(
+                        "[{}] Failed to revoke token {} for user {} on logout: {}",
+                        ip, token_id, username, e
+                    );
+                }
+            }
+            Err(_) => {
+                // Cookie was missing/invalid/already expired — nothing
+                // meaningful to revoke; still proceed with clearing it.
+            }
+        }
+    }
+
     let expires_str = OffsetDateTime::UNIX_EPOCH.format(&Rfc2822).unwrap();
 
     let raw_cookie = format!(

@@ -1,36 +1,36 @@
-use proxyauth::token::security::parse_query_map;
-use proxyauth::token::security::apply_filters_regex_allow_only;
 use actix_web::http::StatusCode;
-use proxyauth::config::config::RegexCond;
-use proxyauth::token::security::cond_matches_strict;
-use proxyauth::token::security::get_build_rand;
-use proxyauth::token::security::get_build_epochdate;
-use proxyauth::token::security::extract_token_user;
-use proxyauth::token::security::generate_token;
-use proxyauth::token::security::get_build_datetime;
-use proxyauth::token::security::get_build_seed2;
-use proxyauth::token::security::get_build_time;
-use proxyauth::token::security::all_values_match;
-use proxyauth::token::security::format_long_date;
-use proxyauth::token::security::generate_secret;
-use proxyauth::token::crypto::derive_key_from_secret;
-use proxyauth::token::security::check_date_token;
-use proxyauth::network::canonical_url::canonicalize_path_for_match;
-use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
-use serde_json::Value as JsonValue;
+use chrono::Utc;
 use proxyauth::AppConfig;
 use proxyauth::AppState;
-use chrono::Utc;
+use proxyauth::config::config::RegexCond;
+use proxyauth::network::canonical_url::canonicalize_path_for_match;
+use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
+use proxyauth::token::crypto::derive_key_from_secret;
+use proxyauth::token::security::all_values_match;
+use proxyauth::token::security::apply_filters_regex_allow_only;
+use proxyauth::token::security::check_date_token;
+use proxyauth::token::security::cond_matches_strict;
+use proxyauth::token::security::extract_token_user;
+use proxyauth::token::security::format_long_date;
+use proxyauth::token::security::generate_secret;
+use proxyauth::token::security::generate_token;
+use proxyauth::token::security::get_build_datetime;
+use proxyauth::token::security::get_build_epochdate;
+use proxyauth::token::security::get_build_rand;
+use proxyauth::token::security::get_build_seed2;
+use proxyauth::token::security::get_build_time;
+use proxyauth::token::security::parse_query_map;
+use serde_json::Value as JsonValue;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{test, http::header, http::Method, test::TestRequest};
+    use actix_web::{http::Method, http::header, test, test::TestRequest};
+    use bytes::Bytes;
+    use proxyauth::config::config::{AllowRegexCfg, BackendInput, RegexCondCfg, RouteRule};
     use regex::Regex;
     use serde_json::json;
-    use bytes::Bytes;
     use std::collections::HashMap;
-    use proxyauth::config::config::{AllowRegexCfg, RegexCondCfg, RouteRule, BackendInput};
 
     // ---------- parse_query_map ----------------------------------------------
 
@@ -50,7 +50,7 @@ mod tests {
             prefix: "/api".into(),
             target: "http://upstream".into(),
             username: vec![],
-            secure: false,
+            required_login: false,
             proxy: false,
             proxy_config: String::new(),
             cert: HashMap::new(),
@@ -70,11 +70,24 @@ mod tests {
         let filters = AllowRegexCfg {
             default_allow: false,
                 allow: vec![
-                    RegexCondCfg::Method { pattern: r"(?i)^POST$".into() },
-                    RegexCondCfg::Path   { pattern: r"^/api/v1/items$".into() },
-                    RegexCondCfg::Header { name: r"(?i)^x-trace-id$".into(), pattern: r"^[a-f0-9-]{8,}$".into() },
-                    RegexCondCfg::Query  { name: r"(?i)^page$".into(), pattern: r"^\d+$".into() },
-                    RegexCondCfg::BodyJson { key: "name".into(), pattern: r"^[a-z0-9_-]{3,16}$".into() },
+                    RegexCondCfg::Method {
+                        pattern: r"(?i)^POST$".into(),
+                    },
+                    RegexCondCfg::Path {
+                        pattern: r"^/api/v1/items$".into(),
+                    },
+                    RegexCondCfg::Header {
+                        name: r"(?i)^x-trace-id$".into(),
+                        pattern: r"^[a-f0-9-]{8,}$".into(),
+                    },
+                    RegexCondCfg::Query {
+                        name: r"(?i)^page$".into(),
+                        pattern: r"^\d+$".into(),
+                    },
+                    RegexCondCfg::BodyJson {
+                        key: "name".into(),
+                        pattern: r"^[a-z0-9_-]{3,16}$".into(),
+                    },
                 ],
         };
         let rule = mk_rule(filters);
@@ -86,7 +99,11 @@ mod tests {
         .set_payload(r#"{ "name":"hello_123" }"#)
         .to_http_request();
 
-        let status = super::apply_filters_regex_allow_only(&rule, &req, &Bytes::from_static(b"{\"name\":\"hello_123\"}"));
+        let status = super::apply_filters_regex_allow_only(
+            &rule,
+            &req,
+            &Bytes::from_static(b"{\"name\":\"hello_123\"}"),
+        );
         assert!(status.is_none(), "should be allowed (all conditions match)");
     }
 
@@ -94,15 +111,13 @@ mod tests {
     async fn acl_mismatch_denied() {
         let filters = AllowRegexCfg {
             default_allow: false,
-                allow: vec![
-                    RegexCondCfg::Method { pattern: r"(?i)^GET$".into() },
-                ],
+                allow: vec![RegexCondCfg::Method {
+                    pattern: r"(?i)^GET$".into(),
+                }],
         };
         let rule = mk_rule(filters);
 
-        let req = test::TestRequest::post()
-        .uri("/api/list")
-        .to_http_request();
+        let req = test::TestRequest::post().uri("/api/list").to_http_request();
 
         let status = super::apply_filters_regex_allow_only(&rule, &req, &[]);
         assert_eq!(status, Some(StatusCode::FORBIDDEN));
@@ -110,7 +125,10 @@ mod tests {
 
     #[actix_web::test]
     async fn acl_default_allow_false_and_no_rules_denied() {
-        let filters = AllowRegexCfg { default_allow: false, allow: vec![] };
+        let filters = AllowRegexCfg {
+            default_allow: false,
+                allow: vec![],
+        };
         let rule = mk_rule(filters);
         let req = test::TestRequest::get().uri("/api").to_http_request();
         let status = super::apply_filters_regex_allow_only(&rule, &req, &[]);
@@ -122,10 +140,20 @@ mod tests {
         let filters = AllowRegexCfg {
             default_allow: false,
                 allow: vec![
-                    RegexCondCfg::Method  { pattern: r"^POST$".into() },
-                    RegexCondCfg::Header  { name: r"(?i)^content-type$".into(), pattern: r"^application/x-www-form-urlencoded".into() },
-                    RegexCondCfg::Query   { name: r"(?i)^lang$".into(), pattern: r"^(en|fr)$".into() },
-                    RegexCondCfg::BodyRaw { pattern: r"(^|&)name=[a-z]{2,8}(&|$)".into() },
+                    RegexCondCfg::Method {
+                        pattern: r"^POST$".into(),
+                    },
+                    RegexCondCfg::Header {
+                        name: r"(?i)^content-type$".into(),
+                        pattern: r"^application/x-www-form-urlencoded".into(),
+                    },
+                    RegexCondCfg::Query {
+                        name: r"(?i)^lang$".into(),
+                        pattern: r"^(en|fr)$".into(),
+                    },
+                    RegexCondCfg::BodyRaw {
+                        pattern: r"(^|&)name=[a-z]{2,8}(&|$)".into(),
+                    },
                 ],
         };
         let rule = mk_rule(filters);
@@ -157,7 +185,9 @@ mod tests {
     async fn cond_matches_path_with_canonicalization() {
         let raw_path = "/api%2Fadmin";
         let canon = canonicalize_path_for_match(raw_path);
-        let cond = RegexCond::Path { re: Regex::new("^/api/admin$").unwrap() };
+        let cond = RegexCond::Path {
+            re: Regex::new("^/api/admin$").unwrap(),
+        };
 
         let ok = cond_matches_strict(
             &cond,
@@ -176,16 +206,28 @@ mod tests {
 
     #[test]
     async fn cond_matches_method_exact() {
-        let cond = RegexCond::Method { re: Regex::new("^POST$").unwrap() };
+        let cond = RegexCond::Method {
+            re: Regex::new("^POST$").unwrap(),
+        };
         assert!(cond_matches_strict(
-            &cond, &Method::POST, "/",
+            &cond,
+            &Method::POST,
+            "/",
             actix_web::http::header::HeaderMap::new(),
-                                    &std::collections::HashMap::new(), None, None, ""
+                                    &std::collections::HashMap::new(),
+                                    None,
+                                    None,
+                                    ""
         ));
         assert!(!cond_matches_strict(
-            &cond, &Method::GET, "/",
+            &cond,
+            &Method::GET,
+            "/",
             actix_web::http::header::HeaderMap::new(),
-                                     &std::collections::HashMap::new(), None, None, ""
+                                     &std::collections::HashMap::new(),
+                                     None,
+                                     None,
+                                     ""
         ));
     }
 
@@ -204,9 +246,14 @@ mod tests {
             re: Regex::new("^[a-z0-9_\\-]+$").unwrap(),
         };
         assert!(cond_matches_strict(
-            &cond_ok, &Method::GET, "/",
-            req.headers().clone(), &std::collections::HashMap::new(),
-                                    None, None, ""
+            &cond_ok,
+            &Method::GET,
+            "/",
+            req.headers().clone(),
+                                    &std::collections::HashMap::new(),
+                                    None,
+                                    None,
+                                    ""
         ));
 
         let req_bad = TestRequest::default()
@@ -215,9 +262,14 @@ mod tests {
         .to_http_request();
 
         assert!(!cond_matches_strict(
-            &cond_ok, &Method::GET, "/",
-            req_bad.headers().clone(), &std::collections::HashMap::new(),
-                                     None, None, ""
+            &cond_ok,
+            &Method::GET,
+            "/",
+            req_bad.headers().clone(),
+                                     &std::collections::HashMap::new(),
+                                     None,
+                                     None,
+                                     ""
         ));
 
         let cond_name_missing = RegexCond::Header {
@@ -225,9 +277,14 @@ mod tests {
             re: Regex::new(".*").unwrap(),
         };
         assert!(!cond_matches_strict(
-            &cond_name_missing, &Method::GET, "/",
-            req.headers().clone(), &std::collections::HashMap::new(),
-                                     None, None, ""
+            &cond_name_missing,
+            &Method::GET,
+            "/",
+            req.headers().clone(),
+                                     &std::collections::HashMap::new(),
+                                     None,
+                                     None,
+                                     ""
         ));
     }
 
@@ -242,8 +299,14 @@ mod tests {
             re: Regex::new("^[ab]+$").unwrap(),
         };
         assert!(cond_matches_strict(
-            &cond_ok, &Method::GET, "/",
-            actix_web::http::header::HeaderMap::new(), &q, None, None, ""
+            &cond_ok,
+            &Method::GET,
+            "/",
+            actix_web::http::header::HeaderMap::new(),
+                                    &q,
+                                    None,
+                                    None,
+                                    ""
         ));
 
         let cond_bad = RegexCond::Query {
@@ -251,8 +314,14 @@ mod tests {
             re: Regex::new("^a$").unwrap(),
         };
         assert!(!cond_matches_strict(
-            &cond_bad, &Method::GET, "/",
-            actix_web::http::header::HeaderMap::new(), &q, None, None, ""
+            &cond_bad,
+            &Method::GET,
+            "/",
+            actix_web::http::header::HeaderMap::new(),
+                                     &q,
+                                     None,
+                                     None,
+                                     ""
         ));
 
         let cond_missing = RegexCond::Query {
@@ -260,8 +329,14 @@ mod tests {
             re: Regex::new(".*").unwrap(),
         };
         assert!(!cond_matches_strict(
-            &cond_missing, &Method::GET, "/",
-            actix_web::http::header::HeaderMap::new(), &q, None, None, ""
+            &cond_missing,
+            &Method::GET,
+            "/",
+            actix_web::http::header::HeaderMap::new(),
+                                     &q,
+                                     None,
+                                     None,
+                                     ""
         ));
     }
 
@@ -269,16 +344,28 @@ mod tests {
 
     #[test]
     async fn cond_matches_body_raw_utf8() {
-        let cond = RegexCond::BodyRaw { re: Regex::new("^hello[ ]+world$").unwrap() };
+        let cond = RegexCond::BodyRaw {
+            re: Regex::new("^hello[ ]+world$").unwrap(),
+        };
         assert!(cond_matches_strict(
-            &cond, &Method::POST, "/",
-            actix_web::http::header::HeaderMap::new(), &std::collections::HashMap::new(),
-                                    Some("hello world"), None, "text/plain"
+            &cond,
+            &Method::POST,
+            "/",
+            actix_web::http::header::HeaderMap::new(),
+                                    &std::collections::HashMap::new(),
+                                    Some("hello world"),
+                                    None,
+                                    "text/plain"
         ));
         assert!(!cond_matches_strict(
-            &cond, &Method::POST, "/",
-            actix_web::http::header::HeaderMap::new(), &std::collections::HashMap::new(),
-                                     Some("hello  WORLD"), None, "text/plain"
+            &cond,
+            &Method::POST,
+            "/",
+            actix_web::http::header::HeaderMap::new(),
+                                     &std::collections::HashMap::new(),
+                                     Some("hello  WORLD"),
+                                     None,
+                                     "text/plain"
         ));
     }
 
@@ -291,29 +378,56 @@ mod tests {
         let body_utf8 = std::str::from_utf8(&body_bytes).ok();
         let body_json: Option<JsonValue> = serde_json::from_slice(&body_bytes).ok();
 
-        let c_role = RegexCond::BodyJson { key: "role".into(), re: Regex::new("^admin$").unwrap() };
-        let c_num  = RegexCond::BodyJson { key: "n".into(),    re: Regex::new("^42$").unwrap() };
-        let c_bool = RegexCond::BodyJson { key: "active".into(), re: Regex::new("^true$").unwrap() };
+        let c_role = RegexCond::BodyJson {
+            key: "role".into(),
+            re: Regex::new("^admin$").unwrap(),
+        };
+        let c_num = RegexCond::BodyJson {
+            key: "n".into(),
+            re: Regex::new("^42$").unwrap(),
+        };
+        let c_bool = RegexCond::BodyJson {
+            key: "active".into(),
+            re: Regex::new("^true$").unwrap(),
+        };
 
         for cond in [&c_role, &c_num, &c_bool] {
             assert!(cond_matches_strict(
-                cond, &Method::POST, "/",
-                actix_web::http::header::HeaderMap::new(), &std::collections::HashMap::new(),
-                                        body_utf8, body_json.as_ref(), "application/json"
+                cond,
+                &Method::POST,
+                "/",
+                actix_web::http::header::HeaderMap::new(),
+                                        &std::collections::HashMap::new(),
+                                        body_utf8,
+                                        body_json.as_ref(),
+                                        "application/json"
             ));
         }
 
         assert!(!cond_matches_strict(
-            &c_role, &Method::POST, "/",
-            actix_web::http::header::HeaderMap::new(), &std::collections::HashMap::new(),
-                                     body_utf8, body_json.as_ref(), "text/plain"
+            &c_role,
+            &Method::POST,
+            "/",
+            actix_web::http::header::HeaderMap::new(),
+                                     &std::collections::HashMap::new(),
+                                     body_utf8,
+                                     body_json.as_ref(),
+                                     "text/plain"
         ));
 
-        let c_missing = RegexCond::BodyJson { key: "missing".into(), re: Regex::new(".*").unwrap() };
+        let c_missing = RegexCond::BodyJson {
+            key: "missing".into(),
+            re: Regex::new(".*").unwrap(),
+        };
         assert!(!cond_matches_strict(
-            &c_missing, &Method::POST, "/",
-            actix_web::http::header::HeaderMap::new(), &std::collections::HashMap::new(),
-                                     body_utf8, body_json.as_ref(), "application/json"
+            &c_missing,
+            &Method::POST,
+            "/",
+            actix_web::http::header::HeaderMap::new(),
+                                     &std::collections::HashMap::new(),
+                                     body_utf8,
+                                     body_json.as_ref(),
+                                     "application/json"
         ));
     }
 
@@ -354,7 +468,7 @@ mod tests {
 #[cfg(test)]
 mod more_unit_tests {
     use super::*;
-    use proxyauth::config::config::{AllowRegexCfg, RouteRule, BackendInput};
+    use proxyauth::config::config::{AllowRegexCfg, BackendInput, RouteRule};
     use std::collections::HashMap;
 
     fn mk_rule(filters: AllowRegexCfg) -> RouteRule {
@@ -363,7 +477,7 @@ mod more_unit_tests {
             prefix: "/api".into(),
             target: "http://upstream".into(),
             username: vec![],
-            secure: false,
+            required_login: false,
             proxy: false,
             proxy_config: String::new(),
             cert: HashMap::new(),
@@ -392,14 +506,17 @@ mod more_unit_tests {
 
     #[test]
     fn check_date_token_accepts_future_epoch() {
-        let exp_epoch = (Utc::now() + chrono::Duration::minutes(5)).timestamp().to_string();
+        let exp_epoch = (Utc::now() + chrono::Duration::minutes(5))
+        .timestamp()
+        .to_string();
         let res = check_date_token(&exp_epoch, "bob", "127.0.0.1", "UTC");
         assert!(res.is_ok());
     }
 
     #[test]
     fn check_date_token_rejects_expired() {
-        let past = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let past = (Utc::now() - chrono::Duration::minutes(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let res = check_date_token(&past, "carol", "127.0.0.1", "UTC");
         assert!(res.is_err());
     }
@@ -438,9 +555,14 @@ mod more_unit_tests {
 
     #[actix_web::test]
     async fn acl_default_allow_true_and_no_rules_allows() {
-        let filters = AllowRegexCfg { default_allow: true, allow: vec![] };
+        let filters = AllowRegexCfg {
+            default_allow: true,
+                allow: vec![],
+        };
         let rule = mk_rule(filters);
-        let req = actix_web::test::TestRequest::get().uri("/api/anything").to_http_request();
+        let req = actix_web::test::TestRequest::get()
+        .uri("/api/anything")
+        .to_http_request();
         let status = super::apply_filters_regex_allow_only(&rule, &req, &[]);
         assert!(status.is_none());
     }
@@ -457,8 +579,8 @@ mod more_unit_tests {
             stats: false,
             ..Default::default()
         };
-        let err = extract_token_user("this-is-not-encrypted", &cfg, "127.0.0.1".into())
-        .unwrap_err();
+        let err =
+        extract_token_user("this-is-not-encrypted", &cfg, "127.0.0.1".into()).unwrap_err();
         assert_eq!(err, "Invalid token format");
     }
 }
@@ -470,11 +592,11 @@ pub(super) fn validate_token_from_decrypted(
     config: &proxyauth::AppConfig,
     ip: &str,
 ) -> Result<(String, String, u64), String> {
-    use tracing::{error, warn};
     use proxyauth::revoke::load::is_token_revoked;
     use proxyauth::token::crypto::calcul_factorhash;
-    use proxyauth::token::security::generate_token;
     use proxyauth::token::security::check_date_token;
+    use proxyauth::token::security::generate_token;
+    use tracing::{error, warn};
 
     let data: [&str; 4] = decrypt_token
     .splitn(4, '|')
@@ -517,17 +639,23 @@ pub(super) fn validate_token_from_decrypted(
         }
 
         if config.stats {
-            let count = data_app
+            let count =
+            data_app
             .counter
             .record_and_get(&user.username, data[3], &time_expire.to_string());
             tracing::info!(
                 "[{}] user {} is logged token expire in {} seconds [token used: {}]",
-                ip, user.username, time_expire, count
+                ip,
+                user.username,
+                time_expire,
+                count
             );
         } else {
             tracing::info!(
                 "[{}] user {} is logged token expire in {} seconds",
-                ip, user.username, time_expire
+                ip,
+                user.username,
+                time_expire
             );
         }
 
@@ -539,24 +667,25 @@ mod validate_token_path_tests {
     use super::*;
     use actix_web::web;
     use chrono::Utc;
-    use std::sync::Arc;
     use dashmap::DashMap;
+    use std::sync::Arc;
 
     // hyper 1.x
+    use http_body_util::combinators::BoxBody;
+    use hyper::body::Bytes;
+    use hyper_http_proxy::{Intercept, Proxy, ProxyConnector};
+    use hyper_rustls::HttpsConnectorBuilder;
     use hyper_util::client::legacy::Client;
     use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_util::rt::TokioExecutor;
-    use hyper_rustls::HttpsConnectorBuilder;
-    use http_body_util::combinators::BoxBody;
     use std::convert::Infallible;
-    use hyper::body::Bytes;
-    use hyper_http_proxy::{Proxy, ProxyConnector, Intercept};
 
     use proxyauth::config::config::RouteConfig;
     use proxyauth::stats::tokencount::CounterToken;
     use proxyauth::token::crypto::calcul_factorhash;
 
-    fn build_https_client_for_tests() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>> {
+    fn build_https_client_for_tests()
+    -> Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
         .unwrap()
@@ -570,7 +699,10 @@ mod validate_token_path_tests {
     // Pour les tests qui n'exercent pas réellement le proxy, on réutilise le client https.
     fn build_proxy_client_for_tests(
         _proxy_addr: &str,
-    ) -> Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, BoxBody<Bytes, Infallible>> {
+    ) -> Client<
+    ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>,
+    BoxBody<Bytes, Infallible>,
+    > {
         let https = HttpsConnectorBuilder::new()
         .with_native_roots()
         .unwrap()
@@ -598,13 +730,14 @@ mod validate_token_path_tests {
 
         web::Data::new(AppState {
             counter,
-            client_normal:     build_https_client_for_tests(),
-                       client_with_cert:  build_https_client_for_tests(),
+            client_normal: build_https_client_for_tests(),
+                       client_with_cert: build_https_client_for_tests(),
                        client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
                        revoked_tokens: revoked.into(),
                        config: Arc::new(cfg),
                        routes: Arc::new(routes),
                        stats,
+                       otp_overrides: DashMap::<String, Option<String>>::new().into(),
         })
     }
 
@@ -639,9 +772,14 @@ mod validate_token_path_tests {
         blake3::hash(token_hash.as_bytes()).to_hex().to_string()
     }
 
-    fn compute_transport_hash(username: &str, cfg: &AppConfig, time_str: &str, token_id: &str) -> String {
+    fn compute_transport_hash(
+        username: &str,
+        cfg: &AppConfig,
+        time_str: &str,
+        token_id: &str,
+    ) -> String {
         let token_generated = generate_token(username, cfg, time_str, token_id);
-        let token_hash      = calcul_factorhash(token_generated);
+        let token_hash = calcul_factorhash(token_generated);
         blake3::hash(token_hash.as_bytes()).to_hex().to_string()
     }
 
@@ -784,7 +922,9 @@ mod validate_token_path_tests {
         let cfg = mk_config(3600, false);
         let st = mk_state();
 
-        let expires = (Utc::now() + chrono::Duration::minutes(5)).timestamp().to_string();
+        let expires = (Utc::now() + chrono::Duration::minutes(5))
+        .timestamp()
+        .to_string();
         let h = make_valid_hash("alice", &cfg, &expires, "tid-unix");
         let dec = format!("{}|{}|0|tid-unix", h, expires);
 
@@ -836,11 +976,12 @@ mod validate_token_path_tests {
             config: Arc::new(AppConfig::default()),
                                 routes: Arc::new(RouteConfig { routes: vec![] }),
                                 counter: Arc::new(CounterToken::new()),
-                                client_normal:     build_https_client_for_tests(),
-                                client_with_cert:  build_https_client_for_tests(),
+                                client_normal: build_https_client_for_tests(),
+                                client_with_cert: build_https_client_for_tests(),
                                 client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
                                 revoked_tokens: DashMap::<String, u64>::new().into(),
                                 stats,
+                                otp_overrides: DashMap::<String, Option<String>>::new().into(),
         });
 
         let future = (Utc::now() + chrono::Duration::minutes(5))
@@ -852,7 +993,8 @@ mod validate_token_path_tests {
         h_bad.push(if last == 'a' { 'b' } else { 'a' });
 
         let dec_bad = format!("{}|{}|0|tid-tamper", h_bad, future);
-        let err = super::validate_token_from_decrypted(&dec_bad, &st, &cfg, "127.0.0.1").unwrap_err();
+        let err =
+        super::validate_token_from_decrypted(&dec_bad, &st, &cfg, "127.0.0.1").unwrap_err();
         assert_eq!(err, "no valid token");
     }
 

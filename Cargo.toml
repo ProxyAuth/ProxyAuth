@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.0.0-beta4"
+version = "1.0.0-beta5"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -52,7 +52,7 @@ ctor = "0.2"
 actix-web = { version = "4.12.1", features = ["rustls-0_23"] }
 mimalloc = { version = "0.1", default-features = false }
 actix-service = "2"
-reqwest = { version = "0.12", features = ["rustls-tls", "json", "blocking"] }
+reqwest = { version = "0.13", features = ["rustls", "json", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.33"
 serde_json = "1.0.140"
@@ -114,12 +114,13 @@ regex = "1"
 serial_test = "3" # it's for coverage code
 notify = "6"
 arc-swap = "1.8.0"
-
+diesel = { version = "2.1", features = ["postgres", "mysql"] }
 http = "1"
 hyper-tls = "0.5"
 hmac = "0.13.0-rc.2"
 cookie = "0.18"
 lettre = { version = "0.11.22", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
+rpassword = "7.3"
 
 [dependencies.rustls-webpki]
 version = ">=0.103.13, <0.104.0-alpha.1"
@@ -127,11 +128,13 @@ version = ">=0.103.13, <0.104.0-alpha.1"
 [dependencies.quinn-proto]
 version = ">=0.11.15"
 
+[dependencies.h2]
+version = ">=0.4.16, <0.5.0"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = true
 debug = false
 incremental = false

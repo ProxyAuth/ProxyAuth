@@ -1,19 +1,19 @@
-use std::path::{Path, PathBuf};
-use std::fs::File;
-use std::io::{BufReader, Read};
-use std::collections::HashMap;
-use std::sync::Arc;
-use sequoia_openpgp as openpgp;
+use crate::config::config::load_config;
 use openpgp::{
     Cert, KeyID, Result,
+    crypto::{KeyPair, Password, SessionKey},
+    packet::{PKESK, SKESK},
     parse::Parse,
     parse::stream::{DecryptionHelper, DecryptorBuilder, MessageStructure, VerificationHelper},
-    packet::{PKESK, SKESK},
-    crypto::{KeyPair, Password, SessionKey},
     policy::{Policy, StandardPolicy},
     types::SymmetricAlgorithm,
 };
-use crate::config::config::load_config;
+use sequoia_openpgp as openpgp;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Default location of config.json, used to load the passphrase that
 /// protects the secret key material in key.asc.
@@ -59,8 +59,7 @@ pub fn decrypt_keystore(import_dir_opt: Option<&Path>) -> Result<Option<String>>
     let policy = &StandardPolicy::new();
     let helper = Helper::new(policy, vec![cert.clone()], password)?;
 
-    let mut decryptor = DecryptorBuilder::from_bytes(&data)?
-    .with_policy(policy, None, helper)?;
+    let mut decryptor = DecryptorBuilder::from_bytes(&data)?.with_policy(policy, None, helper)?;
 
     let mut output = Vec::new();
     std::io::copy(&mut decryptor, &mut output)?;
@@ -95,26 +94,26 @@ impl<'a> Helper<'a> {
                 .with_policy(policy, None)
                 .supported()
                 .for_transport_encryption()
-                {
-                    // Cert only ever exposes PublicParts keys, so we
-                    // explicitly opt in to treating this as a secret key.
-                    let secret_key = match ka.key().clone().parts_into_secret() {
-                        Ok(k) => k,
-                        Err(_) => continue, // no secret material for this key, skip it
-                    };
+            {
+                // Cert only ever exposes PublicParts keys, so we
+                // explicitly opt in to treating this as a secret key.
+                let secret_key = match ka.key().clone().parts_into_secret() {
+                    Ok(k) => k,
+                    Err(_) => continue, // no secret material for this key, skip it
+                };
 
-                    let pair = if secret_key.has_unencrypted_secret() {
-                        secret_key.into_keypair()
-                    } else {
-                        secret_key
+                let pair = if secret_key.has_unencrypted_secret() {
+                    secret_key.into_keypair()
+                } else {
+                    secret_key
                         .decrypt_secret(&password)
                         .and_then(|k| k.into_keypair())
-                    };
+                };
 
-                    if let Ok(pair) = pair {
-                        keys.insert(ka.key().keyid(), (cert.clone(), pair));
-                    }
+                if let Ok(pair) = pair {
+                    keys.insert(ka.key().keyid(), (cert.clone(), pair));
                 }
+            }
         }
         Ok(Self { keys, policy })
     }
@@ -160,9 +159,9 @@ impl<'a> VerificationHelper for Helper<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, io::Write};
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::{fs, io::Write};
 
     // Serializes tests that mutate PROXYAUTH_CONFIG_PATH, since env
     // vars are process-global and cargo test runs tests concurrently.
@@ -188,8 +187,8 @@ mod tests {
         "users": [],
         "log": {}
     }"#;
-    fs::write(&config_path, config_json).expect("write test config");
-    config_path
+        fs::write(&config_path, config_json).expect("write test config");
+        config_path
     }
 
     // --- key-dependent cases -------------------------------
@@ -199,8 +198,7 @@ mod tests {
         let mut dir = std::env::temp_dir();
         dir.push(format!("proxyauth-import-missing-{}", std::process::id()));
 
-        let got = decrypt_keystore(Some(&dir))
-        .expect("should not error");
+        let got = decrypt_keystore(Some(&dir)).expect("should not error");
         assert!(got.is_none());
     }
 
@@ -208,14 +206,12 @@ mod tests {
     fn returns_none_if_one_of_files_is_missing() {
         let d1 = mk_tmpdir("only-key");
         fs::write(d1.join("key.asc"), b"not a real key").unwrap();
-        let got1 = decrypt_keystore(Some(&d1))
-        .expect("should not error");
+        let got1 = decrypt_keystore(Some(&d1)).expect("should not error");
         assert!(got1.is_none());
 
         let d2 = mk_tmpdir("only-data");
         fs::write(d2.join("data.pgp"), b"not pgp data").unwrap();
-        let got2 = decrypt_keystore(Some(&d2))
-        .expect("should not error");
+        let got2 = decrypt_keystore(Some(&d2)).expect("should not error");
         assert!(got2.is_none());
     }
 
@@ -227,14 +223,18 @@ mod tests {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap();
         let cfg_dir = mk_tmpdir("cfg-for-invalid");
         let config_path = mk_test_config(&cfg_dir);
-        unsafe { std::env::set_var("PROXYAUTH_CONFIG_PATH", config_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("PROXYAUTH_CONFIG_PATH", config_path.to_str().unwrap());
+        }
 
         let d = mk_tmpdir("invalid-both");
         fs::write(d.join("key.asc"), b"--- invalid openpgp key ---").unwrap();
         fs::write(d.join("data.pgp"), b"--- invalid pgp ciphertext ---").unwrap();
 
         let res = decrypt_keystore(Some(&d));
-        unsafe { std::env::remove_var("PROXYAUTH_CONFIG_PATH"); }
+        unsafe {
+            std::env::remove_var("PROXYAUTH_CONFIG_PATH");
+        }
         assert!(res.is_err(), "Expected error when both files are invalid");
     }
 
@@ -257,7 +257,8 @@ mod tests {
     fn helper_new_with_empty_certs_yields_empty_keymap() {
         let policy = StandardPolicy::new();
         let password = Password::from("unused-password");
-        let h = Helper::new(&policy, vec![], password).expect("helper construction should not fail");
+        let h =
+            Helper::new(&policy, vec![], password).expect("helper construction should not fail");
 
         let mut h2 = h;
         let pkesks: &[PKESK] = &[];
@@ -268,18 +269,21 @@ mod tests {
             algo.is_some()
         };
         let out = DecryptionHelper::decrypt(&mut h2, pkesks, skesks, None, &mut dec)
-        .expect("decrypt with empty pkesks should not fail");
+            .expect("decrypt with empty pkesks should not fail");
         assert!(out.is_none(), "no recipient should be found");
-        assert!(!called, "decrypt closure must not be called with empty pkesks");
+        assert!(
+            !called,
+            "decrypt closure must not be called with empty pkesks"
+        );
     }
 
     #[test]
     fn verification_helper_get_certs_returns_empty() {
         let policy = StandardPolicy::new();
         let password = Password::from("unused-password");
-        let mut h = Helper::new(&policy, vec![], password).expect("helper construction should not fail");
-        let got = VerificationHelper::get_certs(&mut h, &[])
-        .expect("get_certs should not fail");
+        let mut h =
+            Helper::new(&policy, vec![], password).expect("helper construction should not fail");
+        let got = VerificationHelper::get_certs(&mut h, &[]).expect("get_certs should not fail");
         assert!(got.is_empty());
     }
 
@@ -290,12 +294,15 @@ mod tests {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap();
         let cfg_dir = mk_tmpdir("cfg-for-parse-attempt");
         let config_path = mk_test_config(&cfg_dir);
-        unsafe { std::env::set_var("PROXYAUTH_CONFIG_PATH", config_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("PROXYAUTH_CONFIG_PATH", config_path.to_str().unwrap());
+        }
 
         let d = mk_tmpdir("exists-both-but-invalid");
         {
             let mut f = File::create(d.join("key.asc")).unwrap();
-            f.write_all(b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n...").unwrap();
+            f.write_all(b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n...")
+                .unwrap();
         }
         {
             let mut f = File::create(d.join("data.pgp")).unwrap();
@@ -303,7 +310,9 @@ mod tests {
         }
 
         let res = decrypt_keystore(Some(&d));
-        unsafe { std::env::remove_var("PROXYAUTH_CONFIG_PATH"); }
+        unsafe {
+            std::env::remove_var("PROXYAUTH_CONFIG_PATH");
+        }
         assert!(res.is_err(), "Parsing should fail with bogus contents");
     }
 }

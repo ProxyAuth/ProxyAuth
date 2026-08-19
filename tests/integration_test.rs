@@ -3,9 +3,9 @@ use dashmap::DashMap;
 use proxyauth::network::shared_client::{
     ClientOptions, build_hyper_client_cert, build_hyper_client_normal, build_hyper_client_proxy,
 };
+use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 use proxyauth::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use proxyauth::{AppConfig, AppState, CounterToken, RouteConfig, auth as auth_handler};
-use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::fs;
@@ -18,8 +18,8 @@ static CRYPTO: OnceLock<()> = OnceLock::new();
 fn setup_crypto() {
     CRYPTO.get_or_init(|| {
         rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install crypto provider");
+            .install_default()
+            .expect("Failed to install crypto provider");
     });
 }
 
@@ -61,9 +61,9 @@ macro_rules! build_app {
                 ClientOptions {
                     use_proxy: true,
                     proxy_addr: Some("http://127.0.0.1:8888".to_string()),
-                                                             use_cert: false,
-                                                             cert_path: None,
-                                                             key_path: None,
+                    use_cert: false,
+                    cert_path: None,
+                    key_path: None,
                 },
                 &config,
             );
@@ -82,8 +82,8 @@ macro_rules! build_app {
 
             start_revoked_token_ttl(
                 revoked_tokens.clone(),
-                                    std::time::Duration::from_secs(15),
-                                    config.redis.clone(),
+                std::time::Duration::from_secs(15),
+                config.redis.clone(),
             )
             .await;
 
@@ -96,13 +96,14 @@ macro_rules! build_app {
                 client_with_proxy,
                 revoked_tokens,
                 stats,
+                otp_overrides: Arc::new(DashMap::new()),
             });
 
             test::init_service(
                 App::new()
-                .app_data(state)
-                .service(web::resource("/auth").route(web::post().to(auth_handler)))
-                .default_service(web::to(proxy_handler)),
+                    .app_data(state)
+                    .service(web::resource("/auth").route(web::post().to(auth_handler)))
+                    .default_service(web::to(proxy_handler)),
             )
             .await
         }
@@ -113,21 +114,23 @@ macro_rules! build_app {
 #[actix_web::test]
 async fn test_auth_route() {
     std::fs::create_dir_all("/tmp/proxyauth-test-db").unwrap();
-    unsafe { std::env::set_var("LMDB_PATH", "/tmp/proxyauth-test-db"); }
+    unsafe {
+        std::env::set_var("LMDB_PATH", "/tmp/proxyauth-test-db");
+    }
 
     let app = build_app!().await;
 
     let req = test::TestRequest::post()
-    .uri("/auth")
-    .set_json(&json!({
-        "username": "admin",
-        "password": "admin123"
-    }))
-    .peer_addr(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                               8080,
-    ))
-    .to_request();
+        .uri("/auth")
+        .set_json(&json!({
+            "username": "admin",
+            "password": "admin123"
+        }))
+        .peer_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            8080,
+        ))
+        .to_request();
 
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());

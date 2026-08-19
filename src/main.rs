@@ -16,34 +16,36 @@ mod adm;
 mod build;
 mod cli;
 mod config;
+mod databases;
 mod keystore;
 mod logs;
 mod network;
 mod revoke;
+mod smtp;
 mod start_actix;
 mod stats;
 mod tls;
 mod token;
-mod smtp;
 
-use crate::adm::registry_otp::{get_otpauth_uri, get_otpauth_uri_option};
+use crate::adm::registry_otp::{get_otpauth_uri, get_otpauth_uri_option, reset_otp_route};
 use crate::adm::revoke::revoke_route;
-use crate::adm::stats::{get_proxy_stats, get_proxy_sessions};
+use crate::adm::stats::{get_proxy_sessions, get_proxy_stats};
 use crate::build::build_info::update_build_info;
 use crate::cli::prompt::prompt;
 use crate::keystore::import::decrypt_keystore;
-use crate::network::cors::CorsMiddleware;
-use crate::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
-use crate::network::proxy::init_routes;
 use crate::network::config::init_loadbalancer;
+use crate::network::cors::CorsMiddleware;
+use crate::network::proxy::init_routes;
 use crate::network::stats::{RequestStats, spawn_stats_ticker};
-use crate::smtp::template::ensure_reset_template_exists;
+use crate::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use crate::smtp::smtp::SmtpClient;
+use crate::smtp::template::ensure_reset_template_exists;
 use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{App, http::Method, web};
 use chrono::Local;
 use config::config::{AppConfig, AppState, RouteConfig, load_config};
-use config::def_config::{create_config, ensure_running_as_proxyauth, switch_to_user};
+use config::def_config;
+use config::def_config::{ensure_running_as_proxyauth, switch_to_user};
 use dashmap::DashMap;
 use futures_util::future::join_all;
 use logs::{ChannelLogWriter, get_logs, log_collector};
@@ -54,7 +56,6 @@ use network::shared_client::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 use start_actix::mode_actix_web;
-use stats::stats::stats as metric_stats;
 pub use stats::tokencount::CounterToken;
 use std::net::TcpListener;
 use std::{fs, process, sync::Arc, time::Duration};
@@ -75,7 +76,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ID: &str = env!("id");
-
 
 struct LocalTime;
 
@@ -150,14 +150,16 @@ async fn wait_for_port(addr: &str, max_retries: u32, delay: Duration) {
     process::exit(1);
 }
 
-
 macro_rules! build_app {
     ($state:expr) => {{
         let state = $state.clone();
         App::new()
         .app_data(state.clone())
+        .app_data(web::PayloadConfig::new(state.config.max_body_size))
         .wrap(RateLimitLogger)
-        .wrap(CorsMiddleware { config: state.clone() })
+        .wrap(CorsMiddleware {
+            config: state.clone(),
+        })
         .service(
             web::resource("/auth")
             .route(web::post().to(auth))
@@ -167,6 +169,7 @@ macro_rules! build_app {
         .service(web::resource("/adm/stats/sessions").route(web::get().to(get_proxy_sessions)))
         .service(web::resource("/adm/logs").route(web::get().to(get_logs)))
         .service(web::resource("/adm/revoke").route(web::post().to(revoke_route)))
+        .service(web::resource("/adm/auth/totp/reset").route(web::post().to(reset_otp_route)))
         .service(
             web::resource("/logout")
             .route(web::get().to(logout_session))
@@ -182,14 +185,13 @@ macro_rules! build_app {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
     rustls::crypto::ring::default_provider()
     .install_default()
     .expect("Failed to install rustls crypto provider");
 
     if let Err(e) = prompt().await {
-      eprintln!("Error: {}", e);
-      std::process::exit(1);
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 
     // launch as user proxyauth
@@ -198,29 +200,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // detect if program is running proxyauth user
     ensure_running_as_proxyauth();
 
-    // download default config from repository
-    create_config(
-        &format!("https://proxyauth.app/config/{}/config.json", VERSION),
-                  "/etc/proxyauth/config/config.json",
+    // create default config files on first run (never overwrites an existing file)
+    def_config::create_default_file(
+        "/etc/proxyauth/config/config.json",
+        def_config::DEFAULT_CONFIG_JSON,
     )
-    .await
-    .expect("No possible download config/config.json");
+    .expect("Could not create default config/config.json");
 
-    create_config(
-        &format!("https://proxyauth.app/config/{}/routes.yml", VERSION),
-                  "/etc/proxyauth/config/routes.yml",
+    def_config::create_default_file(
+        "/etc/proxyauth/config/routes.yml",
+        def_config::DEFAULT_ROUTES_YML,
     )
-    .await
-    .expect("No possible download config/routes.yml");
+    .expect("Could not create default config/routes.yml");
 
     let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
 
+    // Periodically re-scan `databases` (if configured) so users added or
+    // edited directly in the database eventually take effect without a
+    // restart. `refresh_interval_secs: 0` disables this (DB is only read
+    // once, at startup, inside load_config).
+    if let Some(db_cfg) = &config.databases {
+        if db_cfg.refresh_interval_secs > 0 {
+            let refresh_config = Arc::clone(&config);
+            let interval_secs = db_cfg.refresh_interval_secs;
+            tokio::spawn(async move {
+                let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                // First tick fires immediately; skip it since load_config
+                // already did an initial load.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    refresh_config.refresh_db_users();
+                }
+            });
+        }
+    }
+
     init_loadbalancer(&config);
 
-    let mut routes: RouteConfig = serde_yaml::from_str(
-        &fs::read_to_string("/etc/proxyauth/config/routes.yml").expect("cannot read routes"),
-    )
-    .expect("Failed to parse routes.yml");
+    let routes_str =
+    fs::read_to_string("/etc/proxyauth/config/routes.yml").expect("cannot read routes");
+
+    if let Err(e) = config::config::check_deprecated_secure_key(&routes_str) {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+
+    let mut routes: RouteConfig =
+    serde_yaml::from_str(&routes_str).expect("Failed to parse routes.yml");
 
     let counter_token = Arc::new(CounterToken::new());
 
@@ -256,19 +284,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     start_revoked_token_ttl(
         revoked_tokens.clone(),
-        std::time::Duration::from_secs(15),
-        config.redis.clone(),
+                            std::time::Duration::from_secs(15),
+                            config.redis.clone(),
     )
     .await;
 
     let client_normal = build_hyper_client_normal(&config);
     let client_with_cert = build_hyper_client_cert(
         ClientOptions {
-        use_proxy: false,
-        proxy_addr: None,
-        use_cert: false,
-        cert_path: None,
-        key_path: None,
+            use_proxy: false,
+            proxy_addr: None,
+            use_cert: false,
+            cert_path: None,
+            key_path: None,
         },
         &config,
     );
@@ -277,9 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ClientOptions {
             use_proxy: true,
             proxy_addr: Some("http://127.0.0.1:8888".to_string()),
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
+                                                     use_cert: false,
+                                                     cert_path: None,
+                                                     key_path: None,
         },
         &config,
     );
@@ -288,13 +316,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = web::Data::new(AppState {
         config: Arc::clone(&config),
-        routes: Arc::new(routes),
-        counter: counter_token,
-        client_normal,
-        client_with_cert,
-        client_with_proxy,
-        revoked_tokens,
-        stats,
+                               routes: Arc::new(routes),
+                               counter: counter_token,
+                               client_normal,
+                               client_with_cert,
+                               client_with_proxy,
+                               revoked_tokens,
+                               stats,
+                               otp_overrides: Arc::new(DashMap::new()),
     });
 
     init_derived_key(&config.secret);
@@ -467,8 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 bind_server(
                     move || {
-                        build_app!(state_cloned)
-                        .default_service(
+                        build_app!(state_cloned).default_service(
                             web::to(global_proxy).wrap(Governor::new(&governor_proxy_conf)),
                         )
                     },
@@ -498,6 +526,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .wrap(Governor::new(&governor_auth_conf)),
                             )
                             .route(web::method(Method::OPTIONS).to(auth_options)),
+                        )
+                        .service(
+                            web::resource("/adm/auth/totp/get")
+                            .route(
+                                web::post()
+                                .to(get_otpauth_uri)
+                                .wrap(Governor::new(&governor_auth_conf)),
+                            )
+                            .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
                         )
                         .default_service(web::to(global_proxy))
                     },
@@ -537,6 +574,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .route(web::method(Method::OPTIONS).to(auth_options)),
                         )
+                        .service(
+                            web::resource("/adm/auth/totp/get")
+                            .route(
+                                web::post()
+                                .to(get_otpauth_uri)
+                                .wrap(Governor::new(&governor_auth_conf)),
+                            )
+                            .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
+                        )
                         .default_service(
                             web::to(global_proxy).wrap(Governor::new(&governor_proxy_conf)),
                         )
@@ -547,11 +593,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ => bind_server(
-                move || {
-                    build_app!(state_cloned).default_service(web::to(global_proxy))
-                },
-                listener,
-                &config,
+                move || build_app!(state_cloned).default_service(web::to(global_proxy)),
+                             listener,
+                             &config,
             )?,
         };
 
@@ -642,5 +686,3 @@ mod tests {
         wait_for_port("127.0.0.1:0", 3, Duration::from_millis(100)).await;
     }
 }
-
-

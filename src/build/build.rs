@@ -1,3 +1,4 @@
+use blake3;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -7,13 +8,12 @@ use std::io::Write;
 use std::path::Path;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
-use blake3;
 
 pub fn identity(seed: u64) -> String {
     let timestamp = SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .expect("Time went backwards")
-    .as_nanos();
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_nanos();
 
     let mut input = Vec::with_capacity(24);
     input.extend_from_slice(&seed.to_be_bytes());
@@ -28,9 +28,9 @@ pub fn identity(seed: u64) -> String {
     id[0] = (id[0] & 0b1111_1100) | 0b0000_0010;
 
     id.iter()
-    .map(|b| format!("{:02X}", b))
-    .collect::<Vec<_>>()
-    .join(":")
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn main() {
@@ -55,14 +55,16 @@ fn main() {
         .to_string();
 
     let random_epoch: i64 = rng.gen_range(0..999_999_999_999);
-    let identity = identity(rng.gen_range(1..999_999_999));
+    let identity_str = identity(rng.gen_range(1..999_999_999_999));
+    let hk = identity(rng.gen_range(1..999_999_999_999));
 
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);
     println!("cargo:rustc-env=BUILD_RAND={}", build_rand);
     println!("cargo:rustc-env=BUILD_SEED={}", build_seed);
     println!("cargo:rustc-env=BUILD_SEED2={}", build_seed2);
     println!("cargo:rustc-env=BUILD_EPOCH_DATE={}", random_epoch);
-    println!("cargo:rustc-env=id={}", identity);
+    println!("cargo:rustc-env=BUILD_HK={}", hk);
+    println!("cargo:rustc-env=id={}", identity_str);
 
     // SHUFFLE BUILD
     let mut fields = vec![
@@ -72,6 +74,7 @@ fn main() {
         "time_expire".to_string(),
         "build_rand".to_string(),
         "token_id".to_string(),
+        "hk".to_string(),
     ];
 
     let mut shuffle_rng = ChaCha8Rng::seed_from_u64(build_seed);

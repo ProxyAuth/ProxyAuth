@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::network::proxy::client_ip;
 use crate::network::ratelimit::governor::clock::DefaultClock;
 use crate::token::security::extract_token_user;
 use actix_governor::governor::clock::Clock;
@@ -16,45 +17,36 @@ use futures_util::future::{LocalBoxFuture, Ready};
 use std::task::{Context, Poll};
 use tracing::warn;
 
-use std::net::IpAddr;
 //use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct UserToken;
-
-fn client_ip(req: &ServiceRequest) -> Option<IpAddr> {
-    if let Some(forwarded) = req.headers().get("x-forwarded-for") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            if let Some(ip_str) = forwarded_str.split(',').next() {
-                if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-
-    if let Some(real_ip) = req.headers().get("x-real-ip") {
-        if let Ok(ip_str) = real_ip.to_str() {
-            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                return Some(ip);
-            }
-        }
-    }
-
-    req.peer_addr().map(|addr| addr.ip())
-}
 
 impl KeyExtractor for UserToken {
     type Key = String;
     type KeyExtractionError = SimpleKeyExtractionError<&'static str>;
 
     fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError> {
-        let ip = client_ip(&req).expect("?").to_string();
-
         let app_data = req.app_data::<web::Data<AppState>>().ok_or_else(|| {
             Self::KeyExtractionError::new("Missing app state")
                 .set_status_code(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
+
+        // SECURITY: reuse network::proxy::client_ip, which only trusts
+        // X-Forwarded-For/X-Real-Ip when the peer is a configured trusted
+        // proxy (trust_proxy_forward_for). The previous local client_ip()
+        // trusted these headers unconditionally, letting any client spoof
+        // a fresh rate-limit key on every request and bypass brute-force
+        // protection entirely.
+        let ip = match client_ip(req.request(), &app_data.config) {
+            Some(ip) => ip.to_string(),
+            None => {
+                return Err(
+                    Self::KeyExtractionError::new("Unable to determine client IP")
+                        .set_status_code(StatusCode::INTERNAL_SERVER_ERROR),
+                );
+            }
+        };
 
         // key ratelimite: user extract inside the token
         let user_or_ip = req

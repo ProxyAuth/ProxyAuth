@@ -1,28 +1,27 @@
 use crate::token::security::get_build_seed2;
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use blake3;
 
 use chacha20poly1305::{
+    Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
-    XChaCha20Poly1305, XNonce, Key
 };
 
 use hkdf::Hkdf;
 use lru::LruCache;
 use once_cell::sync::Lazy;
+use rand::RngCore;
+use rand::rngs::OsRng;
 use sha2::Sha256;
 use std::fmt::Write;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use rand::rngs::OsRng;
-use rand::RngCore;
-
+use crate::build::build_info;
 
 const KEY_LEN: usize = 32;
 const TAG_V1: u8 = 1;
 pub const TAG_V1_PW: u8 = 0xE1;
-const HKDF_SALT_CONST: &[u8] = b"proxyauth.hkdf.v1";
 const HKDF_INFO_DERIVE: &[u8] = b"derive_key_from_secret.v1";
 const HKDF_INFO_PW: &[u8] = b"encrypt_base64.password.v1";
 
@@ -40,7 +39,8 @@ pub fn derive_key_from_secret(secret: &str) -> [u8; 32] {
         return k;
     }
 
-    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT_CONST), secret.as_bytes());
+    let salt = build_info::get().build_hk;
+    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), secret.as_bytes());
     let mut okm = [0u8; KEY_LEN];
     hk.expand(HKDF_INFO_DERIVE, &mut okm).expect("HKDF expand");
 
@@ -60,8 +60,8 @@ pub fn encrypt(message: &str, key_bytes: &[u8]) -> String {
     let nonce = XNonce::try_from(&nonce_bytes[..]).expect("invalid nonce length");
 
     let ct = cipher
-    .encrypt(&nonce, message.as_bytes())
-    .expect("encryption failure");
+        .encrypt(&nonce, message.as_bytes())
+        .expect("encryption failure");
 
     let mut out = Vec::with_capacity(1 + 24 + ct.len());
     out.push(TAG_V1);
@@ -208,7 +208,8 @@ pub fn encrypt_base64(message: &str, password: &str) -> String {
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), password.as_bytes());
     let mut key_bytes = [0u8; KEY_LEN];
-    hk.expand(HKDF_INFO_PW, &mut key_bytes).expect("HKDF expand");
+    hk.expand(HKDF_INFO_PW, &mut key_bytes)
+        .expect("HKDF expand");
 
     let key = Key::try_from(&key_bytes[..]).expect("invalid key");
     let cipher = XChaCha20Poly1305::new(&key);
@@ -217,9 +218,7 @@ pub fn encrypt_base64(message: &str, password: &str) -> String {
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::try_from(&nonce_bytes[..]).unwrap();
 
-    let ct = cipher
-    .encrypt(&nonce, message.as_bytes())
-    .expect("encrypt");
+    let ct = cipher.encrypt(&nonce, message.as_bytes()).expect("encrypt");
 
     let mut out = Vec::with_capacity(1 + 16 + 24 + ct.len());
     out.push(TAG_V1_PW);
@@ -233,8 +232,8 @@ pub fn encrypt_base64(message: &str, password: &str) -> String {
 #[allow(dead_code)]
 pub fn decrypt_base64(encoded: &str, password: &str) -> String {
     let data = general_purpose::STANDARD
-    .decode(encoded.as_bytes())
-    .expect("Invalid base64");
+        .decode(encoded.as_bytes())
+        .expect("Invalid base64");
 
     if data.len() < 1 + 16 + 24 || data[0] != TAG_V1_PW {
         panic!("Invalid ciphertext format");
@@ -246,15 +245,15 @@ pub fn decrypt_base64(encoded: &str, password: &str) -> String {
 
     let hk = Hkdf::<Sha256>::new(Some(salt), password.as_bytes());
     let mut key_bytes = [0u8; KEY_LEN];
-    hk.expand(HKDF_INFO_PW, &mut key_bytes).expect("HKDF expand");
+    hk.expand(HKDF_INFO_PW, &mut key_bytes)
+        .expect("HKDF expand");
 
     let key = Key::try_from(&key_bytes[..]).expect("invalid key");
     let cipher = XChaCha20Poly1305::new(&key);
 
     let pt = cipher
-    .decrypt(&nonce, ct)
-    .expect("decryption/authentication failed");
+        .decrypt(&nonce, ct)
+        .expect("decryption/authentication failed");
 
     String::from_utf8(pt).expect("Invalid UTF-8")
 }
-

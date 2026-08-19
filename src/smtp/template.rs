@@ -1,7 +1,7 @@
+use crate::smtp::smtp::RESET_TEMPLATE_PATH;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use crate::smtp::smtp::RESET_TEMPLATE_PATH;
 
 pub fn ensure_reset_template_exists() -> std::io::Result<()> {
     let path = Path::new(RESET_TEMPLATE_PATH);

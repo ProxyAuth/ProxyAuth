@@ -1,11 +1,10 @@
 use lettre::{
-    message::header::ContentType,
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::header::ContentType,
     transport::smtp::authentication::Credentials,
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use std::fs;
+use std::time::Duration;
 
 pub const RESET_TEMPLATE_PATH: &str = "/etc/proxyauth/mail/reset_password.txt";
 
@@ -38,31 +37,30 @@ impl SmtpClient {
         let creds = Credentials::new(cfg.username.clone(), cfg.password.clone());
 
         let builder = if cfg.port == 465 {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)?
-            .port(cfg.port)
+            AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)?.port(cfg.port)
         } else {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)?
-            .port(cfg.port)
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)?.port(cfg.port)
         };
 
         let mailer = builder
-        .credentials(creds)
-        .timeout(Some(Duration::from_secs(cfg.timeout_secs)))
-        .build();
+            .credentials(creds)
+            .timeout(Some(Duration::from_secs(cfg.timeout_secs)))
+            .build();
 
         // Load + parse reset template
-        let raw = fs::read_to_string(RESET_TEMPLATE_PATH)
-        .map_err(|e| format!(
-            "Failed to read reset password template at {}: {}",
-            RESET_TEMPLATE_PATH, e
-        ))?;
+        let raw = fs::read_to_string(RESET_TEMPLATE_PATH).map_err(|e| {
+            format!(
+                "Failed to read reset password template at {}: {}",
+                RESET_TEMPLATE_PATH, e
+            )
+        })?;
 
         let reset_template = Self::parse_reset_template(&raw)?;
 
         Ok(Self {
             mailer,
             from: cfg.from.clone(),
-           reset_template,
+            reset_template,
         })
     }
 
@@ -97,25 +95,31 @@ impl SmtpClient {
         subject: &str,
         body: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-
         let email = Message::builder()
-        .from(self.from.parse().map_err(|e| format!("Invalid From address: {}", e))?)
-        .to(to.parse().map_err(|e| format!("Invalid To address '{}': {}", to, e))?)
-        .subject(subject)
-        .header(ContentType::TEXT_PLAIN)
-        .body(body.to_string())?;
+            .from(
+                self.from
+                    .parse()
+                    .map_err(|e| format!("Invalid From address: {}", e))?,
+            )
+            .to(to
+                .parse()
+                .map_err(|e| format!("Invalid To address '{}': {}", to, e))?)
+            .subject(subject)
+            .header(ContentType::TEXT_PLAIN)
+            .body(body.to_string())?;
 
-        self.mailer.send(email)
-        .await
-        .map(|_response| ())
-        .map_err(|e| format!("Failed to send email via SMTP: {}", e).into())
+        self.mailer
+            .send(email)
+            .await
+            .map(|_response| ())
+            .map_err(|e| format!("Failed to send email via SMTP: {}", e).into())
     }
 
     fn render_reset_body(&self, username: &str, reset_link: &str) -> String {
         self.reset_template
-        .body
-        .replace("{{ username }}", username)
-        .replace("{{ reset_link }}", reset_link)
+            .body
+            .replace("{{ username }}", username)
+            .replace("{{ reset_link }}", reset_link)
     }
 
     pub async fn send_reset_password(
@@ -124,13 +128,9 @@ impl SmtpClient {
         username: &str,
         reset_link: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-
         let body = self.render_reset_body(username, reset_link);
 
-        self.send_text(
-            to,
-            &self.reset_template.subject,
-            &body,
-        ).await
+        self.send_text(to, &self.reset_template.subject, &body)
+            .await
     }
 }

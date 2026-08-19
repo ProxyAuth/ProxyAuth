@@ -1,19 +1,18 @@
 use base64::Engine;
-use proxyauth::token::crypto::decrypt_base64;
-use proxyauth::token::crypto::encrypt_base64;
-use proxyauth::token::crypto::decrypt;
-use proxyauth::token::crypto::derive_key_from_secret;
 use proxyauth::token::crypto::calcul_cipher;
 use proxyauth::token::crypto::calcul_factorhash;
+use proxyauth::token::crypto::decrypt;
+use proxyauth::token::crypto::decrypt_base64;
+use proxyauth::token::crypto::derive_key_from_secret;
 use proxyauth::token::crypto::encrypt;
+use proxyauth::token::crypto::encrypt_base64;
 use proxyauth::token::crypto::process_string;
 use proxyauth::token::crypto::split_hash;
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose};
+    use base64::engine::general_purpose;
 
     // ---------------------------- derive_key ---------------------------
 
@@ -33,7 +32,7 @@ mod tests {
     fn split_hash_chunks_size() {
         let s = "abcdefghijklmnopqrstuvwxyz";
         let v = split_hash(s.to_string(), 5);
-        assert_eq!(v, vec!["abcde","fghij","klmno","pqrst","uvwxy","z"]);
+        assert_eq!(v, vec!["abcde", "fghij", "klmno", "pqrst", "uvwxy", "z"]);
         // n=0 => no split
         let v2 = split_hash(s.to_string(), 0);
         assert_eq!(v2, vec![s.to_string()]);
@@ -51,7 +50,9 @@ mod tests {
         let mut ks3 = proxyauth::token::crypto::Blake3Keystream::new(43);
         let mut diff = 0;
         for _ in 0..64 {
-            if ks1.next_u8() != ks3.next_u8() { diff += 1; }
+            if ks1.next_u8() != ks3.next_u8() {
+                diff += 1;
+            }
         }
         assert!(diff > 0);
     }
@@ -64,7 +65,7 @@ mod tests {
         let out_f0 = process_string(s, 0);
         let out_f5 = process_string(s, 5);
 
-        for ch in ['-','_','_','.','!'] {
+        for ch in ['-', '_', '_', '.', '!'] {
             assert!(out_f0.contains(ch));
             assert!(out_f5.contains(ch));
         }
@@ -89,7 +90,9 @@ mod tests {
                     out.push(n);
                 }
             }
-            if let Some(n) = acc { out.push(n); }
+            if let Some(n) = acc {
+                out.push(n);
+            }
             out
         };
         let nums_f5 = {
@@ -102,7 +105,9 @@ mod tests {
                     out.push(n);
                 }
             }
-            if let Some(n) = acc { out.push(n); }
+            if let Some(n) = acc {
+                out.push(n);
+            }
             out
         };
 
@@ -156,8 +161,8 @@ mod tests {
     #[test]
     fn decrypt_err_on_bad_tag() {
         let mut bogus = vec![0x02u8];
-        bogus.extend_from_slice(&[0u8; 24]);     // nonce
-        bogus.extend_from_slice(&[1,2,3,4,5,6]); // "ct" fictif
+        bogus.extend_from_slice(&[0u8; 24]); // nonce
+        bogus.extend_from_slice(&[1, 2, 3, 4, 5, 6]); // "ct" fictif
         let s = general_purpose::STANDARD.encode(bogus);
         let key = derive_key_from_secret("k");
         assert!(decrypt(&s, &key).is_err());
@@ -185,4 +190,3 @@ mod tests {
         let _ = decrypt_base64(&ok, "pw-bad");
     }
 }
-

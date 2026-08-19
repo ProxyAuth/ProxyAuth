@@ -42,9 +42,9 @@ mod tests {
 
     #[test]
     fn percent_decoded_dots_affect_segments() {
-        assert_eq!(canonicalize_path_for_match("/a/%2E/b"), "/a/b");      // "." no-op
+        assert_eq!(canonicalize_path_for_match("/a/%2E/b"), "/a/b"); // "." no-op
         assert_eq!(canonicalize_path_for_match("/a/%2e/b"), "/a/b");
-        assert_eq!(canonicalize_path_for_match("/a/%2E%2E/b"), "/b");     // ".." move
+        assert_eq!(canonicalize_path_for_match("/a/%2E%2E/b"), "/b"); // ".." move
         assert_eq!(canonicalize_path_for_match("/a/%2e%2e/b"), "/b");
     }
 
@@ -57,13 +57,7 @@ mod tests {
 
     #[test]
     fn idempotent_on_canonical_output() {
-        let cases = [
-            "/a/b/c",
-            "/a/b",
-            "/",
-            "/api/admin",
-            "/a-b_c.1",
-        ];
+        let cases = ["/a/b/c", "/a/b", "/", "/api/admin", "/a-b_c.1"];
         for &p in &cases {
             assert_eq!(canonicalize_path_for_match(p), p);
             let once = canonicalize_path_for_match(p);

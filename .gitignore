@@ -3,6 +3,7 @@ envdocker.yml
 tarpaulin-report.html
 docker-compose.yml
 /config
-/coverag
-/.cargo
+/coverage
+/.cargo/*
+!/.cargo/audit.toml
 

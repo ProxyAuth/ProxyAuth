@@ -81,12 +81,7 @@ pub fn ensure_user_proxyauth_exists() -> io::Result<()> {
 
         let status_user = if alpine {
             Command::new("adduser")
-            .args([
-                "-S",
-                "-G",
-                "proxyauth",
-                "proxyauth",
-            ])
+            .args(["-S", "-G", "proxyauth", "proxyauth"])
             .status()?
         } else {
             Command::new("useradd")
@@ -222,13 +217,87 @@ pub async fn create_config(url: &str, path: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// Default `routes.yml` written on first run when the file is missing.
+/// Built line by line with explicit "\n" so the exact bytes written to
+/// disk are fully controlled (no ambiguity from how a multi-line raw
+/// string literal is stored/edited).
+pub const DEFAULT_ROUTES_YML: &str = concat!(
+    "routes:\n",
+    "  - prefix: \"/login\"\n",
+    "    target: \"http://127.0.0.1:8000/login\"\n",
+    "    required_login: false\n",
+    "  - prefix: \"/private\"\n",
+    "    target: \"http://127.0.0.1:8000/myapp/\"\n",
+    "    required_login: true\n",
+    "    username: [\"admin\"]\n",
+);
+
+/// Default `config.json` written on first run when the file is missing.
+/// Same approach: explicit "\n"-joined lines, no raw string block.
+pub const DEFAULT_CONFIG_JSON: &str = concat!(
+    "{\n",
+    "  \"token_expiry_seconds\": 432000,\n",
+    "  \"secret\": \"supersecretvalue\",\n",
+    "  \"host\": \"0.0.0.0\",\n",
+    "  \"port\": 8080,\n",
+    "  \"worker\": 8,\n",
+    "  \"log\": {\"type\": \"disabled\"},\n",
+    "  \"stats\": false,\n",
+    "  \"max_idle_per_host\": 500,\n",
+    "  \"ratelimit_auth\": {\n",
+    "    \"burst\": 100,\n",
+    "    \"block_delay\": 5000,\n",
+    "    \"requests_per_second\": 5\n",
+    "  },\n",
+    "  \"ratelimit_proxy\": {\n",
+    "    \"block_delay\": 5000,\n",
+    "    \"requests_per_second\": 5,\n",
+    "    \"burst\": 10\n",
+    "  },\n",
+    "  \"users\": [\n",
+    "    {\n",
+    "      \"username\": \"admin\",\n",
+    "      \"password\": \"$argon2id$v=19$m=19456,t=2,p=1$aZVPx4hZQllgOdwX8i/PYg$Fyw3kArZTM/EKSWEmltNjV5UqW8fJLaFxt9vi95TcWY\"\n",
+    "    },\n",
+    "    {\n",
+    "      \"username\": \"alice\",\n",
+    "      \"password\": \"$argon2id$v=19$m=19456,t=2,p=1$r73ntuqsRREIylIXQZo+Tw$Vo75eHcuhtCKmycN9aO049HwXU/iW5jHNkCrOSL56zQ\"\n",
+    "    }\n",
+    "  ]\n",
+    "}\n",
+);
+
+/// Writes `content` to `path` only if the file does not already exist.
+/// Used to seed default config files (`config.json`, `routes.yml`) on first
+/// run, without ever overwriting a config the user has customized.
+pub fn create_default_file(path: &str, content: &str) -> io::Result<()> {
+    if Path::new(path).exists() {
+        return Ok(());
+    }
+
+    println!("Config file {} not found. Creating default file...", path);
+
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut file = fs::File::create(path)?;
+    file.write_all(content.as_bytes())?;
+
+    println!("Default config written to {}", path);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::create_config;
     use std::{fs, net::SocketAddr, path::PathBuf};
     use tokio::task::JoinHandle;
 
-    use actix_web::{web, App, HttpServer, HttpResponse};
+    use actix_web::{App, HttpResponse, HttpServer, web};
 
     // --- Helpers -------------------------------------------------------------
 
@@ -240,13 +309,12 @@ mod tests {
         let handle = tokio::spawn(async move {
             HttpServer::new(move || {
                 App::new().default_service(web::to(move || async move {
-                    HttpResponse::build(
-                        actix_web::http::StatusCode::from_u16(status).unwrap()
-                    )
+                    HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap())
                     .body(body)
                 }))
             })
-            .listen(listener).unwrap()
+            .listen(listener)
+            .unwrap()
             .run()
             .await
             .unwrap();

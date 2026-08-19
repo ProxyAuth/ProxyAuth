@@ -1,8 +1,8 @@
 use crate::AppConfig;
 use crate::AppState;
 use crate::config::config::{AuthRequest, User};
-use crate::network::proxy::client_ip;
 use crate::network::error::render_error_page;
+use crate::network::proxy::client_ip;
 use crate::token::crypto::{calcul_cipher, derive_key_from_secret, encrypt};
 use crate::token::csrf::verify_csrf_token;
 use crate::token::security::{generate_token, validate_token};
@@ -15,7 +15,7 @@ use actix_web::{
     web::{self, Form, Json},
 };
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordVerifier};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use blake3;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -26,11 +26,12 @@ use ipnet::IpNet;
 use rand::rngs::OsRng;
 use rand::seq::SliceRandom;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use totp_rs::{Algorithm, TOTP};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub enum EitherAuth {
     Json(AuthRequest),
@@ -111,6 +112,63 @@ pub fn verify_password(input: &str, stored_hash: &str) -> bool {
     }
 }
 
+/// A syntactically valid Argon2id hash with no correspondence to any real
+/// account password. Computed once (lazily, at the same cost as hashing a
+/// real user's password) and cached for the life of the process.
+///
+/// SECURITY: used to verify against *something* with the same Argon2 cost
+/// even when the supplied username doesn't match any account, so that
+/// login response time doesn't reveal which usernames exist. Without this,
+/// `verify_password` (expensive) only ran for known usernames, giving an
+/// attacker a timing oracle for username enumeration.
+pub fn dummy_password_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+        Argon2::default()
+        .hash_password(b"proxyauth-constant-time-placeholder", &salt)
+        .map(|h| h.to_string())
+        // Fallback (should never trigger): a fixed, syntactically
+        // valid Argon2id PHC hash, still forces real Argon2 work on
+        // verification even if it can't be generated at runtime.
+        .unwrap_or_else(|_| {
+            "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR2YWx1ZQ$\
+3lJ8m5vRHkNfhVn8wq6qF7z0h9k0m3qkQeQwzE9pM4"
+.to_string()
+        })
+    })
+}
+
+/// Runs an Argon2 verification against either the matched user's real
+/// password hash, or the dummy hash if no user matched — always doing the
+/// same amount of expensive work either way. Returns `true` only if a
+/// user actually matched *and* the password was correct.
+///
+/// SECURITY: replaces the old `user.username == auth.username &&
+/// verify_password(...)` short-circuit pattern, which skipped the
+/// expensive Argon2 check entirely for unknown usernames and thereby leaked
+/// account existence through response timing.
+pub fn verify_credentials_constant_time<'a>(
+    users: &'a [User],
+    username: &str,
+    password: &str,
+) -> Option<&'a User> {
+    match users.iter().find(|u| u.username == username) {
+        Some(user) => {
+            if verify_password(password, &user.password) {
+                Some(user)
+            } else {
+                None
+            }
+        }
+        None => {
+            // Burn the same Argon2 cost as a real check; result discarded.
+            let _ = verify_password(password, dummy_password_hash());
+            None
+        }
+    }
+}
+
 pub fn generate_random_string(len: usize) -> String {
     let charset: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^*()+-=";
@@ -140,11 +198,30 @@ pub fn generate_random_string(len: usize) -> String {
     hex::encode(hash.as_bytes())
 }
 
+// SECURITY/RELIABILITY: previously `.expect("Invalid timezone in config")`.
+// This runs on every successful login (token expiry computation) — a typo'd
+// or non-IANA `timezone` value in config.json (e.g. "CET" instead of
+// "Europe/Paris") would panic on every single login attempt. With
+// `panic = "abort"` removed from the release profile, that panic no longer
+// crashes and restarts the whole process — it just makes login fail with a
+// clean 500 every time, forever, until the config is fixed. Falling back to
+// UTC (and logging loudly) keeps the service usable and makes the
+// misconfiguration visible in logs instead of as a silent total outage.
+fn resolve_timezone(config: &AppConfig) -> Tz {
+    config.timezone.parse().unwrap_or_else(|_| {
+        error!(
+            "Invalid timezone {:?} in config.json -- falling back to UTC. Fix the `timezone` field to a valid IANA name (e.g. Europe/Paris, UTC).",
+               config.timezone
+        );
+        Tz::UTC
+    })
+}
+
 pub fn get_expiry_with_timezone(
     config: Arc<AppConfig>,
     optional_timestamp: Option<i64>,
 ) -> DateTime<Tz> {
-    let tz: Tz = config.timezone.parse().expect("Invalid timezone in config");
+    let tz: Tz = resolve_timezone(&config);
 
     let utc_now = optional_timestamp
     .map(|ts| {
@@ -162,7 +239,7 @@ pub fn get_expiry_with_timezone_format(
     config: Arc<AppConfig>,
     optional_timestamp: Option<i64>,
 ) -> String {
-    let tz: Tz = config.timezone.parse().expect("Invalid timezone in config");
+    let tz: Tz = resolve_timezone(&config);
 
     let utc_now = optional_timestamp
     .map(|ts| {
@@ -210,12 +287,90 @@ pub async fn auth_options(req: HttpRequest, data: web::Data<AppState>) -> impl R
     }
 }
 
+/// Shared by the POST /auth handler (`auth`) and the new GET /auth handler
+/// (`auth_get`): if `session_cookie` is enabled and the request carries a
+/// still-valid `session_token` cookie, returns a ready response — a
+/// redirect straight to `login_redirect_url`, or an error page for an
+/// expired/revoked cookie — instead of letting the caller continue.
+/// Returns `None` when there's no session cookie to consider, meaning the
+/// caller should proceed with its own logic (show the login form, or
+/// process freshly submitted credentials).
+///
+/// UX/RELIABILITY: this used to live inline in `auth()` only, which meant
+/// landing on `/auth` via GET (e.g. bounced back here after logout, or a
+/// bookmark) with a still-valid cookie just showed the login form again —
+/// confusing, since the visitor is actually still authenticated. Extracting
+/// it lets `auth_get` apply the exact same "already logged in? skip
+/// straight to the app" check.
+pub async fn existing_session_response(
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+    ip: &str,
+) -> Option<HttpResponse> {
+    if !data.config.session_cookie {
+        return None;
+    }
+    let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+    let existing_cookie = req.cookie("session_token")?;
+    let session_token = existing_cookie.value();
+
+    match validate_token(session_token, data, &data.config, ip).await {
+        Ok((username, _token_id, time_expire)) if time_expire > 0 => {
+            // Cookie encore valide → redirect direct, pas besoin de re-auth
+            info!(
+                "[{}] user {} already authenticated ({}s remaining), forwarding to {}",
+                  ip, username, time_expire, redirect_target
+            );
+
+            let mut resp = HttpResponse::SeeOther();
+            resp.append_header(("server", "ProxyAuth"));
+            resp.append_header(("location", redirect_target));
+
+            if let Some(origin_header) = req.headers().get(header::ORIGIN) {
+                if let Ok(origin_str) = origin_header.to_str() {
+                    if let Some(cors_origins) = &data.config.cors_origins {
+                        let origin_normalized = origin_str.trim_end_matches('/');
+                        if cors_origins
+                            .iter()
+                            .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
+                            {
+                                resp.append_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str));
+                                resp.append_header((header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true"));
+                            }
+                    }
+                }
+            }
+
+            Some(resp.finish())
+        }
+        Ok(_) => {
+            // time_expire == 0 : session expirée côté serveur
+            warn!("[{}] session token expired, notifying user", ip);
+            Some(
+                render_error_page(req, data.clone(), "Session expired, please re-authenticate")
+                .await,
+            )
+        }
+        Err(e) => {
+            // Token invalide ou révoqué
+            warn!("[{}] session token invalid ({}), notifying user", ip, e);
+            Some(
+                render_error_page(
+                    req,
+                    data.clone(),
+                                  "Invalid credential, please re-authenticate",
+                )
+                .await,
+            )
+        }
+    }
+}
+
 pub async fn auth(
     req: HttpRequest,
     data: web::Data<AppState>,
     payload: EitherAuth,
 ) -> impl Responder {
-
     if data.config.session_cookie
         && data.config.csrf_token
         && !validate_csrf(&req, &payload, &data.config.secret)
@@ -228,7 +383,7 @@ pub async fn auth(
             EitherAuth::Form(f) => f,
         };
 
-    let ip = client_ip(&req)
+    let ip = client_ip(&req, &data.config)
     .map(|s| s.to_string())
     .or_else(|| {
         req.headers()
@@ -236,91 +391,43 @@ pub async fn auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(|s| s.trim().to_string())
-        .or_else(|| req.connection_info().realip_remote_addr().map(|s| s.to_string()))
+        .or_else(|| {
+            req.connection_info()
+            .realip_remote_addr()
+            .map(|s| s.to_string())
+        })
     })
     .unwrap_or_else(|| "-".to_string());
 
-    // Check if session_cookie is enabled
+    if let Some(resp) = existing_session_response(&req, &data, &ip).await {
+        return resp;
+    }
+
     if data.config.session_cookie {
         let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
-
-        if let Some(existing_cookie) = req.cookie("session_token") {
-            let session_token = existing_cookie.value();
-
-            match validate_token(session_token, &data, &data.config, &ip).await {
-                Ok((username, _token_id, time_expire)) if time_expire > 0 => {
-
-                    // Cookie encore valide → redirect direct, pas besoin de re-auth
-                    info!(
-                        "[{}] user {} already authenticated ({}s remaining), forwarding to {}",
-                          ip, username, time_expire, redirect_target
-                    );
-
-                    let mut resp = HttpResponse::SeeOther();
-                    resp.append_header(("server", "ProxyAuth"));
-                    resp.append_header(("location", redirect_target));
-
-                    if let Some(origin_header) = req.headers().get(header::ORIGIN) {
-                        if let Ok(origin_str) = origin_header.to_str() {
-                            if let Some(cors_origins) = &data.config.cors_origins {
-                                let origin_normalized = origin_str.trim_end_matches('/');
-                                if cors_origins.iter().any(|allowed| {
-                                    allowed.trim_end_matches('/') == origin_normalized
-                                }) {
-                                    resp.append_header((
-                                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                                        origin_str,
-                                    ));
-                                    resp.append_header((
-                                        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                                        "true",
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    return resp.finish();
-                }
-                Ok(_) => {
-                    // time_expire == 0 : session expirée côté serveur
-                    warn!("[{}] session token expired, notifying user", ip);
-                    return render_error_page(
-                        &req,
-                        data.clone(),
-                        "Session expired, please re-authenticate",
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    // Token invalide ou révoqué
-                    warn!("[{}] session token invalid ({}), notifying user", ip, e);
-                    return render_error_page(
-                        &req,
-                        data.clone(),
-                        "Invalid credential, please re-authenticate",
-                    )
-                    .await;
-                }
-            }
-        } else if !redirect_target.starts_with('/') {
+        if req.cookie("session_token").is_none() && !redirect_target.starts_with('/') {
             return HttpResponse::BadRequest()
             .append_header(("server", "ProxyAuth"))
             .body("Invalid redirect URL");
         }
     }
 
-    if let Some(index_user) = data
-        .config
-        .users
-        .iter()
-        .enumerate()
-        .find(|(_, user)| {
-            user.username == auth.username && verify_password(&auth.password, &user.password)
-        })
-        .map(|(i, _)| i)
+    // SECURITY: was `.find(|(_, user)| user.username == auth.username &&
+    // verify_password(...))`, which short-circuits on the username check
+    // and skips the expensive Argon2 verification entirely for unknown
+    // usernames — an attacker could enumerate valid usernames purely by
+    // measuring response latency. verify_credentials_constant_time always
+    // burns the same Argon2 cost, against a dummy hash when no user
+    // matches, so response time no longer reveals account existence.
+    let combined_users = data.config.combined_users();
+    if let Some(matched_user) =
+        verify_credentials_constant_time(&combined_users, &auth.username, &auth.password)
         {
-            let user = &data.config.users[index_user];
+            let index_user = combined_users
+            .iter()
+            .position(|u| std::ptr::eq(u, matched_user))
+            .expect("matched user must be present in combined_users");
+            let user = &combined_users[index_user];
 
             if !is_ip_allowed(&ip, &user) {
                 warn!("[{}] Access ip denied for user {}", ip, user.username);
@@ -363,7 +470,10 @@ pub async fn auth(
                 .as_secs();
                 let generated_code = totp.generate(now);
 
-                if generated_code != totp_code {
+                // SECURITY: constant-time comparison — a plain `!=` on the
+                // 6-digit code leaks timing information about how many
+                // leading digits matched.
+                if !bool::from(generated_code.as_bytes().ct_eq(totp_code.as_bytes())) {
                     warn!("Invalid TOTP code for user {}", user.username);
                     return render_error_page(&req, data.clone(), "Invalid TOTP code").await;
                 }
@@ -389,10 +499,7 @@ pub async fn auth(
 
             let cipher_token = format!(
                 "{}|{}|{}|{}",
-                token_generate,
-                expiry_ts,
-                index_user,
-                id_token
+                token_generate, expiry_ts, index_user, id_token
             );
 
             let token_encrypt = encrypt(&cipher_token, &key);

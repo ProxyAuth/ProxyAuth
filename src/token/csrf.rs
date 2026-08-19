@@ -1,4 +1,9 @@
 use actix_web::HttpRequest;
+use actix_web::HttpResponseBuilder;
+use actix_web::http::{
+    StatusCode,
+    header::{CONTENT_TYPE as CONTENT_TYPE_ACTIX, HeaderValue as HeaderValue_ACTIX},
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use blake3;
 use bytes::Bytes;
@@ -10,12 +15,10 @@ use once_cell::sync::Lazy;
 use rand::RngCore;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime};
-use actix_web::HttpResponseBuilder;
 use tokio::time::{MissedTickBehavior, interval};
-use actix_web::http::{header::{CONTENT_TYPE as CONTENT_TYPE_ACTIX, HeaderValue as HeaderValue_ACTIX}, StatusCode};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub static PURGE_HOOK: AtomicUsize = AtomicUsize::new(0);
 
@@ -73,7 +76,9 @@ pub trait IntoStdDuration {
 
 impl IntoStdDuration for std::time::Duration {
     #[inline]
-    fn into_std(self) -> std::time::Duration { self }
+    fn into_std(self) -> std::time::Duration {
+        self
+    }
 }
 
 impl IntoStdDuration for time::Duration {
@@ -84,10 +89,7 @@ impl IntoStdDuration for time::Duration {
 }
 
 #[allow(dead_code)]
-pub fn spawn_csrf_purger_for_tests(
-    store: CsrfNonceStore,
-    period: impl IntoStdDuration,
-) {
+pub fn spawn_csrf_purger_for_tests(store: CsrfNonceStore, period: impl IntoStdDuration) {
     let period_std: std::time::Duration = period.into_std();
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -126,7 +128,9 @@ pub fn spawn_csrf_purger_for_tests_with_notify(
             tick.tick().await;
             let count = purge_and_count(&store);
             PURGE_HOOK.fetch_add(count, Ordering::SeqCst);
-            if let Some(tx) = notify { let _ = tx.send(count); }
+            if let Some(tx) = notify {
+                let _ = tx.send(count);
+            }
             loop {
                 tick.tick().await;
                 let c = purge_and_count(&store);
@@ -137,7 +141,9 @@ pub fn spawn_csrf_purger_for_tests_with_notify(
         std::thread::spawn(move || {
             let count0 = purge_and_count(&store);
             PURGE_HOOK.fetch_add(count0, Ordering::SeqCst);
-            if let Some(tx) = notify { let _ = tx.send(count0); }
+            if let Some(tx) = notify {
+                let _ = tx.send(count0);
+            }
             loop {
                 std::thread::sleep(period);
                 let c = purge_and_count(&store);
@@ -192,8 +198,8 @@ pub fn validate_csrf_token(
     if matches!(
         method,
         &actix_web::http::Method::GET
-        | &actix_web::http::Method::HEAD
-        | &actix_web::http::Method::OPTIONS
+            | &actix_web::http::Method::HEAD
+            | &actix_web::http::Method::OPTIONS
     ) {
         return true;
     }
@@ -202,44 +208,44 @@ pub fn validate_csrf_token(
         .headers()
         .get("X-CSRF-Token")
         .or_else(|| req.headers().get("X-CSRFToken"))
-        {
-            if let Ok(token_str) = header_token.to_str() {
-                if verify_csrf_token(secret, token_str) {
-                    return true;
-                }
+    {
+        if let Ok(token_str) = header_token.to_str() {
+            if verify_csrf_token(secret, token_str) {
+                return true;
             }
         }
+    }
 
-        // Utiliser &str pour accéder aux headers actix — évite le conflit http 0.2 vs 1.x
-        let content_type = req
+    // Utiliser &str pour accéder aux headers actix — évite le conflit http 0.2 vs 1.x
+    let content_type = req
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-        let ct_lower = content_type.to_ascii_lowercase();
+    let ct_lower = content_type.to_ascii_lowercase();
 
-        if ct_lower.starts_with("application/x-www-form-urlencoded") {
-            if let Ok(body_str) = std::str::from_utf8(body) {
-                if let Some(token) = get_form_param(body_str, "csrf_token") {
-                    return verify_csrf_token(secret, &token);
-                }
+    if ct_lower.starts_with("application/x-www-form-urlencoded") {
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            if let Some(token) = get_form_param(body_str, "csrf_token") {
+                return verify_csrf_token(secret, &token);
             }
         }
+    }
 
-        if ct_lower.starts_with("application/json") {
-            if let Ok(body_str) = std::str::from_utf8(body) {
-                if let Some(token) = extract_json_csrf_token(body_str) {
-                    return verify_csrf_token(secret, &token);
-                }
+    if ct_lower.starts_with("application/json") {
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            if let Some(token) = extract_json_csrf_token(body_str) {
+                return verify_csrf_token(secret, &token);
             }
         }
+    }
 
-        if ct_lower.starts_with("multipart/form-data") {
-            return false;
-        }
+    if ct_lower.starts_with("multipart/form-data") {
+        return false;
+    }
 
-        false
+    false
 }
 
 fn extract_json_csrf_token(json_str: &str) -> Option<String> {
@@ -270,8 +276,8 @@ pub fn make_csrf_token(secret: &str) -> String {
     format!(
         "{}.{}.{}",
         B64.encode(&nonce),
-            B64.encode(exp_b),
-            B64.encode(sig.as_bytes())
+        B64.encode(exp_b),
+        B64.encode(sig.as_bytes())
     )
 }
 
@@ -337,22 +343,22 @@ pub fn inject_csrf_token(
 
     // Utiliser &str pour accéder au HeaderMap hyper — évite le conflit CONTENT_TYPE
     let ct = headers
-    .get("content-type")
-    .and_then(|v| v.to_str().ok())
-    .unwrap_or("");
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let ct_l = ct.to_ascii_lowercase();
     let ct_main = ct_l.split(';').next().unwrap_or("").trim();
     let allow =
-    ct_main == "text/html" || ct_main.ends_with("+html") || ct_main.starts_with("text/html");
+        ct_main == "text/html" || ct_main.ends_with("+html") || ct_main.starts_with("text/html");
 
     if !allow {
         return None;
     }
 
     let enc = headers
-    .get("content-encoding")
-    .and_then(|v| v.to_str().ok())
-    .map(|s| s.to_ascii_lowercase());
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase());
 
     let replace_in = |plain: &[u8]| -> Option<Vec<u8>> {
         if memmem::find(plain, P1).is_none() && memmem::find(plain, P2).is_none() {
@@ -413,24 +419,33 @@ pub fn inject_csrf_token(
 
 pub fn is_static_asset(path: &str) -> bool {
     path.starts_with("/assets/")
-    || path.ends_with(".css")
-    || path.ends_with(".js")
-    || path.ends_with(".png")
-    || path.ends_with(".jpg")
-    || path.ends_with(".jpeg")
-    || path.ends_with(".svg")
-    || path.ends_with(".ico")
-    || path.ends_with(".webp")
+        || path.ends_with(".css")
+        || path.ends_with(".js")
+        || path.ends_with(".png")
+        || path.ends_with(".jpg")
+        || path.ends_with(".jpeg")
+        || path.ends_with(".svg")
+        || path.ends_with(".ico")
+        || path.ends_with(".webp")
 }
 
 pub fn fix_mime_actix(req_path: &str, resp: &mut HttpResponseBuilder, _status: StatusCode) {
     if req_path.ends_with(".css") {
-        resp.insert_header((CONTENT_TYPE_ACTIX, HeaderValue_ACTIX::from_static("text/css; charset=utf-8")));
+        resp.insert_header((
+            CONTENT_TYPE_ACTIX,
+            HeaderValue_ACTIX::from_static("text/css; charset=utf-8"),
+        ));
     }
     if req_path.ends_with(".js") {
-        resp.insert_header((CONTENT_TYPE_ACTIX, HeaderValue_ACTIX::from_static("text/javascript; charset=utf-8")));
+        resp.insert_header((
+            CONTENT_TYPE_ACTIX,
+            HeaderValue_ACTIX::from_static("text/javascript; charset=utf-8"),
+        ));
     }
     if req_path.ends_with(".html") {
-        resp.insert_header((CONTENT_TYPE_ACTIX, HeaderValue_ACTIX::from_static("text/html; charset=utf-8")));
+        resp.insert_header((
+            CONTENT_TYPE_ACTIX,
+            HeaderValue_ACTIX::from_static("text/html; charset=utf-8"),
+        ));
     }
 }

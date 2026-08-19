@@ -30,9 +30,13 @@ pub async fn start_revoked_token_ttl(
     if let Some(path) = opt_path {
         if LMDB_ENV.get().is_none() {
             let env = Environment::new()
-                .set_max_dbs(1)
-                .open(Path::new(&path))
-                .expect("Failed to open LMDB");
+            .set_max_dbs(1)
+            .open(Path::new(&path))
+            .expect("Failed to open LMDB");
+
+            env.create_db(Some("revoke"), lmdb::DatabaseFlags::empty())
+            .expect("Failed to create/open LMDB 'revoke' db");
+
             LMDB_ENV.set(env).expect("LMDB already initialized");
         }
     }
@@ -65,7 +69,7 @@ pub async fn start_revoked_token_ttl(
                     Err(e) => {
                         error!(
                             "[RevokedSync] Failed to initialize Redis: {}. Retrying... ({} attempts left)",
-                            e, attempts
+                               e, attempts
                         );
                         attempts -= 1;
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -84,7 +88,7 @@ pub async fn start_revoked_token_ttl(
         // Handle SIGTERM and SIGINT for graceful shutdown
         tokio::spawn(async move {
             let mut sigterm =
-                signal(SignalKind::terminate()).expect("Failed to listen for SIGTERM");
+            signal(SignalKind::terminate()).expect("Failed to listen for SIGTERM");
             let mut sigint = signal(SignalKind::interrupt()).expect("Failed to listen for SIGINT");
 
             tokio::select! {
@@ -98,8 +102,8 @@ pub async fn start_revoked_token_ttl(
 
             // Signal shutdown
             shutdown_tx
-                .send(true)
-                .expect("Failed to send shutdown signal");
+            .send(true)
+            .expect("Failed to send shutdown signal");
         });
 
         tokio::spawn(async move {
@@ -114,18 +118,18 @@ pub async fn start_revoked_token_ttl(
                         if let Some(client) = REDIS.get() {
                             let mut con = match client.get_connection_with_timeout(Duration::from_secs(5)) {
                                 Ok(con) => con,
-                                Err(e) => {
-                                    error!("[RevokedSync] Failed to get Redis connection: {}. Retrying next tick.", e);
-                                    continue;
-                                }
+                     Err(e) => {
+                         error!("[RevokedSync] Failed to get Redis connection: {}. Retrying next tick.", e);
+                         continue;
+                     }
                             };
 
                             let action_keys: Vec<String> = match con.scan_match::<String, String>("*_action".to_string()) {
                                 Ok(iter) => iter.collect::<Vec<String>>(),
-                                Err(e) => {
-                                    error!("[RevokedSync] Failed to scan Redis: {}", e);
-                                    Vec::new()
-                                }
+                     Err(e) => {
+                         error!("[RevokedSync] Failed to scan Redis: {}", e);
+                         Vec::new()
+                     }
                             };
 
                             for action_key in action_keys {
@@ -180,8 +184,8 @@ pub async fn start_revoked_token_ttl(
 
                                         let exp_val = match value.len() {
                                             8 => Some(u64::from_be_bytes(value.try_into().unwrap())),
-                                            0 => Some(0),
-                                            _ => None,
+                     0 => Some(0),
+                     _ => None,
                                         };
 
                                         if let Some(exp) = exp_val {
@@ -220,18 +224,18 @@ pub async fn start_revoked_token_ttl(
                                         for result in cursor.iter() {
                                             let (key, value) = match result {
                                                 Ok((key, value)) => (key, value),
-                                                Err(_) => continue,
+                     Err(_) => continue,
                                             };
 
                                             let token_id = match std::str::from_utf8(key) {
                                                 Ok(s) => s.to_string(),
-                                                Err(_) => continue,
+                     Err(_) => continue,
                                             };
 
                                             let exp = if value.len() == 8 {
                                                 match value.try_into().map(u64::from_be_bytes) {
                                                     Ok(e) => e,
-                                                    Err(_) => continue,
+                     Err(_) => continue,
                                                 }
                                             } else if value.is_empty() {
                                                 0
