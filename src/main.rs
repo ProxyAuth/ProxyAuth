@@ -43,7 +43,8 @@ use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::{App, http::Method, web};
 use chrono::Local;
 use config::config::{AppConfig, AppState, RouteConfig, load_config};
-use config::def_config::{create_config, ensure_running_as_proxyauth, switch_to_user};
+use config::def_config;
+use config::def_config::{ensure_running_as_proxyauth, switch_to_user};
 use dashmap::DashMap;
 use futures_util::future::join_all;
 use logs::{ChannelLogWriter, get_logs, log_collector};
@@ -198,20 +199,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // detect if program is running proxyauth user
     ensure_running_as_proxyauth();
 
-    // download default config from repository
-    create_config(
-        &format!("https://proxyauth.app/config/{}/config.json", VERSION),
-                  "/etc/proxyauth/config/config.json",
+    // create default config files on first run (never overwrites an existing file)
+    def_config::create_default_file(
+        "/etc/proxyauth/config/config.json",
+        def_config::DEFAULT_CONFIG_JSON,
     )
-    .await
-    .expect("No possible download config/config.json");
+    .expect("Could not create default config/config.json");
 
-    create_config(
-        &format!("https://proxyauth.app/config/{}/routes.yml", VERSION),
-                  "/etc/proxyauth/config/routes.yml",
+    def_config::create_default_file(
+        "/etc/proxyauth/config/routes.yml",
+        def_config::DEFAULT_ROUTES_YML,
     )
-    .await
-    .expect("No possible download config/routes.yml");
+    .expect("Could not create default config/routes.yml");
 
     let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
 

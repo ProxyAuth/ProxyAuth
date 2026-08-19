@@ -81,20 +81,20 @@ pub fn ensure_user_proxyauth_exists() -> io::Result<()> {
 
         let status_user = if alpine {
             Command::new("adduser")
-                .args(["-S", "-G", "proxyauth", "proxyauth"])
-                .status()?
+            .args(["-S", "-G", "proxyauth", "proxyauth"])
+            .status()?
         } else {
             Command::new("useradd")
-                .args([
-                    "--system",
-                    "--no-create-home",
-                    "--shell",
-                    "/usr/sbin/nologin",
-                    "--gid",
-                    "proxyauth",
-                    "proxyauth",
-                ])
-                .status()?
+            .args([
+                "--system",
+                "--no-create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                "--gid",
+                "proxyauth",
+                "proxyauth",
+            ])
+            .status()?
         };
 
         if !status_user.success() {
@@ -123,8 +123,8 @@ pub fn setup_proxyauth_directory() -> io::Result<()> {
     }
 
     let status_chown = Command::new("chown")
-        .args(["-R", "proxyauth:proxyauth", "/etc/proxyauth"])
-        .status()?;
+    .args(["-R", "proxyauth:proxyauth", "/etc/proxyauth"])
+    .status()?;
 
     if !status_chown.success() {
         eprintln!("Failed to change owner of /etc/proxyauth.");
@@ -132,8 +132,8 @@ pub fn setup_proxyauth_directory() -> io::Result<()> {
     }
 
     let status_chmod = Command::new("chmod")
-        .args(["750", "/etc/proxyauth"])
-        .status()?;
+    .args(["750", "/etc/proxyauth"])
+    .status()?;
 
     if !status_chmod.success() {
         eprintln!("Failed to set permissions on /etc/proxyauth.");
@@ -155,8 +155,8 @@ pub fn setup_proxyauth_db_directory(insecure: bool) -> io::Result<()> {
     }
 
     let status_chown = Command::new("chown")
-        .args(["-R", "proxyauth:proxyauth", "/opt/proxyauth"])
-        .status()?;
+    .args(["-R", "proxyauth:proxyauth", "/opt/proxyauth"])
+    .status()?;
 
     if !status_chown.success() {
         eprintln!("Failed to change owner of /opt/proxyauth.");
@@ -166,8 +166,8 @@ pub fn setup_proxyauth_db_directory(insecure: bool) -> io::Result<()> {
     let chmod_mode = if insecure { "777" } else { "700" };
 
     let status_chmod = Command::new("chmod")
-        .args([chmod_mode, "/opt/proxyauth"])
-        .status()?;
+    .args([chmod_mode, "/opt/proxyauth"])
+    .status()?;
 
     if !status_chmod.success() {
         eprintln!("Failed to set permissions on /opt/proxyauth.");
@@ -217,6 +217,74 @@ pub async fn create_config(url: &str, path: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// Default `routes.yml` written on first run when the file is missing.
+pub const DEFAULT_ROUTES_YML: &str = r#"routes:
+- prefix: "/login"
+target: "http://127.0.0.1:8000/login"
+required_login: false
+- prefix: "/private"
+target: "http://127.0.0.1:8000/myapp/"
+required_login: true
+username: ["admin"]
+"#;
+
+/// Default `config.json` written on first run when the file is missing.
+pub const DEFAULT_CONFIG_JSON: &str = r#"{
+"token_expiry_seconds": 432000,
+"secret": "supersecretvalue",
+"host": "0.0.0.0",
+"port": 8080,
+"worker": 8,
+"log": {"type": "disabled"},
+"stats": false,
+"max_idle_per_host": 500,
+"ratelimit_auth": {
+"burst": 100,
+"block_delay": 5000,
+"requests_per_second": 5
+},
+"ratelimit_proxy": {
+"block_delay": 5000,
+"requests_per_second": 5,
+"burst": 10
+},
+"users": [
+{
+"username": "admin",
+"password": "$argon2id$v=19$m=19456,t=2,p=1$aZVPx4hZQllgOdwX8i/PYg$Fyw3kArZTM/EKSWEmltNjV5UqW8fJLaFxt9vi95TcWY"
+},
+{
+"username": "alice",
+"password": "$argon2id$v=19$m=19456,t=2,p=1$r73ntuqsRREIylIXQZo+Tw$Vo75eHcuhtCKmycN9aO049HwXU/iW5jHNkCrOSL56zQ"
+}
+]
+}
+"#;
+
+/// Writes `content` to `path` only if the file does not already exist.
+/// Used to seed default config files (`config.json`, `routes.yml`) on first
+/// run, without ever overwriting a config the user has customized.
+pub fn create_default_file(path: &str, content: &str) -> io::Result<()> {
+    if Path::new(path).exists() {
+        return Ok(());
+    }
+
+    println!("Config file {} not found. Creating default file...", path);
+
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut file = fs::File::create(path)?;
+    file.write_all(content.as_bytes())?;
+
+    println!("Default config written to {}", path);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::create_config;
@@ -236,7 +304,7 @@ mod tests {
             HttpServer::new(move || {
                 App::new().default_service(web::to(move || async move {
                     HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap())
-                        .body(body)
+                    .body(body)
                 }))
             })
             .listen(listener)
@@ -255,10 +323,10 @@ mod tests {
         let suffix = format!(
             "{}_{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+                             std::time::SystemTime::now()
+                             .duration_since(std::time::UNIX_EPOCH)
+                             .unwrap()
+                             .as_nanos()
         );
         std::env::temp_dir().join(format!("proxyauth_test_{}_{}", name, suffix))
     }
@@ -275,8 +343,8 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         create_config(&url, path.to_str().unwrap())
-            .await
-            .expect("download OK");
+        .await
+        .expect("download OK");
 
         let got = fs::read(&path).expect("file exists");
         assert_eq!(got, expected);
@@ -294,8 +362,8 @@ mod tests {
         fs::write(&path, original).unwrap();
 
         create_config(&url, path.to_str().unwrap())
-            .await
-            .expect("noop OK");
+        .await
+        .expect("noop OK");
 
         let got = fs::read(&path).unwrap();
         assert_eq!(&got, original, "existing file must not be overwritten");
