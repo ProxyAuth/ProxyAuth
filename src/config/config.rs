@@ -300,6 +300,16 @@ pub struct AppConfig {
     /// a revoked index outright, invalidating it immediately.
     #[serde(skip)]
     pub db_revoked: std::sync::RwLock<std::collections::HashSet<usize>>,
+
+    /// username -> roles fast index, kept in sync with `users`/`db_users`
+    /// (populated once at startup for `users`, since it's immutable
+    /// after load, and updated on every `refresh_db_users()` for
+    /// database users). Exists purely so `roles_for_username` — called
+    /// on every proxied request via `inject_header` — is an O(1)
+    /// average-case HashMap lookup instead of an O(n) scan over every
+    /// user.
+    #[serde(skip)]
+    pub roles_index: std::sync::RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl Serialize for AppConfig {
@@ -590,21 +600,32 @@ impl AppConfig {
         combined
     }
 
-    /// Returns a single user's `roles`, looked up by username, without
-    /// cloning the whole user list like `combined_users()` does. Used on
-    /// the proxied-request hot path (`inject_header`), which only ever
-    /// needs one user's roles per request — cloning every user just to
-    /// discard all but one doesn't scale with the user count.
+    /// Returns a single user's `roles`, looked up by username, via
+    /// `roles_index` — an O(1) average-case HashMap lookup, not a scan
+    /// over every user. Used on the proxied-request hot path
+    /// (`inject_header`), which only ever needs one user's roles per
+    /// request — a linear scan (or worse, `combined_users()`'s full
+    /// clone) doesn't scale with the user count.
     pub fn roles_for_username(&self, username: &str) -> Option<Vec<String>> {
-        if let Some(u) = self.users.iter().find(|u| u.username == username) {
-            return u.roles.clone();
-        }
-        if let Ok(db_users) = self.db_users.read() {
-            if let Some(u) = db_users.iter().find(|u| u.username == username) {
-                return u.roles.clone();
+        self.roles_index.read().ok()?.get(username).cloned()
+    }
+
+    /// Inserts or removes a single entry in `roles_index`, keeping it in
+    /// sync with a user's current `roles`. `None`/empty roles removes
+    /// the entry entirely (a HashMap miss and "no roles" both correctly
+    /// resolve to `roles_for_username` returning `None`).
+    fn index_roles(&self, username: &str, roles: &Option<Vec<String>>) {
+        let Ok(mut index) = self.roles_index.write() else {
+            return;
+        };
+        match roles {
+            Some(r) if !r.is_empty() => {
+                index.insert(username.to_string(), r.clone());
+            }
+            _ => {
+                index.remove(username);
             }
         }
-        None
     }
 
     /// Resolves a user by its position in the same index space
@@ -672,6 +693,7 @@ impl AppConfig {
             } else {
                 guard.push(new_user.clone());
             }
+            self.index_roles(&new_user.username, &new_user.roles);
         }
 
         let Ok(mut revoked) = self.db_revoked.write() else {
@@ -687,6 +709,7 @@ impl AppConfig {
                 // will fail to parse it and always return an error, so
                 // this account can never authenticate again.
                 user.password = "!revoked!".to_string();
+                self.index_roles(&user.username, &None);
             }
         }
     }
@@ -734,11 +757,18 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
         fs::write(path, updated_str).expect("Failed to write updated config");
     }
 
+    // Seed roles_index for file-based users once — `users` never changes
+    // after this point, so this never needs to run again (unlike the
+    // periodic refresh below, for database users).
+    let app_config = Arc::new(config);
+    for user in &app_config.users {
+        app_config.index_roles(&user.username, &user.roles);
+    }
+
     // Load users stored in the database (if `databases` is configured)
     // into `db_users`, refreshed periodically afterwards by a background
     // task (see main.rs). Done *after* the file write-back above so
     // DB-sourced users are never persisted into config.json.
-    let app_config = Arc::new(config);
     app_config.refresh_db_users();
     app_config
 }
