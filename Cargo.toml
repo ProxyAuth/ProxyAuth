@@ -133,7 +133,7 @@ version = ">=0.4.16, <0.5.0"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 strip = true
 debug = false
