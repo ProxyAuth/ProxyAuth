@@ -590,6 +590,23 @@ impl AppConfig {
         combined
     }
 
+    /// Returns a single user's `roles`, looked up by username, without
+    /// cloning the whole user list like `combined_users()` does. Used on
+    /// the proxied-request hot path (`inject_header`), which only ever
+    /// needs one user's roles per request — cloning every user just to
+    /// discard all but one doesn't scale with the user count.
+    pub fn roles_for_username(&self, username: &str) -> Option<Vec<String>> {
+        if let Some(u) = self.users.iter().find(|u| u.username == username) {
+            return u.roles.clone();
+        }
+        if let Ok(db_users) = self.db_users.read() {
+            if let Some(u) = db_users.iter().find(|u| u.username == username) {
+                return u.roles.clone();
+            }
+        }
+        None
+    }
+
     /// Resolves a user by its position in the same index space
     /// `combined_users()` produces, without cloning the whole list.
     /// Indices `0..self.users.len()` map to file users; indices at or

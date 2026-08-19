@@ -193,13 +193,13 @@ pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -
     if let Ok(val) = hyper::header::HeaderValue::from_str(username) {
         builder = builder.header("x-user", val);
     }
-    let combined_users = config.combined_users();
-    if let Some(user) = combined_users.iter().find(|u| u.username == username) {
-        if let Some(roles) = &user.roles {
-            let roles_str = roles.join(",");
-            if let Ok(val) = hyper::header::HeaderValue::from_str(&roles_str) {
-                builder = builder.header("x-user-roles", val);
-            }
+    // Looked up directly by username — does NOT clone the whole user
+    // list (unlike combined_users()), since this runs on every proxied
+    // request and only ever needs a single user's roles.
+    if let Some(roles) = config.roles_for_username(username) {
+        let roles_str = roles.join(",");
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&roles_str) {
+            builder = builder.header("x-user-roles", val);
         }
     }
     builder
