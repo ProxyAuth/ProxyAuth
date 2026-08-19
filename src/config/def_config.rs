@@ -218,48 +218,54 @@ pub async fn create_config(url: &str, path: &str) -> Result<(), Box<dyn std::err
 }
 
 /// Default `routes.yml` written on first run when the file is missing.
-pub const DEFAULT_ROUTES_YML: &str = r#"routes:
-- prefix: "/login"
-target: "http://127.0.0.1:8000/login"
-required_login: false
-- prefix: "/private"
-target: "http://127.0.0.1:8000/myapp/"
-required_login: true
-username: ["admin"]
-"#;
+/// Built line by line with explicit "\n" so the exact bytes written to
+/// disk are fully controlled (no ambiguity from how a multi-line raw
+/// string literal is stored/edited).
+pub const DEFAULT_ROUTES_YML: &str = concat!(
+    "routes:\n",
+    "  - prefix: \"/login\"\n",
+    "    target: \"http://127.0.0.1:8000/login\"\n",
+    "    required_login: false\n",
+    "  - prefix: \"/private\"\n",
+    "    target: \"http://127.0.0.1:8000/myapp/\"\n",
+    "    required_login: true\n",
+    "    username: [\"admin\"]\n",
+);
 
 /// Default `config.json` written on first run when the file is missing.
-pub const DEFAULT_CONFIG_JSON: &str = r#"{
-"token_expiry_seconds": 432000,
-"secret": "supersecretvalue",
-"host": "0.0.0.0",
-"port": 8080,
-"worker": 8,
-"log": {"type": "disabled"},
-"stats": false,
-"max_idle_per_host": 500,
-"ratelimit_auth": {
-"burst": 100,
-"block_delay": 5000,
-"requests_per_second": 5
-},
-"ratelimit_proxy": {
-"block_delay": 5000,
-"requests_per_second": 5,
-"burst": 10
-},
-"users": [
-{
-"username": "admin",
-"password": "$argon2id$v=19$m=19456,t=2,p=1$aZVPx4hZQllgOdwX8i/PYg$Fyw3kArZTM/EKSWEmltNjV5UqW8fJLaFxt9vi95TcWY"
-},
-{
-"username": "alice",
-"password": "$argon2id$v=19$m=19456,t=2,p=1$r73ntuqsRREIylIXQZo+Tw$Vo75eHcuhtCKmycN9aO049HwXU/iW5jHNkCrOSL56zQ"
-}
-]
-}
-"#;
+/// Same approach: explicit "\n"-joined lines, no raw string block.
+pub const DEFAULT_CONFIG_JSON: &str = concat!(
+    "{\n",
+    "  \"token_expiry_seconds\": 432000,\n",
+    "  \"secret\": \"supersecretvalue\",\n",
+    "  \"host\": \"0.0.0.0\",\n",
+    "  \"port\": 8080,\n",
+    "  \"worker\": 8,\n",
+    "  \"log\": {\"type\": \"disabled\"},\n",
+    "  \"stats\": false,\n",
+    "  \"max_idle_per_host\": 500,\n",
+    "  \"ratelimit_auth\": {\n",
+    "    \"burst\": 100,\n",
+    "    \"block_delay\": 5000,\n",
+    "    \"requests_per_second\": 5\n",
+    "  },\n",
+    "  \"ratelimit_proxy\": {\n",
+    "    \"block_delay\": 5000,\n",
+    "    \"requests_per_second\": 5,\n",
+    "    \"burst\": 10\n",
+    "  },\n",
+    "  \"users\": [\n",
+    "    {\n",
+    "      \"username\": \"admin\",\n",
+    "      \"password\": \"$argon2id$v=19$m=19456,t=2,p=1$aZVPx4hZQllgOdwX8i/PYg$Fyw3kArZTM/EKSWEmltNjV5UqW8fJLaFxt9vi95TcWY\"\n",
+    "    },\n",
+    "    {\n",
+    "      \"username\": \"alice\",\n",
+    "      \"password\": \"$argon2id$v=19$m=19456,t=2,p=1$r73ntuqsRREIylIXQZo+Tw$Vo75eHcuhtCKmycN9aO049HwXU/iW5jHNkCrOSL56zQ\"\n",
+    "    }\n",
+    "  ]\n",
+    "}\n",
+);
 
 /// Writes `content` to `path` only if the file does not already exist.
 /// Used to seed default config files (`config.json`, `routes.yml`) on first
