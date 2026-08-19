@@ -143,7 +143,7 @@ impl Serialize for User {
         state.serialize_field("password", &self.password)?;
         state.serialize_field("otpkey", &self.otpkey)?;
         state.serialize_field("allow", &self.allow)?;
-        state.serialize_field("roles", &self.allow)?;
+        state.serialize_field("roles", &self.roles)?;
         state.end()
     }
 }

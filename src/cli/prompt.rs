@@ -98,7 +98,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             .to_string();
 
             let mut conn = crate::databases::db::connect(db_cfg)?;
-            crate::databases::db::ensure_users_table(&mut conn)?;
+            crate::databases::db::ensure_schema(&mut conn)?;
 
             let user = User {
                 username: username.clone(),
