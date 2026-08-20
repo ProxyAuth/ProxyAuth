@@ -108,6 +108,19 @@ pub struct RouteConfig {
     pub routes: Vec<RouteRule>,
 }
 
+/// One email address on file for a user, with an explicit `primary`
+/// flag — rather than relying on "whichever one happens to be first in
+/// the list", which is fragile (flips depending on argument/insertion
+/// order, easy to get wrong on an update). Exactly one entry should be
+/// `primary: true` per user; if more than one is (or none is), the
+/// first one marked primary wins — see `find_user_email`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EmailEntry {
+    pub address: String,
+    #[serde(default)]
+    pub primary: bool,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct User {
     pub username: String,
@@ -116,8 +129,15 @@ pub struct User {
     pub allow: Option<Vec<String>>,
     pub roles: Option<Vec<String>>,
 
-    #[allow(dead_code)]
-    pub email: Option<Vec<String>>,
+    pub email: Option<Vec<EmailEntry>>,
+
+    /// If true, the next successful login redirects to
+    /// `page_change_password` instead of issuing a normal session —
+    /// used for a temporary password an admin just set (first login)
+    /// as well as right after `proxyauth reset-password`. Cleared
+    /// automatically once the user successfully sets a new password.
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -144,13 +164,14 @@ impl Serialize for User {
         // first-run password hashing) silently duplicated `allow` into
         // `roles` and dropped the real roles. Fixed here; also now
         // includes `email` for completeness.
-        let mut state = serializer.serialize_struct("User", 6)?;
+        let mut state = serializer.serialize_struct("User", 7)?;
         state.serialize_field("username", &self.username)?;
         state.serialize_field("password", &self.password)?;
         state.serialize_field("otpkey", &self.otpkey)?;
         state.serialize_field("allow", &self.allow)?;
         state.serialize_field("roles", &self.roles)?;
         state.serialize_field("email", &self.email)?;
+        state.serialize_field("must_change_password", &self.must_change_password)?;
         state.end()
     }
 }
@@ -346,6 +367,22 @@ pub struct AppConfig {
 
     pub smtp: Option<SmtpConfig>,
 
+    /// URL the user's browser is redirected to (303, when
+    /// `session_cookie` is true) to set a new password — after
+    /// `proxyauth reset-password` sends them a link, or automatically
+    /// on their first login with a temporary password
+    /// (`must_change_password: true`). When `session_cookie` is false
+    /// (API/JSON client, no browser cookie flow), the same information
+    /// is returned as JSON instead of a redirect — see
+    /// `token::auth::maybe_force_password_change`. ProxyAuth appends
+    /// `?token=<reset_token>` itself; the page there is expected to
+    /// submit `token`, `password`, and `verif_password` as a POST to
+    /// `/reset-password` on this instance. Required for the
+    /// `reset-password` CLI command and the `must_change_password`
+    /// gate — both are refused with a clear error if this isn't set.
+    #[serde(default)]
+    pub page_change_password: Option<String>,
+
     /// Users loaded from `databases` (if configured), refreshed
     /// periodically by a background task so DB-side changes (users
     /// added/edited directly in the database) eventually take effect
@@ -441,6 +478,23 @@ pub struct AppState {
     /// missing entry means "use whatever config.json said at startup".
     /// See `resolve_otpkey`.
     pub otp_overrides: Arc<DashMap<String, Option<String>>>,
+
+    /// Same idea as `otp_overrides`, for a password just set via
+    /// `/reset-password`: the new Argon2 hash for a file-based user, so
+    /// it's usable immediately without a restart. (Database-backed
+    /// users don't need this — the change goes through
+    /// `databases::db::update_password`, and the in-memory `db_users`
+    /// snapshot is updated directly at the same time.) See
+    /// `resolve_password_override`.
+    pub password_overrides: Arc<DashMap<String, String>>,
+
+    /// Same idea again, for `must_change_password`: true when set by
+    /// an admin (temporary password) and cleared the moment the user
+    /// successfully sets a real one — without waiting for a restart to
+    /// stop redirecting them to `page_change_password` on every login.
+    /// A missing entry means "use whatever config.json/the database
+    /// said". See `resolve_must_change_password`.
+    pub must_change_overrides: Arc<DashMap<String, bool>>,
 }
 
 /// Resolves the OTP secret to actually use for `username`, checking the
@@ -456,6 +510,97 @@ pub fn resolve_otpkey(
         return entry.clone();
     }
     config_otpkey.map(|s| s.to_string())
+}
+
+/// Resolves the password hash to actually use for a file-based
+/// `username`, checking `password_overrides` before falling back to
+/// `config_password`. See `AppState::password_overrides`.
+pub fn resolve_password_override(
+    state: &AppState,
+    username: &str,
+    config_password: &str,
+) -> String {
+    state
+    .password_overrides
+    .get(username)
+    .map(|entry| entry.clone())
+    .unwrap_or_else(|| config_password.to_string())
+}
+
+/// Resolves whether `username` currently must change their password,
+/// checking `must_change_overrides` before falling back to whatever
+/// `config_value` (from config.json/the database) said. See
+/// `AppState::must_change_overrides`.
+pub fn resolve_must_change_password(
+    state: &AppState,
+    username: &str,
+    config_value: bool,
+) -> bool {
+    state
+    .must_change_overrides
+    .get(username)
+    .map(|entry| *entry)
+    .unwrap_or(config_value)
+}
+
+/// Writes a new Argon2 password hash for a file-based user directly
+/// into `config.json`, and clears `must_change_password` for them at
+/// the same time (a completed password change always satisfies it,
+/// whichever flow triggered it). Mirrors `clear_otpkey`'s approach —
+/// raw JSON manipulation, since `AppConfig`'s own (de)serialization
+/// isn't in scope for a single-field update. Returns `Ok(true)` if the
+/// user was found and updated, `Ok(false)` if not found (so this can
+/// be tried against file-based storage first, then database storage,
+/// without erroring out just because the user lives in the other one).
+pub fn set_user_password(
+    config_path: &str,
+    username: &str,
+    new_password_hash: &str,
+) -> Result<bool, String> {
+    if !Path::new(config_path).exists() {
+        return Err(format!("Config file not found: {}", config_path));
+    }
+
+    let config_str = fs::read_to_string(config_path)
+    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+    let mut json: Value = serde_json::from_str(&config_str)
+    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+
+    let users = json
+    .get_mut("users")
+    .and_then(|u| u.as_array_mut())
+    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+
+    let mut found = false;
+
+    for user in users.iter_mut() {
+        let name = user.get("username").and_then(|u| u.as_str());
+        if name == Some(username) {
+            found = true;
+            if let Some(obj) = user.as_object_mut() {
+                obj.insert(
+                    "password".to_string(),
+                           Value::String(new_password_hash.to_string()),
+                );
+                obj.insert(
+                    "must_change_password".to_string(),
+                           Value::Bool(false),
+                );
+            }
+            break;
+        }
+    }
+
+    if !found {
+        return Ok(false);
+    }
+
+    let updated_str = serde_json::to_string_pretty(&json)
+    .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+    fs::write(config_path, updated_str)
+    .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+
+    Ok(true)
 }
 
 #[derive(Deserialize)]
@@ -870,6 +1015,15 @@ impl AppConfig {
         }
     }
 
+    /// Immediately reflects a single database user's fresh data (e.g.
+    /// right after a password change via `/reset-password`) into the
+    /// in-memory `db_users` snapshot, without waiting for the next
+    /// scan tick. Thin public wrapper around the same `apply_upserts`
+    /// the periodic scans use.
+    pub fn upsert_db_user_now(&self, user: User) {
+        self.apply_upserts(&[user]);
+    }
+
     /// Shared upsert-in-place-or-append step used by both
     /// `refresh_db_users` and `refresh_db_users_incremental`. Returns
     /// the write guard (still held) so `refresh_db_users` can continue
@@ -1149,18 +1303,18 @@ impl AllowRegexCfg {
                 }),
                 RegexCondCfg::Header { name, pattern } => Ok(RegexCond::Header {
                     name_re: Regex::new(name)?,
-                    re: Regex::new(pattern)?,
+                                                             re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::Query { name, pattern } => Ok(RegexCond::Query {
                     name_re: Regex::new(name)?,
-                    re: Regex::new(pattern)?,
+                                                            re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::BodyRaw { pattern } => Ok(RegexCond::BodyRaw {
                     re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::BodyJson { key, pattern } => Ok(RegexCond::BodyJson {
                     key: key.clone(),
-                    re: Regex::new(pattern)?,
+                                                              re: Regex::new(pattern)?,
                 }),
             }
         }

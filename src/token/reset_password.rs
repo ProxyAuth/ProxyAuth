@@ -1,0 +1,233 @@
+//! `POST /reset-password` — the endpoint the form at `page_change_password`
+//! submits to. Handles both flows the same way once a token exists:
+//! an admin's `proxyauth reset-password`, and the automatic redirect a
+//! user gets on login when their `must_change_password` flag is set
+//! (see `token::auth::maybe_force_password_change`). Neither flow needs
+//! special-casing here — a valid, unexpired token is a valid, unexpired
+//! token either way.
+
+use crate::AppState;
+use crate::config::config::{User, resolve_password_override, set_user_password};
+use crate::network::error::render_error_page;
+use crate::reset::db as reset_db;
+use crate::token::auth::verify_password;
+use crate::token::csrf::verify_csrf_token;
+use actix_web::{
+    Error as ActixError, FromRequest, HttpRequest, HttpResponse, Responder,
+    dev::Payload,
+    error::ErrorBadRequest,
+    web::{self, Form, Json},
+};
+use argon2::Argon2;
+use argon2::password_hash::{PasswordHasher, SaltString};
+use futures_util::FutureExt;
+use futures_util::future::{LocalBoxFuture, ready};
+use rand::rngs::OsRng;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+pub struct ResetPasswordRequest {
+    pub token: String,
+    pub password: String,
+    pub verif_password: String,
+    pub csrf_token: Option<String>,
+}
+
+pub enum EitherResetPassword {
+    Json(ResetPasswordRequest),
+    Form(ResetPasswordRequest),
+}
+
+impl FromRequest for EitherResetPassword {
+    type Error = ActixError;
+    type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
+        let content_type = req
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+        if content_type.contains("application/json") {
+            Json::<ResetPasswordRequest>::from_request(req, payload)
+            .map(|res| res.map(|json| EitherResetPassword::Json(json.into_inner())))
+            .boxed_local()
+        } else if content_type.contains("application/x-www-form-urlencoded") {
+            Form::<ResetPasswordRequest>::from_request(req, payload)
+            .map(|res| res.map(|form| EitherResetPassword::Form(form.into_inner())))
+            .boxed_local()
+        } else {
+            ready(Err(ErrorBadRequest("Unsupported Content-Type"))).boxed_local()
+        }
+    }
+}
+
+fn payload_inner(payload: &EitherResetPassword) -> &ResetPasswordRequest {
+    match payload {
+        EitherResetPassword::Json(r) | EitherResetPassword::Form(r) => r,
+    }
+}
+
+fn validate_csrf(payload: &EitherResetPassword, secret: &str) -> bool {
+    match payload_inner(payload).csrf_token.as_deref() {
+        Some(t) => verify_csrf_token(secret, t),
+        None => false,
+    }
+}
+
+pub async fn reset_password_route(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+    payload: EitherResetPassword,
+) -> impl Responder {
+    // CSRF is mandatory here regardless of whether the instance has
+    // csrf_token enabled for the normal /auth flow — this endpoint sets
+    // a new password from an unauthenticated context, there's no
+    // scenario where skipping CSRF is acceptable.
+    if !validate_csrf(&payload, &data.config.secret) {
+        return render_error_page(&req, data.clone(), "invalid csrf request").await;
+    }
+
+    let body = payload_inner(&payload);
+
+    if body.password != body.verif_password {
+        return HttpResponse::BadRequest()
+        .append_header(("server", "ProxyAuth"))
+        .body("Passwords do not match");
+    }
+
+    if body.password.is_empty() {
+        return HttpResponse::BadRequest()
+        .append_header(("server", "ProxyAuth"))
+        .body("Password cannot be empty");
+    }
+
+    let username = match reset_db::validate_token(&body.token) {
+        Ok(u) => u,
+        Err(_) => {
+            return HttpResponse::BadRequest()
+            .append_header(("server", "ProxyAuth"))
+            .body("Invalid or expired reset link");
+        }
+    };
+
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = match Argon2::default().hash_password(body.password.as_bytes(), &salt) {
+        Ok(h) => h.to_string(),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+            .append_header(("server", "ProxyAuth"))
+            .body("Failed to hash password");
+        }
+    };
+
+    // Try file-based storage first, then the database — a username
+    // only ever lives in one of the two, and we don't know which
+    // without checking (mirrors how `combined_users()` treats both as
+    // equally valid sources, file-first).
+    let file_updated = match set_user_password(
+        "/etc/proxyauth/config/config.json",
+        &username,
+        &hash,
+    ) {
+        Ok(updated) => updated,
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+            .append_header(("server", "ProxyAuth"))
+            .body(format!("Failed to update password: {e}"));
+        }
+    };
+
+    if file_updated {
+        // Reflect immediately for this and every other already-running
+        // worker/instance sharing this AppState — otherwise the new
+        // password would only take effect after config.json is
+        // re-read, i.e. never, until a restart. Mirrors
+        // `otp_overrides`'s reasoning exactly.
+        data.password_overrides.insert(username.clone(), hash);
+        data.must_change_overrides.insert(username.clone(), false);
+    } else if let Some(db_cfg) = &data.config.databases {
+        let mut conn = match crate::databases::db::connect(db_cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                .append_header(("server", "ProxyAuth"))
+                .body(format!("Database is not reachable: {e}"));
+            }
+        };
+        if let Err(e) = crate::databases::db::ensure_schema(&mut conn) {
+            return HttpResponse::InternalServerError()
+            .append_header(("server", "ProxyAuth"))
+            .body(format!("Database is not reachable: {e}"));
+        }
+
+        match crate::databases::db::update_password(&mut conn, &username, &hash) {
+            Ok(true) => {
+                // Reflect the change into db_users immediately, same
+                // reasoning as the file-based branch above — don't
+                // wait for the next incremental scan tick.
+                if let Ok(Some(updated_user)) =
+                    crate::databases::db::load_user_by_username(&mut conn, &username)
+                    {
+                        data.config.upsert_db_user_now(updated_user);
+                    }
+            }
+            Ok(false) => {
+                return HttpResponse::NotFound()
+                .append_header(("server", "ProxyAuth"))
+                .body("Unknown user");
+            }
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                .append_header(("server", "ProxyAuth"))
+                .body(format!("Failed to update password: {e}"));
+            }
+        }
+    } else {
+        return HttpResponse::NotFound()
+        .append_header(("server", "ProxyAuth"))
+        .body("Unknown user");
+    }
+
+    let _ = reset_db::consume_token(&body.token);
+
+    HttpResponse::Ok()
+    .append_header(("server", "ProxyAuth"))
+    .json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Kept here for reuse by both the CLI (`reset-password`) and the
+/// forced first-login redirect (`token::auth`) — resolves whichever
+/// email address is on file for `username`, if any, using the same
+/// file-or-database lookup order as the rest of the reset flow.
+/// Resolves which email to actually use for `username` — the entry
+/// explicitly marked `primary`, if any; otherwise falls back to the
+/// first one on file (covers data that predates the explicit flag, or
+/// simply has none marked). Never picks a *second* primary entry over
+/// the first — `db-add-user`/config.json are expected to keep at most
+/// one `primary: true` per user, but this stays deterministic even if
+/// that's violated.
+pub fn find_user_email(users: &[User], username: &str) -> Option<String> {
+    let emails = users
+    .iter()
+    .find(|u| u.username == username)
+    .and_then(|u| u.email.as_ref())?;
+
+    emails
+    .iter()
+    .find(|e| e.primary)
+    .or_else(|| emails.first())
+    .map(|e| e.address.clone())
+}
+
+/// Unused directly by the route above (kept for symmetry / potential
+/// future direct-password-check use cases, e.g. requiring the old
+/// password too) — verifies a plaintext password against a stored
+/// Argon2 hash, resolving any live override first.
+#[allow(dead_code)]
+pub fn verify_current_password(state: &AppState, user: &User, plaintext: &str) -> bool {
+    let hash = resolve_password_override(state, &user.username, &user.password);
+    verify_password(plaintext, &hash)
+}

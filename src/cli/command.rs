@@ -27,6 +27,28 @@ pub enum Commands {
         username: String,
         #[arg(long)]
         password: Option<String>,
+        /// Email address to notify this user at — required for
+        /// `proxyauth reset-password` to work for them. Repeat the
+        /// flag to set more than one (e.g. --email a@x.com --email
+        /// b@x.com). Omitting it entirely clears any email(s) already
+        /// on file for this user (this command is authoritative, not a
+        /// merge — same reasoning as --must-change-password below).
+        #[arg(long)]
+        email: Vec<String>,
+        /// Which of the --email addresses is the primary one (used
+        /// when sending a reset link). Must exactly match one of the
+        /// --email values given. Defaults to the first --email given
+        /// if omitted.
+        #[arg(long)]
+        primary_email: Option<String>,
+        /// Marks the account as needing a real password before it can
+        /// be used normally — their next successful login redirects to
+        /// `page_change_password` instead of issuing a session. Use
+        /// this when --password is a temporary one you're handing to
+        /// someone directly, rather than a permanent password they
+        /// chose themselves.
+        #[arg(long)]
+        must_change_password: bool,
     },
     /// Soft-delete a user in the configured database: the row is kept
     /// (marked deleted) rather than removed immediately, so every
@@ -75,5 +97,16 @@ pub enum Commands {
     DbSyncCache {
         #[arg(long)]
         force: bool,
+    },
+    /// Resets a user's password: generates a single-use, time-limited
+    /// link and emails it to them (requires both `smtp` and
+    /// `page_change_password` to be configured, and the user to have
+    /// an email on file). Their current password keeps working until
+    /// they actually follow the link and set a new one — this doesn't
+    /// lock them out immediately, it just gives them a way back in
+    /// without needing their old password.
+    ResetPassword {
+        #[arg(long)]
+        username: String,
     },
 }

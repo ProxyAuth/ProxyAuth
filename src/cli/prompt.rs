@@ -1,5 +1,5 @@
 use crate::cli::command::{Cli, Commands};
-use crate::config::config::{AppConfig, User, load_config};
+use crate::config::config::{AppConfig, EmailEntry, User, load_config};
 use crate::config::def_config::{
     ensure_running_as_proxyauth, ensure_running_as_root, ensure_user_proxyauth_exists,
     setup_proxyauth_db_directory, setup_proxyauth_directory, switch_to_user,
@@ -73,7 +73,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Some(Commands::DbAddUser { username, password }) => {
+        Some(Commands::DbAddUser {
+            username,
+            password,
+            email,
+            primary_email,
+            must_change_password,
+        }) => {
             switch_to_user("proxyauth")?;
             ensure_running_as_proxyauth();
 
@@ -117,13 +123,43 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| e.to_string())?
             .to_string();
 
+            // --primary-email must name one of the --email addresses
+            // given, if provided at all — otherwise it's ambiguous
+            // which entry it was meant to mark. Defaults to the first
+            // --email given, matching the pre-existing convention this
+            // replaces (positional "first wins"), just made explicit.
+            let email_entries: Vec<EmailEntry> = if email.is_empty() {
+                Vec::new()
+            } else {
+                let primary_addr = match primary_email {
+                    Some(p) => {
+                        if !email.contains(p) {
+                            eprintln!(
+                                "--primary-email '{p}' must match one of the --email addresses given."
+                            );
+                            std::process::exit(1);
+                        }
+                        p.clone()
+                    }
+                    None => email[0].clone(),
+                };
+                email
+                .iter()
+                .map(|addr| EmailEntry {
+                    address: addr.clone(),
+                     primary: *addr == primary_addr,
+                })
+                .collect()
+            };
+
             let user = User {
                 username: username.clone(),
                 password: hash,
                 otpkey: None,
                 allow: None,
                 roles: None,
-                email: None,
+                email: if email_entries.is_empty() { None } else { Some(email_entries) },
+                must_change_password: *must_change_password,
             };
 
             crate::databases::db::upsert_user(&mut conn, &user)?;
@@ -319,6 +355,101 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Local cache synced from the database — now holds {count} user(s).");
             std::process::exit(0);
+        }
+
+        Some(Commands::ResetPassword { username }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            // Check every prerequisite up front and report all of them
+            // together, rather than bailing on the first one — nobody
+            // wants to fix "page_change_password missing", re-run,
+            // then discover "this user has no email" only on the
+            // second try. combined_users() already includes
+            // database-backed users (refreshed by load_config() just
+            // above), so this looks the user up wherever they actually
+            // live, file or database.
+            let mut problems = Vec::new();
+
+            if config.page_change_password.is_none() {
+                problems.push(
+                    "'page_change_password' is not configured in config.json — nowhere to send the user.".to_string(),
+                );
+            }
+
+            if config.smtp.is_none() {
+                problems.push(
+                    "'smtp' is not configured in config.json — cannot send an email.".to_string(),
+                );
+            }
+
+            let combined_users = config.combined_users();
+            let email = crate::token::reset_password::find_user_email(&combined_users, username);
+            let user_exists = combined_users.iter().any(|u| &u.username == username);
+
+            if !user_exists {
+                problems.push(format!("Unknown user '{username}'."));
+            } else if email.is_none() {
+                problems.push(format!(
+                    "User '{username}' has no email on file — add one to 'email' in config.json (or the database) before resetting their password this way."
+                ));
+            }
+
+            if !problems.is_empty() {
+                for p in &problems {
+                    eprintln!("{p}");
+                }
+                std::process::exit(1);
+            }
+
+            // All checks passed, so these are guaranteed Some by this
+            // point — the branches above already covered every case
+            // where they wouldn't be.
+            let page_change_password = config.page_change_password.as_ref().unwrap();
+            let smtp_cfg = config.smtp.as_ref().unwrap();
+            let email = email.unwrap();
+
+            // 1 hour is generous enough for someone to check their
+            // email without the link staying valid indefinitely.
+            let token = match crate::reset::db::create_token(
+                username,
+                crate::reset::db::ResetKind::AdminReset,
+                3600,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Failed to generate a reset token: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let separator = if page_change_password.contains('?') {
+                '&'
+            } else {
+                '?'
+            };
+            let reset_link = format!("{page_change_password}{separator}token={token}");
+
+            let client = match crate::smtp::smtp::SmtpClient::new(smtp_cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to set up the SMTP client: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            match client.send_reset_password(&email, username, &reset_link).await {
+                Ok(()) => {
+                    println!("Password reset link sent to '{username}' at {email}.");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Failed to send the reset email: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

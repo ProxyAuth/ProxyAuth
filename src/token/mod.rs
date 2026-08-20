@@ -16,4 +16,5 @@ pub mod auth;
 pub mod crypto;
 pub mod csrf;
 pub mod logout;
+pub mod reset_password;
 pub mod security;
