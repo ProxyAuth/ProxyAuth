@@ -174,9 +174,36 @@ pub fn connect(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
     }
 }
 
+/// Once `ensure_schema` has run successfully in this process, every DDL
+/// step (table/index/trigger creation, migrations) is skipped on later
+/// calls — the schema doesn't change after the first time, and calling
+/// it on every scan tick (every 30s by default) was needlessly racy:
+/// concurrent calls (from the incremental scan, the full scan, the
+/// purge task, all running independently) could interleave their
+/// DROP TRIGGER/CREATE TRIGGER pairs, briefly leaving the deletion
+/// trigger absent or spuriously failing with "already exists" —
+/// which `load_users_from_config` would then misread as the database
+/// being unreachable and fall back to the local cache for no real
+/// reason. Process-local (not persisted), so a fresh process still
+/// runs it once at its own startup.
+static SCHEMA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Creates `users`, `user_allow` and `user_roles` if they don't exist yet.
-/// Safe to call on every startup.
+/// Safe to call on every startup — and cheap to call repeatedly after
+/// that too, since it does nothing once `SCHEMA_READY` is set (see
+/// above) rather than re-running DDL every time.
 pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
+    if SCHEMA_READY.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+
+    ensure_schema_inner(conn)?;
+
+    SCHEMA_READY.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
     match conn {
         DbConnection::Postgres(c) => {
             c.batch_execute(
@@ -268,15 +295,23 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
 
             // Re-created on every startup (drop then create) to stay
             // idempotent — Postgres has no `CREATE TRIGGER IF NOT
-            // EXISTS` on versions this targets.
+            // EXISTS` on versions this targets. If a concurrent call
+            // (another scan tick, another instance) recreates it
+            // between our DROP and CREATE, treat "already exists" as
+            // success rather than a hard failure — the trigger being
+            // present is all we actually care about.
             c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete ON users")
             .map_err(|e| format!("Failed to drop trg_log_user_delete (postgres): {e}"))?;
-            c.batch_execute(
+            if let Err(e) = c.batch_execute(
                 "CREATE TRIGGER trg_log_user_delete
                 AFTER DELETE ON users
                 FOR EACH ROW EXECUTE FUNCTION log_deleted_user()",
-            )
-            .map_err(|e| format!("Failed to create trg_log_user_delete (postgres): {e}"))?;
+            ) {
+                let msg = e.to_string().to_lowercase();
+                if !msg.contains("already exists") {
+                    return Err(format!("Failed to create trg_log_user_delete (postgres): {e}"));
+                }
+            }
 
             Ok(())
         }
@@ -358,16 +393,24 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
 
             // Re-created on every startup (drop then create) to stay
             // idempotent — MySQL/MariaDB has no reliable `CREATE
-            // TRIGGER IF NOT EXISTS` across every targeted version.
+            // TRIGGER IF NOT EXISTS` across every targeted version. If
+            // a concurrent call (another scan tick, another instance)
+            // recreates it between our DROP and CREATE, treat "already
+            // exists" as success rather than a hard failure — the
+            // trigger being present is all we actually care about.
             c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete")
             .map_err(|e| format!("Failed to drop trg_log_user_delete (mysql): {e}"))?;
-            c.batch_execute(
+            if let Err(e) = c.batch_execute(
                 "CREATE TRIGGER trg_log_user_delete
                 AFTER DELETE ON users
                 FOR EACH ROW
                 INSERT INTO deleted_users_log (username) VALUES (OLD.username)",
-            )
-            .map_err(|e| format!("Failed to create trg_log_user_delete (mysql): {e}"))?;
+            ) {
+                let msg = e.to_string().to_lowercase();
+                if !msg.contains("already exists") {
+                    return Err(format!("Failed to create trg_log_user_delete (mysql): {e}"));
+                }
+            }
 
             Ok(())
         }
