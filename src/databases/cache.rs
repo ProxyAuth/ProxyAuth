@@ -106,6 +106,35 @@ pub fn read_snapshot() -> Result<Vec<User>, String> {
     .map_err(|e| format!("Failed to deserialize cached snapshot: {e}"))
 }
 
+/// Deletes the cached snapshot, if one exists. A no-op (not an error) if
+/// there was nothing cached to begin with. The next successful full
+/// database read repopulates it as usual — this only clears what's
+/// there *right now*, it doesn't disable caching going forward.
+pub fn clear_snapshot() -> Result<(), String> {
+    let env = env()?;
+
+    let _guard = CACHE_MUTEX.lock().map_err(|e| e.to_string())?;
+    let db = env
+    .open_db(Some(DB_NAME))
+    .map_err(|e| format!("Failed to open LMDB cache db: {e}"))?;
+    let mut txn = env
+    .begin_rw_txn()
+    .map_err(|e| format!("Failed to begin LMDB cache write txn: {e}"))?;
+
+    match txn.del(db, &SNAPSHOT_KEY, None) {
+        Ok(()) => {}
+        Err(lmdb::Error::NotFound) => {
+            // Nothing cached — already in the desired end state.
+        }
+        Err(e) => return Err(format!("Failed to clear LMDB cache snapshot: {e}")),
+    }
+
+    txn.commit()
+    .map_err(|e| format!("Failed to commit LMDB cache clear: {e}"))?;
+
+    Ok(())
+}
+
 /// Same as `read_snapshot`, but logs the outcome and adapts it to the
 /// `Option<Vec<User>>` shape `load_users_from_config` needs: `Some` on a
 /// cache hit (treated the same as a fresh database read by callers —
