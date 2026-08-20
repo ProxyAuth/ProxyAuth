@@ -86,6 +86,26 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             };
 
+            // A live connection is required, checked here before even
+            // asking for a password — the LMDB fallback cache (see
+            // databases::cache) exists only for *reads* used to keep
+            // serving logins during a DB outage. It's never a valid
+            // target for a write: writing there would silently diverge
+            // from the real database and vanish on the next successful
+            // sync, giving a false impression the user was actually
+            // created.
+            let mut conn = match crate::databases::db::connect(db_cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database is not reachable — cannot write a user: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = crate::databases::db::ensure_schema(&mut conn) {
+                eprintln!("Database is not reachable — cannot write a user: {e}");
+                std::process::exit(1);
+            }
+
             let password = match password {
                 Some(p) => p.clone(),
                 None => rpassword::prompt_password("password: ")?,
@@ -96,9 +116,6 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             .hash_password(password.as_bytes(), &salt)
             .map_err(|e| e.to_string())?
             .to_string();
-
-            let mut conn = crate::databases::db::connect(db_cfg)?;
-            crate::databases::db::ensure_schema(&mut conn)?;
 
             let user = User {
                 username: username.clone(),
@@ -112,7 +129,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             crate::databases::db::upsert_user(&mut conn, &user)?;
             println!(
                 "User '{}' written to the database (revived if it was previously soft-deleted).",
-                     username
+                username
             );
             std::process::exit(0);
         }
@@ -130,8 +147,19 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             };
 
-            let mut conn = crate::databases::db::connect(db_cfg)?;
-            crate::databases::db::ensure_schema(&mut conn)?;
+            // Same reasoning as db-add-user above — this must hit the
+            // real database, never the local read-only fallback cache.
+            let mut conn = match crate::databases::db::connect(db_cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database is not reachable — cannot delete a user: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = crate::databases::db::ensure_schema(&mut conn) {
+                eprintln!("Database is not reachable — cannot delete a user: {e}");
+                std::process::exit(1);
+            }
             crate::databases::db::mark_user_deleted(&mut conn, username)?;
 
             println!(
