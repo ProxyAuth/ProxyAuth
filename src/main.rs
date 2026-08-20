@@ -280,6 +280,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if n > 0 {
                             println!("[databases] purged {n} soft-deleted user(s)");
                         }
+
+                        let n_log = crate::databases::db::purge_deletion_log_in_config(
+                            db_cfg,
+                            db_cfg.deleted_retention_secs,
+                        );
+                        if n_log > 0 {
+                            println!("[databases] purged {n_log} deletion log entr(y/ies)");
+                        }
                     }
                 }
             });

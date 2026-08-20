@@ -138,12 +138,19 @@ impl Serialize for User {
     where
     S: Serializer,
     {
-        let mut state = serializer.serialize_struct("User", 2)?;
+        // Length hint was wrong (2, should match the actual field count)
+        // and `roles` was serializing `self.allow`'s value instead of
+        // `self.roles`'s — meaning every config.json rewrite (e.g. on
+        // first-run password hashing) silently duplicated `allow` into
+        // `roles` and dropped the real roles. Fixed here; also now
+        // includes `email` for completeness.
+        let mut state = serializer.serialize_struct("User", 6)?;
         state.serialize_field("username", &self.username)?;
         state.serialize_field("password", &self.password)?;
         state.serialize_field("otpkey", &self.otpkey)?;
         state.serialize_field("allow", &self.allow)?;
-        state.serialize_field("roles", &self.allow)?;
+        state.serialize_field("roles", &self.roles)?;
+        state.serialize_field("email", &self.email)?;
         state.end()
     }
 }
@@ -183,21 +190,22 @@ pub struct DatabaseConfig {
     /// How often (in seconds) the *full* scan runs — reads the entire
     /// `users` table. Slower and more expensive at scale than the
     /// incremental scan above, but it's the only way to detect a user
-    /// that was hard-deleted from the database (a `modified_at` filter
-    /// can never see a row that no longer exists). Defaults to 300 (5
-    /// minutes). Set to 0 to disable (deletions then only take effect
-    /// on the next restart).
+    /// that was hard-deleted from the database without going through
+    /// `deleted_users_log` (e.g. a `TRUNCATE TABLE users`, which
+    /// bypasses row-level `DELETE` triggers entirely). Defaults to 300
+    /// (5 minutes). Set to 0 to disable (deletions then only take
+    /// effect on the next restart).
     #[serde(default = "default_db_full_refresh_interval")]
     pub full_refresh_interval_secs: u64,
 
     /// How long (in seconds) a soft-deleted user (`deleted = TRUE`,
-    /// see `db-delete-user`) stays in the database before being
-    /// permanently purged (`DELETE FROM users`). Keeping the row around
-    /// for a while after the soft-delete gives every instance's
-    /// incremental scan a chance to see and revoke it, and leaves an
-    /// audit trail. Defaults to 86400 (24 hours). Set to 0 to disable
-    /// automatic purging (soft-deleted rows are kept forever, until
-    /// removed manually).
+    /// see `db-delete-user`) — and its `deleted_users_log` entry, for a
+    /// hard-deleted one — stays in the database before being
+    /// permanently purged. Keeping the row/log entry around for a while
+    /// gives every instance's incremental scan a chance to see and
+    /// revoke it, and leaves an audit trail. Defaults to 86400 (24
+    /// hours). Set to 0 to disable automatic purging (rows/log entries
+    /// are kept forever, until removed manually).
     #[serde(default = "default_db_deleted_retention")]
     pub deleted_retention_secs: i64,
 
@@ -726,12 +734,22 @@ impl AppConfig {
     ///
     /// If a username reappears later (re-created), the slot is reused
     /// and un-revoked automatically.
+    ///
+    /// SECURITY: if the database can't be reached at all right now
+    /// (`load_users_from_config` returns `None`), this returns
+    /// immediately without touching `db_users`/`db_revoked` — a
+    /// transient outage must never be misread as "every database user
+    /// was deleted." Only a genuine, successfully-fetched (possibly
+    /// from the local LMDB cache) user list is used for the
+    /// revoke-by-absence comparison below.
     pub fn refresh_db_users(&self) {
         let Some(db_cfg) = &self.databases else {
             return;
         };
 
-        let fresh = crate::databases::db::load_users_from_config(db_cfg);
+        let Some(fresh) = crate::databases::db::load_users_from_config(db_cfg) else {
+            return;
+        };
         let fresh_usernames: std::collections::HashSet<&str> =
         fresh.iter().map(|u| u.username.as_str()).collect();
 

@@ -37,6 +37,7 @@
 //! `refresh_db_users_incremental` in `config.rs`).
 
 use crate::config::config::{DatabaseConfig, User};
+use crate::databases::cache;
 use chrono::NaiveDateTime;
 use diesel::connection::SimpleConnection;
 use diesel::mysql::MysqlConnection;
@@ -85,6 +86,14 @@ struct DbUserChangeRow {
 pub enum DbUserChange {
     Upserted(User),
     Deleted { username: String },
+}
+
+/// A username from `deleted_users_log` (populated by the trigger on a
+/// hard `DELETE FROM users`).
+#[derive(QueryableByName, Debug)]
+struct DeletedLogRow {
+    #[diesel(sql_type = Text)]
+    username: String,
 }
 
 /// Generic (user_id, value) row shape shared by `user_allow` and
@@ -198,6 +207,50 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
             )
             .map_err(|e| format!("Failed to create user_roles table (postgres): {e}"))?;
 
+            // Log of hard-deletions, populated by a trigger (below) —
+            // lets the incremental scan detect a raw `DELETE FROM users`
+            // (bypassing the app's soft-delete convention) within a
+            // bounded time window too, instead of needing a full-table
+            // scan to notice a row is simply gone.
+            c.batch_execute(
+                "CREATE TABLE IF NOT EXISTS deleted_users_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    username VARCHAR(255) NOT NULL,
+                            deleted_at TIMESTAMP NOT NULL DEFAULT now()
+            )",
+            )
+            .map_err(|e| format!("Failed to create deleted_users_log table (postgres): {e}"))?;
+
+            c.batch_execute(
+                "CREATE INDEX IF NOT EXISTS idx_deleted_users_log_deleted_at
+                ON deleted_users_log (deleted_at)",
+            )
+            .map_err(|e| {
+                format!("Failed to create deleted_users_log index (postgres): {e}")
+            })?;
+
+            c.batch_execute(
+                "CREATE OR REPLACE FUNCTION log_deleted_user() RETURNS TRIGGER AS $$
+                BEGIN
+                INSERT INTO deleted_users_log (username) VALUES (OLD.username);
+            RETURN OLD;
+            END;
+            $$ LANGUAGE plpgsql",
+            )
+            .map_err(|e| format!("Failed to create log_deleted_user() function (postgres): {e}"))?;
+
+            // Re-created on every startup (drop then create) to stay
+            // idempotent — Postgres has no `CREATE TRIGGER IF NOT
+            // EXISTS` on versions this targets.
+            c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete ON users")
+            .map_err(|e| format!("Failed to drop trg_log_user_delete (postgres): {e}"))?;
+            c.batch_execute(
+                "CREATE TRIGGER trg_log_user_delete
+                AFTER DELETE ON users
+                FOR EACH ROW EXECUTE FUNCTION log_deleted_user()",
+            )
+            .map_err(|e| format!("Failed to create trg_log_user_delete (postgres): {e}"))?;
+
             Ok(())
         }
         DbConnection::MySql(c) => {
@@ -260,6 +313,34 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
             )",
             )
             .map_err(|e| format!("Failed to create user_roles table (mysql): {e}"))?;
+
+            // Log of hard-deletions, populated by a trigger (below) —
+            // lets the incremental scan detect a raw `DELETE FROM users`
+            // (bypassing the app's soft-delete convention) within a
+            // bounded time window too, instead of needing a full-table
+            // scan to notice a row is simply gone.
+            c.batch_execute(
+                "CREATE TABLE IF NOT EXISTS deleted_users_log (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(255) NOT NULL,
+                            deleted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            INDEX idx_deleted_users_log_deleted_at (deleted_at)
+            )",
+            )
+            .map_err(|e| format!("Failed to create deleted_users_log table (mysql): {e}"))?;
+
+            // Re-created on every startup (drop then create) to stay
+            // idempotent — MySQL/MariaDB has no reliable `CREATE
+            // TRIGGER IF NOT EXISTS` across every targeted version.
+            c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete")
+            .map_err(|e| format!("Failed to drop trg_log_user_delete (mysql): {e}"))?;
+            c.batch_execute(
+                "CREATE TRIGGER trg_log_user_delete
+                AFTER DELETE ON users
+                FOR EACH ROW
+                INSERT INTO deleted_users_log (username) VALUES (OLD.username)",
+            )
+            .map_err(|e| format!("Failed to create trg_log_user_delete (mysql): {e}"))?;
 
             Ok(())
         }
@@ -324,6 +405,12 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
 }
 
 /// Inserts or updates the `users` row itself, returning its `id`.
+///
+/// If a soft-deleted row with this username already exists (see
+/// `mark_user_deleted`), this revives it: `deleted` is reset to
+/// `FALSE` along with the fresh password/otpkey, so `db-add-user` on a
+/// previously deleted username brings the account back rather than
+/// silently leaving it revoked underneath new-looking data.
 fn upsert_user_row(conn: &mut DbConnection, user: &User) -> Result<i64, String> {
     match conn {
         DbConnection::Postgres(c) => {
@@ -333,6 +420,7 @@ fn upsert_user_row(conn: &mut DbConnection, user: &User) -> Result<i64, String> 
             ON CONFLICT (username) DO UPDATE SET
             password = EXCLUDED.password,
             otpkey = EXCLUDED.otpkey,
+            deleted = FALSE,
             modified_at = now()
             RETURNING id",
             )
@@ -353,6 +441,7 @@ fn upsert_user_row(conn: &mut DbConnection, user: &User) -> Result<i64, String> 
             ON DUPLICATE KEY UPDATE
             password = VALUES(password),
                       otpkey = VALUES(otpkey),
+                      deleted = FALSE,
                       id = LAST_INSERT_ID(id)",
             )
             .bind::<Text, _>(&user.username)
@@ -449,6 +538,10 @@ fn replace_user_roles(
 /// rows to match `user` exactly. `password` must already be the final
 /// stored value (e.g. an argon2 hash) — this function does not hash it
 /// for you.
+///
+/// If `username` matches a previously soft-deleted row, it's revived
+/// (`deleted` reset to `FALSE`) rather than left revoked underneath the
+/// new data — see `upsert_user_row`.
 pub fn upsert_user(conn: &mut DbConnection, user: &User) -> Result<(), String> {
     let user_id = upsert_user_row(conn, user)?;
     replace_user_allow(conn, user_id, user.allow.as_deref())?;
@@ -510,6 +603,27 @@ pub fn purge_deleted_users(conn: &mut DbConnection, retention_secs: i64) -> Resu
     }
 }
 
+/// Trims `deleted_users_log` entries older than `retention_secs` — the
+/// log would otherwise grow forever. Note: `purge_deleted_users` above
+/// itself fires the delete trigger, so purging soft-deleted rows adds a
+/// few more entries here too; harmless, just something to keep in mind
+/// when reading row counts.
+pub fn purge_deletion_log(conn: &mut DbConnection, retention_secs: i64) -> Result<u64, String> {
+    let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(retention_secs);
+    match conn {
+        DbConnection::Postgres(c) => sql_query("DELETE FROM deleted_users_log WHERE deleted_at < $1")
+        .bind::<Timestamp, _>(cutoff)
+        .execute(c)
+        .map(|n| n as u64)
+        .map_err(|e| format!("Failed to purge deleted_users_log (postgres): {e}")),
+        DbConnection::MySql(c) => sql_query("DELETE FROM deleted_users_log WHERE deleted_at < ?")
+        .bind::<Timestamp, _>(cutoff)
+        .execute(c)
+        .map(|n| n as u64)
+        .map_err(|e| format!("Failed to purge deleted_users_log (mysql): {e}")),
+    }
+}
+
 /// Connects and soft-deletes a user by username. Errors are logged, not
 /// panicked — consistent with the rest of this module's "never take
 /// down the caller" style, but note this one has a real side effect
@@ -527,10 +641,13 @@ pub fn mark_user_deleted_in_config(cfg: &DatabaseConfig, username: &str) -> Resu
 ///
 /// Unlike `load_users`, this does **not** filter out `deleted = TRUE`
 /// rows — a soft-deletion is itself a `modified_at`-bumping UPDATE, so
-/// it naturally falls inside the scanned window. Each row comes back as
-/// `DbUserChange::Deleted` or `::Upserted` so the caller can revoke a
-/// just-deleted user immediately, on the next incremental tick, rather
-/// than waiting for the slower full scan.
+/// it naturally falls inside the scanned window. It also merges in
+/// hard-deletions from `deleted_users_log` (see `load_recent_deletions`)
+/// — populated by a trigger, so a raw `DELETE FROM users` run outside
+/// the app's normal soft-delete flow is *also* caught within a bounded
+/// window, instead of needing the slower full-table scan. Either kind
+/// comes back as `DbUserChange::Deleted`; the caller doesn't need to
+/// care which one it was.
 pub fn load_recently_changed_users(
     conn: &mut DbConnection,
     cutoff: NaiveDateTime,
@@ -549,10 +666,6 @@ pub fn load_recently_changed_users(
         .load(c)
         .map_err(|e| format!("Failed to load recently changed users (mysql): {e}"))?,
     };
-
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
 
     // Small, bounded set (bounded by how many users changed in the
     // window) — a per-id lookup for allow/roles here is cheap and keeps
@@ -579,7 +692,35 @@ pub fn load_recently_changed_users(
         }));
     }
 
+    for username in load_recent_deletions(conn, cutoff)? {
+        changes.push(DbUserChange::Deleted { username });
+    }
+
     Ok(changes)
+}
+
+/// Reads usernames hard-deleted (`DELETE FROM users`) at or after
+/// `cutoff`, from `deleted_users_log` (populated by a trigger — see
+/// `ensure_schema`). May return the same username more than once if it
+/// was deleted, re-created, and deleted again within the window;
+/// callers revoking by username handle that fine (idempotent).
+fn load_recent_deletions(conn: &mut DbConnection, cutoff: NaiveDateTime) -> Result<Vec<String>, String> {
+    match conn {
+        DbConnection::Postgres(c) => {
+            sql_query("SELECT username FROM deleted_users_log WHERE deleted_at >= $1")
+            .bind::<Timestamp, _>(cutoff)
+            .load::<DeletedLogRow>(c)
+            .map(|rows| rows.into_iter().map(|r| r.username).collect())
+            .map_err(|e| format!("Failed to load deleted_users_log (postgres): {e}"))
+        }
+        DbConnection::MySql(c) => {
+            sql_query("SELECT username FROM deleted_users_log WHERE deleted_at >= ?")
+            .bind::<Timestamp, _>(cutoff)
+            .load::<DeletedLogRow>(c)
+            .map(|rows| rows.into_iter().map(|r| r.username).collect())
+            .map_err(|e| format!("Failed to load deleted_users_log (mysql): {e}"))
+        }
+    }
 }
 
 /// Fetches all `value` entries for one user from a child table
@@ -667,29 +808,75 @@ pub fn purge_deleted_users_in_config(cfg: &DatabaseConfig, retention_secs: i64) 
     }
 }
 
-/// Connects, ensures the schema exists, and returns the users currently
-/// stored in the database. Returns an empty Vec (with a logged warning,
-/// never a panic) on any failure, so a DB outage doesn't take the whole
-/// proxy down — file-based `users` in config.json still work.
-pub fn load_users_from_config(cfg: &DatabaseConfig) -> Vec<User> {
+/// Connects, ensures the schema exists, and trims `deleted_users_log`
+/// entries older than `retention_secs`. Same failure behavior as
+/// `purge_deleted_users_in_config`.
+pub fn purge_deletion_log_in_config(cfg: &DatabaseConfig, retention_secs: i64) -> u64 {
     let mut conn = match connect(cfg) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[databases] {e}");
-            return Vec::new();
+            return 0;
         }
     };
 
     if let Err(e) = ensure_schema(&mut conn) {
         eprintln!("[databases] {e}");
-        return Vec::new();
+        return 0;
+    }
+
+    match purge_deletion_log(&mut conn, retention_secs) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[databases] {e}");
+            0
+        }
+    }
+}
+
+/// Connects, ensures the schema exists, and returns the users currently
+/// stored in the database. Returns an empty Vec (with a logged warning,
+/// never a panic) on any failure, so a DB outage doesn't take the whole
+/// proxy down — file-based `users` in config.json still work.
+/// Connects, ensures the schema exists, and returns the users currently
+/// stored in the database. Returns `None` — distinct from `Some(vec![])`
+/// — on any connection/query failure, so callers can tell "the database
+/// is unreachable, don't touch what I already know" apart from "the
+/// database answered and genuinely has zero users right now". Confusing
+/// the two used to be a real bug: `refresh_db_users` treated an empty
+/// result as "every user was deleted" and revoked all of them on a
+/// transient DB outage — a five-second network blip could log out an
+/// entire user base. See `AppConfig::refresh_db_users`.
+///
+/// On success, the result is also cached to a local LMDB store (see
+/// `cache` module) so that if the database is unreachable on a later
+/// *startup* — not just a mid-session outage — ProxyAuth can still come
+/// up with the last known set of database-backed users instead of zero,
+/// falling back to that cache below when the database itself fails.
+pub fn load_users_from_config(cfg: &DatabaseConfig) -> Option<Vec<User>> {
+    let mut conn = match connect(cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[databases] {e}");
+            return cache::read_snapshot_with_fallback_log();
+        }
+    };
+
+    if let Err(e) = ensure_schema(&mut conn) {
+        eprintln!("[databases] {e}");
+        return cache::read_snapshot_with_fallback_log();
     }
 
     match load_users(&mut conn) {
-        Ok(users) => users,
+        Ok(users) => {
+            if let Err(e) = cache::write_snapshot(&users) {
+                eprintln!("[databases] failed to update local cache: {e}");
+            }
+            Some(users)
+        }
         Err(e) => {
             eprintln!("[databases] {e}");
-            Vec::new()
+            cache::read_snapshot_with_fallback_log()
         }
     }
 }
