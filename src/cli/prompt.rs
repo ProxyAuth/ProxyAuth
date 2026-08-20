@@ -238,9 +238,27 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
 
             println!(
                 "Restored {} user(s) from the local cache into the database.",
-                restored
+                     restored
             );
             std::process::exit(0);
+        }
+
+        Some(Commands::DbClearCache) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            match crate::databases::cache::clear_snapshot() {
+                Ok(()) => {
+                    println!(
+                        "Local cache cleared. It will be repopulated on the next successful full database read."
+                    );
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Failed to clear local cache: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

@@ -51,4 +51,13 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Clears this instance's local LMDB fallback cache. The next
+    /// successful full database read repopulates it as usual — this
+    /// doesn't disable caching going forward, it only wipes what's
+    /// stored right now. Useful if the cache itself is suspected stale
+    /// or wrong (e.g. before running db-restore-from-cache, if you'd
+    /// rather force a fresh database read first) and you want to be
+    /// certain a later fallback wouldn't reuse it. A no-op, not an
+    /// error, if nothing was cached to begin with.
+    DbClearCache,
 }
