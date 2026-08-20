@@ -62,10 +62,10 @@ once_cell = "1.19"
 hyper       = { version = "1", features = ["server", "http1", "http2", "client"] }
 http-body-util = "^0.1"
 hyper-util  = { version = "^0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
-hyper-http-proxy = "1.1.0"
+hyper-http-proxy = "1.2.0"
 hyper-rustls = "0.27"
 rustls = { version = "0.23", features = ["ring"] }
-rustls-native-certs = "0.7"
+rustls-native-certs = "0.8"
 rustls-pki-types = "1.9"
 webpki-roots = "0.26"
 rustc-hash = "1"
@@ -119,7 +119,7 @@ version = ">=0.4.16, <0.5.0"
 [build-dependencies]
 rand = "0.8"
 rand_chacha = "0.3"
-reqwest = { version = "0.11", features = ["blocking", "json"] }
+reqwest = { version = "0.13", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
