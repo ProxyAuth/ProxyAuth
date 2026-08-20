@@ -656,6 +656,14 @@ pub fn purge_deletion_log(conn: &mut DbConnection, retention_secs: i64) -> Resul
 /// down the caller" style, but note this one has a real side effect
 /// (unlike the read-only `load_*_from_config` helpers), so callers that
 /// need to know whether it actually happened should check the return.
+///
+/// Not currently called anywhere — `db-delete-user` (cli/prompt.rs)
+/// calls `connect`/`ensure_schema`/`mark_user_deleted` directly instead,
+/// so it can report which specific step failed with its own message.
+/// Kept as public API for a future caller that just wants "delete this
+/// user" in one call without that level of control (e.g. an eventual
+/// admin HTTP endpoint).
+#[allow(dead_code)]
 pub fn mark_user_deleted_in_config(cfg: &DatabaseConfig, username: &str) -> Result<(), String> {
     let mut conn = connect(cfg)?;
     ensure_schema(&mut conn)?;
