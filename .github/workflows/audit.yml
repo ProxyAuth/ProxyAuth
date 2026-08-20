@@ -68,7 +68,7 @@ jobs:
         run: cargo install --locked cargo-nextest
 
       - name: Build the binary
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Prepare User for run proxyauth
         run: sudo ./target/release/proxyauth prepare --insecure
