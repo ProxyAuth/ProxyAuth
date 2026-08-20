@@ -110,7 +110,10 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             crate::databases::db::upsert_user(&mut conn, &user)?;
-            println!("User '{}' written to the database.", username);
+            println!(
+                "User '{}' written to the database (revived if it was previously soft-deleted).",
+                     username
+            );
             std::process::exit(0);
         }
 
