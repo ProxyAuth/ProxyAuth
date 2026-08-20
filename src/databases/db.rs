@@ -88,6 +88,33 @@ pub enum DbUserChange {
     Deleted { username: String },
 }
 
+/// The result of `load_users_from_config`, distinguishing a fresh read
+/// of the real database from a fallback to the local LMDB cache.
+///
+/// This distinction matters for correctness, not just diagnostics:
+/// `AppConfig::refresh_db_users` uses "is this username absent from the
+/// list I just got?" to decide who to revoke. That's only safe to do
+/// against a list that's actually current. The cache is only refreshed
+/// on a successful *full* scan — if the database goes down again before
+/// the next one, and a user was created via the (more frequent)
+/// incremental scan in between, that user exists in RAM but wouldn't
+/// exist in the stale cached snapshot — comparing against it would
+/// incorrectly revoke a user who was never deleted. So a `Cache` result
+/// is only ever upserted, never used for absence-based revocation;
+/// only a genuine `Database` result is.
+pub enum UsersSource {
+    Database(Vec<User>),
+    Cache(Vec<User>),
+}
+
+impl UsersSource {
+    pub fn users(&self) -> &[User] {
+        match self {
+            UsersSource::Database(u) | UsersSource::Cache(u) => u,
+        }
+    }
+}
+
 /// A username from `deleted_users_log` (populated by the trigger on a
 /// hard `DELETE FROM users`).
 #[derive(QueryableByName, Debug)]
@@ -835,36 +862,31 @@ pub fn purge_deletion_log_in_config(cfg: &DatabaseConfig, retention_secs: i64) -
 }
 
 /// Connects, ensures the schema exists, and returns the users currently
-/// stored in the database. Returns an empty Vec (with a logged warning,
-/// never a panic) on any failure, so a DB outage doesn't take the whole
-/// proxy down — file-based `users` in config.json still work.
-/// Connects, ensures the schema exists, and returns the users currently
-/// stored in the database. Returns `None` — distinct from `Some(vec![])`
-/// — on any connection/query failure, so callers can tell "the database
-/// is unreachable, don't touch what I already know" apart from "the
-/// database answered and genuinely has zero users right now". Confusing
-/// the two used to be a real bug: `refresh_db_users` treated an empty
-/// result as "every user was deleted" and revoked all of them on a
-/// transient DB outage — a five-second network blip could log out an
-/// entire user base. See `AppConfig::refresh_db_users`.
+/// stored in the database. Returns `None` — distinct from
+/// `Some(UsersSource::Database(vec![]))` — on any connection/query
+/// failure with no usable cache either, so callers can tell "nothing at
+/// all to go on, don't touch what I already know" apart from "I have
+/// *something*, even if it's only the cache". See `UsersSource` for why
+/// the distinction between a fresh database read and a cache fallback
+/// matters, not just where the data came from.
 ///
-/// On success, the result is also cached to a local LMDB store (see
-/// `cache` module) so that if the database is unreachable on a later
-/// *startup* — not just a mid-session outage — ProxyAuth can still come
-/// up with the last known set of database-backed users instead of zero,
-/// falling back to that cache below when the database itself fails.
-pub fn load_users_from_config(cfg: &DatabaseConfig) -> Option<Vec<User>> {
+/// On a successful database read, the result is also mirrored to a
+/// local LMDB store (see `cache` module) so that if the database is
+/// unreachable later — most importantly on a subsequent *startup*, not
+/// just mid-session — ProxyAuth can still come up with the last known
+/// set of database-backed users instead of zero.
+pub fn load_users_from_config(cfg: &DatabaseConfig) -> Option<UsersSource> {
     let mut conn = match connect(cfg) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[databases] {e}");
-            return cache::read_snapshot_with_fallback_log();
+            return cache::read_snapshot_with_fallback_log().map(UsersSource::Cache);
         }
     };
 
     if let Err(e) = ensure_schema(&mut conn) {
         eprintln!("[databases] {e}");
-        return cache::read_snapshot_with_fallback_log();
+        return cache::read_snapshot_with_fallback_log().map(UsersSource::Cache);
     }
 
     match load_users(&mut conn) {
@@ -872,11 +894,11 @@ pub fn load_users_from_config(cfg: &DatabaseConfig) -> Option<Vec<User>> {
             if let Err(e) = cache::write_snapshot(&users) {
                 eprintln!("[databases] failed to update local cache: {e}");
             }
-            Some(users)
+            Some(UsersSource::Database(users))
         }
         Err(e) => {
             eprintln!("[databases] {e}");
-            cache::read_snapshot_with_fallback_log()
+            cache::read_snapshot_with_fallback_log().map(UsersSource::Cache)
         }
     }
 }

@@ -735,25 +735,44 @@ impl AppConfig {
     /// If a username reappears later (re-created), the slot is reused
     /// and un-revoked automatically.
     ///
-    /// SECURITY: if the database can't be reached at all right now
+    /// SECURITY: if the database can't be reached at all right now, and
+    /// there's no usable local cache either
     /// (`load_users_from_config` returns `None`), this returns
     /// immediately without touching `db_users`/`db_revoked` — a
     /// transient outage must never be misread as "every database user
-    /// was deleted." Only a genuine, successfully-fetched (possibly
-    /// from the local LMDB cache) user list is used for the
-    /// revoke-by-absence comparison below.
+    /// was deleted."
+    ///
+    /// If the only thing available is the local LMDB cache
+    /// (`UsersSource::Cache`) rather than a fresh database read
+    /// (`UsersSource::Database`), the revoke-by-absence comparison below
+    /// is skipped entirely — only upserts are applied. The cache is
+    /// only refreshed on a successful *full* scan, so it can lag behind
+    /// a user created moments ago via the more frequent incremental
+    /// scan; comparing that user's presence against a stale cached
+    /// snapshot would incorrectly revoke them for simply not having
+    /// existed yet in that older snapshot. Only a genuinely current
+    /// database read is trustworthy enough to conclude "this username
+    /// is really gone."
     pub fn refresh_db_users(&self) {
         let Some(db_cfg) = &self.databases else {
             return;
         };
 
-        let Some(fresh) = crate::databases::db::load_users_from_config(db_cfg) else {
+        let Some(source) = crate::databases::db::load_users_from_config(db_cfg) else {
             return;
         };
+
+        let fresh = source.users();
+
+        if let crate::databases::db::UsersSource::Cache(_) = &source {
+            self.apply_upserts(fresh);
+            return;
+        }
+
         let fresh_usernames: std::collections::HashSet<&str> =
         fresh.iter().map(|u| u.username.as_str()).collect();
 
-        let Some(mut guard) = self.apply_upserts(&fresh) else {
+        let Some(mut guard) = self.apply_upserts(fresh) else {
             return;
         };
 
