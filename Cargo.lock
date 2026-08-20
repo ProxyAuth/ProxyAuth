@@ -2803,6 +2803,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "argon2",
+ "arrayref",
  "base32",
  "base64 0.21.7",
  "blake3",
