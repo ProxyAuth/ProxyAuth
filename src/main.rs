@@ -228,6 +228,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     the database, since a time-window filter can never see a row
     //     that no longer exists.
     // Either can be set to 0 to disable it independently.
+    //
+    // Both refresh_db_users*() calls below are synchronous/blocking
+    // (Diesel isn't async) — a database that's unreachable can take a
+    // long time to fail a TCP connection attempt (tens of seconds, if
+    // packets are silently dropped rather than actively refused).
+    // Running that directly inside a plain tokio::spawn ties up a
+    // tokio worker thread for the whole duration; on a small instance
+    // with few worker threads, that can starve the runtime enough that
+    // graceful shutdown (SIGTERM handling) has no thread left to run
+    // on until the blocking call eventually times out on its own.
+    // spawn_blocking runs it on tokio's separate blocking-thread pool
+    // instead, so a stuck database connection never holds up shutdown.
     if let Some(db_cfg) = &config.databases {
         if db_cfg.refresh_interval_secs > 0 {
             let refresh_config = Arc::clone(&config);
@@ -240,7 +252,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    refresh_config.refresh_db_users_incremental();
+                    let refresh_config = Arc::clone(&refresh_config);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        refresh_config.refresh_db_users_incremental();
+                    })
+                    .await;
                 }
             });
         }
@@ -254,7 +270,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    refresh_config.refresh_db_users();
+                    let refresh_config = Arc::clone(&refresh_config);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        refresh_config.refresh_db_users();
+                    })
+                    .await;
                 }
             });
         }
@@ -262,7 +282,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Periodically hard-delete users that were soft-deleted
         // (`db-delete-user`) more than deleted_retention_secs ago.
         // Safe to enable on every instance — a second, redundant purge
-        // just deletes zero rows.
+        // just deletes zero rows. Same spawn_blocking reasoning as
+        // above — purge_*_in_config are blocking Diesel calls too.
         if db_cfg.purge_interval_secs > 0 {
             let purge_config = Arc::clone(&config);
             let interval_secs = db_cfg.purge_interval_secs;
@@ -272,7 +293,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    if let Some(db_cfg) = &purge_config.databases {
+                    let purge_config = Arc::clone(&purge_config);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let Some(db_cfg) = &purge_config.databases else {
+                            return;
+                        };
                         let n = crate::databases::db::purge_deleted_users_in_config(
                             db_cfg,
                             db_cfg.deleted_retention_secs,
@@ -288,7 +313,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if n_log > 0 {
                             println!("[databases] purged {n_log} deletion log entr(y/ies)");
                         }
-                    }
+                    })
+                    .await;
                 }
             });
         }
