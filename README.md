@@ -1,7 +1,7 @@
 <div align="center">
 <h1>ProxyAuth (Community Edition)</h1>
 <br>
-<img src='images/logo.png' width="350px" height="350px"/>
+<img src='https://git.proxyauth.app/ProxyAuth/ProxyAuth/raw/branch/main/images/logo.png' width="350px" height="350px"/>
 </div>
 <br>
 
