@@ -113,5 +113,29 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             println!("User '{}' written to the database.", username);
             std::process::exit(0);
         }
+
+        Some(Commands::DbDeleteUser { username }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let Some(db_cfg) = &config.databases else {
+                eprintln!(
+                    "No 'databases' block configured in config.json — nothing to delete from."
+                );
+                std::process::exit(1);
+            };
+
+            let mut conn = crate::databases::db::connect(db_cfg)?;
+            crate::databases::db::ensure_schema(&mut conn)?;
+            crate::databases::db::mark_user_deleted(&mut conn, username)?;
+
+            println!(
+                "User '{}' soft-deleted — will be revoked on the next incremental scan of every connected instance, and permanently purged after {}s.",
+                username, db_cfg.deleted_retention_secs
+            );
+            std::process::exit(0);
+        }
     }
 }

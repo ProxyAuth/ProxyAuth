@@ -162,17 +162,73 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub password: String,
 
-    /// How often (in seconds) to re-scan the database and refresh the
-    /// in-memory user list, so users added/edited directly in the DB
-    /// eventually take effect without restarting the process. Defaults
-    /// to 30s. Set to 0 to disable periodic refresh (DB is only read
-    /// once, at startup).
+    /// How often (in seconds) the *incremental* scan runs — a cheap,
+    /// indexed query that only reads users changed within
+    /// `incremental_window_secs`. This is what keeps freshly
+    /// created/edited DB users usable quickly, without the cost of a
+    /// full table read on every tick. Defaults to 30s. Set to 0 to
+    /// disable it (falls back to relying solely on the slower full
+    /// scan below).
     #[serde(default = "default_db_refresh_interval")]
     pub refresh_interval_secs: u64,
+
+    /// The lookback window (in seconds) used by the incremental scan —
+    /// i.e. "users changed in the last N seconds". Must be at least as
+    /// long as `refresh_interval_secs` (ideally longer, with some
+    /// overlap) so a change can never fall in the gap between two scans
+    /// and be missed entirely. Defaults to 300 (5 minutes).
+    #[serde(default = "default_db_incremental_window")]
+    pub incremental_window_secs: i64,
+
+    /// How often (in seconds) the *full* scan runs — reads the entire
+    /// `users` table. Slower and more expensive at scale than the
+    /// incremental scan above, but it's the only way to detect a user
+    /// that was hard-deleted from the database (a `modified_at` filter
+    /// can never see a row that no longer exists). Defaults to 300 (5
+    /// minutes). Set to 0 to disable (deletions then only take effect
+    /// on the next restart).
+    #[serde(default = "default_db_full_refresh_interval")]
+    pub full_refresh_interval_secs: u64,
+
+    /// How long (in seconds) a soft-deleted user (`deleted = TRUE`,
+    /// see `db-delete-user`) stays in the database before being
+    /// permanently purged (`DELETE FROM users`). Keeping the row around
+    /// for a while after the soft-delete gives every instance's
+    /// incremental scan a chance to see and revoke it, and leaves an
+    /// audit trail. Defaults to 86400 (24 hours). Set to 0 to disable
+    /// automatic purging (soft-deleted rows are kept forever, until
+    /// removed manually).
+    #[serde(default = "default_db_deleted_retention")]
+    pub deleted_retention_secs: i64,
+
+    /// How often (in seconds) to run the purge of soft-deleted users
+    /// past `deleted_retention_secs`. Any single connected instance
+    /// running this is enough — deleting already-purged rows on another
+    /// instance is a harmless no-op, so this is safe to leave enabled
+    /// on every instance. Defaults to 3600 (hourly). Set to 0 to
+    /// disable.
+    #[serde(default = "default_db_purge_interval")]
+    pub purge_interval_secs: u64,
 }
 
 fn default_db_refresh_interval() -> u64 {
     30
+}
+
+fn default_db_incremental_window() -> i64 {
+    300
+}
+
+fn default_db_full_refresh_interval() -> u64 {
+    300
+}
+
+fn default_db_deleted_retention() -> i64 {
+    86400
+}
+
+fn default_db_purge_interval() -> u64 {
+    3600
 }
 
 impl DatabaseConfig {
@@ -679,22 +735,9 @@ impl AppConfig {
         let fresh_usernames: std::collections::HashSet<&str> =
         fresh.iter().map(|u| u.username.as_str()).collect();
 
-        let mut guard = match self.db_users.write() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("[databases] failed to acquire db_users lock: {e}");
-                return;
-            }
+        let Some(mut guard) = self.apply_upserts(&fresh) else {
+            return;
         };
-
-        for new_user in &fresh {
-            if let Some(existing) = guard.iter_mut().find(|u| u.username == new_user.username) {
-                *existing = new_user.clone();
-            } else {
-                guard.push(new_user.clone());
-            }
-            self.index_roles(&new_user.username, &new_user.roles);
-        }
 
         let Ok(mut revoked) = self.db_revoked.write() else {
             eprintln!("[databases] failed to acquire db_revoked lock");
@@ -712,6 +755,128 @@ impl AppConfig {
                 self.index_roles(&user.username, &None);
             }
         }
+    }
+
+    /// Lightweight sibling of `refresh_db_users`: reads only the users
+    /// changed in the last `incremental_window_secs` (see
+    /// `DatabaseConfig`) instead of the whole table — the query cost
+    /// scales with recent changes, not total row count.
+    ///
+    /// Unlike the previous design, this *can* revoke users now: a
+    /// soft-deletion (`db::mark_user_deleted`) is itself a
+    /// `modified_at`-bumping UPDATE, so it naturally falls inside the
+    /// scanned window and comes back as `DbUserChange::Deleted` — no
+    /// need to wait for the slower full scan to notice it. The full
+    /// scan (`refresh_db_users`) remains a safety net for anything that
+    /// bypassed the soft-delete convention (e.g. a manual hard `DELETE`
+    /// run directly against the database).
+    pub fn refresh_db_users_incremental(&self) {
+        let Some(db_cfg) = &self.databases else {
+            return;
+        };
+
+        let changes = crate::databases::db::load_recently_changed_from_config(
+            db_cfg,
+            db_cfg.incremental_window_secs,
+        );
+        if changes.is_empty() {
+            return;
+        }
+
+        let mut upserts = Vec::new();
+        let mut deletions = Vec::new();
+        for change in changes {
+            match change {
+                crate::databases::db::DbUserChange::Upserted(u) => upserts.push(u),
+                crate::databases::db::DbUserChange::Deleted { username } => {
+                    deletions.push(username)
+                }
+            }
+        }
+
+        if !upserts.is_empty() {
+            self.apply_upserts(&upserts);
+        }
+
+        for username in &deletions {
+            self.revoke_username_now(username);
+        }
+    }
+
+    /// Revokes a single user immediately, by username, without scanning
+    /// the whole `db_users` list for absentees like `refresh_db_users`
+    /// does. Same poisoning mechanism (password sentinel + `db_revoked`
+    /// index) — just triggered by an explicit soft-deletion event
+    /// instead of "missing from a full reload". A no-op if the username
+    /// isn't currently known.
+    fn revoke_username_now(&self, username: &str) {
+        let mut guard = match self.db_users.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[databases] failed to acquire db_users lock: {e}");
+                return;
+            }
+        };
+
+        let Some(idx) = guard.iter().position(|u| u.username == username) else {
+            return;
+        };
+
+        let Ok(mut revoked) = self.db_revoked.write() else {
+            eprintln!("[databases] failed to acquire db_revoked lock");
+            return;
+        };
+
+        if revoked.insert(idx) {
+            guard[idx].password = "!revoked!".to_string();
+            self.index_roles(username, &None);
+        }
+    }
+
+    /// Shared upsert-in-place-or-append step used by both
+    /// `refresh_db_users` and `refresh_db_users_incremental`. Returns
+    /// the write guard (still held) so `refresh_db_users` can continue
+    /// straight on to its deletion-detection pass without re-locking.
+    ///
+    /// Also un-revokes every touched index: a user reappearing via
+    /// upsert (soft-delete undone, or re-created with the same
+    /// username) must stop being rejected by `user_by_index` — without
+    /// this, a previously revoked slot would stay revoked forever even
+    /// after being upserted with fresh, valid data.
+    fn apply_upserts<'a>(
+        &'a self,
+        fresh: &[User],
+    ) -> Option<std::sync::RwLockWriteGuard<'a, Vec<User>>> {
+        let mut guard = match self.db_users.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[databases] failed to acquire db_users lock: {e}");
+                return None;
+            }
+        };
+
+        let mut touched_indices = Vec::with_capacity(fresh.len());
+
+        for new_user in fresh {
+            if let Some(idx) = guard.iter().position(|u| u.username == new_user.username) {
+                guard[idx] = new_user.clone();
+                touched_indices.push(idx);
+            } else {
+                guard.push(new_user.clone());
+                touched_indices.push(guard.len() - 1);
+            }
+            self.index_roles(&new_user.username, &new_user.roles);
+        }
+
+        if let Ok(mut revoked) = self.db_revoked.write() {
+            for idx in touched_indices {
+                revoked.remove(&idx);
+            }
+        } else {
+            eprintln!("[databases] failed to acquire db_revoked lock while un-revoking");
+        }
+
+        Some(guard)
     }
 }
 

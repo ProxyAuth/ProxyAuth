@@ -217,8 +217,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Periodically re-scan `databases` (if configured) so users added or
     // edited directly in the database eventually take effect without a
-    // restart. `refresh_interval_secs: 0` disables this (DB is only read
-    // once, at startup, inside load_config).
+    // restart. Two independent timers:
+    //   - incremental (refresh_interval_secs, default 30s): cheap,
+    //     indexed query scoped to the last incremental_window_secs
+    //     (default 5min) — picks up new/edited users quickly even with
+    //     a large user base, since its cost scales with recent changes,
+    //     not total row count.
+    //   - full (full_refresh_interval_secs, default 5min): reads the
+    //     whole table — the only way to detect a user hard-deleted from
+    //     the database, since a time-window filter can never see a row
+    //     that no longer exists.
+    // Either can be set to 0 to disable it independently.
     if let Some(db_cfg) = &config.databases {
         if db_cfg.refresh_interval_secs > 0 {
             let refresh_config = Arc::clone(&config);
@@ -227,11 +236,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 // First tick fires immediately; skip it since load_config
-                // already did an initial load.
+                // already did an initial (full) load.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    refresh_config.refresh_db_users_incremental();
+                }
+            });
+        }
+
+        if db_cfg.full_refresh_interval_secs > 0 {
+            let refresh_config = Arc::clone(&config);
+            let interval_secs = db_cfg.full_refresh_interval_secs;
+            tokio::spawn(async move {
+                let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
                     refresh_config.refresh_db_users();
+                }
+            });
+        }
+
+        // Periodically hard-delete users that were soft-deleted
+        // (`db-delete-user`) more than deleted_retention_secs ago.
+        // Safe to enable on every instance — a second, redundant purge
+        // just deletes zero rows.
+        if db_cfg.purge_interval_secs > 0 {
+            let purge_config = Arc::clone(&config);
+            let interval_secs = db_cfg.purge_interval_secs;
+            tokio::spawn(async move {
+                let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    if let Some(db_cfg) = &purge_config.databases {
+                        let n = crate::databases::db::purge_deleted_users_in_config(
+                            db_cfg,
+                            db_cfg.deleted_retention_secs,
+                        );
+                        if n > 0 {
+                            println!("[databases] purged {n} soft-deleted user(s)");
+                        }
+                    }
                 }
             });
         }

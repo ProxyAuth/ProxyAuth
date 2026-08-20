@@ -28,4 +28,13 @@ pub enum Commands {
         #[arg(long)]
         password: Option<String>,
     },
+    /// Soft-delete a user in the configured database: the row is kept
+    /// (marked deleted) rather than removed immediately, so every
+    /// connected instance's incremental scan can pick it up and revoke
+    /// it right away. Permanently purged later on its own
+    /// (`databases.deleted_retention_secs`, default 24h).
+    DbDeleteUser {
+        #[arg(long)]
+        username: String,
+    },
 }
