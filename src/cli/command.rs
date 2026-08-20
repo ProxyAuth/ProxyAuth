@@ -37,4 +37,18 @@ pub enum Commands {
         #[arg(long)]
         username: String,
     },
+    /// Re-populate the configured database from this instance's local
+    /// LMDB fallback cache (the last known-good snapshot, mirrored
+    /// there on every successful full read of the database). Meant for
+    /// after the database comes back empty (e.g. a botched restore, a
+    /// fresh empty database swapped in by mistake) — never run
+    /// automatically, since ProxyAuth can't tell an empty database
+    /// apart from a deliberate one. Refuses if the database already has
+    /// any users, unless --force is given — in which case every cached
+    /// user is upserted, overwriting anything already there with the
+    /// same username.
+    DbRestoreFromCache {
+        #[arg(long)]
+        force: bool,
+    },
 }
