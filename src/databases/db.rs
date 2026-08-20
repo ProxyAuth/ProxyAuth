@@ -36,14 +36,14 @@
 //! full `load_users` pass to catch deletions (see `refresh_db_users` /
 //! `refresh_db_users_incremental` in `config.rs`).
 
-use crate::config::config::{DatabaseConfig, User};
+use crate::config::config::{DatabaseConfig, EmailEntry, User};
 use crate::databases::cache;
 use chrono::NaiveDateTime;
 use diesel::connection::SimpleConnection;
 use diesel::mysql::MysqlConnection;
 use diesel::pg::PgConnection;
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamp};
-use diesel::{Connection, QueryableByName, RunQueryDsl, sql_query};
+use diesel::{Connection, OptionalExtension, QueryableByName, RunQueryDsl, sql_query};
 use std::collections::HashMap;
 
 pub enum DbConnection {
@@ -61,6 +61,8 @@ struct DbUserRow {
     password: String,
     #[diesel(sql_type = Nullable<Text>)]
     otpkey: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    must_change_password: bool,
 }
 
 /// Same shape as `DbUserRow`, plus `deleted` — used only by the
@@ -79,6 +81,8 @@ struct DbUserChangeRow {
     otpkey: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     deleted: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    must_change_password: bool,
 }
 
 /// One row from the incremental scan, distinguishing an active
@@ -133,6 +137,19 @@ struct UserIdValueRow {
     value: String,
 }
 
+/// Same idea as `UserIdValueRow`, but for `user_email` specifically —
+/// that table has a second column (`is_primary`) the generic
+/// single-value helper can't carry.
+#[derive(QueryableByName, Debug)]
+struct UserEmailRow {
+    #[diesel(sql_type = BigInt)]
+    user_id: i64,
+    #[diesel(sql_type = Text)]
+    address: String,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    is_primary: bool,
+}
+
 #[derive(QueryableByName, Debug)]
 struct IdRow {
     #[diesel(sql_type = BigInt)]
@@ -174,9 +191,36 @@ pub fn connect(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
     }
 }
 
+/// Once `ensure_schema` has run successfully in this process, every DDL
+/// step (table/index/trigger creation, migrations) is skipped on later
+/// calls — the schema doesn't change after the first time, and calling
+/// it on every scan tick (every 30s by default) was needlessly racy:
+/// concurrent calls (from the incremental scan, the full scan, the
+/// purge task, all running independently) could interleave their
+/// DROP TRIGGER/CREATE TRIGGER pairs, briefly leaving the deletion
+/// trigger absent or spuriously failing with "already exists" —
+/// which `load_users_from_config` would then misread as the database
+/// being unreachable and fall back to the local cache for no real
+/// reason. Process-local (not persisted), so a fresh process still
+/// runs it once at its own startup.
+static SCHEMA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Creates `users`, `user_allow` and `user_roles` if they don't exist yet.
-/// Safe to call on every startup.
+/// Safe to call on every startup — and cheap to call repeatedly after
+/// that too, since it does nothing once `SCHEMA_READY` is set (see
+/// above) rather than re-running DDL every time.
 pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
+    if SCHEMA_READY.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+
+    ensure_schema_inner(conn)?;
+
+    SCHEMA_READY.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
     match conn {
         DbConnection::Postgres(c) => {
             c.batch_execute(
@@ -187,7 +231,8 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
                             otpkey TEXT,
                             created_at TIMESTAMP NOT NULL DEFAULT now(),
                             modified_at TIMESTAMP NOT NULL DEFAULT now(),
-                            deleted BOOLEAN NOT NULL DEFAULT FALSE
+                            deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                            must_change_password BOOLEAN NOT NULL DEFAULT FALSE
             )",
             )
             .map_err(|e| format!("Failed to create users table (postgres): {e}"))?;
@@ -201,16 +246,17 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
             .map_err(|e| format!("Failed to create users.modified_at index (postgres): {e}"))?;
 
             // Migration for installs from before created_at/modified_at/
-            // deleted existed: CREATE TABLE IF NOT EXISTS above is a
-            // no-op on an already-existing `users` table, so add the
-            // columns here, explicitly, if missing. Postgres supports
-            // `IF NOT EXISTS` on ADD COLUMN directly (9.6+), so this is
-            // safe to re-run every startup.
+            // deleted/must_change_password existed: CREATE TABLE IF NOT
+            // EXISTS above is a no-op on an already-existing `users`
+            // table, so add the columns here, explicitly, if missing.
+            // Postgres supports `IF NOT EXISTS` on ADD COLUMN directly
+            // (9.6+), so this is safe to re-run every startup.
             c.batch_execute(
                 "ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT now(),
                             ADD COLUMN IF NOT EXISTS modified_at TIMESTAMP NOT NULL DEFAULT now(),
-                            ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE",
+                            ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                            ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE",
             )
             .map_err(|e| {
                 format!("Failed to migrate users.created_at/modified_at/deleted (postgres): {e}")
@@ -233,6 +279,16 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
             )",
             )
             .map_err(|e| format!("Failed to create user_roles table (postgres): {e}"))?;
+
+            c.batch_execute(
+                "CREATE TABLE IF NOT EXISTS user_email (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            email TEXT NOT NULL,
+                            is_primary BOOLEAN NOT NULL DEFAULT FALSE
+            )",
+            )
+            .map_err(|e| format!("Failed to create user_email table (postgres): {e}"))?;
 
             // Log of hard-deletions, populated by a trigger (below) —
             // lets the incremental scan detect a raw `DELETE FROM users`
@@ -268,15 +324,23 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
 
             // Re-created on every startup (drop then create) to stay
             // idempotent — Postgres has no `CREATE TRIGGER IF NOT
-            // EXISTS` on versions this targets.
+            // EXISTS` on versions this targets. If a concurrent call
+            // (another scan tick, another instance) recreates it
+            // between our DROP and CREATE, treat "already exists" as
+            // success rather than a hard failure — the trigger being
+            // present is all we actually care about.
             c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete ON users")
             .map_err(|e| format!("Failed to drop trg_log_user_delete (postgres): {e}"))?;
-            c.batch_execute(
+            if let Err(e) = c.batch_execute(
                 "CREATE TRIGGER trg_log_user_delete
                 AFTER DELETE ON users
                 FOR EACH ROW EXECUTE FUNCTION log_deleted_user()",
-            )
-            .map_err(|e| format!("Failed to create trg_log_user_delete (postgres): {e}"))?;
+            ) {
+                let msg = e.to_string().to_lowercase();
+                if !msg.contains("already exists") {
+                    return Err(format!("Failed to create trg_log_user_delete (postgres): {e}"));
+                }
+            }
 
             Ok(())
         }
@@ -291,21 +355,23 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
                             modified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                             ON UPDATE CURRENT_TIMESTAMP,
                             deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                            must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
                             INDEX idx_users_modified_at (modified_at)
             )",
             )
             .map_err(|e| format!("Failed to create users table (mysql): {e}"))?;
 
             // Migration for installs from before created_at/modified_at/
-            // deleted existed. Unlike Postgres, `ADD COLUMN IF NOT
-            // EXISTS` isn't reliably available across every MySQL/
-            // MariaDB version this targets, so attempt the ALTER
-            // unconditionally and treat a "duplicate column" error
-            // (already migrated) as success.
+            // deleted/must_change_password existed. Unlike Postgres,
+            // `ADD COLUMN IF NOT EXISTS` isn't reliably available
+            // across every MySQL/MariaDB version this targets, so
+            // attempt the ALTER unconditionally and treat a "duplicate
+            // column" error (already migrated) as success.
             for stmt in [
                 "ALTER TABLE users ADD COLUMN created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
                 "ALTER TABLE users ADD COLUMN modified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
                 "ALTER TABLE users ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT FALSE",
                 "ALTER TABLE users ADD INDEX idx_users_modified_at (modified_at)",
             ] {
                 if let Err(e) = c.batch_execute(stmt) {
@@ -341,6 +407,17 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
             )
             .map_err(|e| format!("Failed to create user_roles table (mysql): {e}"))?;
 
+            c.batch_execute(
+                "CREATE TABLE IF NOT EXISTS user_email (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    email TEXT NOT NULL,
+                    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )",
+            )
+            .map_err(|e| format!("Failed to create user_email table (mysql): {e}"))?;
+
             // Log of hard-deletions, populated by a trigger (below) —
             // lets the incremental scan detect a raw `DELETE FROM users`
             // (bypassing the app's soft-delete convention) within a
@@ -358,16 +435,24 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
 
             // Re-created on every startup (drop then create) to stay
             // idempotent — MySQL/MariaDB has no reliable `CREATE
-            // TRIGGER IF NOT EXISTS` across every targeted version.
+            // TRIGGER IF NOT EXISTS` across every targeted version. If
+            // a concurrent call (another scan tick, another instance)
+            // recreates it between our DROP and CREATE, treat "already
+            // exists" as success rather than a hard failure — the
+            // trigger being present is all we actually care about.
             c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete")
             .map_err(|e| format!("Failed to drop trg_log_user_delete (mysql): {e}"))?;
-            c.batch_execute(
+            if let Err(e) = c.batch_execute(
                 "CREATE TRIGGER trg_log_user_delete
                 AFTER DELETE ON users
                 FOR EACH ROW
                 INSERT INTO deleted_users_log (username) VALUES (OLD.username)",
-            )
-            .map_err(|e| format!("Failed to create trg_log_user_delete (mysql): {e}"))?;
+            ) {
+                let msg = e.to_string().to_lowercase();
+                if !msg.contains("already exists") {
+                    return Err(format!("Failed to create trg_log_user_delete (mysql): {e}"));
+                }
+            }
 
             Ok(())
         }
@@ -379,13 +464,14 @@ pub fn ensure_schema(conn: &mut DbConnection) -> Result<(), String> {
 /// both backends without relying on backend-specific aggregate functions
 /// like `string_agg`/`GROUP_CONCAT`).
 pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
-    let (user_rows, allow_rows, role_rows): (
+    let (user_rows, allow_rows, role_rows, email_rows): (
         Vec<DbUserRow>,
         Vec<UserIdValueRow>,
         Vec<UserIdValueRow>,
+        Vec<UserEmailRow>,
     ) = match conn {
         DbConnection::Postgres(c) => (
-            sql_query("SELECT id, username, password, otpkey FROM users WHERE deleted = FALSE")
+            sql_query("SELECT id, username, password, otpkey, must_change_password FROM users WHERE deleted = FALSE")
             .load(c)
             .map_err(|e| format!("Failed to load users (postgres): {e}"))?,
                                       sql_query("SELECT user_id, cidr AS value FROM user_allow")
@@ -394,9 +480,12 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
                                       sql_query("SELECT user_id, role AS value FROM user_roles")
                                       .load(c)
                                       .map_err(|e| format!("Failed to load user_roles (postgres): {e}"))?,
+                                      sql_query("SELECT user_id, email AS address, is_primary FROM user_email")
+                                      .load(c)
+                                      .map_err(|e| format!("Failed to load user_email (postgres): {e}"))?,
         ),
         DbConnection::MySql(c) => (
-            sql_query("SELECT id, username, password, otpkey FROM users WHERE deleted = FALSE")
+            sql_query("SELECT id, username, password, otpkey, must_change_password FROM users WHERE deleted = FALSE")
             .load(c)
             .map_err(|e| format!("Failed to load users (mysql): {e}"))?,
                                    sql_query("SELECT user_id, cidr AS value FROM user_allow")
@@ -405,6 +494,9 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
                                    sql_query("SELECT user_id, role AS value FROM user_roles")
                                    .load(c)
                                    .map_err(|e| format!("Failed to load user_roles (mysql): {e}"))?,
+                                   sql_query("SELECT user_id, email AS address, is_primary FROM user_email")
+                                   .load(c)
+                                   .map_err(|e| format!("Failed to load user_email (mysql): {e}"))?,
         ),
     };
 
@@ -418,6 +510,14 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
         roles_map.entry(row.user_id).or_default().push(row.value);
     }
 
+    let mut email_map: HashMap<i64, Vec<EmailEntry>> = HashMap::new();
+    for row in email_rows {
+        email_map.entry(row.user_id).or_default().push(EmailEntry {
+            address: row.address,
+            primary: row.is_primary,
+        });
+    }
+
     Ok(user_rows
     .into_iter()
     .map(|r| User {
@@ -426,7 +526,8 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
          otpkey: r.otpkey,
          allow: allow_map.remove(&r.id),
          roles: roles_map.remove(&r.id),
-         email: None,
+         email: email_map.remove(&r.id),
+         must_change_password: r.must_change_password,
     })
     .collect())
 }
@@ -442,11 +543,12 @@ fn upsert_user_row(conn: &mut DbConnection, user: &User) -> Result<i64, String> 
     match conn {
         DbConnection::Postgres(c) => {
             let row: IdRow = sql_query(
-                "INSERT INTO users (username, password, otpkey)
-            VALUES ($1, $2, $3)
+                "INSERT INTO users (username, password, otpkey, must_change_password)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (username) DO UPDATE SET
             password = EXCLUDED.password,
             otpkey = EXCLUDED.otpkey,
+            must_change_password = EXCLUDED.must_change_password,
             deleted = FALSE,
             modified_at = now()
             RETURNING id",
@@ -454,6 +556,7 @@ fn upsert_user_row(conn: &mut DbConnection, user: &User) -> Result<i64, String> 
             .bind::<Text, _>(&user.username)
             .bind::<Text, _>(&user.password)
             .bind::<Nullable<Text>, _>(&user.otpkey)
+            .bind::<diesel::sql_types::Bool, _>(user.must_change_password)
             .get_result(c)
             .map_err(|e| format!("Failed to upsert user (postgres): {e}"))?;
             Ok(row.id)
@@ -463,17 +566,19 @@ fn upsert_user_row(conn: &mut DbConnection, user: &User) -> Result<i64, String> 
             // `ON UPDATE CURRENT_TIMESTAMP` fires automatically whenever
             // this UPDATE branch of ON DUPLICATE KEY runs.
             sql_query(
-                "INSERT INTO users (username, password, otpkey)
-            VALUES (?, ?, ?)
+                "INSERT INTO users (username, password, otpkey, must_change_password)
+            VALUES (?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
             password = VALUES(password),
                       otpkey = VALUES(otpkey),
+                      must_change_password = VALUES(must_change_password),
                       deleted = FALSE,
                       id = LAST_INSERT_ID(id)",
             )
             .bind::<Text, _>(&user.username)
             .bind::<Text, _>(&user.password)
             .bind::<Nullable<Text>, _>(&user.otpkey)
+            .bind::<diesel::sql_types::Bool, _>(user.must_change_password)
             .execute(c)
             .map_err(|e| format!("Failed to upsert user (mysql): {e}"))?;
 
@@ -561,6 +666,48 @@ fn replace_user_roles(
     Ok(())
 }
 
+/// Same as `replace_user_allow`, for `user_email`.
+/// Same as `replace_user_allow`, for `user_email` — also writes
+/// `is_primary` per entry, since `EmailEntry` carries that explicitly
+/// rather than relying on list order.
+fn replace_user_email(
+    conn: &mut DbConnection,
+    user_id: i64,
+    values: Option<&[EmailEntry]>,
+) -> Result<(), String> {
+    match conn {
+        DbConnection::Postgres(c) => {
+            sql_query("DELETE FROM user_email WHERE user_id = $1")
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_email (postgres): {e}"))?;
+            for entry in values.unwrap_or_default() {
+                sql_query("INSERT INTO user_email (user_id, email, is_primary) VALUES ($1, $2, $3)")
+                .bind::<BigInt, _>(user_id)
+                .bind::<Text, _>(&entry.address)
+                .bind::<diesel::sql_types::Bool, _>(entry.primary)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_email (postgres): {e}"))?;
+            }
+        }
+        DbConnection::MySql(c) => {
+            sql_query("DELETE FROM user_email WHERE user_id = ?")
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_email (mysql): {e}"))?;
+            for entry in values.unwrap_or_default() {
+                sql_query("INSERT INTO user_email (user_id, email, is_primary) VALUES (?, ?, ?)")
+                .bind::<BigInt, _>(user_id)
+                .bind::<Text, _>(&entry.address)
+                .bind::<diesel::sql_types::Bool, _>(entry.primary)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_email (mysql): {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Writes (creates or updates) a user, and replaces their `allow`/`roles`
 /// rows to match `user` exactly. `password` must already be the final
 /// stored value (e.g. an argon2 hash) — this function does not hash it
@@ -569,10 +716,20 @@ fn replace_user_roles(
 /// If `username` matches a previously soft-deleted row, it's revived
 /// (`deleted` reset to `FALSE`) rather than left revoked underneath the
 /// new data — see `upsert_user_row`.
+///
+/// Authoritative, not a merge: `must_change_password` is set to exactly
+/// whatever `user.must_change_password` says, every call — including
+/// resetting a currently-`true` flag back to `false` if `user` doesn't
+/// set it. `db-add-user` (the CLI command backed by this) relies on
+/// that: each run represents the account's complete intended state,
+/// not a partial patch, so re-running it without
+/// `--must-change-password` intentionally clears a pending forced
+/// change rather than leaving it dangling from some earlier call.
 pub fn upsert_user(conn: &mut DbConnection, user: &User) -> Result<(), String> {
     let user_id = upsert_user_row(conn, user)?;
     replace_user_allow(conn, user_id, user.allow.as_deref())?;
     replace_user_roles(conn, user_id, user.roles.as_deref())?;
+    replace_user_email(conn, user_id, user.email.as_deref())?;
     Ok(())
 }
 
@@ -601,6 +758,85 @@ pub fn mark_user_deleted(conn: &mut DbConnection, username: &str) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Sets a new password for a user (must already be the final stored
+/// value — an Argon2 hash, not plaintext) and clears
+/// `must_change_password` at the same time, since a completed password
+/// change always satisfies it regardless of which flow triggered it
+/// (an admin's `reset-password`, or a forced first-login change).
+/// Returns `Ok(false)` if no row matched `username` (nothing to do,
+/// not an error).
+pub fn update_password(
+    conn: &mut DbConnection,
+    username: &str,
+    new_password_hash: &str,
+) -> Result<bool, String> {
+    let affected = match conn {
+        DbConnection::Postgres(c) => sql_query(
+            "UPDATE users SET password = $1, must_change_password = FALSE, modified_at = now()
+        WHERE username = $2 AND deleted = FALSE",
+        )
+        .bind::<Text, _>(new_password_hash)
+        .bind::<Text, _>(username)
+        .execute(c)
+        .map_err(|e| format!("Failed to update password (postgres): {e}"))?,
+        DbConnection::MySql(c) => sql_query(
+            "UPDATE users SET password = ?, must_change_password = FALSE
+            WHERE username = ? AND deleted = FALSE",
+        )
+        .bind::<Text, _>(new_password_hash)
+        .bind::<Text, _>(username)
+        .execute(c)
+        .map_err(|e| format!("Failed to update password (mysql): {e}"))?,
+    };
+    Ok(affected > 0)
+}
+
+/// Fetches a single non-deleted user by username, with its `allow`/
+/// `roles`. Used to refresh the in-memory `db_users` snapshot for one
+/// user immediately after a write (e.g. `update_password`), without
+/// waiting for the next scan tick.
+pub fn load_user_by_username(
+    conn: &mut DbConnection,
+    username: &str,
+) -> Result<Option<User>, String> {
+    let row: Option<DbUserRow> = match conn {
+        DbConnection::Postgres(c) => sql_query(
+            "SELECT id, username, password, otpkey, must_change_password FROM users
+            WHERE username = $1 AND deleted = FALSE",
+        )
+        .bind::<Text, _>(username)
+        .get_result(c)
+        .optional()
+        .map_err(|e| format!("Failed to load user '{username}' (postgres): {e}"))?,
+        DbConnection::MySql(c) => sql_query(
+            "SELECT id, username, password, otpkey, must_change_password FROM users
+            WHERE username = ? AND deleted = FALSE",
+        )
+        .bind::<Text, _>(username)
+        .get_result(c)
+        .optional()
+        .map_err(|e| format!("Failed to load user '{username}' (mysql): {e}"))?,
+    };
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let allow = load_values_for_user(conn, "user_allow", "cidr", row.id)?;
+    let roles = load_values_for_user(conn, "user_roles", "role", row.id)?;
+    let email = load_emails_for_user(conn, row.id)?;
+
+    Ok(Some(User {
+        username: row.username,
+        password: row.password,
+        otpkey: row.otpkey,
+        allow: if allow.is_empty() { None } else { Some(allow) },
+            roles: if roles.is_empty() { None } else { Some(roles) },
+            email: if email.is_empty() { None } else { Some(email) },
+            must_change_password: row.must_change_password,
+    }))
 }
 
 /// Permanently removes users that have been soft-deleted for at least
@@ -689,13 +925,13 @@ pub fn load_recently_changed_users(
 ) -> Result<Vec<DbUserChange>, String> {
     let rows: Vec<DbUserChangeRow> = match conn {
         DbConnection::Postgres(c) => sql_query(
-            "SELECT id, username, password, otpkey, deleted FROM users WHERE modified_at >= $1",
+            "SELECT id, username, password, otpkey, deleted, must_change_password FROM users WHERE modified_at >= $1",
         )
         .bind::<Timestamp, _>(cutoff)
         .load(c)
         .map_err(|e| format!("Failed to load recently changed users (postgres): {e}"))?,
         DbConnection::MySql(c) => sql_query(
-            "SELECT id, username, password, otpkey, deleted FROM users WHERE modified_at >= ?",
+            "SELECT id, username, password, otpkey, deleted, must_change_password FROM users WHERE modified_at >= ?",
         )
         .bind::<Timestamp, _>(cutoff)
         .load(c)
@@ -717,13 +953,15 @@ pub fn load_recently_changed_users(
 
         let allow = load_values_for_user(conn, "user_allow", "cidr", row.id)?;
         let roles = load_values_for_user(conn, "user_roles", "role", row.id)?;
+        let email = load_emails_for_user(conn, row.id)?;
         changes.push(DbUserChange::Upserted(User {
             username: row.username,
             password: row.password,
             otpkey: row.otpkey,
             allow: if allow.is_empty() { None } else { Some(allow) },
                                             roles: if roles.is_empty() { None } else { Some(roles) },
-                                            email: None,
+                                            email: if email.is_empty() { None } else { Some(email) },
+                                            must_change_password: row.must_change_password,
         }));
     }
 
@@ -781,6 +1019,35 @@ fn load_values_for_user(
         .map(|rows| rows.into_iter().map(|r| r.value).collect())
         .map_err(|e| format!("Failed to load {table} for user (mysql): {e}")),
     }
+}
+
+/// Loads every `user_email` row for one user, `is_primary` included.
+fn load_emails_for_user(
+    conn: &mut DbConnection,
+    user_id: i64,
+) -> Result<Vec<EmailEntry>, String> {
+    let rows: Vec<UserEmailRow> = match conn {
+        DbConnection::Postgres(c) => {
+            sql_query("SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = $1")
+            .bind::<BigInt, _>(user_id)
+            .load(c)
+            .map_err(|e| format!("Failed to load user_email for user (postgres): {e}"))?
+        }
+        DbConnection::MySql(c) => {
+            sql_query("SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = ?")
+            .bind::<BigInt, _>(user_id)
+            .load(c)
+            .map_err(|e| format!("Failed to load user_email for user (mysql): {e}"))?
+        }
+    };
+
+    Ok(rows
+    .into_iter()
+    .map(|r| EmailEntry {
+        address: r.address,
+         primary: r.is_primary,
+    })
+    .collect())
 }
 
 /// Connects, ensures the schema exists, and returns only the changes

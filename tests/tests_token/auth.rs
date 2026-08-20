@@ -168,6 +168,8 @@ mod tests {
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
             stats,
             otp_overrides: Arc::new(DashMap::new()),
+            password_overrides: Arc::new(DashMap::new()),
+            must_change_overrides: Arc::new(DashMap::new()),
         };
         actix_web::web::Data::new(state)
     }
@@ -303,6 +305,7 @@ mod tests {
             allow: None,
             roles: None,
             email: None,
+            must_change_password: false,
         };
 
         assert!(proxyauth::token::auth::is_ip_allowed(
@@ -422,6 +425,7 @@ mod tests {
             allow: None,
             roles: Some(vec!["user".into()]),
             email: None,
+            must_change_password: false,
         };
 
         let mut cfg = base_config();
@@ -483,6 +487,7 @@ mod tests {
             allow: None,
             roles: None,
             email: None,
+            must_change_password: false,
         }];
         cfg.logout_redirect_url = Some(format!("http://{}/logout", addr));
         let data = mk_state(routes, cfg);
@@ -540,6 +545,7 @@ mod tests {
             allow: None,
             roles: None,
             email: None,
+            must_change_password: false,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -592,6 +598,7 @@ mod tests {
             allow: None,
             roles: None,
             email: None,
+            must_change_password: false,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -647,6 +654,7 @@ mod tests {
             allow: None,
             roles: None,
             email: None,
+            must_change_password: false,
         };
         let mut cfg = base_config();
         cfg.users = vec![user];
@@ -687,6 +695,7 @@ mod tests {
             allow: None,
             roles: None,
             email: None,
+            must_change_password: false,
         };
 
         let mut cfg = base_config();
@@ -744,6 +753,7 @@ mod tests {
             allow: None,
             roles: None,
             email: None,
+            must_change_password: false,
         };
 
         let mut cfg = base_config();
@@ -865,6 +875,8 @@ mod render_error_page_tests {
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
             stats,
             otp_overrides: Arc::new(DashMap::new()),
+            password_overrides: Arc::new(DashMap::new()),
+            must_change_overrides: Arc::new(DashMap::new()),
         };
         actix_web::web::Data::new(state)
     }

@@ -738,6 +738,8 @@ mod validate_token_path_tests {
                        routes: Arc::new(routes),
                        stats,
                        otp_overrides: DashMap::<String, Option<String>>::new().into(),
+                       password_overrides: DashMap::<String, String>::new().into(),
+                       must_change_overrides: DashMap::<String, bool>::new().into(),
         })
     }
 
@@ -757,6 +759,7 @@ mod validate_token_path_tests {
                            otpkey: Some(String::new()),
                            password: String::new(),
                            email: None,
+                           must_change_password: false,
             });
         }
         cfg
@@ -974,14 +977,16 @@ mod validate_token_path_tests {
 
         let st = web::Data::new(AppState {
             config: Arc::new(AppConfig::default()),
-                                routes: Arc::new(RouteConfig { routes: vec![] }),
-                                counter: Arc::new(CounterToken::new()),
-                                client_normal: build_https_client_for_tests(),
-                                client_with_cert: build_https_client_for_tests(),
-                                client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
-                                revoked_tokens: DashMap::<String, u64>::new().into(),
-                                stats,
-                                otp_overrides: DashMap::<String, Option<String>>::new().into(),
+            routes: Arc::new(RouteConfig { routes: vec![] }),
+            counter: Arc::new(CounterToken::new()),
+            client_normal: build_https_client_for_tests(),
+            client_with_cert: build_https_client_for_tests(),
+            client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
+            revoked_tokens: DashMap::<String, u64>::new().into(),
+            stats,
+            otp_overrides: DashMap::<String, Option<String>>::new().into(),
+            password_overrides: DashMap::<String, String>::new().into(),
+            must_change_overrides: DashMap::<String, bool>::new().into(),
         });
 
         let future = (Utc::now() + chrono::Duration::minutes(5))

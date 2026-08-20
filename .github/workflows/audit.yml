@@ -42,7 +42,7 @@ jobs:
         run: apt update && apt install -y nettle-dev pkg-config libssl-dev libpq-dev default-libmysqlclient-dev
 
       - name: install tarpaulin for coverage
-        run: cargo install cargo-tarpaulin
+        run: cargo install --locked cargo-tarpaulin
 
       - name: Coverage
         run: cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm -- --test-threads=1

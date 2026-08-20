@@ -21,6 +21,7 @@ mod keystore;
 mod logs;
 mod network;
 mod revoke;
+mod reset;
 mod smtp;
 mod start_actix;
 mod stats;
@@ -61,6 +62,7 @@ use std::net::TcpListener;
 use std::{fs, process, sync::Arc, time::Duration};
 use tls::bind_server;
 use token::auth::{auth, auth_options};
+use token::reset_password::reset_password_route;
 use token::logout::{logout_options, logout_session};
 use token::security::init_derived_key;
 use tokio::sync::mpsc::unbounded_channel;
@@ -164,6 +166,10 @@ macro_rules! build_app {
             web::resource("/auth")
             .route(web::post().to(auth))
             .route(web::method(Method::OPTIONS).to(auth_options)),
+        )
+        .service(
+            web::resource("/reset-password")
+            .route(web::post().to(reset_password_route)),
         )
         .service(web::resource("/adm/stats").route(web::get().to(get_proxy_stats)))
         .service(web::resource("/adm/stats/sessions").route(web::get().to(get_proxy_sessions)))
@@ -320,6 +326,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Password-reset tokens (`reset::db`, its own local LMDB store)
+    // don't depend on `databases` at all — they're used for file-based
+    // users too — so this purge runs unconditionally, unlike the
+    // database-specific tasks above. Hourly by default is plenty for
+    // something that's just cleaning up expired single-use tokens.
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let _ = tokio::task::spawn_blocking(|| {
+                match reset::db::purge_expired() {
+                    Ok(n) if n > 0 => println!("[reset] purged {n} expired password-reset token(s)"),
+                                                Ok(_) => {}
+                                                Err(e) => eprintln!("[reset] failed to purge expired tokens: {e}"),
+                }
+            })
+            .await;
+        }
+    });
+
     init_loadbalancer(&config);
 
     let routes_str =
@@ -407,6 +434,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                revoked_tokens,
                                stats,
                                otp_overrides: Arc::new(DashMap::new()),
+                               password_overrides: Arc::new(DashMap::new()),
+                               must_change_overrides: Arc::new(DashMap::new()),
     });
 
     init_derived_key(&config.secret);
@@ -611,6 +640,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .route(web::method(Method::OPTIONS).to(auth_options)),
                         )
                         .service(
+                            web::resource("/reset-password")
+                            .route(
+                                web::post()
+                                .to(reset_password_route)
+                                .wrap(Governor::new(&governor_auth_conf)),
+                            ),
+                        )
+                        .service(
                             web::resource("/adm/auth/totp/get")
                             .route(
                                 web::post()
@@ -656,6 +693,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .wrap(Governor::new(&governor_auth_conf)),
                             )
                             .route(web::method(Method::OPTIONS).to(auth_options)),
+                        )
+                        .service(
+                            web::resource("/reset-password")
+                            .route(
+                                web::post()
+                                .to(reset_password_route)
+                                .wrap(Governor::new(&governor_auth_conf)),
+                            ),
                         )
                         .service(
                             web::resource("/adm/auth/totp/get")

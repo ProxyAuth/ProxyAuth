@@ -479,6 +479,74 @@ pub async fn auth(
                 }
             }
 
+            // Credentials (and TOTP, if required) checked out — but if
+            // this account is flagged must_change_password (a temporary
+            // password an admin just set, or a not-yet-completed
+            // reset-password), don't issue a normal session yet.
+            let must_change = crate::config::config::resolve_must_change_password(
+                &data,
+                &user.username,
+                user.must_change_password,
+            );
+            if must_change {
+                let Some(page_change_password) = &data.config.page_change_password else {
+                    warn!(
+                        "[{}] user {} must change their password, but page_change_password isn't configured",
+                        ip, user.username
+                    );
+                    return render_error_page(
+                        &req,
+                        data.clone(),
+                                             "Password change required, but no change-password page is configured — contact an administrator.",
+                    )
+                    .await;
+                };
+
+                let token = match crate::reset::db::create_token(
+                    &user.username,
+                    crate::reset::db::ResetKind::FirstLogin,
+                    3600,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("[{}] failed to create a first-login reset token: {}", ip, e);
+                        return render_error_page(&req, data.clone(), "Internal error").await;
+                    }
+                };
+
+                let separator = if page_change_password.contains('?') {
+                    '&'
+                } else {
+                    '?'
+                };
+                let redirect_url = format!("{page_change_password}{separator}token={token}");
+
+                info!(
+                    "[{}] user {} must change their password",
+                    ip, user.username
+                );
+
+                // Only a real browser flow (session_cookie: true) can
+                // meaningfully be sent an HTTP redirect and expected to
+                // follow it. An API/JSON client (session_cookie: false)
+                // wouldn't naturally follow a 303 from a fetch/curl call
+                // — it needs the same information back as data it can
+                // act on itself instead.
+                if data.config.session_cookie {
+                    return HttpResponse::SeeOther()
+                    .append_header(("server", "ProxyAuth"))
+                    .append_header((header::LOCATION, redirect_url))
+                    .finish();
+                }
+
+                return HttpResponse::Ok()
+                .append_header(("server", "ProxyAuth"))
+                .json(serde_json::json!({
+                    "must_change_password": true,
+                    "reset_link": redirect_url,
+                }));
+            }
+
             let expiry = get_expiry_with_timezone(data.config.clone(), None);
 
             let id_token = generate_random_string(48);

@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.0.0-beta6"
+version = "1.0.0"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -30,23 +30,6 @@ RUST_TEST_THREADS = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
-
-[build-dependencies]
-rand = "0.8"
-rand_chacha = "0.3"
-reqwest = { version = "0.11", features = ["blocking", "json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-blake3 = "1"
-
-[dev-dependencies]
-serial_test = "3"
-tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
-actix-rt = "2"
-actix-web = "4"
-actix-http = "3.9.0"
-serde_json = "1"
-ctor = "0.2"
 
 [dependencies]
 actix-web = { version = "4.12.1", features = ["rustls-0_23"] }
@@ -79,10 +62,10 @@ once_cell = "1.19"
 hyper       = { version = "1", features = ["server", "http1", "http2", "client"] }
 http-body-util = "^0.1"
 hyper-util  = { version = "^0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
-hyper-http-proxy = "1.1.0"
+hyper-http-proxy = "1.2.0"
 hyper-rustls = "0.27"
 rustls = { version = "0.23", features = ["ring"] }
-rustls-native-certs = "0.7"
+rustls-native-certs = "0.8"
 rustls-pki-types = "1.9"
 webpki-roots = "0.26"
 rustc-hash = "1"
@@ -121,15 +104,34 @@ hmac = "0.13.0-rc.2"
 cookie = "0.18"
 lettre = { version = "0.11.22", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
 rpassword = "7.3"
+arrayref = "=0.3.9"
 
+# Security-advisory floors, not exact pins — deliberately left as
+# ranges so the resolver can still pick up a future patched release
+# without needing this file edited again.
 [dependencies.rustls-webpki]
 version = ">=0.103.13, <0.104.0-alpha.1"
-
 [dependencies.quinn-proto]
 version = ">=0.11.15"
-
 [dependencies.h2]
 version = ">=0.4.16, <0.5.0"
+
+[build-dependencies]
+rand = "0.8"
+rand_chacha = "0.3"
+reqwest = { version = "0.13", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+
+[dev-dependencies]
+serial_test = "3"
+tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
+actix-rt = "2"
+actix-web = "4"
+actix-http = "3.9.0"
+serde_json = "1"
+ctor = "0.2"
 
 [profile.release]
 opt-level = 3
