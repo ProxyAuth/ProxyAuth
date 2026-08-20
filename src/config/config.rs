@@ -138,12 +138,19 @@ impl Serialize for User {
     where
     S: Serializer,
     {
-        let mut state = serializer.serialize_struct("User", 2)?;
+        // Length hint was wrong (2, should match the actual field count)
+        // and `roles` was serializing `self.allow`'s value instead of
+        // `self.roles`'s — meaning every config.json rewrite (e.g. on
+        // first-run password hashing) silently duplicated `allow` into
+        // `roles` and dropped the real roles. Fixed here; also now
+        // includes `email` for completeness.
+        let mut state = serializer.serialize_struct("User", 6)?;
         state.serialize_field("username", &self.username)?;
         state.serialize_field("password", &self.password)?;
         state.serialize_field("otpkey", &self.otpkey)?;
         state.serialize_field("allow", &self.allow)?;
         state.serialize_field("roles", &self.roles)?;
+        state.serialize_field("email", &self.email)?;
         state.end()
     }
 }
@@ -162,17 +169,74 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub password: String,
 
-    /// How often (in seconds) to re-scan the database and refresh the
-    /// in-memory user list, so users added/edited directly in the DB
-    /// eventually take effect without restarting the process. Defaults
-    /// to 30s. Set to 0 to disable periodic refresh (DB is only read
-    /// once, at startup).
+    /// How often (in seconds) the *incremental* scan runs — a cheap,
+    /// indexed query that only reads users changed within
+    /// `incremental_window_secs`. This is what keeps freshly
+    /// created/edited DB users usable quickly, without the cost of a
+    /// full table read on every tick. Defaults to 30s. Set to 0 to
+    /// disable it (falls back to relying solely on the slower full
+    /// scan below).
     #[serde(default = "default_db_refresh_interval")]
     pub refresh_interval_secs: u64,
+
+    /// The lookback window (in seconds) used by the incremental scan —
+    /// i.e. "users changed in the last N seconds". Must be at least as
+    /// long as `refresh_interval_secs` (ideally longer, with some
+    /// overlap) so a change can never fall in the gap between two scans
+    /// and be missed entirely. Defaults to 300 (5 minutes).
+    #[serde(default = "default_db_incremental_window")]
+    pub incremental_window_secs: i64,
+
+    /// How often (in seconds) the *full* scan runs — reads the entire
+    /// `users` table. Slower and more expensive at scale than the
+    /// incremental scan above, but it's the only way to detect a user
+    /// that was hard-deleted from the database without going through
+    /// `deleted_users_log` (e.g. a `TRUNCATE TABLE users`, which
+    /// bypasses row-level `DELETE` triggers entirely). Defaults to 300
+    /// (5 minutes). Set to 0 to disable (deletions then only take
+    /// effect on the next restart).
+    #[serde(default = "default_db_full_refresh_interval")]
+    pub full_refresh_interval_secs: u64,
+
+    /// How long (in seconds) a soft-deleted user (`deleted = TRUE`,
+    /// see `db-delete-user`) — and its `deleted_users_log` entry, for a
+    /// hard-deleted one — stays in the database before being
+    /// permanently purged. Keeping the row/log entry around for a while
+    /// gives every instance's incremental scan a chance to see and
+    /// revoke it, and leaves an audit trail. Defaults to 86400 (24
+    /// hours). Set to 0 to disable automatic purging (rows/log entries
+    /// are kept forever, until removed manually).
+    #[serde(default = "default_db_deleted_retention")]
+    pub deleted_retention_secs: i64,
+
+    /// How often (in seconds) to run the purge of soft-deleted users
+    /// past `deleted_retention_secs`. Any single connected instance
+    /// running this is enough — deleting already-purged rows on another
+    /// instance is a harmless no-op, so this is safe to leave enabled
+    /// on every instance. Defaults to 3600 (hourly). Set to 0 to
+    /// disable.
+    #[serde(default = "default_db_purge_interval")]
+    pub purge_interval_secs: u64,
 }
 
 fn default_db_refresh_interval() -> u64 {
     30
+}
+
+fn default_db_incremental_window() -> i64 {
+    300
+}
+
+fn default_db_full_refresh_interval() -> u64 {
+    300
+}
+
+fn default_db_deleted_retention() -> i64 {
+    86400
+}
+
+fn default_db_purge_interval() -> u64 {
+    3600
 }
 
 impl DatabaseConfig {
@@ -290,6 +354,26 @@ pub struct AppConfig {
     /// `combined_users()` rather than reading either list alone.
     #[serde(skip)]
     pub db_users: std::sync::RwLock<Vec<User>>,
+
+    /// Raw indices (positions within `db_users`) that were removed from
+    /// the database on the last refresh. The slot itself is never
+    /// deleted/reordered (that would shift the index of every entry
+    /// after it, embedded in already-issued tokens) — instead its
+    /// password is poisoned (see `refresh_db_users`) so it can never
+    /// log in again, and `user_by_index` rejects any token pointing at
+    /// a revoked index outright, invalidating it immediately.
+    #[serde(skip)]
+    pub db_revoked: std::sync::RwLock<std::collections::HashSet<usize>>,
+
+    /// username -> roles fast index, kept in sync with `users`/`db_users`
+    /// (populated once at startup for `users`, since it's immutable
+    /// after load, and updated on every `refresh_db_users()` for
+    /// database users). Exists purely so `roles_for_username` — called
+    /// on every proxied request via `inject_header` — is an O(1)
+    /// average-case HashMap lookup instead of an O(n) scan over every
+    /// user.
+    #[serde(skip)]
+    pub roles_index: std::sync::RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl Serialize for AppConfig {
@@ -580,16 +664,53 @@ impl AppConfig {
         combined
     }
 
+    /// Returns a single user's `roles`, looked up by username, via
+    /// `roles_index` — an O(1) average-case HashMap lookup, not a scan
+    /// over every user. Used on the proxied-request hot path
+    /// (`inject_header`), which only ever needs one user's roles per
+    /// request — a linear scan (or worse, `combined_users()`'s full
+    /// clone) doesn't scale with the user count.
+    pub fn roles_for_username(&self, username: &str) -> Option<Vec<String>> {
+        self.roles_index.read().ok()?.get(username).cloned()
+    }
+
+    /// Inserts or removes a single entry in `roles_index`, keeping it in
+    /// sync with a user's current `roles`. `None`/empty roles removes
+    /// the entry entirely (a HashMap miss and "no roles" both correctly
+    /// resolve to `roles_for_username` returning `None`).
+    fn index_roles(&self, username: &str, roles: &Option<Vec<String>>) {
+        let Ok(mut index) = self.roles_index.write() else {
+            return;
+        };
+        match roles {
+            Some(r) if !r.is_empty() => {
+                index.insert(username.to_string(), r.clone());
+            }
+            _ => {
+                index.remove(username);
+            }
+        }
+    }
+
     /// Resolves a user by its position in the same index space
     /// `combined_users()` produces, without cloning the whole list.
     /// Indices `0..self.users.len()` map to file users; indices at or
     /// past that map into `db_users`. Used when validating a token's
-    /// embedded user index.
+    /// embedded user index. Returns `None` — rejecting the token — for
+    /// an index whose database user was since deleted (see
+    /// `refresh_db_users`), even though the slot itself still exists.
     pub fn user_by_index(&self, index: usize) -> Option<User> {
         if let Some(u) = self.users.get(index) {
             return Some(u.clone());
         }
         let db_index = index.checked_sub(self.users.len())?;
+
+        if let Ok(revoked) = self.db_revoked.read() {
+            if revoked.contains(&db_index) {
+                return None;
+            }
+        }
+
         self.db_users.read().ok()?.get(db_index).cloned()
     }
 
@@ -600,30 +721,199 @@ impl AppConfig {
     /// SECURITY: existing users are updated *in place* and new users are
     /// only ever *appended* — never removed or reordered — so a
     /// previously issued token's embedded index (see `user_by_index`)
-    /// keeps resolving to the same user across refreshes. A user removed
-    /// from the database is therefore left in place (stale) rather than
-    /// dropped, to avoid shifting every index after it.
+    /// keeps resolving to the same slot across refreshes.
+    ///
+    /// A user removed from the database is detected here (its username
+    /// is no longer present in `fresh`) and its slot is *revoked*
+    /// in place, without ever deleting/reordering it:
+    /// - its `password` is overwritten with a sentinel that can never
+    ///   verify, so it immediately stops being able to log in again;
+    /// - its raw index is recorded in `db_revoked`, so `user_by_index`
+    ///   rejects any token already issued for it, invalidating that
+    ///   session immediately rather than waiting for it to expire.
+    ///
+    /// If a username reappears later (re-created), the slot is reused
+    /// and un-revoked automatically.
+    ///
+    /// SECURITY: if the database can't be reached at all right now, and
+    /// there's no usable local cache either
+    /// (`load_users_from_config` returns `None`), this returns
+    /// immediately without touching `db_users`/`db_revoked` — a
+    /// transient outage must never be misread as "every database user
+    /// was deleted."
+    ///
+    /// If the only thing available is the local LMDB cache
+    /// (`UsersSource::Cache`) rather than a fresh database read
+    /// (`UsersSource::Database`), the revoke-by-absence comparison below
+    /// is skipped entirely — only upserts are applied. The cache is
+    /// only refreshed on a successful *full* scan, so it can lag behind
+    /// a user created moments ago via the more frequent incremental
+    /// scan; comparing that user's presence against a stale cached
+    /// snapshot would incorrectly revoke them for simply not having
+    /// existed yet in that older snapshot. Only a genuinely current
+    /// database read is trustworthy enough to conclude "this username
+    /// is really gone."
     pub fn refresh_db_users(&self) {
         let Some(db_cfg) = &self.databases else {
             return;
         };
 
-        let fresh = crate::databases::db::load_users_from_config(db_cfg);
+        let Some(source) = crate::databases::db::load_users_from_config(db_cfg) else {
+            return;
+        };
 
-        match self.db_users.write() {
-            Ok(mut guard) => {
-                for new_user in fresh {
-                    if let Some(existing) =
-                        guard.iter_mut().find(|u| u.username == new_user.username)
-                        {
-                            *existing = new_user;
-                        } else {
-                            guard.push(new_user);
-                        }
+        let fresh = source.users();
+
+        if let crate::databases::db::UsersSource::Cache(_) = &source {
+            self.apply_upserts(fresh);
+            return;
+        }
+
+        let fresh_usernames: std::collections::HashSet<&str> =
+        fresh.iter().map(|u| u.username.as_str()).collect();
+
+        let Some(mut guard) = self.apply_upserts(fresh) else {
+            return;
+        };
+
+        let Ok(mut revoked) = self.db_revoked.write() else {
+            eprintln!("[databases] failed to acquire db_revoked lock");
+            return;
+        };
+
+        for (idx, user) in guard.iter_mut().enumerate() {
+            if fresh_usernames.contains(user.username.as_str()) {
+                revoked.remove(&idx);
+            } else if revoked.insert(idx) {
+                // Not a valid argon2 hash — PasswordHash::verify_password
+                // will fail to parse it and always return an error, so
+                // this account can never authenticate again.
+                user.password = "!revoked!".to_string();
+                self.index_roles(&user.username, &None);
+            }
+        }
+    }
+
+    /// Lightweight sibling of `refresh_db_users`: reads only the users
+    /// changed in the last `incremental_window_secs` (see
+    /// `DatabaseConfig`) instead of the whole table — the query cost
+    /// scales with recent changes, not total row count.
+    ///
+    /// Unlike the previous design, this *can* revoke users now: a
+    /// soft-deletion (`db::mark_user_deleted`) is itself a
+    /// `modified_at`-bumping UPDATE, so it naturally falls inside the
+    /// scanned window and comes back as `DbUserChange::Deleted` — no
+    /// need to wait for the slower full scan to notice it. The full
+    /// scan (`refresh_db_users`) remains a safety net for anything that
+    /// bypassed the soft-delete convention (e.g. a manual hard `DELETE`
+    /// run directly against the database).
+    pub fn refresh_db_users_incremental(&self) {
+        let Some(db_cfg) = &self.databases else {
+            return;
+        };
+
+        let changes = crate::databases::db::load_recently_changed_from_config(
+            db_cfg,
+            db_cfg.incremental_window_secs,
+        );
+        if changes.is_empty() {
+            return;
+        }
+
+        let mut upserts = Vec::new();
+        let mut deletions = Vec::new();
+        for change in changes {
+            match change {
+                crate::databases::db::DbUserChange::Upserted(u) => upserts.push(u),
+                crate::databases::db::DbUserChange::Deleted { username } => {
+                    deletions.push(username)
                 }
             }
-            Err(e) => eprintln!("[databases] failed to acquire db_users lock: {e}"),
         }
+
+        if !upserts.is_empty() {
+            self.apply_upserts(&upserts);
+        }
+
+        for username in &deletions {
+            self.revoke_username_now(username);
+        }
+    }
+
+    /// Revokes a single user immediately, by username, without scanning
+    /// the whole `db_users` list for absentees like `refresh_db_users`
+    /// does. Same poisoning mechanism (password sentinel + `db_revoked`
+    /// index) — just triggered by an explicit soft-deletion event
+    /// instead of "missing from a full reload". A no-op if the username
+    /// isn't currently known.
+    fn revoke_username_now(&self, username: &str) {
+        let mut guard = match self.db_users.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[databases] failed to acquire db_users lock: {e}");
+                return;
+            }
+        };
+
+        let Some(idx) = guard.iter().position(|u| u.username == username) else {
+            return;
+        };
+
+        let Ok(mut revoked) = self.db_revoked.write() else {
+            eprintln!("[databases] failed to acquire db_revoked lock");
+            return;
+        };
+
+        if revoked.insert(idx) {
+            guard[idx].password = "!revoked!".to_string();
+            self.index_roles(username, &None);
+        }
+    }
+
+    /// Shared upsert-in-place-or-append step used by both
+    /// `refresh_db_users` and `refresh_db_users_incremental`. Returns
+    /// the write guard (still held) so `refresh_db_users` can continue
+    /// straight on to its deletion-detection pass without re-locking.
+    ///
+    /// Also un-revokes every touched index: a user reappearing via
+    /// upsert (soft-delete undone, or re-created with the same
+    /// username) must stop being rejected by `user_by_index` — without
+    /// this, a previously revoked slot would stay revoked forever even
+    /// after being upserted with fresh, valid data.
+    fn apply_upserts<'a>(
+        &'a self,
+        fresh: &[User],
+    ) -> Option<std::sync::RwLockWriteGuard<'a, Vec<User>>> {
+        let mut guard = match self.db_users.write() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[databases] failed to acquire db_users lock: {e}");
+                return None;
+            }
+        };
+
+        let mut touched_indices = Vec::with_capacity(fresh.len());
+
+        for new_user in fresh {
+            if let Some(idx) = guard.iter().position(|u| u.username == new_user.username) {
+                guard[idx] = new_user.clone();
+                touched_indices.push(idx);
+            } else {
+                guard.push(new_user.clone());
+                touched_indices.push(guard.len() - 1);
+            }
+            self.index_roles(&new_user.username, &new_user.roles);
+        }
+
+        if let Ok(mut revoked) = self.db_revoked.write() {
+            for idx in touched_indices {
+                revoked.remove(&idx);
+            }
+        } else {
+            eprintln!("[databases] failed to acquire db_revoked lock while un-revoking");
+        }
+
+        Some(guard)
     }
 }
 
@@ -669,11 +959,18 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
         fs::write(path, updated_str).expect("Failed to write updated config");
     }
 
+    // Seed roles_index for file-based users once — `users` never changes
+    // after this point, so this never needs to run again (unlike the
+    // periodic refresh below, for database users).
+    let app_config = Arc::new(config);
+    for user in &app_config.users {
+        app_config.index_roles(&user.username, &user.roles);
+    }
+
     // Load users stored in the database (if `databases` is configured)
     // into `db_users`, refreshed periodically afterwards by a background
     // task (see main.rs). Done *after* the file write-back above so
     // DB-sourced users are never persisted into config.json.
-    let app_config = Arc::new(config);
     app_config.refresh_db_users();
     app_config
 }
@@ -852,18 +1149,18 @@ impl AllowRegexCfg {
                 }),
                 RegexCondCfg::Header { name, pattern } => Ok(RegexCond::Header {
                     name_re: Regex::new(name)?,
-                                                             re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::Query { name, pattern } => Ok(RegexCond::Query {
                     name_re: Regex::new(name)?,
-                                                            re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::BodyRaw { pattern } => Ok(RegexCond::BodyRaw {
                     re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::BodyJson { key, pattern } => Ok(RegexCond::BodyJson {
                     key: key.clone(),
-                                                              re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
             }
         }

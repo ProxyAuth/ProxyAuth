@@ -86,6 +86,26 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             };
 
+            // A live connection is required, checked here before even
+            // asking for a password — the LMDB fallback cache (see
+            // databases::cache) exists only for *reads* used to keep
+            // serving logins during a DB outage. It's never a valid
+            // target for a write: writing there would silently diverge
+            // from the real database and vanish on the next successful
+            // sync, giving a false impression the user was actually
+            // created.
+            let mut conn = match crate::databases::db::connect(db_cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database is not reachable — cannot write a user: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = crate::databases::db::ensure_schema(&mut conn) {
+                eprintln!("Database is not reachable — cannot write a user: {e}");
+                std::process::exit(1);
+            }
+
             let password = match password {
                 Some(p) => p.clone(),
                 None => rpassword::prompt_password("password: ")?,
@@ -97,9 +117,6 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| e.to_string())?
             .to_string();
 
-            let mut conn = crate::databases::db::connect(db_cfg)?;
-            crate::databases::db::ensure_schema(&mut conn)?;
-
             let user = User {
                 username: username.clone(),
                 password: hash,
@@ -110,7 +127,197 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             crate::databases::db::upsert_user(&mut conn, &user)?;
-            println!("User '{}' written to the database.", username);
+            println!(
+                "User '{}' written to the database (revived if it was previously soft-deleted).",
+                     username
+            );
+            std::process::exit(0);
+        }
+
+        Some(Commands::DbDeleteUser { username }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let Some(db_cfg) = &config.databases else {
+                eprintln!(
+                    "No 'databases' block configured in config.json — nothing to delete from."
+                );
+                std::process::exit(1);
+            };
+
+            // Same reasoning as db-add-user above — this must hit the
+            // real database, never the local read-only fallback cache.
+            let mut conn = match crate::databases::db::connect(db_cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database is not reachable — cannot delete a user: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = crate::databases::db::ensure_schema(&mut conn) {
+                eprintln!("Database is not reachable — cannot delete a user: {e}");
+                std::process::exit(1);
+            }
+            crate::databases::db::mark_user_deleted(&mut conn, username)?;
+
+            println!(
+                "User '{}' soft-deleted — will be revoked on the next incremental scan of every connected instance, and permanently purged after {}s.",
+                username, db_cfg.deleted_retention_secs
+            );
+            std::process::exit(0);
+        }
+
+        Some(Commands::DbRestoreFromCache { force }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let Some(db_cfg) = &config.databases else {
+                eprintln!(
+                    "No 'databases' block configured in config.json — nothing to restore into."
+                );
+                std::process::exit(1);
+            };
+
+            let cached = match crate::databases::cache::read_snapshot() {
+                Ok(users) if !users.is_empty() => users,
+                Ok(_) => {
+                    eprintln!("Local cache is empty — nothing to restore.");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("No usable local cache to restore from: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            // Same reasoning as db-add-user/db-delete-user above — this
+            // must hit the real database, never fall back to anything
+            // else if it's unreachable.
+            let mut conn = match crate::databases::db::connect(db_cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database is not reachable — cannot restore: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = crate::databases::db::ensure_schema(&mut conn) {
+                eprintln!("Database is not reachable — cannot restore: {e}");
+                std::process::exit(1);
+            }
+
+            let existing: std::collections::HashSet<String> =
+            match crate::databases::db::load_users(&mut conn) {
+                Ok(users) => users.into_iter().map(|u| u.username).collect(),
+                Err(e) => {
+                    eprintln!("Failed to read current database state before restoring: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            if !existing.is_empty() && !force {
+                eprintln!(
+                    "Database already has {} user(s) — refusing to restore without --force, to avoid silently overwriting them with the (possibly older) cached snapshot.",
+                          existing.len()
+                );
+                eprintln!("Re-run with --force if you're sure you want the cache to win.");
+                std::process::exit(1);
+            }
+
+            let mut restored = 0u32;
+            for user in &cached {
+                if let Err(e) = crate::databases::db::upsert_user(&mut conn, user) {
+                    eprintln!("Failed to restore user '{}': {e}", user.username);
+                    std::process::exit(1);
+                }
+                restored += 1;
+            }
+
+            println!(
+                "Restored {} user(s) from the local cache into the database.",
+                     restored
+            );
+            std::process::exit(0);
+        }
+
+        Some(Commands::DbClearCache) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            match crate::databases::cache::clear_snapshot() {
+                Ok(()) => {
+                    println!(
+                        "Local cache cleared. It will be repopulated on the next successful full database read."
+                    );
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Failed to clear local cache: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Some(Commands::DbSyncCache { force }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let Some(db_cfg) = &config.databases else {
+                eprintln!("No 'databases' block configured in config.json — nothing to sync.");
+                std::process::exit(1);
+            };
+
+            // A live connection is required — this must be a genuinely
+            // fresh read, never a fallback to the cache we're about to
+            // overwrite (that would just be writing the cache back to
+            // itself).
+            let mut conn = match crate::databases::db::connect(db_cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database is not reachable — cannot sync the cache: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = crate::databases::db::ensure_schema(&mut conn) {
+                eprintln!("Database is not reachable — cannot sync the cache: {e}");
+                std::process::exit(1);
+            }
+
+            let users = match crate::databases::db::load_users(&mut conn) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Failed to read users from the database: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            if users.is_empty() && !*force {
+                let existing_count = crate::databases::cache::read_snapshot()
+                .map(|u| u.len())
+                .unwrap_or(0);
+                if existing_count > 0 {
+                    eprintln!(
+                        "Database returned 0 users, but the local cache currently has {existing_count} — refusing to overwrite it with an empty snapshot without --force."
+                    );
+                    eprintln!(
+                        "If the database genuinely has no users right now, re-run with --force."
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            let count = users.len();
+            if let Err(e) = crate::databases::cache::write_snapshot(&users) {
+                eprintln!("Failed to write the local cache: {e}");
+                std::process::exit(1);
+            }
+
+            println!("Local cache synced from the database — now holds {count} user(s).");
             std::process::exit(0);
         }
     }

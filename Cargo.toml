@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.0.0-beta5"
+version = "1.0.0-beta6"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -114,7 +114,7 @@ regex = "1"
 serial_test = "3" # it's for coverage code
 notify = "6"
 arc-swap = "1.8.0"
-diesel = { version = "2.1", features = ["postgres", "mysql"] }
+diesel = { version = "2.1", features = ["postgres", "mysql", "chrono"] }
 http = "1"
 hyper-tls = "0.5"
 hmac = "0.13.0-rc.2"
@@ -133,7 +133,7 @@ version = ">=0.4.16, <0.5.0"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 strip = true
 debug = false
