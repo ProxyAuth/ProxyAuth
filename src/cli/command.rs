@@ -60,4 +60,20 @@ pub enum Commands {
     /// certain a later fallback wouldn't reuse it. A no-op, not an
     /// error, if nothing was cached to begin with.
     DbClearCache,
+    /// Forces an immediate sync of the local LMDB fallback cache from
+    /// the configured database — a live full read, right now, instead
+    /// of waiting for the next scheduled full scan
+    /// (`databases.full_refresh_interval_secs`). Useful right after
+    /// fixing a database connectivity issue, to get a fresh cache
+    /// immediately.
+    ///
+    /// Refuses to overwrite a non-empty existing cache with an empty
+    /// result (the database answered, but has zero users right now —
+    /// could be genuine, could be a wrong database/permissions issue)
+    /// unless --force is given, mirroring the same protection
+    /// db-restore-from-cache has in the other direction.
+    DbSyncCache {
+        #[arg(long)]
+        force: bool,
+    },
 }

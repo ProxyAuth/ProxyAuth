@@ -221,7 +221,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             if !existing.is_empty() && !force {
                 eprintln!(
                     "Database already has {} user(s) — refusing to restore without --force, to avoid silently overwriting them with the (possibly older) cached snapshot.",
-                    existing.len()
+                          existing.len()
                 );
                 eprintln!("Re-run with --force if you're sure you want the cache to win.");
                 std::process::exit(1);
@@ -259,6 +259,66 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Some(Commands::DbSyncCache { force }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let Some(db_cfg) = &config.databases else {
+                eprintln!("No 'databases' block configured in config.json — nothing to sync.");
+                std::process::exit(1);
+            };
+
+            // A live connection is required — this must be a genuinely
+            // fresh read, never a fallback to the cache we're about to
+            // overwrite (that would just be writing the cache back to
+            // itself).
+            let mut conn = match crate::databases::db::connect(db_cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Database is not reachable — cannot sync the cache: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = crate::databases::db::ensure_schema(&mut conn) {
+                eprintln!("Database is not reachable — cannot sync the cache: {e}");
+                std::process::exit(1);
+            }
+
+            let users = match crate::databases::db::load_users(&mut conn) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Failed to read users from the database: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            if users.is_empty() && !*force {
+                let existing_count = crate::databases::cache::read_snapshot()
+                .map(|u| u.len())
+                .unwrap_or(0);
+                if existing_count > 0 {
+                    eprintln!(
+                        "Database returned 0 users, but the local cache currently has {existing_count} — refusing to overwrite it with an empty snapshot without --force."
+                    );
+                    eprintln!(
+                        "If the database genuinely has no users right now, re-run with --force."
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            let count = users.len();
+            if let Err(e) = crate::databases::cache::write_snapshot(&users) {
+                eprintln!("Failed to write the local cache: {e}");
+                std::process::exit(1);
+            }
+
+            println!("Local cache synced from the database — now holds {count} user(s).");
+            std::process::exit(0);
         }
     }
 }
