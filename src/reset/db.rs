@@ -182,7 +182,7 @@ pub fn consume_token(token: &str) -> Result<(), String> {
 /// called periodically — tokens that are never submitted would
 /// otherwise accumulate forever. Returns the number purged.
 pub fn purge_expired() -> Result<u64, String> {
-    use lmdb::{Cursor, Transaction, WriteFlags};
+    use lmdb::{Cursor, Transaction};
 
     let env = env()?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
