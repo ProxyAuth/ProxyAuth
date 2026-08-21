@@ -45,6 +45,7 @@ use diesel::pg::PgConnection;
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamp};
 use diesel::{Connection, OptionalExtension, QueryableByName, RunQueryDsl, sql_query};
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 pub enum DbConnection {
     Postgres(PgConnection),
@@ -156,20 +157,85 @@ struct IdRow {
     id: i64,
 }
 
+/// Bounds how many abandoned connection-attempt threads can be alive at
+/// once (see `connect` below) — without this, a database that stays
+/// unreachable for a while causes these to accumulate faster than they
+/// naturally resolve, since a new attempt starts every scan tick (as
+/// often as every 30s) while an abandoned one can take much longer
+/// than `connect_timeout_secs` to actually finish in the background
+/// (bounded only by the OS's own TCP timeout, often 30-130s+). Past
+/// enough accumulated threads, this was observed to make the whole
+/// process slow to respond to SIGTERM again — the exact problem
+/// `connect_timeout_secs` was meant to solve, just re-introduced by a
+/// pile of abandoned attempts instead of one long one.
+static INFLIGHT_CONNECT_ATTEMPTS: std::sync::atomic::AtomicUsize =
+std::sync::atomic::AtomicUsize::new(0);
+const MAX_INFLIGHT_CONNECT_ATTEMPTS: usize = 3;
+
 /// Opens a connection to the database described by `cfg`.
+///
+/// Bounded to `cfg.connect_timeout_secs` (default 5s), via `connect_inner`
+/// running on its own OS thread while this function waits on a channel
+/// with a timeout — not just a URL-level timeout parameter, because
+/// that approach doesn't work uniformly: Postgres's libpq honors a
+/// `connect_timeout=N` query parameter, but MySQL/MariaDB's client
+/// library (as used through Diesel) does **not** — verified empirically
+/// (a stuck-server connection attempt with `connect_timeout=3` in the
+/// URL still hung indefinitely for MySQL). This wrapper works the same
+/// way regardless of backend, so `connect()` never blocks its caller
+/// longer than the configured timeout either way.
+///
+/// If the timeout elapses, the spawned thread is abandoned — it keeps
+/// trying in the background until its own eventual OS-level timeout.
+/// `INFLIGHT_CONNECT_ATTEMPTS` caps how many such abandoned attempts
+/// can pile up at once: if the cap is already reached, this returns an
+/// error immediately without spawning yet another one, rather than
+/// letting them accumulate unbounded while the database stays down.
 pub fn connect(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
+    use std::sync::atomic::Ordering;
+
+    if INFLIGHT_CONNECT_ATTEMPTS.load(Ordering::Acquire) >= MAX_INFLIGHT_CONNECT_ATTEMPTS {
+        return Err(format!(
+            "Too many database connection attempts already in progress (limit: {MAX_INFLIGHT_CONNECT_ATTEMPTS}) — the database has likely been unreachable for a while; skipping this attempt rather than piling on another one"
+        ));
+    }
+
+    let timeout = std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1));
+    let cfg_owned = cfg.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    INFLIGHT_CONNECT_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
+    std::thread::spawn(move || {
+        let result = connect_inner(&cfg_owned);
+        // The receiver may already be gone (we timed out and moved on)
+        // — that's fine, .send() just fails silently in that case.
+        let _ = tx.send(result);
+        INFLIGHT_CONNECT_ATTEMPTS.fetch_sub(1, Ordering::AcqRel);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Database connection attempt did not complete within {}s — giving up (the database may be unreachable, or the connect_timeout_secs setting may need adjusting for your network)",
+                              timeout.as_secs()
+        )),
+    }
+}
+
+fn connect_inner(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
     match cfg.db_type.to_lowercase().as_str() {
         "postgres" | "postgresql" | "pg" => {
             let url = format!(
-                "postgres://{}:{}@{}:{}/{}",
+                "postgres://{}:{}@{}:{}/{}?connect_timeout={}",
                 cfg.user,
                 cfg.password,
                 cfg.host,
                 cfg.effective_port(),
-                cfg.db_name
+                              cfg.db_name,
+                              cfg.connect_timeout_secs.max(1),
             );
             let conn = PgConnection::establish(&url)
-                .map_err(|e| format!("Postgres connection failed: {e}"))?;
+            .map_err(|e| format!("Postgres connection failed: {e}"))?;
             Ok(DbConnection::Postgres(conn))
         }
         "mysql" | "mariadb" => {
@@ -179,15 +245,90 @@ pub fn connect(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
                 cfg.password,
                 cfg.host,
                 cfg.effective_port(),
-                cfg.db_name
+                              cfg.db_name
             );
             let conn = MysqlConnection::establish(&url)
-                .map_err(|e| format!("MySQL connection failed: {e}"))?;
+            .map_err(|e| format!("MySQL connection failed: {e}"))?;
             Ok(DbConnection::MySql(conn))
         }
         other => Err(format!(
             "Unsupported databases.type '{other}': expected 'postgres' or 'mysql'"
         )),
+    }
+}
+
+/// The one, process-lifetime database connection — established on
+/// first use, then reused for every subsequent operation instead of
+/// reconnecting each time. `None` means "not connected right now"
+/// (either never connected yet, or the last operation on it failed and
+/// it was dropped so the next call reconnects from scratch).
+static DB_CONNECTION: OnceLock<Mutex<Option<DbConnection>>> = OnceLock::new();
+
+fn db_connection_slot() -> &'static Mutex<Option<DbConnection>> {
+    DB_CONNECTION.get_or_init(|| Mutex::new(None))
+}
+
+/// Runs `f` against the single shared, persistent database connection —
+/// connecting first if this is the very first call, or if the
+/// connection was dropped after a previous call's operation failed.
+/// Every caller in this module (the periodic scans, the CLI commands,
+/// `reset_password_route`'s DB write) goes through this instead of
+/// calling `connect()` directly and opening its own short-lived
+/// connection, so the database sees one long-lived connection over the
+/// process's lifetime rather than a fresh one per operation.
+///
+/// Deliberately simple about *when* to reconnect: any `Err` from `f` —
+/// not just ones that look connection-related — drops the stored
+/// connection, so the next call starts fresh. This can occasionally
+/// reconnect after an error that didn't strictly need it (e.g. a
+/// constraint violation on a perfectly healthy connection), but that's
+/// a minor inefficiency, not a correctness problem — distinguishing
+/// "the connection itself died" from "the query failed for a data
+/// reason" would mean parsing Diesel's error variants (this module
+/// already converts everything to `String` well before this point, so
+/// that distinction isn't available here without a larger refactor).
+///
+/// A `Mutex` around a single connection means database operations are
+/// serialized process-wide — only one can run at a time. For
+/// ProxyAuth's actual DB workload (periodic scans a few times a
+/// minute, occasional CLI/admin use, occasional password resets)
+/// that's an acceptable, deliberate trade-off in exchange for a
+/// simple, well-understood connection lifecycle; a connection pool
+/// (e.g. `diesel::r2d2`) would allow genuine concurrency at the cost
+/// of more moving parts, if that's ever needed.
+pub fn with_connection<T>(
+    cfg: &DatabaseConfig,
+    f: impl FnOnce(&mut DbConnection) -> Result<T, String>,
+) -> Result<T, String> {
+    let slot = db_connection_slot();
+    let mut guard = match slot.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            // A previous operation panicked while holding this lock —
+            // recover by taking the guard anyway (its *contents* — an
+            // Option<DbConnection> — are still perfectly usable data,
+            // a panic doesn't corrupt them) and force a reconnect,
+            // rather than letting one panic permanently break all
+            // future database access for the rest of the process.
+            let mut g = poisoned.into_inner();
+            *g = None;
+            g
+        }
+    };
+
+    if guard.is_none() {
+        *guard = Some(connect(cfg)?);
+    }
+
+    // Safe: the branch above guarantees Some at this point.
+    let conn = guard.as_mut().expect("connection slot just set to Some");
+
+    match f(conn) {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            *guard = None;
+            Err(e)
+        }
     }
 }
 
@@ -308,7 +449,9 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
                 "CREATE INDEX IF NOT EXISTS idx_deleted_users_log_deleted_at
                 ON deleted_users_log (deleted_at)",
             )
-            .map_err(|e| format!("Failed to create deleted_users_log index (postgres): {e}"))?;
+            .map_err(|e| {
+                format!("Failed to create deleted_users_log index (postgres): {e}")
+            })?;
 
             c.batch_execute(
                 "CREATE OR REPLACE FUNCTION log_deleted_user() RETURNS TRIGGER AS $$
@@ -328,7 +471,7 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
             // success rather than a hard failure — the trigger being
             // present is all we actually care about.
             c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete ON users")
-                .map_err(|e| format!("Failed to drop trg_log_user_delete (postgres): {e}"))?;
+            .map_err(|e| format!("Failed to drop trg_log_user_delete (postgres): {e}"))?;
             if let Err(e) = c.batch_execute(
                 "CREATE TRIGGER trg_log_user_delete
                 AFTER DELETE ON users
@@ -336,9 +479,7 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
             ) {
                 let msg = e.to_string().to_lowercase();
                 if !msg.contains("already exists") {
-                    return Err(format!(
-                        "Failed to create trg_log_user_delete (postgres): {e}"
-                    ));
+                    return Err(format!("Failed to create trg_log_user_delete (postgres): {e}"));
                 }
             }
 
@@ -377,8 +518,8 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
                 if let Err(e) = c.batch_execute(stmt) {
                     let msg = e.to_string().to_lowercase();
                     let already_there = msg.contains("duplicate column")
-                        || msg.contains("duplicate key name")
-                        || msg.contains("already exists");
+                    || msg.contains("duplicate key name")
+                    || msg.contains("already exists");
                     if !already_there {
                         return Err(format!(
                             "Failed to migrate users.created_at/modified_at/deleted (mysql): {e}"
@@ -441,7 +582,7 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
             // exists" as success rather than a hard failure — the
             // trigger being present is all we actually care about.
             c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete")
-                .map_err(|e| format!("Failed to drop trg_log_user_delete (mysql): {e}"))?;
+            .map_err(|e| format!("Failed to drop trg_log_user_delete (mysql): {e}"))?;
             if let Err(e) = c.batch_execute(
                 "CREATE TRIGGER trg_log_user_delete
                 AFTER DELETE ON users
@@ -519,17 +660,17 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
     }
 
     Ok(user_rows
-        .into_iter()
-        .map(|r| User {
-            username: r.username,
-            password: r.password,
-            otpkey: r.otpkey,
-            allow: allow_map.remove(&r.id),
-            roles: roles_map.remove(&r.id),
-            email: email_map.remove(&r.id),
-            must_change_password: r.must_change_password,
-        })
-        .collect())
+    .into_iter()
+    .map(|r| User {
+        username: r.username,
+         password: r.password,
+         otpkey: r.otpkey,
+         allow: allow_map.remove(&r.id),
+         roles: roles_map.remove(&r.id),
+         email: email_map.remove(&r.id),
+         must_change_password: r.must_change_password,
+    })
+    .collect())
 }
 
 /// Inserts or updates the `users` row itself, returning its `id`.
@@ -583,8 +724,8 @@ fn upsert_user_row(conn: &mut DbConnection, user: &User) -> Result<i64, String> 
             .map_err(|e| format!("Failed to upsert user (mysql): {e}"))?;
 
             let row: IdRow = sql_query("SELECT LAST_INSERT_ID() AS id")
-                .get_result(c)
-                .map_err(|e| format!("Failed to fetch inserted user id (mysql): {e}"))?;
+            .get_result(c)
+            .map_err(|e| format!("Failed to fetch inserted user id (mysql): {e}"))?;
             Ok(row.id)
         }
     }
@@ -601,28 +742,28 @@ fn replace_user_allow(
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM user_allow WHERE user_id = $1")
-                .bind::<BigInt, _>(user_id)
-                .execute(c)
-                .map_err(|e| format!("Failed to clear user_allow (postgres): {e}"))?;
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_allow (postgres): {e}"))?;
             for cidr in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_allow (user_id, cidr) VALUES ($1, $2)")
-                    .bind::<BigInt, _>(user_id)
-                    .bind::<Text, _>(cidr)
-                    .execute(c)
-                    .map_err(|e| format!("Failed to insert user_allow (postgres): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .bind::<Text, _>(cidr)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_allow (postgres): {e}"))?;
             }
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM user_allow WHERE user_id = ?")
-                .bind::<BigInt, _>(user_id)
-                .execute(c)
-                .map_err(|e| format!("Failed to clear user_allow (mysql): {e}"))?;
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_allow (mysql): {e}"))?;
             for cidr in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_allow (user_id, cidr) VALUES (?, ?)")
-                    .bind::<BigInt, _>(user_id)
-                    .bind::<Text, _>(cidr)
-                    .execute(c)
-                    .map_err(|e| format!("Failed to insert user_allow (mysql): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .bind::<Text, _>(cidr)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_allow (mysql): {e}"))?;
             }
         }
     }
@@ -638,28 +779,28 @@ fn replace_user_roles(
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM user_roles WHERE user_id = $1")
-                .bind::<BigInt, _>(user_id)
-                .execute(c)
-                .map_err(|e| format!("Failed to clear user_roles (postgres): {e}"))?;
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_roles (postgres): {e}"))?;
             for role in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_roles (user_id, role) VALUES ($1, $2)")
-                    .bind::<BigInt, _>(user_id)
-                    .bind::<Text, _>(role)
-                    .execute(c)
-                    .map_err(|e| format!("Failed to insert user_roles (postgres): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .bind::<Text, _>(role)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_roles (postgres): {e}"))?;
             }
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM user_roles WHERE user_id = ?")
-                .bind::<BigInt, _>(user_id)
-                .execute(c)
-                .map_err(|e| format!("Failed to clear user_roles (mysql): {e}"))?;
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_roles (mysql): {e}"))?;
             for role in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_roles (user_id, role) VALUES (?, ?)")
-                    .bind::<BigInt, _>(user_id)
-                    .bind::<Text, _>(role)
-                    .execute(c)
-                    .map_err(|e| format!("Failed to insert user_roles (mysql): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .bind::<Text, _>(role)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_roles (mysql): {e}"))?;
             }
         }
     }
@@ -678,13 +819,11 @@ fn replace_user_email(
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM user_email WHERE user_id = $1")
-                .bind::<BigInt, _>(user_id)
-                .execute(c)
-                .map_err(|e| format!("Failed to clear user_email (postgres): {e}"))?;
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_email (postgres): {e}"))?;
             for entry in values.unwrap_or_default() {
-                sql_query(
-                    "INSERT INTO user_email (user_id, email, is_primary) VALUES ($1, $2, $3)",
-                )
+                sql_query("INSERT INTO user_email (user_id, email, is_primary) VALUES ($1, $2, $3)")
                 .bind::<BigInt, _>(user_id)
                 .bind::<Text, _>(&entry.address)
                 .bind::<diesel::sql_types::Bool, _>(entry.primary)
@@ -694,16 +833,16 @@ fn replace_user_email(
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM user_email WHERE user_id = ?")
-                .bind::<BigInt, _>(user_id)
-                .execute(c)
-                .map_err(|e| format!("Failed to clear user_email (mysql): {e}"))?;
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_email (mysql): {e}"))?;
             for entry in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_email (user_id, email, is_primary) VALUES (?, ?, ?)")
-                    .bind::<BigInt, _>(user_id)
-                    .bind::<Text, _>(&entry.address)
-                    .bind::<diesel::sql_types::Bool, _>(entry.primary)
-                    .execute(c)
-                    .map_err(|e| format!("Failed to insert user_email (mysql): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .bind::<Text, _>(&entry.address)
+                .bind::<diesel::sql_types::Bool, _>(entry.primary)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_email (mysql): {e}"))?;
             }
         }
     }
@@ -746,17 +885,17 @@ pub fn mark_user_deleted(conn: &mut DbConnection, username: &str) -> Result<(), 
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("UPDATE users SET deleted = TRUE, modified_at = now() WHERE username = $1")
-                .bind::<Text, _>(username)
-                .execute(c)
-                .map_err(|e| format!("Failed to soft-delete user (postgres): {e}"))?;
+            .bind::<Text, _>(username)
+            .execute(c)
+            .map_err(|e| format!("Failed to soft-delete user (postgres): {e}"))?;
         }
         DbConnection::MySql(c) => {
             // No explicit modified_at needed — ON UPDATE CURRENT_TIMESTAMP
             // fires automatically for this UPDATE.
             sql_query("UPDATE users SET deleted = TRUE WHERE username = ?")
-                .bind::<Text, _>(username)
-                .execute(c)
-                .map_err(|e| format!("Failed to soft-delete user (mysql): {e}"))?;
+            .bind::<Text, _>(username)
+            .execute(c)
+            .map_err(|e| format!("Failed to soft-delete user (mysql): {e}"))?;
         }
     }
     Ok(())
@@ -835,9 +974,9 @@ pub fn load_user_by_username(
         password: row.password,
         otpkey: row.otpkey,
         allow: if allow.is_empty() { None } else { Some(allow) },
-        roles: if roles.is_empty() { None } else { Some(roles) },
-        email: if email.is_empty() { None } else { Some(email) },
-        must_change_password: row.must_change_password,
+            roles: if roles.is_empty() { None } else { Some(roles) },
+            email: if email.is_empty() { None } else { Some(email) },
+            must_change_password: row.must_change_password,
     }))
 }
 
@@ -853,17 +992,17 @@ pub fn purge_deleted_users(conn: &mut DbConnection, retention_secs: i64) -> Resu
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM users WHERE deleted = TRUE AND modified_at < $1")
-                .bind::<Timestamp, _>(cutoff)
-                .execute(c)
-                .map(|n| n as u64)
-                .map_err(|e| format!("Failed to purge deleted users (postgres): {e}"))
+            .bind::<Timestamp, _>(cutoff)
+            .execute(c)
+            .map(|n| n as u64)
+            .map_err(|e| format!("Failed to purge deleted users (postgres): {e}"))
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM users WHERE deleted = TRUE AND modified_at < ?")
-                .bind::<Timestamp, _>(cutoff)
-                .execute(c)
-                .map(|n| n as u64)
-                .map_err(|e| format!("Failed to purge deleted users (mysql): {e}"))
+            .bind::<Timestamp, _>(cutoff)
+            .execute(c)
+            .map(|n| n as u64)
+            .map_err(|e| format!("Failed to purge deleted users (mysql): {e}"))
         }
     }
 }
@@ -876,18 +1015,16 @@ pub fn purge_deleted_users(conn: &mut DbConnection, retention_secs: i64) -> Resu
 pub fn purge_deletion_log(conn: &mut DbConnection, retention_secs: i64) -> Result<u64, String> {
     let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(retention_secs);
     match conn {
-        DbConnection::Postgres(c) => {
-            sql_query("DELETE FROM deleted_users_log WHERE deleted_at < $1")
-                .bind::<Timestamp, _>(cutoff)
-                .execute(c)
-                .map(|n| n as u64)
-                .map_err(|e| format!("Failed to purge deleted_users_log (postgres): {e}"))
-        }
+        DbConnection::Postgres(c) => sql_query("DELETE FROM deleted_users_log WHERE deleted_at < $1")
+        .bind::<Timestamp, _>(cutoff)
+        .execute(c)
+        .map(|n| n as u64)
+        .map_err(|e| format!("Failed to purge deleted_users_log (postgres): {e}")),
         DbConnection::MySql(c) => sql_query("DELETE FROM deleted_users_log WHERE deleted_at < ?")
-            .bind::<Timestamp, _>(cutoff)
-            .execute(c)
-            .map(|n| n as u64)
-            .map_err(|e| format!("Failed to purge deleted_users_log (mysql): {e}")),
+        .bind::<Timestamp, _>(cutoff)
+        .execute(c)
+        .map(|n| n as u64)
+        .map_err(|e| format!("Failed to purge deleted_users_log (mysql): {e}")),
     }
 }
 
@@ -898,17 +1035,19 @@ pub fn purge_deletion_log(conn: &mut DbConnection, retention_secs: i64) -> Resul
 /// need to know whether it actually happened should check the return.
 ///
 /// Not currently called anywhere — `db-delete-user` (cli/prompt.rs)
-/// calls `connect`/`ensure_schema`/`mark_user_deleted` directly instead,
-/// so it can report which specific step failed with its own message.
-/// Kept as public API for a future caller that just wants "delete this
-/// user" in one call without that level of control (e.g. an eventual
-/// admin HTTP endpoint).
+/// calls `with_connection`/`ensure_schema`/`mark_user_deleted` directly
+/// instead, so it can report which specific step failed with its own
+/// message. Kept as public API for a future caller that just wants
+/// "delete this user" in one call without that level of control (e.g.
+/// an eventual admin HTTP endpoint).
 #[allow(dead_code)]
 pub fn mark_user_deleted_in_config(cfg: &DatabaseConfig, username: &str) -> Result<(), String> {
-    let mut conn = connect(cfg)?;
-    ensure_schema(&mut conn)?;
-    mark_user_deleted(&mut conn, username)
+    with_connection(cfg, |conn| {
+        ensure_schema(conn)?;
+        mark_user_deleted(conn, username)
+    })
 }
+
 
 /// Loads the users whose `modified_at` falls at or after `cutoff` — the
 /// incremental counterpart to `load_users`, used for frequent refreshes
@@ -963,9 +1102,9 @@ pub fn load_recently_changed_users(
             password: row.password,
             otpkey: row.otpkey,
             allow: if allow.is_empty() { None } else { Some(allow) },
-            roles: if roles.is_empty() { None } else { Some(roles) },
-            email: if email.is_empty() { None } else { Some(email) },
-            must_change_password: row.must_change_password,
+                                            roles: if roles.is_empty() { None } else { Some(roles) },
+                                            email: if email.is_empty() { None } else { Some(email) },
+                                            must_change_password: row.must_change_password,
         }));
     }
 
@@ -981,24 +1120,21 @@ pub fn load_recently_changed_users(
 /// `ensure_schema`). May return the same username more than once if it
 /// was deleted, re-created, and deleted again within the window;
 /// callers revoking by username handle that fine (idempotent).
-fn load_recent_deletions(
-    conn: &mut DbConnection,
-    cutoff: NaiveDateTime,
-) -> Result<Vec<String>, String> {
+fn load_recent_deletions(conn: &mut DbConnection, cutoff: NaiveDateTime) -> Result<Vec<String>, String> {
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("SELECT username FROM deleted_users_log WHERE deleted_at >= $1")
-                .bind::<Timestamp, _>(cutoff)
-                .load::<DeletedLogRow>(c)
-                .map(|rows| rows.into_iter().map(|r| r.username).collect())
-                .map_err(|e| format!("Failed to load deleted_users_log (postgres): {e}"))
+            .bind::<Timestamp, _>(cutoff)
+            .load::<DeletedLogRow>(c)
+            .map(|rows| rows.into_iter().map(|r| r.username).collect())
+            .map_err(|e| format!("Failed to load deleted_users_log (postgres): {e}"))
         }
         DbConnection::MySql(c) => {
             sql_query("SELECT username FROM deleted_users_log WHERE deleted_at >= ?")
-                .bind::<Timestamp, _>(cutoff)
-                .load::<DeletedLogRow>(c)
-                .map(|rows| rows.into_iter().map(|r| r.username).collect())
-                .map_err(|e| format!("Failed to load deleted_users_log (mysql): {e}"))
+            .bind::<Timestamp, _>(cutoff)
+            .load::<DeletedLogRow>(c)
+            .map(|rows| rows.into_iter().map(|r| r.username).collect())
+            .map_err(|e| format!("Failed to load deleted_users_log (mysql): {e}"))
         }
     }
 }
@@ -1016,42 +1152,45 @@ fn load_values_for_user(
     let query = format!("SELECT {column} AS value FROM {table} WHERE user_id = ");
     match conn {
         DbConnection::Postgres(c) => sql_query(format!("{query}$1"))
-            .bind::<BigInt, _>(user_id)
-            .load::<UserIdValueRow>(c)
-            .map(|rows| rows.into_iter().map(|r| r.value).collect())
-            .map_err(|e| format!("Failed to load {table} for user (postgres): {e}")),
+        .bind::<BigInt, _>(user_id)
+        .load::<UserIdValueRow>(c)
+        .map(|rows| rows.into_iter().map(|r| r.value).collect())
+        .map_err(|e| format!("Failed to load {table} for user (postgres): {e}")),
         DbConnection::MySql(c) => sql_query(format!("{query}?"))
-            .bind::<BigInt, _>(user_id)
-            .load::<UserIdValueRow>(c)
-            .map(|rows| rows.into_iter().map(|r| r.value).collect())
-            .map_err(|e| format!("Failed to load {table} for user (mysql): {e}")),
+        .bind::<BigInt, _>(user_id)
+        .load::<UserIdValueRow>(c)
+        .map(|rows| rows.into_iter().map(|r| r.value).collect())
+        .map_err(|e| format!("Failed to load {table} for user (mysql): {e}")),
     }
 }
 
 /// Loads every `user_email` row for one user, `is_primary` included.
-fn load_emails_for_user(conn: &mut DbConnection, user_id: i64) -> Result<Vec<EmailEntry>, String> {
+fn load_emails_for_user(
+    conn: &mut DbConnection,
+    user_id: i64,
+) -> Result<Vec<EmailEntry>, String> {
     let rows: Vec<UserEmailRow> = match conn {
-        DbConnection::Postgres(c) => sql_query(
-            "SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = $1",
-        )
-        .bind::<BigInt, _>(user_id)
-        .load(c)
-        .map_err(|e| format!("Failed to load user_email for user (postgres): {e}"))?,
-        DbConnection::MySql(c) => sql_query(
-            "SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = ?",
-        )
-        .bind::<BigInt, _>(user_id)
-        .load(c)
-        .map_err(|e| format!("Failed to load user_email for user (mysql): {e}"))?,
+        DbConnection::Postgres(c) => {
+            sql_query("SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = $1")
+            .bind::<BigInt, _>(user_id)
+            .load(c)
+            .map_err(|e| format!("Failed to load user_email for user (postgres): {e}"))?
+        }
+        DbConnection::MySql(c) => {
+            sql_query("SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = ?")
+            .bind::<BigInt, _>(user_id)
+            .load(c)
+            .map_err(|e| format!("Failed to load user_email for user (mysql): {e}"))?
+        }
     };
 
     Ok(rows
-        .into_iter()
-        .map(|r| EmailEntry {
-            address: r.address,
-            primary: r.is_primary,
-        })
-        .collect())
+    .into_iter()
+    .map(|r| EmailEntry {
+        address: r.address,
+         primary: r.is_primary,
+    })
+    .collect())
 }
 
 /// Connects, ensures the schema exists, and returns only the changes
@@ -1063,22 +1202,12 @@ pub fn load_recently_changed_from_config(
     cfg: &DatabaseConfig,
     window_secs: i64,
 ) -> Vec<DbUserChange> {
-    let mut conn = match connect(cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[databases] {e}");
-            return Vec::new();
-        }
-    };
-
-    if let Err(e) = ensure_schema(&mut conn) {
-        eprintln!("[databases] {e}");
-        return Vec::new();
-    }
-
     let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(window_secs);
 
-    match load_recently_changed_users(&mut conn, cutoff) {
+    match with_connection(cfg, |conn| {
+        ensure_schema(conn)?;
+        load_recently_changed_users(conn, cutoff)
+    }) {
         Ok(changes) => changes,
         Err(e) => {
             eprintln!("[databases] {e}");
@@ -1092,20 +1221,10 @@ pub fn load_recently_changed_from_config(
 /// any failure rather than panicking, consistent with the rest of this
 /// module.
 pub fn purge_deleted_users_in_config(cfg: &DatabaseConfig, retention_secs: i64) -> u64 {
-    let mut conn = match connect(cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[databases] {e}");
-            return 0;
-        }
-    };
-
-    if let Err(e) = ensure_schema(&mut conn) {
-        eprintln!("[databases] {e}");
-        return 0;
-    }
-
-    match purge_deleted_users(&mut conn, retention_secs) {
+    match with_connection(cfg, |conn| {
+        ensure_schema(conn)?;
+        purge_deleted_users(conn, retention_secs)
+    }) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("[databases] {e}");
@@ -1118,20 +1237,10 @@ pub fn purge_deleted_users_in_config(cfg: &DatabaseConfig, retention_secs: i64) 
 /// entries older than `retention_secs`. Same failure behavior as
 /// `purge_deleted_users_in_config`.
 pub fn purge_deletion_log_in_config(cfg: &DatabaseConfig, retention_secs: i64) -> u64 {
-    let mut conn = match connect(cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[databases] {e}");
-            return 0;
-        }
-    };
-
-    if let Err(e) = ensure_schema(&mut conn) {
-        eprintln!("[databases] {e}");
-        return 0;
-    }
-
-    match purge_deletion_log(&mut conn, retention_secs) {
+    match with_connection(cfg, |conn| {
+        ensure_schema(conn)?;
+        purge_deletion_log(conn, retention_secs)
+    }) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("[databases] {e}");
@@ -1155,20 +1264,12 @@ pub fn purge_deletion_log_in_config(cfg: &DatabaseConfig, retention_secs: i64) -
 /// just mid-session — ProxyAuth can still come up with the last known
 /// set of database-backed users instead of zero.
 pub fn load_users_from_config(cfg: &DatabaseConfig) -> Option<UsersSource> {
-    let mut conn = match connect(cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[databases] {e}");
-            return cache::read_snapshot_with_fallback_log().map(UsersSource::Cache);
-        }
-    };
+    let result = with_connection(cfg, |conn| {
+        ensure_schema(conn)?;
+        load_users(conn)
+    });
 
-    if let Err(e) = ensure_schema(&mut conn) {
-        eprintln!("[databases] {e}");
-        return cache::read_snapshot_with_fallback_log().map(UsersSource::Cache);
-    }
-
-    match load_users(&mut conn) {
+    match result {
         Ok(users) => {
             if let Err(e) = cache::write_snapshot(&users) {
                 eprintln!("[databases] failed to update local cache: {e}");
