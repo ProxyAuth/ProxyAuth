@@ -36,7 +36,7 @@ const SNAPSHOT_KEY: &[u8] = b"snapshot";
 
 fn cache_path() -> PathBuf {
     let base = std::env::var("PROXYAUTH_DB_CACHE_PATH")
-    .unwrap_or_else(|_| "/opt/proxyauth/db/db_users_cache".to_string());
+        .unwrap_or_else(|_| "/opt/proxyauth/db/db_users_cache".to_string());
     PathBuf::from(base)
 }
 
@@ -47,22 +47,31 @@ fn env() -> Result<&'static Environment, String> {
 
     let path = cache_path();
     std::fs::create_dir_all(&path)
-    .map_err(|e| format!("Failed to create LMDB cache dir {}: {e}", path.display()))?;
+        .map_err(|e| format!("Failed to create LMDB cache dir {}: {e}", path.display()))?;
+
+    // SECURITY: this cache mirrors the full user table, including
+    // password hashes — restrict to owner-only rather than relying
+    // solely on the process umask. Unix-only; no-op elsewhere.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+    }
 
     let env = Environment::new()
-    .set_max_dbs(1)
-    .open(Path::new(&path))
-    .map_err(|e| format!("Failed to open LMDB cache at {}: {e}", path.display()))?;
+        .set_max_dbs(1)
+        .open(Path::new(&path))
+        .map_err(|e| format!("Failed to open LMDB cache at {}: {e}", path.display()))?;
 
     env.create_db(Some(DB_NAME), lmdb::DatabaseFlags::empty())
-    .map_err(|e| format!("Failed to create/open LMDB cache db: {e}"))?;
+        .map_err(|e| format!("Failed to create/open LMDB cache db: {e}"))?;
 
     // Another thread may have raced us to initialize it — either way,
     // by this point `CACHE_ENV.get()` will return Some.
     let _ = CACHE_ENV.set(env);
     CACHE_ENV
-    .get()
-    .ok_or_else(|| "LMDB cache environment failed to initialize".to_string())
+        .get()
+        .ok_or_else(|| "LMDB cache environment failed to initialize".to_string())
 }
 
 /// Overwrites the cached snapshot with `users`. Best-effort — errors are
@@ -70,19 +79,19 @@ fn env() -> Result<&'static Environment, String> {
 pub fn write_snapshot(users: &[User]) -> Result<(), String> {
     let env = env()?;
     let bytes = serde_json::to_vec(users)
-    .map_err(|e| format!("Failed to serialize users for LMDB cache: {e}"))?;
+        .map_err(|e| format!("Failed to serialize users for LMDB cache: {e}"))?;
 
     let _guard = CACHE_MUTEX.lock().map_err(|e| e.to_string())?;
     let db = env
-    .open_db(Some(DB_NAME))
-    .map_err(|e| format!("Failed to open LMDB cache db: {e}"))?;
+        .open_db(Some(DB_NAME))
+        .map_err(|e| format!("Failed to open LMDB cache db: {e}"))?;
     let mut txn = env
-    .begin_rw_txn()
-    .map_err(|e| format!("Failed to begin LMDB cache write txn: {e}"))?;
+        .begin_rw_txn()
+        .map_err(|e| format!("Failed to begin LMDB cache write txn: {e}"))?;
     txn.put(db, &SNAPSHOT_KEY, &bytes, WriteFlags::empty())
-    .map_err(|e| format!("Failed to write LMDB cache snapshot: {e}"))?;
+        .map_err(|e| format!("Failed to write LMDB cache snapshot: {e}"))?;
     txn.commit()
-    .map_err(|e| format!("Failed to commit LMDB cache snapshot: {e}"))?;
+        .map_err(|e| format!("Failed to commit LMDB cache snapshot: {e}"))?;
 
     Ok(())
 }
@@ -93,17 +102,16 @@ pub fn read_snapshot() -> Result<Vec<User>, String> {
 
     let _guard = CACHE_MUTEX.lock().map_err(|e| e.to_string())?;
     let db = env
-    .open_db(Some(DB_NAME))
-    .map_err(|e| format!("Failed to open LMDB cache db: {e}"))?;
+        .open_db(Some(DB_NAME))
+        .map_err(|e| format!("Failed to open LMDB cache db: {e}"))?;
     let txn = env
-    .begin_ro_txn()
-    .map_err(|e| format!("Failed to begin LMDB cache read txn: {e}"))?;
+        .begin_ro_txn()
+        .map_err(|e| format!("Failed to begin LMDB cache read txn: {e}"))?;
     let bytes = txn
-    .get(db, &SNAPSHOT_KEY)
-    .map_err(|e| format!("No cached snapshot available: {e}"))?;
+        .get(db, &SNAPSHOT_KEY)
+        .map_err(|e| format!("No cached snapshot available: {e}"))?;
 
-    serde_json::from_slice(bytes)
-    .map_err(|e| format!("Failed to deserialize cached snapshot: {e}"))
+    serde_json::from_slice(bytes).map_err(|e| format!("Failed to deserialize cached snapshot: {e}"))
 }
 
 /// Deletes the cached snapshot, if one exists. A no-op (not an error) if
@@ -115,11 +123,11 @@ pub fn clear_snapshot() -> Result<(), String> {
 
     let _guard = CACHE_MUTEX.lock().map_err(|e| e.to_string())?;
     let db = env
-    .open_db(Some(DB_NAME))
-    .map_err(|e| format!("Failed to open LMDB cache db: {e}"))?;
+        .open_db(Some(DB_NAME))
+        .map_err(|e| format!("Failed to open LMDB cache db: {e}"))?;
     let mut txn = env
-    .begin_rw_txn()
-    .map_err(|e| format!("Failed to begin LMDB cache write txn: {e}"))?;
+        .begin_rw_txn()
+        .map_err(|e| format!("Failed to begin LMDB cache write txn: {e}"))?;
 
     match txn.del(db, &SNAPSHOT_KEY, None) {
         Ok(()) => {}
@@ -130,7 +138,7 @@ pub fn clear_snapshot() -> Result<(), String> {
     }
 
     txn.commit()
-    .map_err(|e| format!("Failed to commit LMDB cache clear: {e}"))?;
+        .map_err(|e| format!("Failed to commit LMDB cache clear: {e}"))?;
 
     Ok(())
 }
@@ -151,7 +159,9 @@ pub(super) fn read_snapshot_with_fallback_log() -> Option<Vec<User>> {
             Some(users)
         }
         Err(e) => {
-            eprintln!("[databases] database unreachable and no usable local cache either ({e}) — leaving current state untouched");
+            eprintln!(
+                "[databases] database unreachable and no usable local cache either ({e}) — leaving current state untouched"
+            );
             None
         }
     }

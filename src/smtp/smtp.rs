@@ -40,9 +40,9 @@ impl SmtpClient {
         };
 
         let mailer = builder
-        .credentials(creds)
-        .timeout(Some(Duration::from_secs(cfg.timeout_secs)))
-        .build();
+            .credentials(creds)
+            .timeout(Some(Duration::from_secs(cfg.timeout_secs)))
+            .build();
 
         // Load + parse reset template
         let raw = fs::read_to_string(RESET_TEMPLATE_PATH).map_err(|e| {
@@ -57,7 +57,7 @@ impl SmtpClient {
         Ok(Self {
             mailer,
             from: cfg.from.clone(),
-           reset_template,
+            reset_template,
         })
     }
 
@@ -93,30 +93,30 @@ impl SmtpClient {
         body: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let email = Message::builder()
-        .from(
-            self.from
-            .parse()
-            .map_err(|e| format!("Invalid From address: {}", e))?,
-        )
-        .to(to
-        .parse()
-        .map_err(|e| format!("Invalid To address '{}': {}", to, e))?)
-        .subject(subject)
-        .header(ContentType::TEXT_PLAIN)
-        .body(body.to_string())?;
+            .from(
+                self.from
+                    .parse()
+                    .map_err(|e| format!("Invalid From address: {}", e))?,
+            )
+            .to(to
+                .parse()
+                .map_err(|e| format!("Invalid To address '{}': {}", to, e))?)
+            .subject(subject)
+            .header(ContentType::TEXT_PLAIN)
+            .body(body.to_string())?;
 
         self.mailer
-        .send(email)
-        .await
-        .map(|_response| ())
-        .map_err(|e| format!("Failed to send email via SMTP: {}", e).into())
+            .send(email)
+            .await
+            .map(|_response| ())
+            .map_err(|e| format!("Failed to send email via SMTP: {}", e).into())
     }
 
     fn render_reset_body(&self, username: &str, reset_link: &str) -> String {
         self.reset_template
-        .body
-        .replace("{{ username }}", username)
-        .replace("{{ reset_link }}", reset_link)
+            .body
+            .replace("{{ username }}", username)
+            .replace("{{ reset_link }}", reset_link)
     }
 
     pub async fn send_reset_password(
@@ -128,6 +128,6 @@ impl SmtpClient {
         let body = self.render_reset_body(username, reset_link);
 
         self.send_text(to, &self.reset_template.subject, &body)
-        .await
+            .await
     }
 }

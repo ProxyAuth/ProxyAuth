@@ -69,35 +69,35 @@ mod tests {
     async fn acl_all_must_match_ok() {
         let filters = AllowRegexCfg {
             default_allow: false,
-                allow: vec![
-                    RegexCondCfg::Method {
-                        pattern: r"(?i)^POST$".into(),
-                    },
-                    RegexCondCfg::Path {
-                        pattern: r"^/api/v1/items$".into(),
-                    },
-                    RegexCondCfg::Header {
-                        name: r"(?i)^x-trace-id$".into(),
-                        pattern: r"^[a-f0-9-]{8,}$".into(),
-                    },
-                    RegexCondCfg::Query {
-                        name: r"(?i)^page$".into(),
-                        pattern: r"^\d+$".into(),
-                    },
-                    RegexCondCfg::BodyJson {
-                        key: "name".into(),
-                        pattern: r"^[a-z0-9_-]{3,16}$".into(),
-                    },
-                ],
+            allow: vec![
+                RegexCondCfg::Method {
+                    pattern: r"(?i)^POST$".into(),
+                },
+                RegexCondCfg::Path {
+                    pattern: r"^/api/v1/items$".into(),
+                },
+                RegexCondCfg::Header {
+                    name: r"(?i)^x-trace-id$".into(),
+                    pattern: r"^[a-f0-9-]{8,}$".into(),
+                },
+                RegexCondCfg::Query {
+                    name: r"(?i)^page$".into(),
+                    pattern: r"^\d+$".into(),
+                },
+                RegexCondCfg::BodyJson {
+                    key: "name".into(),
+                    pattern: r"^[a-z0-9_-]{3,16}$".into(),
+                },
+            ],
         };
         let rule = mk_rule(filters);
 
         let req = test::TestRequest::post()
-        .uri("/api/v1/items?page=2")
-        .insert_header((header::CONTENT_TYPE, "application/json"))
-        .insert_header(("x-trace-id", "abcd-1234-ef"))
-        .set_payload(r#"{ "name":"hello_123" }"#)
-        .to_http_request();
+            .uri("/api/v1/items?page=2")
+            .insert_header((header::CONTENT_TYPE, "application/json"))
+            .insert_header(("x-trace-id", "abcd-1234-ef"))
+            .set_payload(r#"{ "name":"hello_123" }"#)
+            .to_http_request();
 
         let status = super::apply_filters_regex_allow_only(
             &rule,
@@ -111,9 +111,9 @@ mod tests {
     async fn acl_mismatch_denied() {
         let filters = AllowRegexCfg {
             default_allow: false,
-                allow: vec![RegexCondCfg::Method {
-                    pattern: r"(?i)^GET$".into(),
-                }],
+            allow: vec![RegexCondCfg::Method {
+                pattern: r"(?i)^GET$".into(),
+            }],
         };
         let rule = mk_rule(filters);
 
@@ -127,7 +127,7 @@ mod tests {
     async fn acl_default_allow_false_and_no_rules_denied() {
         let filters = AllowRegexCfg {
             default_allow: false,
-                allow: vec![],
+            allow: vec![],
         };
         let rule = mk_rule(filters);
         let req = test::TestRequest::get().uri("/api").to_http_request();
@@ -139,30 +139,30 @@ mod tests {
     async fn acl_bodyraw_and_header_and_query() {
         let filters = AllowRegexCfg {
             default_allow: false,
-                allow: vec![
-                    RegexCondCfg::Method {
-                        pattern: r"^POST$".into(),
-                    },
-                    RegexCondCfg::Header {
-                        name: r"(?i)^content-type$".into(),
-                        pattern: r"^application/x-www-form-urlencoded".into(),
-                    },
-                    RegexCondCfg::Query {
-                        name: r"(?i)^lang$".into(),
-                        pattern: r"^(en|fr)$".into(),
-                    },
-                    RegexCondCfg::BodyRaw {
-                        pattern: r"(^|&)name=[a-z]{2,8}(&|$)".into(),
-                    },
-                ],
+            allow: vec![
+                RegexCondCfg::Method {
+                    pattern: r"^POST$".into(),
+                },
+                RegexCondCfg::Header {
+                    name: r"(?i)^content-type$".into(),
+                    pattern: r"^application/x-www-form-urlencoded".into(),
+                },
+                RegexCondCfg::Query {
+                    name: r"(?i)^lang$".into(),
+                    pattern: r"^(en|fr)$".into(),
+                },
+                RegexCondCfg::BodyRaw {
+                    pattern: r"(^|&)name=[a-z]{2,8}(&|$)".into(),
+                },
+            ],
         };
         let rule = mk_rule(filters);
 
         let req = test::TestRequest::post()
-        .uri("/api/form?lang=fr")
-        .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
-        .set_payload("name=alice&x=1")
-        .to_http_request();
+            .uri("/api/form?lang=fr")
+            .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
+            .set_payload("name=alice&x=1")
+            .to_http_request();
 
         let status = super::apply_filters_regex_allow_only(&rule, &req, b"name=alice&x=1");
         assert!(status.is_none(), "form should pass");
@@ -194,10 +194,10 @@ mod tests {
             &Method::GET,
             &canon,
             actix_web::http::header::HeaderMap::new(),
-                                     &std::collections::HashMap::new(),
-                                     None,
-                                     None,
-                                     "",
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            "",
         );
         assert!(ok);
     }
@@ -214,20 +214,20 @@ mod tests {
             &Method::POST,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                    &std::collections::HashMap::new(),
-                                    None,
-                                    None,
-                                    ""
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            ""
         ));
         assert!(!cond_matches_strict(
             &cond,
             &Method::GET,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                     &std::collections::HashMap::new(),
-                                     None,
-                                     None,
-                                     ""
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            ""
         ));
     }
 
@@ -236,10 +236,10 @@ mod tests {
     #[test]
     async fn cond_matches_header_name_and_values() {
         let req = TestRequest::default()
-        .insert_header(("x-client", "abc_123"))
-        .insert_header(("x-client", "def-456"))
-        .insert_header(("other", "zzz"))
-        .to_http_request();
+            .insert_header(("x-client", "abc_123"))
+            .insert_header(("x-client", "def-456"))
+            .insert_header(("other", "zzz"))
+            .to_http_request();
 
         let cond_ok = RegexCond::Header {
             name_re: Regex::new("^x-client$").unwrap(),
@@ -250,26 +250,26 @@ mod tests {
             &Method::GET,
             "/",
             req.headers().clone(),
-                                    &std::collections::HashMap::new(),
-                                    None,
-                                    None,
-                                    ""
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            ""
         ));
 
         let req_bad = TestRequest::default()
-        .insert_header(("x-client", "ok"))
-        .insert_header(("x-client", "NO!"))
-        .to_http_request();
+            .insert_header(("x-client", "ok"))
+            .insert_header(("x-client", "NO!"))
+            .to_http_request();
 
         assert!(!cond_matches_strict(
             &cond_ok,
             &Method::GET,
             "/",
             req_bad.headers().clone(),
-                                     &std::collections::HashMap::new(),
-                                     None,
-                                     None,
-                                     ""
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            ""
         ));
 
         let cond_name_missing = RegexCond::Header {
@@ -281,10 +281,10 @@ mod tests {
             &Method::GET,
             "/",
             req.headers().clone(),
-                                     &std::collections::HashMap::new(),
-                                     None,
-                                     None,
-                                     ""
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            ""
         ));
     }
 
@@ -303,10 +303,10 @@ mod tests {
             &Method::GET,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                    &q,
-                                    None,
-                                    None,
-                                    ""
+            &q,
+            None,
+            None,
+            ""
         ));
 
         let cond_bad = RegexCond::Query {
@@ -318,10 +318,10 @@ mod tests {
             &Method::GET,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                     &q,
-                                     None,
-                                     None,
-                                     ""
+            &q,
+            None,
+            None,
+            ""
         ));
 
         let cond_missing = RegexCond::Query {
@@ -333,10 +333,10 @@ mod tests {
             &Method::GET,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                     &q,
-                                     None,
-                                     None,
-                                     ""
+            &q,
+            None,
+            None,
+            ""
         ));
     }
 
@@ -352,20 +352,20 @@ mod tests {
             &Method::POST,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                    &std::collections::HashMap::new(),
-                                    Some("hello world"),
-                                    None,
-                                    "text/plain"
+            &std::collections::HashMap::new(),
+            Some("hello world"),
+            None,
+            "text/plain"
         ));
         assert!(!cond_matches_strict(
             &cond,
             &Method::POST,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                     &std::collections::HashMap::new(),
-                                     Some("hello  WORLD"),
-                                     None,
-                                     "text/plain"
+            &std::collections::HashMap::new(),
+            Some("hello  WORLD"),
+            None,
+            "text/plain"
         ));
     }
 
@@ -397,10 +397,10 @@ mod tests {
                 &Method::POST,
                 "/",
                 actix_web::http::header::HeaderMap::new(),
-                                        &std::collections::HashMap::new(),
-                                        body_utf8,
-                                        body_json.as_ref(),
-                                        "application/json"
+                &std::collections::HashMap::new(),
+                body_utf8,
+                body_json.as_ref(),
+                "application/json"
             ));
         }
 
@@ -409,10 +409,10 @@ mod tests {
             &Method::POST,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                     &std::collections::HashMap::new(),
-                                     body_utf8,
-                                     body_json.as_ref(),
-                                     "text/plain"
+            &std::collections::HashMap::new(),
+            body_utf8,
+            body_json.as_ref(),
+            "text/plain"
         ));
 
         let c_missing = RegexCond::BodyJson {
@@ -424,10 +424,10 @@ mod tests {
             &Method::POST,
             "/",
             actix_web::http::header::HeaderMap::new(),
-                                     &std::collections::HashMap::new(),
-                                     body_utf8,
-                                     body_json.as_ref(),
-                                     "application/json"
+            &std::collections::HashMap::new(),
+            body_utf8,
+            body_json.as_ref(),
+            "application/json"
         ));
     }
 
@@ -497,8 +497,8 @@ mod more_unit_tests {
     #[test]
     fn check_date_token_accepts_future_iso_in_tz() {
         let exp = (Utc::now() + chrono::Duration::minutes(10))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         let res = check_date_token(&exp, "alice", "127.0.0.1", "UTC");
         assert!(res.is_ok());
         assert!(res.unwrap() > 0);
@@ -507,8 +507,8 @@ mod more_unit_tests {
     #[test]
     fn check_date_token_accepts_future_epoch() {
         let exp_epoch = (Utc::now() + chrono::Duration::minutes(5))
-        .timestamp()
-        .to_string();
+            .timestamp()
+            .to_string();
         let res = check_date_token(&exp_epoch, "bob", "127.0.0.1", "UTC");
         assert!(res.is_ok());
     }
@@ -516,7 +516,7 @@ mod more_unit_tests {
     #[test]
     fn check_date_token_rejects_expired() {
         let past = (Utc::now() - chrono::Duration::minutes(1))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let res = check_date_token(&past, "carol", "127.0.0.1", "UTC");
         assert!(res.is_err());
     }
@@ -524,8 +524,8 @@ mod more_unit_tests {
     #[test]
     fn check_date_token_rejects_bad_timezone() {
         let exp = (Utc::now() + chrono::Duration::minutes(2))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         let res = check_date_token(&exp, "dave", "127.0.0.1", "Not/AZone");
         assert!(res.is_err());
     }
@@ -557,12 +557,12 @@ mod more_unit_tests {
     async fn acl_default_allow_true_and_no_rules_allows() {
         let filters = AllowRegexCfg {
             default_allow: true,
-                allow: vec![],
+            allow: vec![],
         };
         let rule = mk_rule(filters);
         let req = actix_web::test::TestRequest::get()
-        .uri("/api/anything")
-        .to_http_request();
+            .uri("/api/anything")
+            .to_http_request();
         let status = super::apply_filters_regex_allow_only(&rule, &req, &[]);
         assert!(status.is_none());
     }
@@ -580,7 +580,7 @@ mod more_unit_tests {
             ..Default::default()
         };
         let err =
-        extract_token_user("this-is-not-encrypted", &cfg, "127.0.0.1".into()).unwrap_err();
+            extract_token_user("this-is-not-encrypted", &cfg, "127.0.0.1".into()).unwrap_err();
         assert_eq!(err, "Invalid token format");
     }
 }
@@ -599,10 +599,10 @@ pub(super) fn validate_token_from_decrypted(
     use tracing::{error, warn};
 
     let data: [&str; 4] = decrypt_token
-    .splitn(4, '|')
-    .collect::<Vec<&str>>()
-    .try_into()
-    .map_err(|_| "Invalid token format")?;
+        .splitn(4, '|')
+        .collect::<Vec<&str>>()
+        .try_into()
+        .map_err(|_| "Invalid token format")?;
 
     let token_hash_decrypt = data[0];
 
@@ -610,56 +610,56 @@ pub(super) fn validate_token_from_decrypted(
     let user = config.users.get(index_user).ok_or("User not found")?;
 
     let time_expire = check_date_token(data[1], &user.username, ip, &config.timezone)
-    .map_err(|_| "Your token is expired")?;
+        .map_err(|_| "Your token is expired")?;
 
     if (time_expire > (config.token_expiry_seconds as i64).try_into().unwrap())
         .try_into()
         .unwrap()
-        {
-            error!(
-                "[{}] username {} try to access token limit config {} value request {}",
-                ip, user.username, config.token_expiry_seconds, time_expire
-            );
-            return Err("Bad time token".to_string());
-        }
+    {
+        error!(
+            "[{}] username {} try to access token limit config {} value request {}",
+            ip, user.username, config.token_expiry_seconds, time_expire
+        );
+        return Err("Bad time token".to_string());
+    }
 
-        let token_generated = generate_token(&user.username, config, data[1], data[3]);
-        let token_hash = calcul_factorhash(token_generated);
-        if blake3::hash(token_hash.as_bytes()).to_hex().to_string() != token_hash_decrypt {
-            warn!("[{}] Invalid token", ip);
-            return Err("no valid token".to_string());
-        }
+    let token_generated = generate_token(&user.username, config, data[1], data[3]);
+    let token_hash = calcul_factorhash(token_generated);
+    if blake3::hash(token_hash.as_bytes()).to_hex().to_string() != token_hash_decrypt {
+        warn!("[{}] Invalid token", ip);
+        return Err("no valid token".to_string());
+    }
 
-        if is_token_revoked(data[3], &data_app.revoked_tokens) {
-            warn!(
-                "[{}] token_id {} is revoked from user {}",
-                ip, data[3], user.username
-            );
-            return Err("revoked token".to_string());
-        }
+    if is_token_revoked(data[3], &data_app.revoked_tokens) {
+        warn!(
+            "[{}] token_id {} is revoked from user {}",
+            ip, data[3], user.username
+        );
+        return Err("revoked token".to_string());
+    }
 
-        if config.stats {
-            let count =
+    if config.stats {
+        let count =
             data_app
-            .counter
-            .record_and_get(&user.username, data[3], &time_expire.to_string());
-            tracing::info!(
-                "[{}] user {} is logged token expire in {} seconds [token used: {}]",
-                ip,
-                user.username,
-                time_expire,
-                count
-            );
-        } else {
-            tracing::info!(
-                "[{}] user {} is logged token expire in {} seconds",
-                ip,
-                user.username,
-                time_expire
-            );
-        }
+                .counter
+                .record_and_get(&user.username, data[3], &time_expire.to_string());
+        tracing::info!(
+            "[{}] user {} is logged token expire in {} seconds [token used: {}]",
+            ip,
+            user.username,
+            time_expire,
+            count
+        );
+    } else {
+        tracing::info!(
+            "[{}] user {} is logged token expire in {} seconds",
+            ip,
+            user.username,
+            time_expire
+        );
+    }
 
-        Ok((user.username.to_string(), data[3].to_string(), time_expire))
+    Ok((user.username.to_string(), data[3].to_string(), time_expire))
 }
 
 #[cfg(test)]
@@ -687,11 +687,11 @@ mod validate_token_path_tests {
     fn build_https_client_for_tests()
     -> Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>> {
         let https = HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .unwrap()
-        .https_or_http()
-        .enable_http1()
-        .build();
+            .with_native_roots()
+            .unwrap()
+            .https_or_http()
+            .enable_http1()
+            .build();
         Client::builder(TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(https)
     }
 
@@ -700,15 +700,15 @@ mod validate_token_path_tests {
     fn build_proxy_client_for_tests(
         _proxy_addr: &str,
     ) -> Client<
-    ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>,
-    BoxBody<Bytes, Infallible>,
+        ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>,
+        BoxBody<Bytes, Infallible>,
     > {
         let https = HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .unwrap()
-        .https_or_http()
-        .enable_http1()
-        .build();
+            .with_native_roots()
+            .unwrap()
+            .https_or_http()
+            .enable_http1()
+            .build();
         let proxy = Proxy::new(Intercept::All, _proxy_addr.parse().unwrap());
         let connector = ProxyConnector::from_proxy(https, proxy).unwrap();
         Client::builder(TokioExecutor::new()).build::<_, BoxBody<Bytes, Infallible>>(connector)
@@ -731,15 +731,15 @@ mod validate_token_path_tests {
         web::Data::new(AppState {
             counter,
             client_normal: build_https_client_for_tests(),
-                       client_with_cert: build_https_client_for_tests(),
-                       client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
-                       revoked_tokens: revoked.into(),
-                       config: Arc::new(cfg),
-                       routes: Arc::new(routes),
-                       stats,
-                       otp_overrides: DashMap::<String, Option<String>>::new().into(),
-                       password_overrides: DashMap::<String, String>::new().into(),
-                       must_change_overrides: DashMap::<String, bool>::new().into(),
+            client_with_cert: build_https_client_for_tests(),
+            client_with_proxy: build_proxy_client_for_tests("http://127.0.0.1:8080"),
+            revoked_tokens: revoked.into(),
+            config: Arc::new(cfg),
+            routes: Arc::new(routes),
+            stats,
+            otp_overrides: DashMap::<String, Option<String>>::new().into(),
+            password_overrides: DashMap::<String, String>::new().into(),
+            must_change_overrides: DashMap::<String, bool>::new().into(),
         })
     }
 
@@ -754,12 +754,12 @@ mod validate_token_path_tests {
         if cfg.users.is_empty() {
             cfg.users.push(proxyauth::config::config::User {
                 username: "alice".into(),
-                           roles: None,
-                           allow: Some(vec!["127.0.0.1".to_string()]),
-                           otpkey: Some(String::new()),
-                           password: String::new(),
-                           email: None,
-                           must_change_password: false,
+                roles: None,
+                allow: Some(vec!["127.0.0.1".to_string()]),
+                otpkey: Some(String::new()),
+                password: String::new(),
+                email: None,
+                must_change_password: false,
             });
         }
         cfg
@@ -804,7 +804,7 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let future = (Utc::now() + chrono::Duration::minutes(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let dec = format!("hash|{}|not-a-number|tid", future);
         let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
         assert_eq!(err, "Index invalide");
@@ -816,7 +816,7 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let future = (Utc::now() + chrono::Duration::minutes(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let dec = format!("hash|{}|999|tid", future);
         let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
         assert_eq!(err, "User not found");
@@ -829,7 +829,7 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let future = (Utc::now() + chrono::Duration::minutes(10))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let dec = format!("deadbeef|{}|0|tid", future);
         let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
         assert_eq!(err, "Your token is expired");
@@ -841,7 +841,7 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let past = (Utc::now() - chrono::Duration::minutes(1))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let dec = format!("deadbeef|{}|0|tid", past);
         let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
         assert_eq!(err, "Your token is expired");
@@ -853,7 +853,7 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let far = (Utc::now() + chrono::Duration::days(1))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let good_hash = make_valid_hash("alice", &cfg, &far, "tid-1");
         let dec = format!("{}|{}|0|tid-1", good_hash, far);
         let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
@@ -866,7 +866,7 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let future = (Utc::now() + chrono::Duration::minutes(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let dec = format!("deadbeef|{}|0|tid-x", future);
         let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
         assert_eq!(err, "no valid token");
@@ -880,7 +880,7 @@ mod validate_token_path_tests {
         st.revoked_tokens.insert("tid-revoked".into(), 1u64);
 
         let future = (Utc::now() + chrono::Duration::minutes(2))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let good_hash = make_valid_hash("alice", &cfg, &future, "tid-revoked");
         let dec = format!("{}|{}|0|tid-revoked", good_hash, future);
 
@@ -896,12 +896,12 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let future = (Utc::now() + chrono::Duration::minutes(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let good_hash = make_valid_hash("alice", &cfg, &future, "tid-ok");
         let dec = format!("{}|{}|0|tid-ok", good_hash, future);
 
         let (user, tid, _exp) =
-        super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap();
+            super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap();
         assert_eq!(user, "alice");
         assert_eq!(tid, "tid-ok");
     }
@@ -912,7 +912,7 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let future = (Utc::now() + chrono::Duration::minutes(3))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let good_hash = make_valid_hash("alice", &cfg, &future, "tid-stats");
         let dec = format!("{}|{}|0|tid-stats", good_hash, future);
 
@@ -926,13 +926,13 @@ mod validate_token_path_tests {
         let st = mk_state();
 
         let expires = (Utc::now() + chrono::Duration::minutes(5))
-        .timestamp()
-        .to_string();
+            .timestamp()
+            .to_string();
         let h = make_valid_hash("alice", &cfg, &expires, "tid-unix");
         let dec = format!("{}|{}|0|tid-unix", h, expires);
 
         let (user, tid, _exp) =
-        super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap();
+            super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap();
         assert_eq!(user, "alice");
         assert_eq!(tid, "tid-unix");
     }
@@ -943,7 +943,7 @@ mod validate_token_path_tests {
     fn blake3_hash_matches_on_valid_data() {
         let cfg = mk_config(3600, false);
         let future = (Utc::now() + chrono::Duration::minutes(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let tid = "tid-ok";
         let h1 = compute_transport_hash("alice", &cfg, &future, tid);
@@ -956,9 +956,9 @@ mod validate_token_path_tests {
         let cfg = mk_config(3600, false);
 
         let t1 = (Utc::now() + chrono::Duration::minutes(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let t2 = (Utc::now() + chrono::Duration::minutes(6))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let h1 = compute_transport_hash("alice", &cfg, &t1, "tid-X");
         let h2 = compute_transport_hash("alice", &cfg, &t2, "tid-X");
@@ -990,7 +990,7 @@ mod validate_token_path_tests {
         });
 
         let future = (Utc::now() + chrono::Duration::minutes(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let h_ok = compute_transport_hash("alice", &cfg, &future, "tid-tamper");
         let mut h_bad = h_ok.clone();
@@ -999,7 +999,7 @@ mod validate_token_path_tests {
 
         let dec_bad = format!("{}|{}|0|tid-tamper", h_bad, future);
         let err =
-        super::validate_token_from_decrypted(&dec_bad, &st, &cfg, "127.0.0.1").unwrap_err();
+            super::validate_token_from_decrypted(&dec_bad, &st, &cfg, "127.0.0.1").unwrap_err();
         assert_eq!(err, "no valid token");
     }
 
@@ -1008,7 +1008,7 @@ mod validate_token_path_tests {
         let cfg = mk_config(3600, false);
 
         let t = (Utc::now() + chrono::Duration::minutes(4))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         let g1 = generate_token("alice", &cfg, &t, "tidZ");
         let g2 = generate_token("alice", &cfg, &t, "tidZ");

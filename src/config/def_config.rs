@@ -81,20 +81,20 @@ pub fn ensure_user_proxyauth_exists() -> io::Result<()> {
 
         let status_user = if alpine {
             Command::new("adduser")
-            .args(["-S", "-G", "proxyauth", "proxyauth"])
-            .status()?
+                .args(["-S", "-G", "proxyauth", "proxyauth"])
+                .status()?
         } else {
             Command::new("useradd")
-            .args([
-                "--system",
-                "--no-create-home",
-                "--shell",
-                "/usr/sbin/nologin",
-                "--gid",
-                "proxyauth",
-                "proxyauth",
-            ])
-            .status()?
+                .args([
+                    "--system",
+                    "--no-create-home",
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    "--gid",
+                    "proxyauth",
+                    "proxyauth",
+                ])
+                .status()?
         };
 
         if !status_user.success() {
@@ -123,8 +123,8 @@ pub fn setup_proxyauth_directory() -> io::Result<()> {
     }
 
     let status_chown = Command::new("chown")
-    .args(["-R", "proxyauth:proxyauth", "/etc/proxyauth"])
-    .status()?;
+        .args(["-R", "proxyauth:proxyauth", "/etc/proxyauth"])
+        .status()?;
 
     if !status_chown.success() {
         eprintln!("Failed to change owner of /etc/proxyauth.");
@@ -132,8 +132,8 @@ pub fn setup_proxyauth_directory() -> io::Result<()> {
     }
 
     let status_chmod = Command::new("chmod")
-    .args(["750", "/etc/proxyauth"])
-    .status()?;
+        .args(["750", "/etc/proxyauth"])
+        .status()?;
 
     if !status_chmod.success() {
         eprintln!("Failed to set permissions on /etc/proxyauth.");
@@ -155,8 +155,8 @@ pub fn setup_proxyauth_db_directory(insecure: bool) -> io::Result<()> {
     }
 
     let status_chown = Command::new("chown")
-    .args(["-R", "proxyauth:proxyauth", "/opt/proxyauth"])
-    .status()?;
+        .args(["-R", "proxyauth:proxyauth", "/opt/proxyauth"])
+        .status()?;
 
     if !status_chown.success() {
         eprintln!("Failed to change owner of /opt/proxyauth.");
@@ -166,8 +166,8 @@ pub fn setup_proxyauth_db_directory(insecure: bool) -> io::Result<()> {
     let chmod_mode = if insecure { "777" } else { "700" };
 
     let status_chmod = Command::new("chmod")
-    .args([chmod_mode, "/opt/proxyauth"])
-    .status()?;
+        .args([chmod_mode, "/opt/proxyauth"])
+        .status()?;
 
     if !status_chmod.success() {
         eprintln!("Failed to set permissions on /opt/proxyauth.");
@@ -310,7 +310,7 @@ mod tests {
             HttpServer::new(move || {
                 App::new().default_service(web::to(move || async move {
                     HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap())
-                    .body(body)
+                        .body(body)
                 }))
             })
             .listen(listener)
@@ -329,10 +329,10 @@ mod tests {
         let suffix = format!(
             "{}_{}",
             std::process::id(),
-                             std::time::SystemTime::now()
-                             .duration_since(std::time::UNIX_EPOCH)
-                             .unwrap()
-                             .as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         );
         std::env::temp_dir().join(format!("proxyauth_test_{}_{}", name, suffix))
     }
@@ -349,8 +349,8 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         create_config(&url, path.to_str().unwrap())
-        .await
-        .expect("download OK");
+            .await
+            .expect("download OK");
 
         let got = fs::read(&path).expect("file exists");
         assert_eq!(got, expected);
@@ -368,8 +368,8 @@ mod tests {
         fs::write(&path, original).unwrap();
 
         create_config(&url, path.to_str().unwrap())
-        .await
-        .expect("noop OK");
+            .await
+            .expect("noop OK");
 
         let got = fs::read(&path).unwrap();
         assert_eq!(&got, original, "existing file must not be overwritten");

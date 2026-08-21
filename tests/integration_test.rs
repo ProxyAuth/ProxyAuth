@@ -18,8 +18,8 @@ static CRYPTO: OnceLock<()> = OnceLock::new();
 fn setup_crypto() {
     CRYPTO.get_or_init(|| {
         rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install crypto provider");
+            .install_default()
+            .expect("Failed to install crypto provider");
     });
 }
 
@@ -82,8 +82,8 @@ macro_rules! build_app {
 
             start_revoked_token_ttl(
                 revoked_tokens.clone(),
-                                    std::time::Duration::from_secs(15),
-                                    config.redis.clone(),
+                std::time::Duration::from_secs(15),
+                config.redis.clone(),
             )
             .await;
 
@@ -103,9 +103,9 @@ macro_rules! build_app {
 
             test::init_service(
                 App::new()
-                .app_data(state)
-                .service(web::resource("/auth").route(web::post().to(auth_handler)))
-                .default_service(web::to(proxy_handler)),
+                    .app_data(state)
+                    .service(web::resource("/auth").route(web::post().to(auth_handler)))
+                    .default_service(web::to(proxy_handler)),
             )
             .await
         }
@@ -123,16 +123,16 @@ async fn test_auth_route() {
     let app = build_app!().await;
 
     let req = test::TestRequest::post()
-    .uri("/auth")
-    .set_json(&json!({
-        "username": "admin",
-        "password": "admin123"
-    }))
-    .peer_addr(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                               8080,
-    ))
-    .to_request();
+        .uri("/auth")
+        .set_json(&json!({
+            "username": "admin",
+            "password": "admin123"
+        }))
+        .peer_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            8080,
+        ))
+        .to_request();
 
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());

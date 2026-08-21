@@ -54,14 +54,14 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             headers.insert("X-Auth-Token", HeaderValue::from_str(&config.token_admin)?);
 
             let client = ClientBuilder::new()
-            .danger_accept_invalid_certs(true)
-            .build()?;
+                .danger_accept_invalid_certs(true)
+                .build()?;
 
             let response = client
-            .get("https://127.0.0.1:8080/adm/stats")
-            .headers(headers)
-            .send()
-            .await?;
+                .get("https://127.0.0.1:8080/adm/stats")
+                .headers(headers)
+                .send()
+                .await?;
 
             if response.status().is_success() {
                 let body = response.text().await?;
@@ -86,9 +86,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
 
             let Some(db_cfg) = &config.databases else {
-                eprintln!(
-                    "No 'databases' block configured in config.json — nothing to write to."
-                );
+                eprintln!("No 'databases' block configured in config.json — nothing to write to.");
                 std::process::exit(1);
             };
 
@@ -119,9 +117,9 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
 
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|e| e.to_string())?
-            .to_string();
+                .hash_password(password.as_bytes(), &salt)
+                .map_err(|e| e.to_string())?
+                .to_string();
 
             // --primary-email must name one of the --email addresses
             // given, if provided at all — otherwise it's ambiguous
@@ -144,12 +142,12 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                     None => email[0].clone(),
                 };
                 email
-                .iter()
-                .map(|addr| EmailEntry {
-                    address: addr.clone(),
-                     primary: *addr == primary_addr,
-                })
-                .collect()
+                    .iter()
+                    .map(|addr| EmailEntry {
+                        address: addr.clone(),
+                        primary: *addr == primary_addr,
+                    })
+                    .collect()
             };
 
             let user = User {
@@ -158,14 +156,18 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 otpkey: None,
                 allow: None,
                 roles: None,
-                email: if email_entries.is_empty() { None } else { Some(email_entries) },
+                email: if email_entries.is_empty() {
+                    None
+                } else {
+                    Some(email_entries)
+                },
                 must_change_password: *must_change_password,
             };
 
             crate::databases::db::upsert_user(&mut conn, &user)?;
             println!(
                 "User '{}' written to the database (revived if it was previously soft-deleted).",
-                     username
+                username
             );
             std::process::exit(0);
         }
@@ -246,18 +248,18 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let existing: std::collections::HashSet<String> =
-            match crate::databases::db::load_users(&mut conn) {
-                Ok(users) => users.into_iter().map(|u| u.username).collect(),
-                Err(e) => {
-                    eprintln!("Failed to read current database state before restoring: {e}");
-                    std::process::exit(1);
-                }
-            };
+                match crate::databases::db::load_users(&mut conn) {
+                    Ok(users) => users.into_iter().map(|u| u.username).collect(),
+                    Err(e) => {
+                        eprintln!("Failed to read current database state before restoring: {e}");
+                        std::process::exit(1);
+                    }
+                };
 
             if !existing.is_empty() && !force {
                 eprintln!(
                     "Database already has {} user(s) — refusing to restore without --force, to avoid silently overwriting them with the (possibly older) cached snapshot.",
-                          existing.len()
+                    existing.len()
                 );
                 eprintln!("Re-run with --force if you're sure you want the cache to win.");
                 std::process::exit(1);
@@ -274,7 +276,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
 
             println!(
                 "Restored {} user(s) from the local cache into the database.",
-                     restored
+                restored
             );
             std::process::exit(0);
         }
@@ -334,8 +336,8 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
 
             if users.is_empty() && !*force {
                 let existing_count = crate::databases::cache::read_snapshot()
-                .map(|u| u.len())
-                .unwrap_or(0);
+                    .map(|u| u.len())
+                    .unwrap_or(0);
                 if existing_count > 0 {
                     eprintln!(
                         "Database returned 0 users, but the local cache currently has {existing_count} — refusing to overwrite it with an empty snapshot without --force."
@@ -440,7 +442,10 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            match client.send_reset_password(&email, username, &reset_link).await {
+            match client
+                .send_reset_password(&email, username, &reset_link)
+                .await
+            {
                 Ok(()) => {
                     println!("Password reset link sent to '{username}' at {email}.");
                     std::process::exit(0);

@@ -92,16 +92,16 @@ pub fn check_date_token(
     })?;
 
     let expire_time = time_str
-    .parse::<DateTime<Utc>>()
-    .or_else(|_| {
-        time_str
-        .parse::<i64>()
-        .map(|ts| Utc.timestamp_opt(ts, 0).single().unwrap())
-    })
-    .map_err(|_| {
-        warn!("[{}] failed to parse expiration time: {}", ip, time_str);
-        ()
-    })?;
+        .parse::<DateTime<Utc>>()
+        .or_else(|_| {
+            time_str
+                .parse::<i64>()
+                .map(|ts| Utc.timestamp_opt(ts, 0).single().unwrap())
+        })
+        .map_err(|_| {
+            warn!("[{}] failed to parse expiration time: {}", ip, time_str);
+            ()
+        })?;
 
     let expire_local = expire_time.with_timezone(&tz);
     let now_local = Utc::now().with_timezone(&tz);
@@ -144,17 +144,17 @@ pub fn generate_secret(secret: &str, token_expiry_seconds: &i64) -> String {
             };
 
             let first_of_next_month = Utc
-            .with_ymd_and_hms(next_year as i32, next_month, 1, 0, 0, 0)
-            .unwrap();
+                .with_ymd_and_hms(next_year as i32, next_month, 1, 0, 0, 0)
+                .unwrap();
 
             let last_day = first_of_next_month - Duration::days(1);
             last_day
-            .with_hour(23)
-            .unwrap()
-            .with_minute(59)
-            .unwrap()
-            .with_second(59)
-            .unwrap()
+                .with_hour(23)
+                .unwrap()
+                .with_minute(59)
+                .unwrap()
+                .with_second(59)
+                .unwrap()
         }
 
         31_104_001..=157_680_000 => {
@@ -179,22 +179,22 @@ pub fn generate_token(
 ) -> String {
     let values_map = HashMap::from([
         ("username", username.to_string()),
-                                   (
-                                       "secret_with_timestamp",
-                                    generate_secret(&config.secret, &config.token_expiry_seconds),
-                                   ),
-                                   ("build_time", get_build_time().to_string()),
-                                   ("time_expire", time_expire.to_string()),
-                                   ("build_rand", get_build_rand().to_string()),
-                                   ("token_id", token_id.to_string()),
-                                   ("hk", get_build_hk()),
+        (
+            "secret_with_timestamp",
+            generate_secret(&config.secret, &config.token_expiry_seconds),
+        ),
+        ("build_time", get_build_time().to_string()),
+        ("time_expire", time_expire.to_string()),
+        ("build_rand", get_build_rand().to_string()),
+        ("token_id", token_id.to_string()),
+        ("hk", get_build_hk()),
     ]);
 
     let shuffled: Vec<String> = get()
-    .shuffled_order_list()
-    .iter()
-    .map(|k| values_map[k.as_str()].clone())
-    .collect();
+        .shuffled_order_list()
+        .iter()
+        .map(|k| values_map[k.as_str()].clone())
+        .collect();
 
     let shuffle_data = shuffled.join(":");
     blake3::hash(shuffle_data.as_bytes()).to_hex().to_string()
@@ -211,89 +211,87 @@ pub async fn validate_token(
     let decrypt_token = decrypt(token, &key).map_err(|_| "Invalid token format")?;
 
     let data: [&str; 4] = decrypt_token
-    .splitn(4, '|')
-    .collect::<Vec<&str>>()
-    .try_into()
-    .map_err(|_| "Invalid token format")?;
+        .splitn(4, '|')
+        .collect::<Vec<&str>>()
+        .try_into()
+        .map_err(|_| "Invalid token format")?;
 
     let token_hash_decrypt = data[0];
 
     let index_user = data[2].parse::<usize>().map_err(|_| "Index invalide")?;
-    let user = config
-    .user_by_index(index_user)
-    .ok_or("User not found")?;
+    let user = config.user_by_index(index_user).ok_or("User not found")?;
 
     let time_expire = check_date_token(data[1], &user.username, ip, &config.timezone)
-    .map_err(|_| "Your token is expired")?;
+        .map_err(|_| "Your token is expired")?;
 
     if (time_expire > (config.token_expiry_seconds as i64).try_into().unwrap())
         .try_into()
         .unwrap()
-        {
-            error!(
-                "[{}] username {} try to access token limit config {} value request {}",
-                ip, user.username, config.token_expiry_seconds, time_expire
-            );
-            return Err("Bad time token".to_string());
-        }
+    {
+        error!(
+            "[{}] username {} try to access token limit config {} value request {}",
+            ip, user.username, config.token_expiry_seconds, time_expire
+        );
+        return Err("Bad time token".to_string());
+    }
 
-        let token_generated = generate_token(&user.username, &config, data[1], data[3]);
+    let token_generated = generate_token(&user.username, &config, data[1], data[3]);
 
-        // mode fast token is more speed but less secure
-        // and fast is false token is more secure but it's slower
-        let token_hash = if config.fast {
-            token_generated.clone()
-        } else {
-            calcul_factorhash(token_generated.clone())
-        };
+    // mode fast token is more speed but less secure
+    // and fast is false token is more secure but it's slower
+    let token_hash = if config.fast {
+        token_generated.clone()
+    } else {
+        calcul_factorhash(token_generated.clone())
+    };
 
-        // SECURITY: constant-time comparison for both branches — this token
-        // hash is a secret being verified, and a plain `!=` on strings leaks
-        // timing information about how many leading bytes matched.
-        if config.fast {
-            if !bool::from(
-                token_generated
+    // SECURITY: constant-time comparison for both branches — this token
+    // hash is a secret being verified, and a plain `!=` on strings leaks
+    // timing information about how many leading bytes matched.
+    if config.fast {
+        if !bool::from(
+            token_generated
                 .clone()
                 .as_bytes()
                 .ct_eq(token_hash_decrypt.as_bytes()),
-            ) {
-                warn!("[{}] Invalid token", ip);
-                return Err("no valid token".to_string());
-            }
-        } else {
-            let computed = blake3::hash(token_hash.as_bytes()).to_hex().to_string();
-            if !bool::from(computed.as_bytes().ct_eq(token_hash_decrypt.as_bytes())) {
-                warn!("[{}] Invalid token", ip);
-                return Err("no valid token".to_string());
-            }
+        ) {
+            warn!("[{}] Invalid token", ip);
+            return Err("no valid token".to_string());
         }
-
-        if is_token_revoked(data[3], &data_app.revoked_tokens) {
-            warn!(
-                "[{}] token_id {} is revoked from user {}",
-                ip, data[3], user.username
-            );
-            return Err("revoked token".to_string());
+    } else {
+        let computed = blake3::hash(token_hash.as_bytes()).to_hex().to_string();
+        if !bool::from(computed.as_bytes().ct_eq(token_hash_decrypt.as_bytes())) {
+            warn!("[{}] Invalid token", ip);
+            return Err("no valid token".to_string());
         }
+    }
 
-        if config.stats {
-            let count =
+    if is_token_revoked(data[3], &data_app.revoked_tokens) {
+        warn!(
+            "[{}] token_id {} is revoked from user {}",
+            ip, data[3], user.username
+        );
+        return Err("revoked token".to_string());
+    }
+
+    if config.stats {
+        let count =
             data_app
-            .counter
-            .record_and_get(&user.username, data[3], &time_expire.to_string());
+                .counter
+                .record_and_get(&user.username, data[3], &time_expire.to_string());
 
-            info!(
-                "[{}] user {} is logged token expire in {} seconds [token used: {}]",
-                ip, user.username, time_expire, count
-            );
-        } else {
-            info!(
-                "[{}] user {} is logged token expire in {} seconds",
-                ip, user.username, time_expire
-            );
-        }
+        info!(
+            "[{}] user {} is logged token expire in {} seconds [token used: {}]",
+            ip, user.username, time_expire, count
+        );
+    } else {
+        info!(
+            "[{}] user {} is logged token expire in {} seconds",
+            ip, user.username, time_expire
+        );
+    }
 
-        Ok((user.username.to_string(), data[3].to_string(), time_expire))
+    Ok((user.username.to_string(), data[3].to_string(), time_expire))
 }
 
 pub fn extract_token_user(token: &str, config: &AppConfig, ip: String) -> Result<String, String> {
@@ -332,7 +330,7 @@ pub fn extract_token_user(token: &str, config: &AppConfig, ip: String) -> Result
 
 pub fn all_values_match<'a, I>(vals: I, re: &Regex) -> bool
 where
-I: IntoIterator<Item = &'a str>,
+    I: IntoIterator<Item = &'a str>,
 {
     vals.into_iter().all(|v| re.is_match(v))
 }
@@ -373,11 +371,11 @@ pub fn apply_filters_regex_allow_only(
     }
 
     let ct = req
-    .headers()
-    .get(actix_web::http::header::CONTENT_TYPE)
-    .and_then(|v| v.to_str().ok())
-    .unwrap_or("")
-    .to_ascii_lowercase();
+        .headers()
+        .get(actix_web::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
     let body_utf8 = if need_utf8 {
         std::str::from_utf8(body).ok()
@@ -405,10 +403,10 @@ pub fn apply_filters_regex_allow_only(
             method,
             &path_canon,
             req.headers().clone(),
-                            &query,
-                            body_utf8,
-                            body_json.as_ref(),
-                            &ct,
+            &query,
+            body_utf8,
+            body_json.as_ref(),
+            &ct,
         )
     });
 
