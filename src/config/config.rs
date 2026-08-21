@@ -156,7 +156,7 @@ fn default_allow_true() -> bool {
 impl Serialize for User {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-    S: Serializer,
+        S: Serializer,
     {
         // Length hint was wrong (2, should match the actual field count)
         // and `roles` was serializing `self.allow`'s value instead of
@@ -265,10 +265,11 @@ impl DatabaseConfig {
     /// `type` (3306 for mysql/mariadb, 5432 otherwise/postgres) when
     /// `port` wasn't set.
     pub fn effective_port(&self) -> u16 {
-        self.port.unwrap_or_else(|| match self.db_type.to_lowercase().as_str() {
-            "mysql" | "mariadb" => 3306,
-            _ => 5432,
-        })
+        self.port
+            .unwrap_or_else(|| match self.db_type.to_lowercase().as_str() {
+                "mysql" | "mariadb" => 3306,
+                _ => 5432,
+            })
     }
 }
 
@@ -416,7 +417,7 @@ pub struct AppConfig {
 impl Serialize for AppConfig {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-    S: Serializer,
+        S: Serializer,
     {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
@@ -521,26 +522,22 @@ pub fn resolve_password_override(
     config_password: &str,
 ) -> String {
     state
-    .password_overrides
-    .get(username)
-    .map(|entry| entry.clone())
-    .unwrap_or_else(|| config_password.to_string())
+        .password_overrides
+        .get(username)
+        .map(|entry| entry.clone())
+        .unwrap_or_else(|| config_password.to_string())
 }
 
 /// Resolves whether `username` currently must change their password,
 /// checking `must_change_overrides` before falling back to whatever
 /// `config_value` (from config.json/the database) said. See
 /// `AppState::must_change_overrides`.
-pub fn resolve_must_change_password(
-    state: &AppState,
-    username: &str,
-    config_value: bool,
-) -> bool {
+pub fn resolve_must_change_password(state: &AppState, username: &str, config_value: bool) -> bool {
     state
-    .must_change_overrides
-    .get(username)
-    .map(|entry| *entry)
-    .unwrap_or(config_value)
+        .must_change_overrides
+        .get(username)
+        .map(|entry| *entry)
+        .unwrap_or(config_value)
 }
 
 /// Writes a new Argon2 password hash for a file-based user directly
@@ -562,14 +559,14 @@ pub fn set_user_password(
     }
 
     let config_str = fs::read_to_string(config_path)
-    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
     let mut json: Value = serde_json::from_str(&config_str)
-    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+        .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
 
     let mut found = false;
 
@@ -580,12 +577,9 @@ pub fn set_user_password(
             if let Some(obj) = user.as_object_mut() {
                 obj.insert(
                     "password".to_string(),
-                           Value::String(new_password_hash.to_string()),
+                    Value::String(new_password_hash.to_string()),
                 );
-                obj.insert(
-                    "must_change_password".to_string(),
-                           Value::Bool(false),
-                );
+                obj.insert("must_change_password".to_string(), Value::Bool(false));
             }
             break;
         }
@@ -596,9 +590,9 @@ pub fn set_user_password(
     }
 
     let updated_str = serde_json::to_string_pretty(&json)
-    .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
     fs::write(config_path, updated_str)
-    .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
 
     Ok(true)
 }
@@ -758,37 +752,37 @@ fn default_cert() -> HashMap<String, String> {
 /// so we fail loudly instead of falling back to the `required_login`
 /// default.
 pub fn check_deprecated_secure_key(routes_str: &str) -> Result<(), String> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(routes_str)
-    .map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(routes_str).map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
 
     let routes = doc
-    .get("routes")
-    .and_then(|r| r.as_sequence())
-    .cloned()
-    .unwrap_or_default();
+        .get("routes")
+        .and_then(|r| r.as_sequence())
+        .cloned()
+        .unwrap_or_default();
 
     let offenders: Vec<String> = routes
-    .iter()
-    .filter_map(|route| {
-        let map = route.as_mapping()?;
-        if map.contains_key(serde_yaml::Value::String("secure".to_string())) {
-            let prefix = map
-            .get(serde_yaml::Value::String("prefix".to_string()))
-            .and_then(|p| p.as_str())
-            .unwrap_or("<unknown prefix>");
-            Some(prefix.to_string())
-        } else {
-            None
-        }
-    })
-    .collect();
+        .iter()
+        .filter_map(|route| {
+            let map = route.as_mapping()?;
+            if map.contains_key(serde_yaml::Value::String("secure".to_string())) {
+                let prefix = map
+                    .get(serde_yaml::Value::String("prefix".to_string()))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("<unknown prefix>");
+                Some(prefix.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
 
     if offenders.is_empty() {
         Ok(())
     } else {
         Err(format!(
             "routes.yml: 'secure' key is deprecated, rename it to 'required_login' (route(s): {}).",
-                    offenders.join(", ")
+            offenders.join(", ")
         ))
     }
 }
@@ -915,7 +909,7 @@ impl AppConfig {
         }
 
         let fresh_usernames: std::collections::HashSet<&str> =
-        fresh.iter().map(|u| u.username.as_str()).collect();
+            fresh.iter().map(|u| u.username.as_str()).collect();
 
         let Some(mut guard) = self.apply_upserts(fresh) else {
             return;
@@ -1074,7 +1068,7 @@ impl AppConfig {
 pub fn load_config(path: &str) -> Arc<AppConfig> {
     let config_str = fs::read_to_string(path).expect("Could not read config.json file");
     let mut config: AppConfig =
-    serde_json::from_str(&config_str).expect("Invalid config format config.json");
+        serde_json::from_str(&config_str).expect("Invalid config format config.json");
 
     let mut updated = false;
 
@@ -1082,12 +1076,12 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
         if !user.password.starts_with("$argon2") {
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
-            .hash_password(user.password.as_bytes(), &salt)
-            .expect(&format!(
-                "Password hashing failed for user {}",
-                user.username
-            ))
-            .to_string();
+                .hash_password(user.password.as_bytes(), &salt)
+                .expect(&format!(
+                    "Password hashing failed for user {}",
+                    user.username
+                ))
+                .to_string();
             user.password = hash;
             updated = true;
         }
@@ -1095,8 +1089,8 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
 
     let original_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
     config
-    .users
-    .sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
+        .users
+        .sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
 
     let sorted_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
     if original_order != sorted_order {
@@ -1147,14 +1141,14 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
     }
 
     let config_str = fs::read_to_string(config_path)
-    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
     let mut json: Value = serde_json::from_str(&config_str)
-    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+        .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
 
     let mut found = false;
     let mut cleared = false;
@@ -1181,9 +1175,9 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
 
     if cleared {
         let updated_str = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+            .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
         fs::write(config_path, updated_str)
-        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+            .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
     }
 
     Ok(cleared)
@@ -1197,14 +1191,14 @@ pub fn add_otpkey(config_path: &str, username: &str) {
     }
 
     let config_str =
-    fs::read_to_string(config_path).expect("Failed to read the configuration file.");
+        fs::read_to_string(config_path).expect("Failed to read the configuration file.");
     let mut json: Value =
-    serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
+        serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .expect("Missing 'users' field in configuration file.");
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .expect("Missing 'users' field in configuration file.");
 
     let mut updated = false;
 
@@ -1216,8 +1210,8 @@ pub fn add_otpkey(config_path: &str, username: &str) {
             } else {
                 let otpkey = generate_base32_secret(32);
                 user.as_object_mut()
-                .unwrap()
-                .insert("otpkey".to_string(), Value::String(otpkey.clone()));
+                    .unwrap()
+                    .insert("otpkey".to_string(), Value::String(otpkey.clone()));
                 println!(
                     "OTP key successfully generated for '{}': {}",
                     username, otpkey
@@ -1230,21 +1224,21 @@ pub fn add_otpkey(config_path: &str, username: &str) {
 
     if updated {
         let updated_str = serde_json::to_string_pretty(&json)
-        .expect("Failed to serialize the updated configuration.");
+            .expect("Failed to serialize the updated configuration.");
         fs::write(config_path, updated_str)
-        .expect("Failed to write the updated configuration file.");
+            .expect("Failed to write the updated configuration file.");
         println!("Configuration file has been updated.");
     } else if !users
         .iter()
         .any(|u| u.get("username").and_then(|n| n.as_str()) == Some(username))
-        {
-            eprintln!("User '{}' not found in the configuration file.", username);
-        }
+    {
+        eprintln!("User '{}' not found in the configuration file.", username);
+    }
 }
 
 fn deserialize_log_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
 where
-D: Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     struct LogMapVisitor;
 
@@ -1257,7 +1251,7 @@ D: Deserializer<'de>,
 
         fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
         where
-        M: MapAccess<'de>,
+            M: MapAccess<'de>,
         {
             let mut map = HashMap::new();
             while let Some((k, v)) = access.next_entry::<String, serde_json::Value>()? {
@@ -1303,18 +1297,18 @@ impl AllowRegexCfg {
                 }),
                 RegexCondCfg::Header { name, pattern } => Ok(RegexCond::Header {
                     name_re: Regex::new(name)?,
-                                                             re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::Query { name, pattern } => Ok(RegexCond::Query {
                     name_re: Regex::new(name)?,
-                                                            re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::BodyRaw { pattern } => Ok(RegexCond::BodyRaw {
                     re: Regex::new(pattern)?,
                 }),
                 RegexCondCfg::BodyJson { key, pattern } => Ok(RegexCond::BodyJson {
                     key: key.clone(),
-                                                              re: Regex::new(pattern)?,
+                    re: Regex::new(pattern)?,
                 }),
             }
         }
@@ -1324,7 +1318,7 @@ impl AllowRegexCfg {
         }
         Ok(CompiledAllow {
             default_allow: self.default_allow,
-                allow,
+            allow,
         })
     }
 }

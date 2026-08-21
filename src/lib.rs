@@ -16,14 +16,14 @@ pub mod adm;
 pub mod build;
 pub mod cli;
 pub mod config;
+pub mod databases;
 pub mod keystore;
 pub mod network;
+pub mod reset;
 pub mod revoke;
 pub mod smtp;
 pub mod stats;
 pub mod token;
-pub mod databases;
-pub mod reset;
 
 pub use config::config::{AppConfig, AppState, RouteConfig};
 pub use network::proxy::global_proxy;

@@ -22,20 +22,19 @@ pub async fn start_revoked_token_ttl(
     every: Duration,
     redis_url: Option<String>,
 ) {
-    let opt_path = Some(
-        std::env::var("LMDB_PATH").unwrap_or_else(|_| "/opt/proxyauth/db/".to_string()),
-    );
+    let opt_path =
+        Some(std::env::var("LMDB_PATH").unwrap_or_else(|_| "/opt/proxyauth/db/".to_string()));
 
     // Init LMDB
     if let Some(path) = opt_path {
         if LMDB_ENV.get().is_none() {
             let env = Environment::new()
-            .set_max_dbs(1)
-            .open(Path::new(&path))
-            .expect("Failed to open LMDB");
+                .set_max_dbs(1)
+                .open(Path::new(&path))
+                .expect("Failed to open LMDB");
 
             env.create_db(Some("revoke"), lmdb::DatabaseFlags::empty())
-            .expect("Failed to create/open LMDB 'revoke' db");
+                .expect("Failed to create/open LMDB 'revoke' db");
 
             LMDB_ENV.set(env).expect("LMDB already initialized");
         }
@@ -69,7 +68,7 @@ pub async fn start_revoked_token_ttl(
                     Err(e) => {
                         error!(
                             "[RevokedSync] Failed to initialize Redis: {}. Retrying... ({} attempts left)",
-                               e, attempts
+                            e, attempts
                         );
                         attempts -= 1;
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -88,7 +87,7 @@ pub async fn start_revoked_token_ttl(
         // Handle SIGTERM and SIGINT for graceful shutdown
         tokio::spawn(async move {
             let mut sigterm =
-            signal(SignalKind::terminate()).expect("Failed to listen for SIGTERM");
+                signal(SignalKind::terminate()).expect("Failed to listen for SIGTERM");
             let mut sigint = signal(SignalKind::interrupt()).expect("Failed to listen for SIGINT");
 
             tokio::select! {
@@ -102,8 +101,8 @@ pub async fn start_revoked_token_ttl(
 
             // Signal shutdown
             shutdown_tx
-            .send(true)
-            .expect("Failed to send shutdown signal");
+                .send(true)
+                .expect("Failed to send shutdown signal");
         });
 
         tokio::spawn(async move {

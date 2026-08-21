@@ -46,7 +46,7 @@ struct ResetEntry {
 
 fn reset_path() -> PathBuf {
     let base = std::env::var("PROXYAUTH_PASSWORD_RESET_PATH")
-    .unwrap_or_else(|_| "/opt/proxyauth/db/password_reset".to_string());
+        .unwrap_or_else(|_| "/opt/proxyauth/db/password_reset".to_string());
     PathBuf::from(base)
 }
 
@@ -56,21 +56,41 @@ fn env() -> Result<&'static lmdb::Environment, String> {
     }
 
     let path = reset_path();
-    std::fs::create_dir_all(&path)
-    .map_err(|e| format!("Failed to create password-reset dir {}: {e}", path.display()))?;
+    std::fs::create_dir_all(&path).map_err(|e| {
+        format!(
+            "Failed to create password-reset dir {}: {e}",
+            path.display()
+        )
+    })?;
+
+    // SECURITY: this directory holds single-use password-reset tokens
+    // (valid for up to an hour) — restrict to owner-only rather than
+    // relying solely on the process umask, which may not be 077 in
+    // every deployment. Unix-only; on other platforms this is a no-op
+    // and permissions fall back to whatever create_dir_all produced.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+    }
 
     let env = lmdb::Environment::new()
-    .set_max_dbs(1)
-    .open(Path::new(&path))
-    .map_err(|e| format!("Failed to open password-reset LMDB at {}: {e}", path.display()))?;
+        .set_max_dbs(1)
+        .open(Path::new(&path))
+        .map_err(|e| {
+            format!(
+                "Failed to open password-reset LMDB at {}: {e}",
+                path.display()
+            )
+        })?;
 
     env.create_db(Some(DB_NAME), lmdb::DatabaseFlags::empty())
-    .map_err(|e| format!("Failed to create/open password-reset LMDB db: {e}"))?;
+        .map_err(|e| format!("Failed to create/open password-reset LMDB db: {e}"))?;
 
     let _ = RESET_ENV.set(env);
     RESET_ENV
-    .get()
-    .ok_or_else(|| "password-reset LMDB environment failed to initialize".to_string())
+        .get()
+        .ok_or_else(|| "password-reset LMDB environment failed to initialize".to_string())
 }
 
 /// Generates a new, single-use, time-limited reset token for `username`
@@ -88,19 +108,19 @@ pub fn create_token(username: &str, kind: ResetKind, ttl_secs: i64) -> Result<St
         expires_at: OffsetDateTime::now_utc().unix_timestamp() + ttl_secs,
     };
     let bytes = serde_json::to_vec(&entry)
-    .map_err(|e| format!("Failed to serialize reset token entry: {e}"))?;
+        .map_err(|e| format!("Failed to serialize reset token entry: {e}"))?;
 
     let _guard = RESET_MUTEX.lock().map_err(|e| e.to_string())?;
     let db = env
-    .open_db(Some(DB_NAME))
-    .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
+        .open_db(Some(DB_NAME))
+        .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
     let mut txn = env
-    .begin_rw_txn()
-    .map_err(|e| format!("Failed to begin password-reset write txn: {e}"))?;
+        .begin_rw_txn()
+        .map_err(|e| format!("Failed to begin password-reset write txn: {e}"))?;
     txn.put(db, &token.as_bytes(), &bytes, WriteFlags::empty())
-    .map_err(|e| format!("Failed to store reset token: {e}"))?;
+        .map_err(|e| format!("Failed to store reset token: {e}"))?;
     txn.commit()
-    .map_err(|e| format!("Failed to commit reset token: {e}"))?;
+        .map_err(|e| format!("Failed to commit reset token: {e}"))?;
 
     Ok(token)
 }
@@ -116,17 +136,17 @@ pub fn validate_token(token: &str) -> Result<String, String> {
     let env = env()?;
     let _guard = RESET_MUTEX.lock().map_err(|e| e.to_string())?;
     let db = env
-    .open_db(Some(DB_NAME))
-    .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
+        .open_db(Some(DB_NAME))
+        .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
     let txn = env
-    .begin_ro_txn()
-    .map_err(|e| format!("Failed to begin password-reset read txn: {e}"))?;
+        .begin_ro_txn()
+        .map_err(|e| format!("Failed to begin password-reset read txn: {e}"))?;
     let bytes = txn
-    .get(db, &token.as_bytes())
-    .map_err(|_| "Invalid or expired reset token".to_string())?;
+        .get(db, &token.as_bytes())
+        .map_err(|_| "Invalid or expired reset token".to_string())?;
 
     let entry: ResetEntry = serde_json::from_slice(bytes)
-    .map_err(|e| format!("Failed to deserialize reset token entry: {e}"))?;
+        .map_err(|e| format!("Failed to deserialize reset token entry: {e}"))?;
 
     if entry.expires_at <= OffsetDateTime::now_utc().unix_timestamp() {
         return Err("Invalid or expired reset token".to_string());
@@ -143,17 +163,17 @@ pub fn consume_token(token: &str) -> Result<(), String> {
     let env = env()?;
     let _guard = RESET_MUTEX.lock().map_err(|e| e.to_string())?;
     let db = env
-    .open_db(Some(DB_NAME))
-    .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
+        .open_db(Some(DB_NAME))
+        .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
     let mut txn = env
-    .begin_rw_txn()
-    .map_err(|e| format!("Failed to begin password-reset write txn: {e}"))?;
+        .begin_rw_txn()
+        .map_err(|e| format!("Failed to begin password-reset write txn: {e}"))?;
     // A token that's already gone (double-submit, race) is fine to
     // no-op on — the outcome ("this token can't be used again") is
     // already true either way.
     let _ = txn.del(db, &token.as_bytes(), None);
     txn.commit()
-    .map_err(|e| format!("Failed to commit reset token deletion: {e}"))?;
+        .map_err(|e| format!("Failed to commit reset token deletion: {e}"))?;
 
     Ok(())
 }
@@ -169,16 +189,16 @@ pub fn purge_expired() -> Result<u64, String> {
 
     let _guard = RESET_MUTEX.lock().map_err(|e| e.to_string())?;
     let db = env
-    .open_db(Some(DB_NAME))
-    .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
+        .open_db(Some(DB_NAME))
+        .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
 
     let expired_keys: Vec<Vec<u8>> = {
         let txn = env
-        .begin_ro_txn()
-        .map_err(|e| format!("Failed to begin password-reset read txn: {e}"))?;
+            .begin_ro_txn()
+            .map_err(|e| format!("Failed to begin password-reset read txn: {e}"))?;
         let mut cursor = txn
-        .open_ro_cursor(db)
-        .map_err(|e| format!("Failed to open password-reset cursor: {e}"))?;
+            .open_ro_cursor(db)
+            .map_err(|e| format!("Failed to open password-reset cursor: {e}"))?;
 
         let mut keys = Vec::new();
         for item in cursor.iter() {
@@ -197,13 +217,13 @@ pub fn purge_expired() -> Result<u64, String> {
     }
 
     let mut txn = env
-    .begin_rw_txn()
-    .map_err(|e| format!("Failed to begin password-reset write txn: {e}"))?;
+        .begin_rw_txn()
+        .map_err(|e| format!("Failed to begin password-reset write txn: {e}"))?;
     for key in &expired_keys {
         let _ = txn.del(db, key, None);
     }
     txn.commit()
-    .map_err(|e| format!("Failed to commit password-reset purge: {e}"))?;
+        .map_err(|e| format!("Failed to commit password-reset purge: {e}"))?;
 
     Ok(expired_keys.len() as u64)
 }

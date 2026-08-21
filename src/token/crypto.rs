@@ -8,6 +8,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 
+use crate::build::build_info;
 use hkdf::Hkdf;
 use lru::LruCache;
 use once_cell::sync::Lazy;
@@ -17,7 +18,6 @@ use sha2::Sha256;
 use std::fmt::Write;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use crate::build::build_info;
 
 const KEY_LEN: usize = 32;
 const TAG_V1: u8 = 1;
