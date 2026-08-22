@@ -45,8 +45,41 @@ pub struct RouteRule {
     pub prefix: String,
     pub target: String,
 
+    /// Usernames allowed to access this route (when `required_login`
+    /// is `true`) — one of three ways in, alongside `groups`/`roles`
+    /// below; see the doc comment on `roles` for how the three combine,
+    /// including what an empty list means here.
     #[serde(default = "default_username")]
     pub username: Vec<String>,
+
+    /// Groups allowed to access this route — checked against each
+    /// user's `User.groups` via `AppConfig::groups_for_username`; see
+    /// `roles` below for how `username`/`groups`/`roles` combine.
+    /// Meant to avoid maintaining a per-route username list by hand —
+    /// add/remove a user from a group in one place instead of editing
+    /// every route they should reach.
+    #[serde(default)]
+    pub groups: Vec<String>,
+
+    /// Roles allowed to access this route, checked against `User.roles`
+    /// via `AppConfig::roles_for_username` — the same lookup that
+    /// already feeds the `X-User-Roles` header, now also usable to
+    /// gate access rather than being purely informational.
+    ///
+    /// `username`, `groups`, and `roles` combine as an OR: a request
+    /// gets through if it matches *any* of the three — an explicitly
+    /// listed username, membership in an allowed group, or possession
+    /// of an allowed role.
+    ///
+    /// If all three are left empty, that's read as a deliberate
+    /// choice — "any authenticated account may use this route" — not
+    /// a misconfiguration to fail closed on; `required_login` (a
+    /// valid session in the first place) still applies regardless.
+    /// The moment even one of the three is non-empty, this route goes
+    /// back to being allow-listed: only requests matching
+    /// username/groups/roles get through.
+    #[serde(default)]
+    pub roles: Vec<String>,
 
     #[serde(default = "default_required_login")]
     pub required_login: bool,
@@ -129,6 +162,17 @@ pub struct User {
     pub allow: Option<Vec<String>>,
     pub roles: Option<Vec<String>>,
 
+    /// Group memberships for this account — an alternative to
+    /// `roles` specifically for route access control (`roles` is
+    /// only ever forwarded to the backend as the `X-User-Roles`
+    /// header; it never gates access by itself). A route lists
+    /// allowed groups via `RouteRule.groups` in `routes.yml`; a user
+    /// gets in if they're in at least one of them, without needing
+    /// their username individually added to every such route — see
+    /// `AppConfig::groups_for_username`.
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+
     pub email: Option<Vec<EmailEntry>>,
 
     /// If true, the next successful login redirects to
@@ -164,12 +208,13 @@ impl Serialize for User {
         // first-run password hashing) silently duplicated `allow` into
         // `roles` and dropped the real roles. Fixed here; also now
         // includes `email` for completeness.
-        let mut state = serializer.serialize_struct("User", 7)?;
+        let mut state = serializer.serialize_struct("User", 8)?;
         state.serialize_field("username", &self.username)?;
         state.serialize_field("password", &self.password)?;
         state.serialize_field("otpkey", &self.otpkey)?;
         state.serialize_field("allow", &self.allow)?;
         state.serialize_field("roles", &self.roles)?;
+        state.serialize_field("groups", &self.groups)?;
         state.serialize_field("email", &self.email)?;
         state.serialize_field("must_change_password", &self.must_change_password)?;
         state.end()
@@ -428,6 +473,15 @@ pub struct AppConfig {
     /// user.
     #[serde(skip)]
     pub roles_index: std::sync::RwLock<HashMap<String, Vec<String>>>,
+
+    /// username -> groups fast index — same purpose and lifecycle as
+    /// `roles_index`, kept separate rather than reusing it because
+    /// `groups` and `roles` mean different things: `roles` is purely
+    /// informational (forwarded to the backend as `X-User-Roles`,
+    /// never checked by ProxyAuth itself), while `groups` is what
+    /// `RouteRule.groups` actually gates access against.
+    #[serde(skip)]
+    pub groups_index: std::sync::RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl Serialize for AppConfig {
@@ -810,6 +864,72 @@ pub fn check_deprecated_secure_key(routes_str: &str) -> Result<(), String> {
     }
 }
 
+/// What let (or would let) a given username through a route, given its
+/// `username`/`groups`/`roles` configuration — see
+/// `AppConfig::route_access_decision`. Kept as a real enum rather than
+/// a bare `bool` specifically so `proxyauth routes-audit`/`check-access`
+/// (see `cli::audit`) can report *why*, not just whether — and so that
+/// tool is guaranteed to reflect the exact same logic
+/// `network::proxy`'s access check enforces, both calling this one
+/// function, rather than two implementations that could quietly drift
+/// apart over time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteAccessDecision {
+    /// The username is explicitly listed in `RouteRule.username`.
+    AllowedByUsername,
+    /// Not listed by username, but a member of this allowed group.
+    AllowedByGroup(String),
+    /// Not listed by username or group, but holds this allowed role.
+    AllowedByRole(String),
+    /// `username`, `groups`, and `roles` were all left empty on this
+    /// route — read as "any authenticated account may use this
+    /// route", not a misconfiguration (see the doc comment on
+    /// `RouteRule.roles`).
+    AllowedNoRestrictionConfigured,
+    /// None of the above — the request would be rejected.
+    Denied,
+}
+
+impl RouteAccessDecision {
+    pub fn is_allowed(&self) -> bool {
+        !matches!(self, RouteAccessDecision::Denied)
+    }
+}
+
+impl AppConfig {
+    /// Decides whether `username` may access a route with these
+    /// `username`/`groups`/`roles` settings — the single source of
+    /// truth both `network::proxy`'s live access check and
+    /// `proxyauth routes-audit`/`check-access` call, so the CLI audit
+    /// tool can never silently disagree with what the running proxy
+    /// actually enforces.
+    pub fn route_access_decision(&self, rule: &RouteRule, username: &str) -> RouteAccessDecision {
+        if rule.username.iter().any(|u| u == username) {
+            return RouteAccessDecision::AllowedByUsername;
+        }
+
+        if !rule.groups.is_empty() {
+            let user_groups = self.groups_for_username(username).unwrap_or_default();
+            if let Some(g) = rule.groups.iter().find(|g| user_groups.contains(g)) {
+                return RouteAccessDecision::AllowedByGroup(g.clone());
+            }
+        }
+
+        if !rule.roles.is_empty() {
+            let user_roles = self.roles_for_username(username).unwrap_or_default();
+            if let Some(r) = rule.roles.iter().find(|r| user_roles.contains(r)) {
+                return RouteAccessDecision::AllowedByRole(r.clone());
+            }
+        }
+
+        if rule.username.is_empty() && rule.groups.is_empty() && rule.roles.is_empty() {
+            return RouteAccessDecision::AllowedNoRestrictionConfigured;
+        }
+
+        RouteAccessDecision::Denied
+    }
+}
+
 impl AppConfig {
     /// Returns a snapshot combining file-based `users` with the current
     /// database-loaded users (if `databases` is configured), in a stable
@@ -836,6 +956,13 @@ impl AppConfig {
         self.roles_index.read().ok()?.get(username).cloned()
     }
 
+    /// Same as `roles_for_username`, for `groups_index` — the lookup
+    /// `RouteRule.groups` access checks use, on the same proxied-request
+    /// hot path.
+    pub fn groups_for_username(&self, username: &str) -> Option<Vec<String>> {
+        self.groups_index.read().ok()?.get(username).cloned()
+    }
+
     /// Inserts or removes a single entry in `roles_index`, keeping it in
     /// sync with a user's current `roles`. `None`/empty roles removes
     /// the entry entirely (a HashMap miss and "no roles" both correctly
@@ -847,6 +974,21 @@ impl AppConfig {
         match roles {
             Some(r) if !r.is_empty() => {
                 index.insert(username.to_string(), r.clone());
+            }
+            _ => {
+                index.remove(username);
+            }
+        }
+    }
+
+    /// Same as `index_roles`, for `groups_index`/`User.groups`.
+    fn index_groups(&self, username: &str, groups: &Option<Vec<String>>) {
+        let Ok(mut index) = self.groups_index.write() else {
+            return;
+        };
+        match groups {
+            Some(g) if !g.is_empty() => {
+                index.insert(username.to_string(), g.clone());
             }
             _ => {
                 index.remove(username);
@@ -952,6 +1094,7 @@ impl AppConfig {
                 // this account can never authenticate again.
                 user.password = "!revoked!".to_string();
                 self.index_roles(&user.username, &None);
+                self.index_groups(&user.username, &None);
             }
         }
     }
@@ -1029,6 +1172,7 @@ impl AppConfig {
         if revoked.insert(idx) {
             guard[idx].password = "!revoked!".to_string();
             self.index_roles(username, &None);
+            self.index_groups(username, &None);
         }
     }
 
@@ -1074,6 +1218,7 @@ impl AppConfig {
                 touched_indices.push(guard.len() - 1);
             }
             self.index_roles(&new_user.username, &new_user.roles);
+            self.index_groups(&new_user.username, &new_user.groups);
         }
 
         if let Ok(mut revoked) = self.db_revoked.write() {
@@ -1136,6 +1281,7 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
     let app_config = Arc::new(config);
     for user in &app_config.users {
         app_config.index_roles(&user.username, &user.roles);
+        app_config.index_groups(&user.username, &user.groups);
     }
 
     // Load users stored in the database (if `databases` is configured)

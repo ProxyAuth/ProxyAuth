@@ -153,6 +153,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 otpkey: None,
                 allow: None,
                 roles: None,
+                groups: None,
                 email: if email_entries.is_empty() { None } else { Some(email_entries) },
                 must_change_password: *must_change_password,
             };
@@ -434,6 +435,119 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Some(Commands::RoutesAudit) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            crate::cli::audit::print_routes_audit(&config, &routes);
+            std::process::exit(0);
+        }
+
+        Some(Commands::CheckAccess { username }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            // Doesn't require the username to exist — checking access
+            // for a not-(yet)-registered name is still meaningful
+            // (e.g. "if I add alice with these groups, what would she
+            // reach?"), so this deliberately doesn't reject unknown
+            // usernames the way ResetPassword does.
+            crate::cli::audit::print_check_access(&config, &routes, username);
+            std::process::exit(0);
+        }
+
+        Some(Commands::CheckRoutes) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            crate::cli::audit::print_check_routes(&config, &routes);
+            std::process::exit(0);
+        }
+
+        Some(Commands::Users { list }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            crate::cli::audit::print_users(&config, &routes, *list);
+            std::process::exit(0);
+        }
+
+        Some(Commands::Groups { list }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            crate::cli::audit::print_groups(&config, &routes, *list);
+            std::process::exit(0);
+        }
+
+        Some(Commands::Roles { list }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            crate::cli::audit::print_roles(&config, &routes, *list);
+            std::process::exit(0);
         }
     }
 }

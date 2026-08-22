@@ -421,6 +421,34 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
             )
             .map_err(|e| format!("Failed to create user_roles table (postgres): {e}"))?;
 
+            // `group` is a reserved word in both Postgres and MySQL
+            // (used by GROUP BY) — the column/table below is named
+            // `group_name`/`groups` to sidestep needing to quote it
+            // everywhere, and `groups` is a genuine parent table
+            // (with a real FK from `user_groups.group_id`) rather than
+            // a free-text column repeated on every membership row —
+            // a typo in a group name on one user's row can't silently
+            // create a phantom group no route will ever match, and
+            // renaming a group is a one-row UPDATE instead of a
+            // mass-update across every member.
+            c.batch_execute(
+                "CREATE TABLE IF NOT EXISTS groups (
+                    id BIGSERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL UNIQUE
+            )",
+            )
+            .map_err(|e| format!("Failed to create groups table (postgres): {e}"))?;
+
+            c.batch_execute(
+                "CREATE TABLE IF NOT EXISTS user_groups (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                            UNIQUE (user_id, group_id)
+            )",
+            )
+            .map_err(|e| format!("Failed to create user_groups table (postgres): {e}"))?;
+
             c.batch_execute(
                 "CREATE TABLE IF NOT EXISTS user_email (
                     id BIGSERIAL PRIMARY KEY,
@@ -548,6 +576,29 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
             )
             .map_err(|e| format!("Failed to create user_roles table (mysql): {e}"))?;
 
+            // See the matching comment in the postgres branch above for
+            // why `groups` is a real parent table with a genuine FK,
+            // not a free-text column repeated per membership row.
+            c.batch_execute(
+                "CREATE TABLE IF NOT EXISTS groups (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL UNIQUE
+            )",
+            )
+            .map_err(|e| format!("Failed to create groups table (mysql): {e}"))?;
+
+            c.batch_execute(
+                "CREATE TABLE IF NOT EXISTS user_groups (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    group_id BIGINT NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+                    UNIQUE KEY uq_user_group (user_id, group_id)
+            )",
+            )
+            .map_err(|e| format!("Failed to create user_groups table (mysql): {e}"))?;
+
             c.batch_execute(
                 "CREATE TABLE IF NOT EXISTS user_email (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -600,13 +651,14 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
     }
 }
 
-/// Loads every user, along with their `allow` and `roles` rows (three
-/// simple queries, joined in memory — keeps the raw SQL portable across
+/// Loads every user, along with their `allow`, `roles`, and `groups`
+/// rows (queries joined in memory — keeps the raw SQL portable across
 /// both backends without relying on backend-specific aggregate functions
 /// like `string_agg`/`GROUP_CONCAT`).
 pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
-    let (user_rows, allow_rows, role_rows, email_rows): (
+    let (user_rows, allow_rows, role_rows, group_rows, email_rows): (
         Vec<DbUserRow>,
+        Vec<UserIdValueRow>,
         Vec<UserIdValueRow>,
         Vec<UserIdValueRow>,
         Vec<UserEmailRow>,
@@ -621,6 +673,9 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
                                       sql_query("SELECT user_id, role AS value FROM user_roles")
                                       .load(c)
                                       .map_err(|e| format!("Failed to load user_roles (postgres): {e}"))?,
+                                      sql_query("SELECT user_groups.user_id, groups.name AS value FROM user_groups JOIN groups ON groups.id = user_groups.group_id")
+                                      .load(c)
+                                      .map_err(|e| format!("Failed to load user_groups (postgres): {e}"))?,
                                       sql_query("SELECT user_id, email AS address, is_primary FROM user_email")
                                       .load(c)
                                       .map_err(|e| format!("Failed to load user_email (postgres): {e}"))?,
@@ -635,6 +690,9 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
                                    sql_query("SELECT user_id, role AS value FROM user_roles")
                                    .load(c)
                                    .map_err(|e| format!("Failed to load user_roles (mysql): {e}"))?,
+                                   sql_query("SELECT user_groups.user_id, groups.name AS value FROM user_groups JOIN groups ON groups.id = user_groups.group_id")
+                                   .load(c)
+                                   .map_err(|e| format!("Failed to load user_groups (mysql): {e}"))?,
                                    sql_query("SELECT user_id, email AS address, is_primary FROM user_email")
                                    .load(c)
                                    .map_err(|e| format!("Failed to load user_email (mysql): {e}"))?,
@@ -649,6 +707,11 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
     let mut roles_map: HashMap<i64, Vec<String>> = HashMap::new();
     for row in role_rows {
         roles_map.entry(row.user_id).or_default().push(row.value);
+    }
+
+    let mut groups_map: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in group_rows {
+        groups_map.entry(row.user_id).or_default().push(row.value);
     }
 
     let mut email_map: HashMap<i64, Vec<EmailEntry>> = HashMap::new();
@@ -667,6 +730,7 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
          otpkey: r.otpkey,
          allow: allow_map.remove(&r.id),
          roles: roles_map.remove(&r.id),
+         groups: groups_map.remove(&r.id),
          email: email_map.remove(&r.id),
          must_change_password: r.must_change_password,
     })
@@ -807,6 +871,95 @@ fn replace_user_roles(
     Ok(())
 }
 
+/// Resolves a group name to its `groups.id`, creating the row first if
+/// it doesn't exist yet. Idempotent and race-safe under concurrent
+/// callers: the upsert-and-return-id is one atomic statement per
+/// backend (`ON CONFLICT ... RETURNING` for Postgres,
+/// `ON DUPLICATE KEY UPDATE` + `LAST_INSERT_ID()` for MySQL — the
+/// standard idiom for "insert or fetch the existing id" there), not a
+/// separate SELECT-then-INSERT with a race between them.
+fn ensure_group_id(conn: &mut DbConnection, name: &str) -> Result<i64, String> {
+    #[derive(QueryableByName)]
+    struct IdRow {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+    }
+
+    match conn {
+        DbConnection::Postgres(c) => {
+            let row: IdRow = sql_query(
+                "INSERT INTO groups (name) VALUES ($1)
+                ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                RETURNING id",
+            )
+            .bind::<Text, _>(name)
+            .get_result(c)
+            .map_err(|e| format!("Failed to upsert group '{name}' (postgres): {e}"))?;
+            Ok(row.id)
+        }
+        DbConnection::MySql(c) => {
+            sql_query("INSERT INTO groups (name) VALUES (?) ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)")
+            .bind::<Text, _>(name)
+            .execute(c)
+            .map_err(|e| format!("Failed to upsert group '{name}' (mysql): {e}"))?;
+
+            let row: IdRow = sql_query("SELECT LAST_INSERT_ID() AS id")
+            .get_result(c)
+            .map_err(|e| format!("Failed to read LAST_INSERT_ID for group '{name}' (mysql): {e}"))?;
+            Ok(row.id)
+        }
+    }
+}
+
+/// Same as `replace_user_allow`, for `user_groups` — except each value
+/// is a group *name*, resolved (or created) to a `groups.id` via
+/// `ensure_group_id` first, since `user_groups.group_id` is a real FK
+/// rather than a free-text column. Membership rows are only touched
+/// once every name has resolved successfully, so a failure partway
+/// through (a genuine DB error — group *creation* here can't itself
+/// fail on "already exists") leaves the previous membership intact
+/// rather than half-updated.
+fn replace_user_groups(
+    conn: &mut DbConnection,
+    user_id: i64,
+    values: Option<&[String]>,
+) -> Result<(), String> {
+    let mut group_ids = Vec::new();
+    for name in values.unwrap_or_default() {
+        group_ids.push(ensure_group_id(conn, name)?);
+    }
+
+    match conn {
+        DbConnection::Postgres(c) => {
+            sql_query("DELETE FROM user_groups WHERE user_id = $1")
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_groups (postgres): {e}"))?;
+            for group_id in &group_ids {
+                sql_query("INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2)")
+                .bind::<BigInt, _>(user_id)
+                .bind::<BigInt, _>(*group_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_groups (postgres): {e}"))?;
+            }
+        }
+        DbConnection::MySql(c) => {
+            sql_query("DELETE FROM user_groups WHERE user_id = ?")
+            .bind::<BigInt, _>(user_id)
+            .execute(c)
+            .map_err(|e| format!("Failed to clear user_groups (mysql): {e}"))?;
+            for group_id in &group_ids {
+                sql_query("INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)")
+                .bind::<BigInt, _>(user_id)
+                .bind::<BigInt, _>(*group_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to insert user_groups (mysql): {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Same as `replace_user_allow`, for `user_email`.
 /// Same as `replace_user_allow`, for `user_email` — also writes
 /// `is_primary` per entry, since `EmailEntry` carries that explicitly
@@ -870,6 +1023,7 @@ pub fn upsert_user(conn: &mut DbConnection, user: &User) -> Result<(), String> {
     let user_id = upsert_user_row(conn, user)?;
     replace_user_allow(conn, user_id, user.allow.as_deref())?;
     replace_user_roles(conn, user_id, user.roles.as_deref())?;
+    replace_user_groups(conn, user_id, user.groups.as_deref())?;
     replace_user_email(conn, user_id, user.email.as_deref())?;
     Ok(())
 }
@@ -967,6 +1121,7 @@ pub fn load_user_by_username(
 
     let allow = load_values_for_user(conn, "user_allow", "cidr", row.id)?;
     let roles = load_values_for_user(conn, "user_roles", "role", row.id)?;
+    let groups = load_groups_for_user(conn, row.id)?;
     let email = load_emails_for_user(conn, row.id)?;
 
     Ok(Some(User {
@@ -975,6 +1130,7 @@ pub fn load_user_by_username(
         otpkey: row.otpkey,
         allow: if allow.is_empty() { None } else { Some(allow) },
             roles: if roles.is_empty() { None } else { Some(roles) },
+            groups: if groups.is_empty() { None } else { Some(groups) },
             email: if email.is_empty() { None } else { Some(email) },
             must_change_password: row.must_change_password,
     }))
@@ -985,7 +1141,9 @@ pub fn load_user_by_username(
 /// instance running it is enough — a `DELETE` of already-gone rows on a
 /// second instance is simply a no-op, so this is safe to run
 /// redundantly from more than one). `ON DELETE CASCADE` on
-/// `user_allow`/`user_roles` cleans up the child rows automatically.
+/// `user_allow`/`user_roles`/`user_groups` cleans up the child rows
+/// automatically (the `groups` table itself is untouched — a group
+/// definition outlives any particular member).
 /// Returns the number of rows actually deleted.
 pub fn purge_deleted_users(conn: &mut DbConnection, retention_secs: i64) -> Result<u64, String> {
     let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(retention_secs);
@@ -1096,6 +1254,7 @@ pub fn load_recently_changed_users(
 
         let allow = load_values_for_user(conn, "user_allow", "cidr", row.id)?;
         let roles = load_values_for_user(conn, "user_roles", "role", row.id)?;
+        let groups = load_groups_for_user(conn, row.id)?;
         let email = load_emails_for_user(conn, row.id)?;
         changes.push(DbUserChange::Upserted(User {
             username: row.username,
@@ -1103,6 +1262,7 @@ pub fn load_recently_changed_users(
             otpkey: row.otpkey,
             allow: if allow.is_empty() { None } else { Some(allow) },
                                             roles: if roles.is_empty() { None } else { Some(roles) },
+                                            groups: if groups.is_empty() { None } else { Some(groups) },
                                             email: if email.is_empty() { None } else { Some(email) },
                                             must_change_password: row.must_change_password,
         }));
@@ -1161,6 +1321,40 @@ fn load_values_for_user(
         .load::<UserIdValueRow>(c)
         .map(|rows| rows.into_iter().map(|r| r.value).collect())
         .map_err(|e| format!("Failed to load {table} for user (mysql): {e}")),
+    }
+}
+
+/// Same idea as `load_values_for_user`, for one user's group
+/// membership specifically — needs a JOIN (`user_groups.group_id` ->
+/// `groups.name`) rather than a plain child-table select, since group
+/// names live in `groups` now, not as a free-text column on
+/// `user_groups` itself (see `ensure_group_id`).
+fn load_groups_for_user(conn: &mut DbConnection, user_id: i64) -> Result<Vec<String>, String> {
+    #[derive(QueryableByName)]
+    struct GroupNameRow {
+        #[diesel(sql_type = Text)]
+        value: String,
+    }
+
+    match conn {
+        DbConnection::Postgres(c) => sql_query(
+            "SELECT groups.name AS value FROM user_groups
+            JOIN groups ON groups.id = user_groups.group_id
+            WHERE user_groups.user_id = $1",
+        )
+        .bind::<BigInt, _>(user_id)
+        .load::<GroupNameRow>(c)
+        .map(|rows| rows.into_iter().map(|r| r.value).collect())
+        .map_err(|e| format!("Failed to load user_groups for user (postgres): {e}")),
+        DbConnection::MySql(c) => sql_query(
+            "SELECT groups.name AS value FROM user_groups
+            JOIN groups ON groups.id = user_groups.group_id
+            WHERE user_groups.user_id = ?",
+        )
+        .bind::<BigInt, _>(user_id)
+        .load::<GroupNameRow>(c)
+        .map(|rows| rows.into_iter().map(|r| r.value).collect())
+        .map_err(|e| format!("Failed to load user_groups for user (mysql): {e}")),
     }
 }
 

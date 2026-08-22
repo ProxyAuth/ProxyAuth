@@ -12,5 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod audit;
 pub mod command;
 pub mod prompt;

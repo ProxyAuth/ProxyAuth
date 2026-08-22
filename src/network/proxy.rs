@@ -202,6 +202,15 @@ pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -
             builder = builder.header("x-user-roles", val);
         }
     }
+    // Same lookup, for group membership — lets the backend see which
+    // of a user's groups granted them access (or just use it for its
+    // own authorization), the same way it already can with roles.
+    if let Some(groups) = config.groups_for_username(username) {
+        let groups_str = groups.join(",");
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&groups_str) {
+            builder = builder.header("x-groups", val);
+        }
+    }
     builder
 }
 
@@ -594,7 +603,11 @@ pub async fn proxy_with_proxy(
                 }
             };
 
-        if !rule.username.contains(&username) {
+        // Single source of truth for "does this username get through
+        // this route" — see `AppConfig::route_access_decision`. Also
+        // what `proxyauth routes-audit`/`check-access` call, so that
+        // tool can never silently disagree with what's enforced here.
+        if !data.config.route_access_decision(rule, &username).is_allowed() {
             warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
             let mut resp = HttpResponse::Unauthorized();
             resp.append_header(("server", "ProxyAuth"));
@@ -642,6 +655,7 @@ pub async fn proxy_with_proxy(
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
+            && key_str != "x-groups"
         {
             if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
                 request_builder = request_builder.header(key_str, hv);
@@ -1018,7 +1032,9 @@ pub async fn proxy_without_proxy(
                 }
             };
 
-        if !rule.username.contains(&username) {
+        // Same single source of truth as proxy_with_proxy above — see
+        // `AppConfig::route_access_decision`.
+        if !data.config.route_access_decision(rule, &username).is_allowed() {
             info!(
                 "[{}] {} {} 401 Unauthorized token attempt {}",
                 ip, path, method_str, user_agent
@@ -1059,6 +1075,7 @@ pub async fn proxy_without_proxy(
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
+            && key_str != "x-groups"
         {
             if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
                 request_builder = request_builder.header(key_str, hv);

@@ -179,6 +179,8 @@ mod tests {
             prefix: prefix.to_string(),
             target: target.to_string(),
             username: vec![],
+            groups: vec![],
+            roles: vec![],
             required_login: false,
             proxy: false,
             proxy_config: String::new(),
@@ -304,6 +306,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            groups: None,
             email: None,
             must_change_password: false,
         };
@@ -424,6 +427,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: Some(vec!["user".into()]),
+            groups: None,
             email: None,
             must_change_password: false,
         };
@@ -486,6 +490,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            groups: None,
             email: None,
             must_change_password: false,
         }];
@@ -544,6 +549,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            groups: None,
             email: None,
             must_change_password: false,
         };
@@ -597,6 +603,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            groups: None,
             email: None,
             must_change_password: false,
         };
@@ -653,6 +660,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            groups: None,
             email: None,
             must_change_password: false,
         };
@@ -694,6 +702,7 @@ mod tests {
             otpkey: Some(b32.clone()),
             allow: None,
             roles: None,
+            groups: None,
             email: None,
             must_change_password: false,
         };
@@ -752,6 +761,7 @@ mod tests {
             otpkey: None,
             allow: None,
             roles: None,
+            groups: None,
             email: None,
             must_change_password: false,
         };
@@ -921,6 +931,8 @@ mod render_error_page_tests {
             prefix: prefix.to_string(),
             target: target.to_string(),
             username: vec![],
+            groups: vec![],
+            roles: vec![],
             required_login: false,
             proxy: false,
             proxy_config: String::new(),
