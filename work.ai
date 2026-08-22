@@ -1,0 +1,144 @@
+Revue à prévoir — Cache, Logging et Compression HTTP
+
+1. Cache navigateur
+
+Faire en sorte que `cache: true/false` contrôle réellement le comportement du cache côté client.
+
+`cache: true` → headers `Cache-Control` adaptés aux ressources statiques.
+`cache: false` → `no-store / no-cache`.
+
+Éviter les headers inutiles.
+
+À terme, envisager `ETag / Last-Modified` et la gestion des requêtes conditionnelles `304 Not Modified`.
+
+2. Logging ultra-performant
+
+Revoir le système de logging pour qu'un champ désactivé ait le moins de coût possible.
+
+Si le logging ne nécessite pas :
+
+IP
+User-Agent
+vhost
+path
+method
+duration
+token ID
+
+peu importe la ressource de logs utilisée, alors ProxyAuth ne devrait idéalement pas calculer, formater ou allouer ces données.
+
+Objectif :
+
+logging OFF
+    ↓
+quasi zéro overhead
+
+et :
+
+logging ON
+    ↓
+uniquement les données demandées sont calculées
+
+Il faudra notamment limiter :
+
+allocations String
+clone()
+conversions inutiles
+formatage
+calcul des timestamps/durations
+constructions de chaînes
+contention entre workers
+
+Séparation des logs par vhost :
+
+Permettre de configurer un fichier de log spécifique directement au niveau d'un vhost.
+
+Exemple :
+
+- vhost: ["git.proxyauth.app"]
+  log_file: git.proxyauth.app.log
+  routes:
+    - prefix: "/"
+      target: "http://192.168.1.148:3000"
+
+Le fichier doit automatiquement être écrit dans :
+
+`/var/log/proxyauth/`
+
+Dans cet exemple :
+
+`/var/log/proxyauth/git.proxyauth.app.log`
+
+Le système doit initialiser les writers/loggers au démarrage ou lors d'un reload de configuration afin de ne pas effectuer de recherche ou de construction de chemin à chaque requête.
+
+Les logs d'un vhost ne doivent pas ralentir inutilement les autres vhosts.
+
+Prévoir également une validation stricte de `log_file` afin d'empêcher toute traversée de répertoire (`../`) ou utilisation d'un chemin absolu arbitraire.
+
+Si aucun `log_file` n'est défini pour un vhost, utiliser le système de logging global existant.
+
+3. Compression HTTP optimisée
+
+Revoir également la compression des réponses afin d'obtenir un meilleur compromis CPU / latence / réduction de taille.
+
+Le système actuel doit éviter de compresser systématiquement toutes les réponses.
+
+Prévoir notamment :
+
+compression uniquement si le client annonce `Accept-Encoding` ;
+exclusion des formats déjà compressés (`jpg`, `png`, `webp`, `zip`, `gz`, etc.) ;
+seuil `min_size` ;
+ne pas compresser `HEAD` ;
+ne pas recompresser une réponse déjà encodée ;
+ajout correct de `Vary: Accept-Encoding` ;
+utilisation d'un algorithme rapide lorsque le gain est suffisant.
+
+Pour Brotli, le niveau 5 peut être intéressant pour du contenu statique, mais pour du trafic dynamique à fort débit il peut être pertinent de proposer un niveau beaucoup plus rapide, voire un choix automatique selon le type de contenu.
+
+L'objectif est également de rechercher un mécanisme de compression plus performant que l'implémentation actuelle afin de réduire le coût CPU et la latence sur le hot path.
+
+À terme, le système pourrait avoir quelque chose comme :
+
+compression:
+  enabled: true
+  algorithm: br
+  level: 3
+  max_size: 1024
+  file_static: .js, .css, .svg, .png, .html
+
+Avec éventuellement :
+
+contenu dynamique → compression rapide
+contenu statique → compression plus poussée
+petite réponse → aucune compression
+déjà compressé → aucune compression
+
+4. Objectif global
+
+L'objectif de cette revue serait donc de réduire au maximum le coût du request hot path :
+
+Request
+  │
+  ├── routing
+  ├── auth
+  ├── proxy
+  │
+  ├── cache       → uniquement si nécessaire
+  ├── compression → uniquement si rentable
+  └── logging     → uniquement si activé
+
+L'idée importante est que chaque fonctionnalité optionnelle doit réellement être optionnelle en termes de coût CPU/mémoire, pas uniquement en termes de comportement fonctionnel.
+
+Si une fonctionnalité est désactivée, ProxyAuth ne doit pas continuer à effectuer les calculs nécessaires à cette fonctionnalité.
+
+L'objectif est donc de tendre vers un modèle où :
+
+fonctionnalité désactivée
+    ↓
+coût minimal / quasi nul
+
+fonctionnalité activée
+    ↓
+coût uniquement proportionnel au travail réellement demandé
+
+C'est particulièrement important pour ProxyAuth avec les débits élevés obtenus lors des benchmarks : le logging, la compression et les mécanismes de cache ne doivent pas devenir le nouveau goulot d'étranglement du reverse proxy.

@@ -3024,6 +3024,7 @@ pub async fn proxy_without_proxy(
                 .route_access_decision(rule, &username)
                 .is_allowed()
         {
+
             let mut resp = HttpResponse::Unauthorized();
 
             resp.append_header(("server", "ProxyAuth"));

@@ -1942,6 +1942,7 @@ pub struct AppConfig {
     /// `should_use_database_as_fallback`.
     #[serde(skip)]
     pub blakegate_connected: std::sync::atomic::AtomicUsize,
+
 }
 
 impl Serialize for AppConfig {
