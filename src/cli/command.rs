@@ -141,4 +141,34 @@ pub enum Commands {
     /// `routes-audit` alone can't surface since it only describes the
     /// rule, not who it currently resolves to.
     CheckRoutes,
+    /// Lists every known account (file-based and database), each in
+    /// its own small box: groups, roles, and every route it can
+    /// currently reach (and via which mechanism). Uses the same
+    /// `route_access_decision` logic as the other audit commands.
+    Users {
+        /// Just print each username, one per line — no per-account
+        /// detail box. Script-friendly (pipe into `grep`, `xargs`,
+        /// etc.), never colored regardless of `NO_COLOR`/TTY.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Lists every group currently referenced by an account or a
+    /// route, each in its own small box: current members, and which
+    /// routes list it directly.
+    Groups {
+        /// Just print each group name, one per line — see `users
+        /// --list`.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Same as `groups`, for roles: current holders, and which routes
+    /// list it directly. Roles are also still forwarded to the
+    /// backend as `X-User-Roles` regardless of whether any route
+    /// lists them.
+    Roles {
+        /// Just print each role name, one per line — see `users
+        /// --list`.
+        #[arg(long)]
+        list: bool,
+    },
 }

@@ -495,5 +495,59 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             crate::cli::audit::print_check_routes(&config, &routes);
             std::process::exit(0);
         }
+
+        Some(Commands::Users { list }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            crate::cli::audit::print_users(&config, &routes, *list);
+            std::process::exit(0);
+        }
+
+        Some(Commands::Groups { list }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            crate::cli::audit::print_groups(&config, &routes, *list);
+            std::process::exit(0);
+        }
+
+        Some(Commands::Roles { list }) => {
+            switch_to_user("proxyauth")?;
+            ensure_running_as_proxyauth();
+
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            crate::cli::audit::print_roles(&config, &routes, *list);
+            std::process::exit(0);
+        }
     }
 }

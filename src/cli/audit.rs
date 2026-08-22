@@ -352,3 +352,290 @@ pub fn print_check_routes(config: &AppConfig, routes: &RouteConfig) {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// `proxyauth users` / `proxyauth groups` / `proxyauth roles` — one small
+// box-drawing "diagram" per account/group/role, not a generated image
+// file: this is a terminal tool, so the diagram is Unicode box-drawing
+// characters, colored the same way as everything else in this module.
+// ─────────────────────────────────────────────────────────────────────────
+
+const BOX_WIDTH: usize = 50;
+
+fn print_box_header(name: &str, p: &Palette) {
+    let title = format!("─ {name} ");
+    let title_len = title.chars().count();
+    let dashes = if title_len < BOX_WIDTH {
+        BOX_WIDTH - title_len
+    } else {
+        1
+    };
+    println!("{}{}┌{}{}{}", p.bold, p.cyan, title, "─".repeat(dashes), p.reset);
+}
+
+fn print_box_field(label: &str, value: &str, p: &Palette) {
+    println!("{}{}│{}  {:<8}: {}", p.dim, p.cyan, p.reset, label, value);
+}
+
+fn print_box_field_warn(label: &str, value: &str, p: &Palette) {
+    println!(
+        "{}{}│{}  {:<8}: {}{}{}",
+        p.dim, p.cyan, p.reset, label, p.yellow, value, p.reset
+    );
+}
+
+fn print_box_footer(p: &Palette) {
+    println!("{}{}└{}{}", p.bold, p.cyan, "─".repeat(BOX_WIDTH + 1), p.reset);
+    println!();
+}
+
+/// `proxyauth users` — every known account (file-based and database,
+/// via `AppConfig::combined_users`), each in its own small box: its
+/// groups, its roles, and every route it can *currently* reach — via
+/// which of the three mechanisms — computed with the same
+/// `route_access_decision` the live proxy check and the other audit
+/// commands use.
+///
+/// `list_only` (`--list`): skip all of that and just print each
+/// username, one per line, uncolored regardless of terminal/`NO_COLOR`
+/// — meant for scripting (`| xargs`, `| grep`, ...), not for reading.
+pub fn print_users(config: &AppConfig, routes: &RouteConfig, list_only: bool) {
+    let users = config.combined_users();
+    let mut sorted_users = users.clone();
+    sorted_users.sort_by(|a, b| a.username.cmp(&b.username));
+
+    if list_only {
+        for user in &sorted_users {
+            println!("{}", user.username);
+        }
+        return;
+    }
+
+    let p = palette();
+
+    println!(
+        "{}{}Users{} ({} known account(s))",
+        p.bold, p.cyan, p.reset, users.len()
+    );
+    println!();
+
+    if users.is_empty() {
+        println!("{}No accounts configured.{}", p.dim, p.reset);
+        return;
+    }
+
+    for user in &sorted_users {
+        print_box_header(&user.username, p);
+
+        let groups = user.groups.clone().unwrap_or_default();
+        let roles = user.roles.clone().unwrap_or_default();
+
+        if groups.is_empty() {
+            print_box_field_warn("groups", "(none)", p);
+        } else {
+            print_box_field("groups", &groups.join(", "), p);
+        }
+
+        if roles.is_empty() {
+            print_box_field_warn("roles", "(none)", p);
+        } else {
+            print_box_field("roles", &roles.join(", "), p);
+        }
+
+        let mut reachable: Vec<String> = Vec::new();
+        for rule in &routes.routes {
+            if !rule.required_login {
+                reachable.push(format!("{} (public)", rule.prefix));
+                continue;
+            }
+            let reason = match config.route_access_decision(rule, &user.username) {
+                RouteAccessDecision::AllowedByUsername => Some("listed".to_string()),
+                RouteAccessDecision::AllowedByGroup(g) => Some(format!("group '{g}'")),
+                RouteAccessDecision::AllowedByRole(r) => Some(format!("role '{r}'")),
+                RouteAccessDecision::AllowedNoRestrictionConfigured => Some("open".to_string()),
+                RouteAccessDecision::Denied => None,
+            };
+            if let Some(reason) = reason {
+                reachable.push(format!("{} ({reason})", rule.prefix));
+            }
+        }
+
+        if reachable.is_empty() {
+            print_box_field_warn("routes", "(none reachable)", p);
+        } else {
+            print_box_field(
+                "routes",
+                &format!("{}  [{}]", reachable.join(", "), reachable.len()),
+                p,
+            );
+        }
+
+        print_box_footer(p);
+    }
+}
+
+/// `proxyauth groups` — every group name currently referenced *either*
+/// by an account (`User.groups`) *or* by a route (`RouteRule.groups`)
+/// — the union of both, since a group referenced only by a route with
+/// no current member is exactly the kind of thing worth surfacing
+/// (see `check-routes`' "unreachable route" flag for the same idea
+/// from the route's side). Each box: who's currently a member, and
+/// which routes list this group directly.
+///
+/// `list_only` (`--list`): just print each group name, one per line —
+/// see `print_users`'s doc comment for the same flag.
+pub fn print_groups(config: &AppConfig, routes: &RouteConfig, list_only: bool) {
+    let users = config.combined_users();
+
+    let mut all_groups: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for user in &users {
+        if let Some(groups) = &user.groups {
+            all_groups.extend(groups.iter().cloned());
+        }
+    }
+    for rule in &routes.routes {
+        all_groups.extend(rule.groups.iter().cloned());
+    }
+
+    if list_only {
+        for group in &all_groups {
+            println!("{group}");
+        }
+        return;
+    }
+
+    let p = palette();
+
+    println!("{}{}Groups{} ({} known)", p.bold, p.cyan, p.reset, all_groups.len());
+    println!();
+
+    if all_groups.is_empty() {
+        println!(
+            "{}No groups configured on any account or route.{}",
+            p.dim, p.reset
+        );
+        return;
+    }
+
+    for group in &all_groups {
+        print_box_header(group, p);
+
+        let mut members: Vec<&str> = users
+            .iter()
+            .filter(|u| u.groups.as_ref().is_some_and(|g| g.contains(group)))
+            .map(|u| u.username.as_str())
+            .collect();
+        members.sort_unstable();
+
+        let member_routes: Vec<&str> = routes
+            .routes
+            .iter()
+            .filter(|r| r.groups.contains(group))
+            .map(|r| r.prefix.as_str())
+            .collect();
+
+        if members.is_empty() {
+            print_box_field_warn("members", "(none — nobody currently belongs to this group)", p);
+        } else {
+            print_box_field(
+                "members",
+                &format!("{}  [{}]", members.join(", "), members.len()),
+                p,
+            );
+        }
+
+        if member_routes.is_empty() {
+            print_box_field_warn("routes", "(none — no route currently lists this group)", p);
+        } else {
+            print_box_field(
+                "routes",
+                &format!("{}  [{}]", member_routes.join(", "), member_routes.len()),
+                p,
+            );
+        }
+
+        print_box_footer(p);
+    }
+}
+
+/// Same as `print_groups`, for roles. Note `roles` is also forwarded
+/// to the backend as `X-User-Roles` regardless of whether a route
+/// actually lists it — a role showing "(none — no route currently
+/// lists this role)" here can still be meaningful to a holder's
+/// backend, it just isn't gating any route's access on its own.
+///
+/// `list_only` (`--list`): just print each role name, one per line —
+/// see `print_users`'s doc comment for the same flag.
+pub fn print_roles(config: &AppConfig, routes: &RouteConfig, list_only: bool) {
+    let users = config.combined_users();
+
+    let mut all_roles: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for user in &users {
+        if let Some(roles) = &user.roles {
+            all_roles.extend(roles.iter().cloned());
+        }
+    }
+    for rule in &routes.routes {
+        all_roles.extend(rule.roles.iter().cloned());
+    }
+
+    if list_only {
+        for role in &all_roles {
+            println!("{role}");
+        }
+        return;
+    }
+
+    let p = palette();
+
+    println!("{}{}Roles{} ({} known)", p.bold, p.cyan, p.reset, all_roles.len());
+    println!();
+
+    if all_roles.is_empty() {
+        println!(
+            "{}No roles configured on any account or route.{}",
+            p.dim, p.reset
+        );
+        return;
+    }
+
+    for role in &all_roles {
+        print_box_header(role, p);
+
+        let mut holders: Vec<&str> = users
+            .iter()
+            .filter(|u| u.roles.as_ref().is_some_and(|r| r.contains(role)))
+            .map(|u| u.username.as_str())
+            .collect();
+        holders.sort_unstable();
+
+        let granting_routes: Vec<&str> = routes
+            .routes
+            .iter()
+            .filter(|r| r.roles.contains(role))
+            .map(|r| r.prefix.as_str())
+            .collect();
+
+        if holders.is_empty() {
+            print_box_field_warn("holders", "(none — nobody currently holds this role)", p);
+        } else {
+            print_box_field(
+                "holders",
+                &format!("{}  [{}]", holders.join(", "), holders.len()),
+                p,
+            );
+        }
+
+        if granting_routes.is_empty() {
+            print_box_field_warn("routes", "(none — no route currently lists this role)", p);
+        } else {
+            print_box_field(
+                "routes",
+                &format!("{}  [{}]", granting_routes.join(", "), granting_routes.len()),
+                p,
+            );
+        }
+
+        print_box_footer(p);
+    }
+}
