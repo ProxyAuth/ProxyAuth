@@ -48,6 +48,17 @@ pub struct RouteRule {
     #[serde(default = "default_username")]
     pub username: Vec<String>,
 
+    /// Groups allowed to access this route — checked against each
+    /// user's `User.groups` via `AppConfig::groups_for_username`. A
+    /// request is allowed if the user is in `username` OR belongs to
+    /// at least one listed group; empty (the default) grants nothing
+    /// by itself, same "secure by default" behavior `username` already
+    /// has. Meant to avoid maintaining a per-route username list by
+    /// hand — add/remove a user from a group in one place instead of
+    /// editing every route they should reach.
+    #[serde(default)]
+    pub groups: Vec<String>,
+
     #[serde(default = "default_required_login")]
     pub required_login: bool,
 
@@ -129,6 +140,17 @@ pub struct User {
     pub allow: Option<Vec<String>>,
     pub roles: Option<Vec<String>>,
 
+    /// Group memberships for this account — an alternative to
+    /// `roles` specifically for route access control (`roles` is
+    /// only ever forwarded to the backend as the `X-User-Roles`
+    /// header; it never gates access by itself). A route lists
+    /// allowed groups via `RouteRule.groups` in `routes.yml`; a user
+    /// gets in if they're in at least one of them, without needing
+    /// their username individually added to every such route — see
+    /// `AppConfig::groups_for_username`.
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+
     pub email: Option<Vec<EmailEntry>>,
 
     /// If true, the next successful login redirects to
@@ -164,12 +186,13 @@ impl Serialize for User {
         // first-run password hashing) silently duplicated `allow` into
         // `roles` and dropped the real roles. Fixed here; also now
         // includes `email` for completeness.
-        let mut state = serializer.serialize_struct("User", 7)?;
+        let mut state = serializer.serialize_struct("User", 8)?;
         state.serialize_field("username", &self.username)?;
         state.serialize_field("password", &self.password)?;
         state.serialize_field("otpkey", &self.otpkey)?;
         state.serialize_field("allow", &self.allow)?;
         state.serialize_field("roles", &self.roles)?;
+        state.serialize_field("groups", &self.groups)?;
         state.serialize_field("email", &self.email)?;
         state.serialize_field("must_change_password", &self.must_change_password)?;
         state.end()
@@ -428,6 +451,15 @@ pub struct AppConfig {
     /// user.
     #[serde(skip)]
     pub roles_index: std::sync::RwLock<HashMap<String, Vec<String>>>,
+
+    /// username -> groups fast index — same purpose and lifecycle as
+    /// `roles_index`, kept separate rather than reusing it because
+    /// `groups` and `roles` mean different things: `roles` is purely
+    /// informational (forwarded to the backend as `X-User-Roles`,
+    /// never checked by ProxyAuth itself), while `groups` is what
+    /// `RouteRule.groups` actually gates access against.
+    #[serde(skip)]
+    pub groups_index: std::sync::RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl Serialize for AppConfig {
@@ -836,6 +868,13 @@ impl AppConfig {
         self.roles_index.read().ok()?.get(username).cloned()
     }
 
+    /// Same as `roles_for_username`, for `groups_index` — the lookup
+    /// `RouteRule.groups` access checks use, on the same proxied-request
+    /// hot path.
+    pub fn groups_for_username(&self, username: &str) -> Option<Vec<String>> {
+        self.groups_index.read().ok()?.get(username).cloned()
+    }
+
     /// Inserts or removes a single entry in `roles_index`, keeping it in
     /// sync with a user's current `roles`. `None`/empty roles removes
     /// the entry entirely (a HashMap miss and "no roles" both correctly
@@ -847,6 +886,21 @@ impl AppConfig {
         match roles {
             Some(r) if !r.is_empty() => {
                 index.insert(username.to_string(), r.clone());
+            }
+            _ => {
+                index.remove(username);
+            }
+        }
+    }
+
+    /// Same as `index_roles`, for `groups_index`/`User.groups`.
+    fn index_groups(&self, username: &str, groups: &Option<Vec<String>>) {
+        let Ok(mut index) = self.groups_index.write() else {
+            return;
+        };
+        match groups {
+            Some(g) if !g.is_empty() => {
+                index.insert(username.to_string(), g.clone());
             }
             _ => {
                 index.remove(username);
@@ -952,6 +1006,7 @@ impl AppConfig {
                 // this account can never authenticate again.
                 user.password = "!revoked!".to_string();
                 self.index_roles(&user.username, &None);
+                self.index_groups(&user.username, &None);
             }
         }
     }
@@ -1029,6 +1084,7 @@ impl AppConfig {
         if revoked.insert(idx) {
             guard[idx].password = "!revoked!".to_string();
             self.index_roles(username, &None);
+            self.index_groups(username, &None);
         }
     }
 
@@ -1074,6 +1130,7 @@ impl AppConfig {
                 touched_indices.push(guard.len() - 1);
             }
             self.index_roles(&new_user.username, &new_user.roles);
+            self.index_groups(&new_user.username, &new_user.groups);
         }
 
         if let Ok(mut revoked) = self.db_revoked.write() {
@@ -1136,6 +1193,7 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
     let app_config = Arc::new(config);
     for user in &app_config.users {
         app_config.index_roles(&user.username, &user.roles);
+        app_config.index_groups(&user.username, &user.groups);
     }
 
     // Load users stored in the database (if `databases` is configured)

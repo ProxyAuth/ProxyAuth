@@ -153,6 +153,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 otpkey: None,
                 allow: None,
                 roles: None,
+                groups: None,
                 email: if email_entries.is_empty() { None } else { Some(email_entries) },
                 must_change_password: *must_change_password,
             };
