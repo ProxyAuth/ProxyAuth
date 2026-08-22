@@ -45,19 +45,41 @@ pub struct RouteRule {
     pub prefix: String,
     pub target: String,
 
+    /// Usernames allowed to access this route (when `required_login`
+    /// is `true`) — one of three ways in, alongside `groups`/`roles`
+    /// below; see the doc comment on `roles` for how the three combine,
+    /// including what an empty list means here.
     #[serde(default = "default_username")]
     pub username: Vec<String>,
 
     /// Groups allowed to access this route — checked against each
-    /// user's `User.groups` via `AppConfig::groups_for_username`. A
-    /// request is allowed if the user is in `username` OR belongs to
-    /// at least one listed group; empty (the default) grants nothing
-    /// by itself, same "secure by default" behavior `username` already
-    /// has. Meant to avoid maintaining a per-route username list by
-    /// hand — add/remove a user from a group in one place instead of
-    /// editing every route they should reach.
+    /// user's `User.groups` via `AppConfig::groups_for_username`; see
+    /// `roles` below for how `username`/`groups`/`roles` combine.
+    /// Meant to avoid maintaining a per-route username list by hand —
+    /// add/remove a user from a group in one place instead of editing
+    /// every route they should reach.
     #[serde(default)]
     pub groups: Vec<String>,
+
+    /// Roles allowed to access this route, checked against `User.roles`
+    /// via `AppConfig::roles_for_username` — the same lookup that
+    /// already feeds the `X-User-Roles` header, now also usable to
+    /// gate access rather than being purely informational.
+    ///
+    /// `username`, `groups`, and `roles` combine as an OR: a request
+    /// gets through if it matches *any* of the three — an explicitly
+    /// listed username, membership in an allowed group, or possession
+    /// of an allowed role.
+    ///
+    /// If all three are left empty, that's read as a deliberate
+    /// choice — "any authenticated account may use this route" — not
+    /// a misconfiguration to fail closed on; `required_login` (a
+    /// valid session in the first place) still applies regardless.
+    /// The moment even one of the three is non-empty, this route goes
+    /// back to being allow-listed: only requests matching
+    /// username/groups/roles get through.
+    #[serde(default)]
+    pub roles: Vec<String>,
 
     #[serde(default = "default_required_login")]
     pub required_login: bool,
@@ -839,6 +861,72 @@ pub fn check_deprecated_secure_key(routes_str: &str) -> Result<(), String> {
             "routes.yml: 'secure' key is deprecated, rename it to 'required_login' (route(s): {}).",
                     offenders.join(", ")
         ))
+    }
+}
+
+/// What let (or would let) a given username through a route, given its
+/// `username`/`groups`/`roles` configuration — see
+/// `AppConfig::route_access_decision`. Kept as a real enum rather than
+/// a bare `bool` specifically so `proxyauth routes-audit`/`check-access`
+/// (see `cli::audit`) can report *why*, not just whether — and so that
+/// tool is guaranteed to reflect the exact same logic
+/// `network::proxy`'s access check enforces, both calling this one
+/// function, rather than two implementations that could quietly drift
+/// apart over time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteAccessDecision {
+    /// The username is explicitly listed in `RouteRule.username`.
+    AllowedByUsername,
+    /// Not listed by username, but a member of this allowed group.
+    AllowedByGroup(String),
+    /// Not listed by username or group, but holds this allowed role.
+    AllowedByRole(String),
+    /// `username`, `groups`, and `roles` were all left empty on this
+    /// route — read as "any authenticated account may use this
+    /// route", not a misconfiguration (see the doc comment on
+    /// `RouteRule.roles`).
+    AllowedNoRestrictionConfigured,
+    /// None of the above — the request would be rejected.
+    Denied,
+}
+
+impl RouteAccessDecision {
+    pub fn is_allowed(&self) -> bool {
+        !matches!(self, RouteAccessDecision::Denied)
+    }
+}
+
+impl AppConfig {
+    /// Decides whether `username` may access a route with these
+    /// `username`/`groups`/`roles` settings — the single source of
+    /// truth both `network::proxy`'s live access check and
+    /// `proxyauth routes-audit`/`check-access` call, so the CLI audit
+    /// tool can never silently disagree with what the running proxy
+    /// actually enforces.
+    pub fn route_access_decision(&self, rule: &RouteRule, username: &str) -> RouteAccessDecision {
+        if rule.username.iter().any(|u| u == username) {
+            return RouteAccessDecision::AllowedByUsername;
+        }
+
+        if !rule.groups.is_empty() {
+            let user_groups = self.groups_for_username(username).unwrap_or_default();
+            if let Some(g) = rule.groups.iter().find(|g| user_groups.contains(g)) {
+                return RouteAccessDecision::AllowedByGroup(g.clone());
+            }
+        }
+
+        if !rule.roles.is_empty() {
+            let user_roles = self.roles_for_username(username).unwrap_or_default();
+            if let Some(r) = rule.roles.iter().find(|r| user_roles.contains(r)) {
+                return RouteAccessDecision::AllowedByRole(r.clone());
+            }
+        }
+
+        if rule.username.is_empty() && rule.groups.is_empty() && rule.roles.is_empty() {
+            return RouteAccessDecision::AllowedNoRestrictionConfigured;
+        }
+
+        RouteAccessDecision::Denied
     }
 }
 

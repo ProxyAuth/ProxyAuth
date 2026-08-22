@@ -603,17 +603,11 @@ pub async fn proxy_with_proxy(
                 }
             };
 
-        // A request is allowed if the username is explicitly listed
-        // OR the user belongs to at least one group `rule.groups`
-        // allows — either is sufficient, checked once per request via
-        // the same O(1) `groups_index` lookup `roles_for_username`
-        // already uses for the (unrelated, informational-only)
-        // X-User-Roles header.
-        let user_groups = data.config.groups_for_username(&username).unwrap_or_default();
-        let allowed_by_username = rule.username.contains(&username);
-        let allowed_by_group = rule.groups.iter().any(|g| user_groups.contains(g));
-
-        if !allowed_by_username && !allowed_by_group {
+        // Single source of truth for "does this username get through
+        // this route" — see `AppConfig::route_access_decision`. Also
+        // what `proxyauth routes-audit`/`check-access` call, so that
+        // tool can never silently disagree with what's enforced here.
+        if !data.config.route_access_decision(rule, &username).is_allowed() {
             warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
             let mut resp = HttpResponse::Unauthorized();
             resp.append_header(("server", "ProxyAuth"));
@@ -1038,13 +1032,9 @@ pub async fn proxy_without_proxy(
                 }
             };
 
-        // Same "allowed by username OR by group" check as
-        // proxy_with_proxy above — see the comment there.
-        let user_groups = data.config.groups_for_username(&username).unwrap_or_default();
-        let allowed_by_username = rule.username.contains(&username);
-        let allowed_by_group = rule.groups.iter().any(|g| user_groups.contains(g));
-
-        if !allowed_by_username && !allowed_by_group {
+        // Same single source of truth as proxy_with_proxy above — see
+        // `AppConfig::route_access_decision`.
+        if !data.config.route_access_decision(rule, &username).is_allowed() {
             info!(
                 "[{}] {} {} 401 Unauthorized token attempt {}",
                 ip, path, method_str, user_agent

@@ -109,4 +109,36 @@ pub enum Commands {
         #[arg(long)]
         username: String,
     },
+    /// Audits every route in routes.yml, showing exactly what secures
+    /// it — an allow-listed username, groups, roles, "PUBLIC" (no
+    /// login required at all), or "OPEN" (login required, but no
+    /// username/groups/roles configured, so any authenticated account
+    /// gets through). Meant to answer "where are we wide open?" at a
+    /// glance across the whole route table. Reads routes.yml and
+    /// config.json directly and uses the exact same access-decision
+    /// logic the running proxy enforces
+    /// (`AppConfig::route_access_decision`) — the running server
+    /// doesn't need to be involved, and this can never silently
+    /// disagree with what it actually does.
+    RoutesAudit,
+    /// Checks one account's access across every route in routes.yml —
+    /// ✓/✗ per route and exactly why (matched username, a specific
+    /// group, a specific role, an open/public route, or "denied" with
+    /// what would need to change). Same underlying decision logic and
+    /// same caveat as `routes-audit` above: this reflects real
+    /// enforcement, not a re-implementation of it.
+    CheckAccess {
+        #[arg(long)]
+        username: String,
+    },
+    /// The combined "everything at once" view: for every route,
+    /// resolves the abstract username/groups/roles rule down to the
+    /// concrete list of accounts that currently satisfy it — each
+    /// tagged with why (listed by name, via a group, via a role) —
+    /// by checking every known account against it. Also flags any
+    /// route secured by something no current account actually
+    /// matches (almost always a typo in a group/role name), which
+    /// `routes-audit` alone can't surface since it only describes the
+    /// rule, not who it currently resolves to.
+    CheckRoutes,
 }
