@@ -73,7 +73,7 @@ memchr = "2"
 futures-util = "0.3"
 bytes = "1.11.1"
 socket2 = "0.5"
-blake3 = "1"
+blake3 = ">=1.8.7"
 anyhow = "1.0"
 base32 = "0.5.1"
 sequoia-openpgp = { version = "2.1", default-features = false, features = ["crypto-openssl"] }
