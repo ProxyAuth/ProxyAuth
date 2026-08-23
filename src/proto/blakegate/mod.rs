@@ -48,13 +48,20 @@
 //!    in-memory state, at the cost of that small fixed delay and, at
 //!    most, one wasted "nothing changed" check per interval per
 //!    connection.
-//! 4. Reads (and, for now, just logs) any message the endpoint sends
-//!    back — a deliberate hook for a future write-back capability
-//!    (Blakegate pushing configuration overrides into ProxyAuth's
-//!    memory at startup), not implemented yet. Treat incoming
-//!    messages as untrusted input if/when that lands: this is a
-//!    natural place to add it, not a promise it's safe to wire up
-//!    without its own authentication/validation story first.
+//! 4. Reads every message the endpoint sends back and dispatches on
+//!    it — currently one recognized request, `{"kind": "backup_users"}`
+//!    (see [`handle_incoming_message`]/[`backup_users_to_database`]):
+//!    writes every currently known account into the configured
+//!    `databases` backend, on demand, only when Blakegate explicitly
+//!    asks for it — never on a timer, never just because this
+//!    instance happens to have accounts in memory. Anything else
+//!    received is logged and otherwise ignored, so an unrecognized or
+//!    future message kind never breaks the connection. Treat incoming
+//!    messages as untrusted input: `backup_users` only ever writes
+//!    ProxyAuth's *own already-known* accounts into a database it's
+//!    already configured to use — it can't be used to inject
+//!    arbitrary data, but a compromised or misbehaving endpoint could
+//!    still trigger backups more often than intended.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,7 +69,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::config::config::{AppConfig, RouteConfig};
 
@@ -88,6 +95,83 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// startup banner. Every instance running this exact build reports
 /// the same value.
 const ID: &str = env!("id");
+
+/// A TLS certificate verifier that accepts anything — used only for
+/// `blakegate` entries with `selfcert: true`. See `BlakegateEndpoint`'s
+/// doc comment on `selfcert` for what this actually gives up: this
+/// makes the connection's TLS handshake trust *any* certificate the
+/// endpoint presents, self-signed or not, matching hostname or not.
+/// Never used unless an operator explicitly opts a specific endpoint
+/// into it.
+#[derive(Debug)]
+struct AcceptAnyCertificate;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        // A broad, standard set — this verifier never actually checks
+        // the signature (both verify_tls1*_signature methods above
+        // always succeed), so this just needs to list schemes rustls
+        // will consider negotiable at all.
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA1,
+            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// Builds the `tokio_tungstenite` connector for one endpoint:
+/// `None` (the crate's normal, trusted-CA verification) unless
+/// `accept_self_signed` is set, in which case a rustls config using
+/// [`AcceptAnyCertificate`] instead — see `BlakegateEndpoint::selfcert`.
+fn build_connector(accept_self_signed: bool) -> Option<Connector> {
+    if !accept_self_signed {
+        return None;
+    }
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+        .with_no_client_auth();
+    Some(Connector::Rustls(Arc::new(tls_config)))
+}
 
 /// Rewrites an operator-supplied URL's scheme to a WebSocket one.
 /// `https://`/`http://` are accepted for convenience (easier to
@@ -145,12 +229,18 @@ fn build_snapshot(config: &AppConfig, routes: &RouteConfig) -> Value {
 /// or unreachable endpoint never affects ProxyAuth's own request
 /// handling.
 pub fn spawn_clients(config: Arc<AppConfig>, routes: Arc<RouteConfig>) {
-    for raw_url in &config.blakegate {
-        let url = to_websocket_url(raw_url);
+    for endpoint in &config.blakegate {
+        let url = to_websocket_url(endpoint.url());
+        let accept_self_signed = endpoint.accept_self_signed();
+        if accept_self_signed {
+            eprintln!(
+                "[blakegate] \x1b[1;33m⚠ TLS certificate verification is DISABLED for {url} (selfcert: true)\x1b[0m — never use this against a real production endpoint, only local/internal testing."
+            );
+        }
         let config = Arc::clone(&config);
         let routes = Arc::clone(&routes);
         tokio::spawn(async move {
-            run_client(url, config, routes).await;
+            run_client(url, accept_self_signed, config, routes).await;
         });
     }
 }
@@ -159,11 +249,46 @@ pub fn spawn_clients(config: Arc<AppConfig>, routes: Arc<RouteConfig>) {
 /// on every generation change, reconnect after `RECONNECT_DELAY` on
 /// any error or disconnect. Runs forever — the task this is spawned
 /// into only ever ends if the process itself exits.
-async fn run_client(url: String, config: Arc<AppConfig>, routes: Arc<RouteConfig>) {
+/// RAII guard bracketing `AppConfig.blakegate_connected` around one
+/// live connection's lifetime — incremented on construction,
+/// decremented on drop, so it stays accurate even if `drive_connection`
+/// returns via an early `?` rather than falling through normally.
+struct ConnectedGuard<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> ConnectedGuard<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for ConnectedGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn run_client(url: String, accept_self_signed: bool, config: Arc<AppConfig>, routes: Arc<RouteConfig>) {
+    let connector = build_connector(accept_self_signed);
     loop {
-        match tokio_tungstenite::connect_async(&url).await {
+        let connect_result = tokio_tungstenite::connect_async_tls_with_config(
+            &url,
+            None,
+            false,
+            connector.clone(),
+        )
+        .await;
+        match connect_result {
             Ok((stream, _response)) => {
                 println!("[blakegate] connected to {url}");
+                // Marks this endpoint "up" for as long as the connection
+                // holds — see `AppConfig::should_use_database_as_fallback`,
+                // which is what actually reacts to this count. Dropped
+                // (decrementing) the moment this scope ends, regardless
+                // of how `drive_connection` returned.
+                let _connected = ConnectedGuard::new(&config.blakegate_connected);
                 if let Err(e) = drive_connection(stream, &config, &routes).await {
                     eprintln!("[blakegate] connection to {url} ended: {e}");
                 } else {
@@ -215,15 +340,216 @@ async fn drive_connection(
                         stream.send(Message::Pong(payload)).await?;
                     }
                     Some(Ok(Message::Text(text))) => {
-                        // Scaffold for a future write-back capability —
-                        // see the module doc comment. Not applied to
-                        // any in-memory state yet, just observed.
-                        println!("[blakegate] received (not yet applied): {text}");
+                        handle_incoming_message(&text, config).await;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e),
                 }
             }
+        }
+    }
+}
+
+/// Dispatches one incoming text message from a Blakegate endpoint.
+/// Currently recognizes exactly one request: `{"kind": "backup_users"}`
+/// — everything else is logged and otherwise ignored, so an
+/// unrecognized/future message kind never crashes or blocks the
+/// connection. This is the write-back path the module doc comment's
+/// connection-model section flagged as a scaffold; `backup_users` is
+/// its first real use.
+async fn handle_incoming_message(text: &str, config: &Arc<AppConfig>) {
+    let parsed: Option<Value> = serde_json::from_str(text).ok();
+    let kind = parsed.as_ref().and_then(|v| v.get("kind")).and_then(|v| v.as_str());
+
+    match kind {
+        Some("backup_users") => backup_users_to_database(config).await,
+        Some("users_sync") => apply_users_sync(parsed.as_ref(), config).await,
+        Some("routes_sync") => acknowledge_routes_sync(parsed.as_ref()),
+        Some("config_sync") => acknowledge_config_sync(parsed.as_ref()),
+        _ => {
+            println!("[blakegate] received (not acted on): {text}");
+        }
+    }
+}
+
+/// Acknowledges a `{"kind": "routes_sync", "routes": [...]}` push —
+/// **recognized, but not yet applied to the live routing table.**
+/// Unlike `users_sync`, `AppState.routes` isn't internally mutable
+/// today (`Arc<RouteConfig>`, loaded once at startup, read directly by
+/// every proxied request in `network::proxy` with no lock in between)
+/// — making this genuinely live would mean giving `RouteConfig` the
+/// same kind of interior-mutability `AppConfig` already has for
+/// users/roles/groups, and updating every one of its read sites
+/// accordingly. That's a real, separate piece of work, not something
+/// to bolt on silently here. For now this just confirms the message
+/// arrived and was well-formed, so the sending side (and whoever's
+/// reading these logs) isn't left guessing whether it was silently
+/// dropped as unrecognized.
+fn acknowledge_routes_sync(parsed: Option<&Value>) {
+    let Some(parsed) = parsed else {
+        eprintln!("[blakegate] routes_sync: message wasn't valid JSON, ignoring.");
+        return;
+    };
+    let route_count = parsed
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len());
+    match route_count {
+        Some(n) => println!(
+            "[blakegate] routes_sync: received {n} route(s) — acknowledged, but NOT applied to the live routing table yet (route hot-reload isn't implemented)."
+        ),
+        None => eprintln!("[blakegate] routes_sync: message is missing a \"routes\" array, ignoring."),
+    }
+}
+
+/// Acknowledges a `{"kind": "config_sync", "config": {...}}` push —
+/// same status as `acknowledge_routes_sync`: **recognized, logged, not
+/// applied.** Most of `AppConfig` (host, port, session/CSRF settings,
+/// rate limits, TLS, `secret`, ...) is set once at startup from
+/// `config.json` and read directly from then on — no `RwLock`, no
+/// reload path, unlike the specific fields (`db_users`, `roles_index`,
+/// `groups_index`, ...) that already support being updated live. A
+/// handful of these settings (e.g. `port`, `tls`) couldn't safely take
+/// effect without rebinding the listener anyway, so "apply this at
+/// runtime" isn't a uniform operation even in principle — some fields
+/// would need their own individual handling, not a single generic
+/// mechanism. That design work hasn't happened yet; this function
+/// exists so a `config_sync` push is at least visible and confirmed
+/// well-formed in the meantime, rather than silently falling into the
+/// generic "not acted on" case.
+fn acknowledge_config_sync(parsed: Option<&Value>) {
+    let Some(parsed) = parsed else {
+        eprintln!("[blakegate] config_sync: message wasn't valid JSON, ignoring.");
+        return;
+    };
+    match parsed.get("config") {
+        Some(cfg) => {
+            let field_count = cfg.as_object().map(|o| o.len());
+            println!(
+                "[blakegate] config_sync: received a config object ({} field(s)) — acknowledged, but NOT applied to this instance's live settings yet (config hot-reload isn't implemented).",
+                field_count.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string())
+            );
+        }
+        None => eprintln!("[blakegate] config_sync: message is missing a \"config\" object, ignoring."),
+    }
+}
+
+/// Backup mode: writes every currently known account
+/// (`AppConfig::combined_users` — file-based `users` and any
+/// database-sourced accounts alike) into the configured `databases`
+/// backend, via the exact same `upsert_user` the `db-add-user` CLI
+/// command uses.
+///
+/// Deliberately **only** runs in response to this explicit request —
+/// never on a timer, never just because ProxyAuth happens to have
+/// accounts in memory. Blakegate decides when a backup is warranted;
+/// ProxyAuth doesn't second-guess that by also backing up on its own
+/// schedule, which would defeat the point of putting Blakegate in
+/// control of the cadence in the first place.
+///
+/// A no-op (with a log line explaining why) if `databases` isn't
+/// configured — there's nowhere to write a backup to in that case,
+/// and that's not treated as an error on the connection: a request
+/// blakegate sent as a matter of course, before knowing this specific
+/// instance has no database configured, shouldn't tear down the
+/// websocket connection over it.
+async fn backup_users_to_database(config: &Arc<AppConfig>) {
+    write_users_to_database(config, config.combined_users(), "backup_users").await;
+}
+
+/// Applies a Blakegate `users_sync` push — the message that actually
+/// makes "backup mode" real: `{"kind": "users_sync", "users": [...]}`,
+/// where `users` is a full, current, authoritative list in the same
+/// shape as `config.json`'s own `users` array.
+///
+/// Two things happen, in order:
+/// 1. Applied to this instance's in-memory state
+///    (`AppConfig::apply_blakegate_users`) — Blakegate, not the local
+///    database, is what's actually keeping memory up to date while at
+///    least one connection is up (see
+///    `AppConfig::should_use_database_as_fallback`, and the periodic
+///    refresh tasks in `main.rs` that check it).
+/// 2. Written into the configured `databases` backend, as a backup —
+///    so if every Blakegate connection later goes down, this instance
+///    (or any other reading from the same database) still has a
+///    reasonably fresh, durable copy to fall back on rather than
+///    being stuck with nothing.
+async fn apply_users_sync(parsed: Option<&Value>, config: &Arc<AppConfig>) {
+    let Some(parsed) = parsed else {
+        eprintln!("[blakegate] users_sync: message wasn't valid JSON, ignoring.");
+        return;
+    };
+
+    let users: Vec<crate::config::config::User> = match parsed.get("users").cloned() {
+        Some(v) => match serde_json::from_value(v) {
+            Ok(users) => users,
+            Err(e) => {
+                eprintln!("[blakegate] users_sync: couldn't parse the \"users\" field: {e}");
+                return;
+            }
+        },
+        None => {
+            eprintln!("[blakegate] users_sync: message is missing a \"users\" field, ignoring.");
+            return;
+        }
+    };
+
+    let count = users.len();
+    config.apply_blakegate_users(&users);
+    println!(
+        "[blakegate] users_sync: applied {count} account(s) to memory (Blakegate is now the source of truth for users on this instance)."
+    );
+
+    write_users_to_database(config, users, "users_sync backup").await;
+}
+
+/// Writes `users` into the configured `databases` backend, via
+/// `upsert_user` for each — the shared "actually persist these
+/// accounts" step behind both `backup_users_to_database` (backs up
+/// whatever's currently in memory, unchanged) and `apply_users_sync`
+/// (backs up exactly what was just applied to memory from Blakegate's
+/// push). A no-op, logged, if `databases` isn't configured — there's
+/// nowhere to write to, and that's not treated as a connection error:
+/// a request sent as a matter of course, before Blakegate necessarily
+/// knows this instance has no database configured, shouldn't tear
+/// down the websocket connection over it.
+async fn write_users_to_database(
+    config: &Arc<AppConfig>,
+    users: Vec<crate::config::config::User>,
+    context: &str,
+) {
+    let Some(db_cfg) = config.databases.clone() else {
+        eprintln!(
+            "[blakegate] {context}: no `databases` is configured on this instance — nothing to back up to."
+        );
+        return;
+    };
+
+    let count = users.len();
+
+    // Diesel's calls are blocking — spawn_blocking so this doesn't
+    // stall the tokio executor thread this connection's task runs on,
+    // same reasoning as every other database call in this crate (see
+    // e.g. main.rs's periodic refresh/purge tasks).
+    let result = tokio::task::spawn_blocking(move || {
+        crate::databases::db::with_connection(&db_cfg, |conn| {
+            for user in &users {
+                crate::databases::db::upsert_user(conn, user)?;
+            }
+            Ok(())
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            println!("[blakegate] {context}: wrote {count} account(s) to the database.");
+        }
+        Ok(Err(e)) => {
+            eprintln!("[blakegate] {context}: failed to write to the database: {e}");
+        }
+        Err(e) => {
+            eprintln!("[blakegate] {context}: the write task panicked: {e}");
         }
     }
 }

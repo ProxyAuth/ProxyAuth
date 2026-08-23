@@ -136,6 +136,50 @@ pub enum BackendInput {
     Detailed(BackendConfig),
 }
 
+/// One `blakegate` entry — see `AppConfig.blakegate`'s doc comment for
+/// the accepted JSON shapes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum BlakegateEndpoint {
+    Simple(String),
+    Detailed {
+        url: String,
+
+        /// If `true`, this connection accepts **any** TLS
+        /// certificate the endpoint presents — including self-signed
+        /// or otherwise untrusted ones — instead of the normal
+        /// trusted-CA verification every other connection ProxyAuth
+        /// makes uses. Meant for pointing at a local/internal test
+        /// Blakegate endpoint that doesn't have a certificate from a
+        /// trusted CA, not for production use: with this on, a
+        /// network attacker able to intercept the connection can
+        /// present *any* certificate and be accepted, defeating TLS's
+        /// whole purpose for that connection. `false` (verify
+        /// normally) unless explicitly set. A loud warning is logged
+        /// on startup for every endpoint using it, precisely so this
+        /// can't end up silently enabled in a production config
+        /// nobody's looked at closely.
+        #[serde(default)]
+        selfcert: bool,
+    },
+}
+
+impl BlakegateEndpoint {
+    pub fn url(&self) -> &str {
+        match self {
+            BlakegateEndpoint::Simple(url) => url,
+            BlakegateEndpoint::Detailed { url, .. } => url,
+        }
+    }
+
+    pub fn accept_self_signed(&self) -> bool {
+        match self {
+            BlakegateEndpoint::Simple(_) => false,
+            BlakegateEndpoint::Detailed { selfcert, .. } => *selfcert,
+        }
+    }
+}
+
 #[derive(Default, Debug, Deserialize)]
 pub struct RouteConfig {
     pub routes: Vec<RouteRule>,
@@ -432,11 +476,22 @@ pub struct AppConfig {
     /// every time something in this in-memory state actually changes
     /// (a database user/role/group refresh, a revocation, ...), an
     /// updated snapshot is pushed to every connected endpoint. See
-    /// `blakegate::spawn_clients` for the client itself and exactly
-    /// what gets sent (a *redacted* snapshot — `secret` and every
-    /// user's `password`/`otpkey`/`anti_replay_secret` are stripped
-    /// before anything leaves this process; see that module's doc
-    /// comment for why).
+    /// `proto::blakegate::spawn_clients` for the client itself and
+    /// exactly what gets sent (a *redacted* snapshot — `secret` and
+    /// every user's `password`/`otpkey`/`anti_replay_secret` are
+    /// stripped before anything leaves this process; see that
+    /// module's doc comment for why).
+    ///
+    /// Two accepted shapes, matching `backends`' own `BackendInput`
+    /// convention — a plain URL string, or an object when you need
+    /// `selfcert`:
+    ///
+    /// ```json
+    /// "blakegate": [
+    ///   "https://blakegate-1.example.com",
+    ///   { "url": "https://blakegate-2.internal.test", "selfcert": true }
+    /// ]
+    /// ```
     ///
     /// Entries are accepted as `https://`/`http://` for convenience
     /// (easier to type/paste than a raw `wss://` URL) but are always
@@ -444,7 +499,7 @@ pub struct AppConfig {
     /// read literally. ProxyAuth never speaks plain HTTP to these
     /// endpoints.
     #[serde(default)]
-    pub blakegate: Vec<String>,
+    pub blakegate: Vec<BlakegateEndpoint>,
 
     pub smtp: Option<SmtpConfig>,
 
@@ -512,6 +567,14 @@ pub struct AppConfig {
     /// value anything is read alongside for consistency.
     #[serde(skip)]
     pub generation: std::sync::atomic::AtomicU64,
+
+    /// How many `blakegate` connections are currently established —
+    /// incremented/decremented by `proto::blakegate::run_client` for
+    /// the lifetime of each live connection. Used purely to answer
+    /// "is Blakegate backup mode actually in effect right now" — see
+    /// `should_use_database_as_fallback`.
+    #[serde(skip)]
+    pub blakegate_connected: std::sync::atomic::AtomicUsize,
 }
 
 impl Serialize for AppConfig {
@@ -1009,6 +1072,82 @@ impl AppConfig {
     /// since I last checked".
     pub fn current_generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `true` when `blakegate` has at least one entry configured —
+    /// meaning this instance is meant to be running in Blakegate
+    /// "backup mode": Blakegate is the source of truth for users,
+    /// pushed over the websocket (`proto::blakegate::apply_users_sync`),
+    /// not the local database. Doesn't reflect whether any connection
+    /// is actually *up* right now — see `should_use_database_as_fallback`
+    /// for that.
+    pub fn blakegate_backup_mode_active(&self) -> bool {
+        !self.blakegate.is_empty()
+    }
+
+    /// Whether the periodic database-refresh tasks
+    /// (`refresh_db_users`/`refresh_db_users_incremental`, scheduled in
+    /// `main.rs`) should actually run right now.
+    ///
+    /// `true` in two cases: backup mode isn't active at all (`blakegate`
+    /// is empty — the normal, pre-existing behavior, unaffected by any
+    /// of this), or backup mode *is* active but every configured
+    /// endpoint is currently unreachable. That second case is the
+    /// fallback this whole mode exists to provide: if Blakegate goes
+    /// away, this instance still has a locally-backed-up copy of its
+    /// users (kept up to date by `apply_users_sync`'s own write to the
+    /// database every time Blakegate pushes a fresh list) to fall back
+    /// on, rather than being stuck with whatever was last pushed
+    /// indefinitely or unable to authenticate anyone new.
+    ///
+    /// `false` — meaning the periodic refresh is skipped — only when
+    /// backup mode is active AND at least one Blakegate connection is
+    /// currently up: in that case Blakegate is actively supplying user
+    /// data, and the database must not also be syncing into memory at
+    /// the same time, or the two sources could fight each other over
+    /// which one 'wins' on any given refresh tick.
+    pub fn should_use_database_as_fallback(&self) -> bool {
+        !self.blakegate_backup_mode_active()
+            || self
+            .blakegate_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+    }
+
+    /// Applies a full, authoritative user list pushed by Blakegate —
+    /// see `proto::blakegate::apply_users_sync`. Same semantics as a
+    /// full database reload (`refresh_db_users`): any account *not* in
+    /// `fresh` is treated as removed and revoked (password poisoned,
+    /// dropped from the roles/groups indices) — this mirrors that
+    /// exact mechanism, just sourced from a Blakegate push instead of
+    /// a database query, since a `users_sync` message is meant to be
+    /// the complete, current list, not an incremental diff.
+    pub fn apply_blakegate_users(&self, fresh: &[User]) {
+        let fresh_usernames: std::collections::HashSet<&str> =
+        fresh.iter().map(|u| u.username.as_str()).collect();
+
+        let Some(mut guard) = self.apply_upserts(fresh) else {
+            return;
+        };
+
+        let Ok(mut revoked) = self.db_revoked.write() else {
+            eprintln!("[blakegate] failed to acquire db_revoked lock while applying users_sync");
+            return;
+        };
+
+        for (idx, user) in guard.iter_mut().enumerate() {
+            if fresh_usernames.contains(user.username.as_str()) {
+                revoked.remove(&idx);
+            } else if revoked.insert(idx) {
+                user.password = "!revoked!".to_string();
+                self.index_roles(&user.username, &None);
+                self.index_groups(&user.username, &None);
+            }
+        }
+        drop(revoked);
+        drop(guard);
+
+        self.bump_generation();
     }
 
     /// Inserts or removes a single entry in `roles_index`, keeping it in
