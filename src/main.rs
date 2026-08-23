@@ -20,6 +20,7 @@ mod databases;
 mod keystore;
 mod logs;
 mod network;
+mod proto;
 mod reset;
 mod revoke;
 mod smtp;
@@ -418,10 +419,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     init_routes(&mut routes.routes);
+    let routes = Arc::new(routes);
+
+    // Pushes the in-memory config/routes state to every configured
+    // `blakegate` endpoint over WebSocket, near real-time — entirely
+    // decoupled from request handling below; see `blakegate`'s module
+    // doc comment for exactly what's sent (redacted) and the
+    // reconnect/polling model.
+    proto::blakegate::spawn_clients(Arc::clone(&config), Arc::clone(&routes));
 
     let state = web::Data::new(AppState {
         config: Arc::clone(&config),
-        routes: Arc::new(routes),
+        routes: Arc::clone(&routes),
         counter: counter_token,
         client_normal,
         client_with_cert,

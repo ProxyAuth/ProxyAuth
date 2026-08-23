@@ -19,6 +19,7 @@ pub mod config;
 pub mod databases;
 pub mod keystore;
 pub mod network;
+pub mod proto;
 pub mod reset;
 pub mod revoke;
 pub mod smtp;

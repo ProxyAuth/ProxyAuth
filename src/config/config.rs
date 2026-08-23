@@ -40,7 +40,7 @@ pub enum RegexCond {
     BodyJson { key: String, re: Regex },
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouteRule {
     pub prefix: String,
     pub target: String,
@@ -118,7 +118,7 @@ pub struct RouteRule {
     pub filters_compiled: Option<CompiledAllow>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BackendConfig {
     pub url: String,
     #[serde(default = "default_weight")]
@@ -129,7 +129,7 @@ fn default_weight() -> i16 {
     1
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum BackendInput {
     Simple(String),
@@ -184,7 +184,7 @@ pub struct User {
     pub must_change_password: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AllowRegexCfg {
     #[serde(default = "default_allow_true")]
     pub default_allow: bool,
@@ -427,6 +427,25 @@ pub struct AppConfig {
     #[serde(default = "default_fast")]
     pub fast: bool,
 
+    /// External "Blakegate" endpoints ProxyAuth pushes its live
+    /// in-memory configuration to over WebSocket, near real-time —
+    /// every time something in this in-memory state actually changes
+    /// (a database user/role/group refresh, a revocation, ...), an
+    /// updated snapshot is pushed to every connected endpoint. See
+    /// `blakegate::spawn_clients` for the client itself and exactly
+    /// what gets sent (a *redacted* snapshot — `secret` and every
+    /// user's `password`/`otpkey`/`anti_replay_secret` are stripped
+    /// before anything leaves this process; see that module's doc
+    /// comment for why).
+    ///
+    /// Entries are accepted as `https://`/`http://` for convenience
+    /// (easier to type/paste than a raw `wss://` URL) but are always
+    /// connected to as `wss://`/`ws://` — the scheme is rewritten, not
+    /// read literally. ProxyAuth never speaks plain HTTP to these
+    /// endpoints.
+    #[serde(default)]
+    pub blakegate: Vec<String>,
+
     pub smtp: Option<SmtpConfig>,
 
     /// URL the user's browser is redirected to (303, when
@@ -482,6 +501,17 @@ pub struct AppConfig {
     /// `RouteRule.groups` actually gates access against.
     #[serde(skip)]
     pub groups_index: std::sync::RwLock<HashMap<String, Vec<String>>>,
+
+    /// Bumped by every function that mutates this instance's in-memory
+    /// state (`refresh_db_users`, `refresh_db_users_incremental`,
+    /// `revoke_username_now`, ...) — the signal the Blakegate client
+    /// task polls to know a fresh snapshot needs pushing, without
+    /// threading a broadcast channel through every one of those call
+    /// sites individually. `Relaxed` ordering is enough: this is a
+    /// "did *anything* change since I last looked" counter, not a
+    /// value anything is read alongside for consistency.
+    #[serde(skip)]
+    pub generation: std::sync::atomic::AtomicU64,
 }
 
 impl Serialize for AppConfig {
@@ -490,6 +520,7 @@ impl Serialize for AppConfig {
     S: Serializer,
     {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
+        state.serialize_field("blakegate", &self.blakegate)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
         state.serialize_field("cors_origins", &self.cors_origins)?;
         state.serialize_field("databases", &self.databases)?;
@@ -963,6 +994,23 @@ impl AppConfig {
         self.groups_index.read().ok()?.get(username).cloned()
     }
 
+    /// Marks this instance's in-memory state as changed — called from
+    /// every function that actually mutates it. See `generation`'s doc
+    /// comment: the Blakegate client task polls `current_generation()`
+    /// to know when to push a fresh snapshot.
+    pub fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current value of `generation` — changes whenever
+    /// `bump_generation()` has been called since this instance
+    /// started. Not meaningful on its own, only as "did this go up
+    /// since I last checked".
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Inserts or removes a single entry in `roles_index`, keeping it in
     /// sync with a user's current `roles`. `None`/empty roles removes
     /// the entry entirely (a HashMap miss and "no roles" both correctly
@@ -1070,6 +1118,7 @@ impl AppConfig {
 
         if let crate::databases::db::UsersSource::Cache(_) = &source {
             self.apply_upserts(fresh);
+            self.bump_generation();
             return;
         }
 
@@ -1097,6 +1146,8 @@ impl AppConfig {
                 self.index_groups(&user.username, &None);
             }
         }
+
+        self.bump_generation();
     }
 
     /// Lightweight sibling of `refresh_db_users`: reads only the users
@@ -1143,6 +1194,8 @@ impl AppConfig {
         for username in &deletions {
             self.revoke_username_now(username);
         }
+
+        self.bump_generation();
     }
 
     /// Revokes a single user immediately, by username, without scanning
@@ -1443,7 +1496,7 @@ D: Deserializer<'de>,
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "field", rename_all = "snake_case")]
 pub enum RegexCondCfg {
     Method { pattern: String },
