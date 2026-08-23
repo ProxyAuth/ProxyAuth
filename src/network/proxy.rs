@@ -21,6 +21,7 @@ use hyper::http::request::Builder;
 use hyper::{Method, Request, Uri};
 use ipnet::IpNet;
 use once_cell::sync::Lazy;
+use regex::Regex;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::path::Path;
@@ -166,28 +167,13 @@ fn ip_allowed(ip: Option<IpAddr>, rule: &RouteRule) -> bool {
 }
 
 pub fn init_routes_order(routes: &[RouteRule]) {
-    let mut idx: Vec<usize> = (0..routes.len()).collect();
-    idx.sort_by(|&i, &j| {
-        let pi = routes[i].prefix.as_str();
-        let pj = routes[j].prefix.as_str();
-        let ri = pi == "/";
-        let rj = pj == "/";
-        match (ri, rj) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => {
-                let li = norm_len(pi);
-                let lj = norm_len(pj);
-                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-            }
-        }
-    });
-    *ORDERED_ROUTE_IDX.write().unwrap() = Some(idx);
+    *ORDERED_ROUTE_IDX.write().unwrap() = Some(build_route_order(routes));
 }
 
 pub fn init_routes(routes: &mut [RouteRule]) {
     compile_filters_on_routes(routes);
     compile_ip_lists_on_routes(routes);
+    compile_regex_on_routes(routes);
     init_routes_order(routes);
 }
 
@@ -198,6 +184,119 @@ fn matches_prefix(path: &str, prefix: &str) -> bool {
         return true;
     }
     path_norm == pref_norm || path_norm.starts_with(&(pref_norm.clone() + "/"))
+}
+
+/// Parses `regex` (when set) into a compiled `Regex`, so the hot
+/// request path just matches against it instead of recompiling the
+/// pattern on every request — ProxyAuth's equivalent of nginx's
+/// `location ~ pattern { ... }`. Like `allow_ips`/`deny_ips`, an
+/// invalid pattern is a fatal startup error rather than a silently
+/// disabled route.
+pub fn compile_regex_on_routes(routes: &mut [RouteRule]) {
+    for r in routes.iter_mut() {
+        r.regex_compiled = r.regex.as_deref().map(|pattern| {
+            Regex::new(pattern).unwrap_or_else(|e| {
+                panic!(
+                    "routes.yml: route \"{}\": invalid `regex` \"{pattern}\": {e}",
+                    r.prefix
+                )
+            })
+        });
+    }
+}
+
+/// Whether `rule` matches `path` — a compiled `regex` takes over
+/// entirely for a regex route (searched anywhere in the path, same as
+/// nginx's PCRE locations; anchor with `^`/`$` yourself for an exact
+/// match), otherwise the usual longest-prefix rule applies.
+/// Substitutes `{name}` placeholders in `template` with `re`'s named
+/// capture groups matched against `path`. A placeholder whose group
+/// didn't participate in the match (or isn't a named group at all) is
+/// left as literal text — makes a misconfigured template obvious in
+/// the resulting URL/path instead of silently vanishing.
+fn build_regex_target(re: &Regex, template: &str, path: &str) -> String {
+    let Some(caps) = re.captures(path) else {
+        return template.to_string();
+    };
+    let mut result = template.to_string();
+    for name in re.capture_names().flatten() {
+        if let Some(m) = caps.name(name) {
+            result = result.replace(&format!("{{{name}}}"), m.as_str());
+        }
+    }
+    result
+}
+
+/// The scheme+host+port `s` would resolve to, applying the same
+/// "assume http:// if no scheme was given" normalization the rest of
+/// the target-building code uses. `None` if `s` doesn't parse as a URI
+/// at all.
+fn authority_of(s: &str) -> Option<String> {
+    let normalized = if s.starts_with("http://") || s.starts_with("https://") {
+        s.to_string()
+    } else {
+        format!("http://{s}")
+    };
+    Uri::from_str(&normalized)
+        .ok()
+        .and_then(|u| u.authority().map(|a| a.to_string()))
+}
+
+/// Guards against a regex capture smuggling a *different host* into a
+/// rewritten `target` — e.g. a capture containing `@evil.com` landing
+/// right after the authority turns `http://backend/{x}` into
+/// `http://backend@evil.com/...`, which a URI parser reads as
+/// "userinfo=backend, host=evil.com": a captured value from the
+/// client's own request path ends up choosing where the request is
+/// sent. Comparing the rewritten URL's authority against the
+/// template's own literal authority catches this regardless of which
+/// special character (`@`, a stray `:port`, ...) did it — a capture is
+/// only ever allowed to affect the *path*, never the host.
+fn target_authority_tampered(original_target: &str, rewritten: &str) -> bool {
+    authority_of(rewritten) != authority_of(original_target)
+}
+
+fn matches_route(path: &str, rule: &RouteRule) -> bool {
+    match &rule.regex_compiled {
+        Some(re) => re.is_match(path),
+        None => matches_prefix(path, &rule.prefix),
+    }
+}
+
+/// Route evaluation order: every `regex` route is tried first, in the
+/// order it appears in `routes.yml` (first match wins, like nginx
+/// tries regex locations in file order and takes the first that
+/// matches) — then every plain-prefix route, longest prefix first,
+/// exactly as before `regex` existed. Shared by `init_routes_order`
+/// (the common case, precomputed once) and `match_route_idx`'s
+/// fallback for when that cache isn't ready yet.
+fn build_route_order(routes: &[RouteRule]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..routes.len()).collect();
+    idx.sort_by(|&i, &j| {
+        let ri = routes[i].regex_compiled.is_some();
+        let rj = routes[j].regex_compiled.is_some();
+        match (ri, rj) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => i.cmp(&j),
+            (false, false) => {
+                let pi = routes[i].prefix.as_str();
+                let pj = routes[j].prefix.as_str();
+                let root_i = pi == "/";
+                let root_j = pj == "/";
+                match (root_i, root_j) {
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    _ => {
+                        let li = norm_len(pi);
+                        let lj = norm_len(pj);
+                        if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+                    }
+                }
+            }
+        }
+    });
+    idx
 }
 
 /// Strips a trailing `:port` from a `Host` header value and lowercases
@@ -264,7 +363,7 @@ pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule])
         if let Some(order) = guard.as_ref() {
             if order.iter().all(|&i| i < routes.len()) {
                 for &i in order {
-                    if vhost_matches(host, &routes[i].vhost) && matches_prefix(raw_path, &routes[i].prefix) {
+                    if vhost_matches(host, &routes[i].vhost) && matches_route(raw_path, &routes[i]) {
                         return Some(i);
                     }
                 }
@@ -273,24 +372,9 @@ pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule])
         }
     }
 
-    let mut idx: Vec<usize> = (0..routes.len()).collect();
-    idx.sort_by(|&i, &j| {
-        let pi = routes[i].prefix.as_str();
-        let pj = routes[j].prefix.as_str();
-        let ri = pi == "/";
-        let rj = pj == "/";
-        match (ri, rj) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => {
-                let li = norm_len(pi);
-                let lj = norm_len(pj);
-                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-            }
-        }
-    });
+    let idx = build_route_order(routes);
     for &i in &idx {
-        if vhost_matches(host, &routes[i].vhost) && matches_prefix(raw_path, &routes[i].prefix) {
+        if vhost_matches(host, &routes[i].vhost) && matches_route(raw_path, &routes[i]) {
             return Some(i);
         }
     }
@@ -526,14 +610,30 @@ async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
     }
 
     // Directory mode.
-    let prefix_norm = canonicalize_prefix(&rule.prefix);
-    let remainder = if prefix_norm == "/" {
-        req_path.trim_start_matches('/')
+    let remainder_owned;
+    let remainder: &str = if let Some(re) = &rule.regex_compiled {
+        // Regex route: there's no `prefix` to strip — the subpath under
+        // `static` comes from `static_rewrite`, filled in from the
+        // regex's named captures (nginx's `$name` rewrite equivalent).
+        // No template configured just means "serve the directory
+        // itself" (falls through to `static_index` below).
+        match &rule.static_rewrite {
+            Some(tpl) => {
+                remainder_owned = build_regex_target(re, tpl, req_path);
+                remainder_owned.trim_start_matches('/').trim_end_matches('/')
+            }
+            None => "",
+        }
     } else {
-        req_path
-            .strip_prefix(&prefix_norm)
-            .unwrap_or(req_path)
-            .trim_start_matches('/')
+        let prefix_norm = canonicalize_prefix(&rule.prefix);
+        if prefix_norm == "/" {
+            req_path.trim_start_matches('/')
+        } else {
+            req_path
+                .strip_prefix(&prefix_norm)
+                .unwrap_or(req_path)
+                .trim_start_matches('/')
+        }
     };
 
     if remainder.split('/').any(|seg| seg == "..") {
@@ -903,8 +1003,29 @@ pub async fn proxy_with_proxy(
         String::new()
     };
 
-    let mut target_url = rule.target.trim_end_matches('/').to_string();
-    target_url.push_str(&forward_path);
+    let mut target_url = if let Some(re) = &rule.regex_compiled {
+        if rule.target.contains('{') {
+            let rewritten = build_regex_target(re, &rule.target, path_no_query);
+            if target_authority_tampered(&rule.target, &rewritten) {
+                warn!(
+                    "[{}] {} {} 502 blocked: regex capture on route \"{}\" tried to change the target host ({} -> {})",
+                    ip, path, method_str, rule.prefix, rule.target, rewritten
+                );
+                return Ok(HttpResponse::BadGateway()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("502 Bad Gateway"));
+            }
+            rewritten
+        } else {
+            let mut t = rule.target.trim_end_matches('/').to_string();
+            t.push_str(path_no_query);
+            t
+        }
+    } else {
+        let mut t = rule.target.trim_end_matches('/').to_string();
+        t.push_str(&forward_path);
+        t
+    };
     if let Some(q) = original_uri.query() {
         if target_url.contains('?') {
             target_url.push('&');
@@ -1319,8 +1440,29 @@ pub async fn proxy_without_proxy(
         String::new()
     };
 
-    let mut target_url = rule.target.trim_end_matches('/').to_string();
-    target_url.push_str(&forward_path);
+    let mut target_url = if let Some(re) = &rule.regex_compiled {
+        if rule.target.contains('{') {
+            let rewritten = build_regex_target(re, &rule.target, path_no_query);
+            if target_authority_tampered(&rule.target, &rewritten) {
+                warn!(
+                    "[{}] {} {} 502 blocked: regex capture on route \"{}\" tried to change the target host ({} -> {})",
+                    ip, path, method_str, rule.prefix, rule.target, rewritten
+                );
+                return Ok(HttpResponse::BadGateway()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("502 Bad Gateway"));
+            }
+            rewritten
+        } else {
+            let mut t = rule.target.trim_end_matches('/').to_string();
+            t.push_str(path_no_query);
+            t
+        }
+    } else {
+        let mut t = rule.target.trim_end_matches('/').to_string();
+        t.push_str(&forward_path);
+        t
+    };
     if let Some(q) = original_uri.query() {
         if target_url.contains('?') {
             target_url.push('&');

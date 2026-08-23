@@ -260,6 +260,13 @@ pub const DEFAULT_ROUTES_YML: &str = concat!(
     "  #   static: \"/var/www/docs\"\n",
     "  # - prefix: \"/robots.txt\"\n",
     "  #   static: \"/var/www/robots.txt\"\n",
+    "  # Regex routes are matched by pattern instead of prefix (tried\n",
+    "  # before every plain-prefix route), like nginx's \"location ~\".\n",
+    "  # Named captures can rewrite the target/static path via {name}.\n",
+    "  # - prefix: \"/config-version\"          # label only, not matched\n",
+    "  #   regex: '^/config/(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-[^/]+)?/(?<file>.+)$'\n",
+    "  #   static: \"/var/www/docs/config\"\n",
+    "  #   static_rewrite: \"{major}.{minor}.x/{file}\"\n",
 );
 
 /// Default `config.json` written on first run when the file is missing.

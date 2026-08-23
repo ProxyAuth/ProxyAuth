@@ -126,6 +126,37 @@ pub struct RouteRule {
     #[serde(default = "default_static_index")]
     pub static_index: String,
 
+    /// Full regex the request path must match for this route to apply,
+    /// instead of the plain-prefix matching every other route uses —
+    /// ProxyAuth's equivalent of nginx's `location ~ pattern { ... }`.
+    /// Searched anywhere in the path by default (add `^`/`$` yourself
+    /// for an exact match, same convention as nginx/PCRE). Regex routes
+    /// are always tried before every plain-prefix route; among several,
+    /// the first one in `routes.yml` that matches wins.
+    ///
+    /// Use named capture groups (`(?<name>...)`) and reference them as
+    /// `{name}` in `target` (proxy routes) or `static_rewrite` (static
+    /// routes) to rewrite the upstream/file path from what was
+    /// captured — nginx's `$name` equivalent. A proxy route's `target`
+    /// with no `{...}` placeholder just gets the full original request
+    /// path appended, unchanged (nginx's behavior for a `proxy_pass`
+    /// with no URI part).
+    #[serde(default)]
+    pub regex: Option<String>,
+
+    #[serde(skip)]
+    pub regex_compiled: Option<Regex>,
+
+    /// For a regex route whose `static` points at a directory: since
+    /// there's no `prefix` to strip off to get a file path, this
+    /// template (filled in from the regex's named captures, e.g.
+    /// `"{major}.{minor}.x/{file}"`) supplies the path *under* `static`
+    /// instead — same traversal protection as plain directory mode
+    /// still applies to the result. Ignored for non-regex routes, and
+    /// when `static` points at a single file.
+    #[serde(default)]
+    pub static_rewrite: Option<String>,
+
     pub prefix: String,
 
     /// Backend URL for proxied routes. Not required when `static` is
