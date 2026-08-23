@@ -380,8 +380,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let mut routes: RouteConfig =
+    let routes_parsed: RouteConfig =
         serde_yaml::from_str(&routes_str).expect("Failed to parse routes.yml");
+    let mut routes: RouteConfig = routes_parsed.expand_vhost_groups();
 
     let counter_token = Arc::new(CounterToken::new());
 

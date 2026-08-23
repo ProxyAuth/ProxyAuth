@@ -12,6 +12,7 @@ use hyper_http_proxy::ProxyConnector;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
+use ipnet::IpNet;
 use regex::Regex;
 use serde::Deserializer;
 use serde::de::MapAccess;
@@ -75,6 +76,30 @@ pub struct RouteRule {
     /// hot-reloaded without restarting the server.
     #[serde(default = "default_vhost_cert")]
     pub vhost_cert: HashMap<String, String>,
+
+    /// IP/CIDR allow-list for this route (e.g. `["192.168.1.0/24",
+    /// "10.0.0.5"]`) — when non-empty, only clients whose resolved IP
+    /// (same trusted-proxy-aware resolution the rate limiter and
+    /// `X-Forwarded-For` handling already use) falls inside one of these
+    /// networks may reach this route; everyone else gets a 403, before
+    /// any auth/CSRF/backend work happens. Empty (the default) means no
+    /// restriction — identical to every route's behavior before this
+    /// field existed.
+    #[serde(default)]
+    pub allow_ips: Vec<String>,
+
+    /// IP/CIDR deny-list, checked before `allow_ips` — a client matching
+    /// an entry here is always rejected, even if `allow_ips` would
+    /// otherwise let them through. Useful for "everyone in this range
+    /// except this one host". Empty (the default) denies nobody.
+    #[serde(default)]
+    pub deny_ips: Vec<String>,
+
+    #[serde(skip)]
+    pub allow_ips_compiled: Vec<IpNet>,
+
+    #[serde(skip)]
+    pub deny_ips_compiled: Vec<IpNet>,
 
     pub prefix: String,
     pub target: String,
@@ -216,7 +241,59 @@ impl BlakegateEndpoint {
 
 #[derive(Default, Debug, Deserialize)]
 pub struct RouteConfig {
+    #[serde(default)]
     pub routes: Vec<RouteRule>,
+
+    /// Alternative, less repetitive way to write `routes.yml`: group
+    /// routes under a shared `vhost`/`vhost_cert` declared once, instead
+    /// of repeating them on every single route. Purely an authoring
+    /// convenience — `expand_vhost_groups` flattens every group into
+    /// `routes` right after parsing, so nothing downstream (routing, TLS
+    /// SNI resolution, the CLI audit tools) needs to know this form
+    /// exists. Mixing both styles in one file is fine; a route inside a
+    /// group can still set its own `vhost`/`vhost_cert` to override the
+    /// group's.
+    #[serde(default)]
+    pub vhosts: Vec<VhostGroup>,
+}
+
+/// One `vhosts:` entry in `routes.yml` — a `vhost`/`vhost_cert` applied
+/// to every route listed under it. See `RouteConfig::vhosts` and
+/// `RouteConfig::expand_vhost_groups`.
+#[derive(Debug, Default, Deserialize)]
+pub struct VhostGroup {
+    #[serde(default = "default_vhost")]
+    pub vhost: Vec<String>,
+
+    #[serde(default = "default_vhost_cert")]
+    pub vhost_cert: HashMap<String, String>,
+
+    #[serde(default)]
+    pub routes: Vec<RouteRule>,
+}
+
+impl RouteConfig {
+    /// Moves every route out of `vhosts` groups and into `routes`,
+    /// stamping each one with its group's `vhost`/`vhost_cert` unless the
+    /// route already set its own (individual routes can still override a
+    /// group's default this way). Called once, right after parsing
+    /// `routes.yml`, so every other piece of code — matching, the SNI
+    /// certificate resolver, `proxyauth routes-audit`/`check-access` —
+    /// only ever sees the flat `routes` list it already understands.
+    pub fn expand_vhost_groups(mut self) -> Self {
+        for group in self.vhosts.drain(..) {
+            for mut route in group.routes {
+                if route.vhost.is_empty() {
+                    route.vhost = group.vhost.clone();
+                }
+                if route.vhost_cert.is_empty() {
+                    route.vhost_cert = group.vhost_cert.clone();
+                }
+                self.routes.push(route);
+            }
+        }
+        self
+    }
 }
 
 /// One email address on file for a user, with an explicit `primary`

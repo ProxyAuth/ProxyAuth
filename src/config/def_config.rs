@@ -246,6 +246,11 @@ pub const DEFAULT_ROUTES_YML: &str = concat!(
     "  #   vhost_cert:\n",
     "  #     cert: \"/etc/proxyauth/certs/app.example.com/cert.pem\"\n",
     "  #     key: \"/etc/proxyauth/certs/app.example.com/key.pem\"\n",
+    "  # allow_ips/deny_ips are optional too. Left out, a route has no IP\n",
+    "  # restriction, same as before these fields existed. deny_ips wins\n",
+    "  # over allow_ips (checked first).\n",
+    "  # allow_ips: [\"192.168.1.0/24\", \"10.0.0.5\"]\n",
+    "  # deny_ips: [\"192.168.1.66\"]\n",
 );
 
 /// Default `config.json` written on first run when the file is missing.

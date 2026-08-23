@@ -75,7 +75,9 @@ pub fn load_routes_for_cli() -> Result<RouteConfig, String> {
     let routes_str = std::fs::read_to_string("/etc/proxyauth/config/routes.yml")
         .map_err(|e| format!("Failed to read routes.yml: {e}"))?;
     crate::config::config::check_deprecated_secure_key(&routes_str)?;
-    serde_yaml::from_str(&routes_str).map_err(|e| format!("Failed to parse routes.yml: {e}"))
+    let parsed: RouteConfig = serde_yaml::from_str(&routes_str)
+        .map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
+    Ok(parsed.expand_vhost_groups())
 }
 
 fn describe_restrictions(rule: &RouteRule) -> String {

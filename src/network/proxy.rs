@@ -108,6 +108,62 @@ pub fn compile_filters_on_routes(routes: &mut [RouteRule]) {
     }
 }
 
+/// Parses `allow_ips`/`deny_ips` into `IpNet`s once at startup, so the
+/// hot request path just does a `.contains()` check instead of
+/// re-parsing strings on every proxied request.
+///
+/// An entry that fails to parse is a **fatal** config error (panics
+/// with the offending route/field/value) rather than a warning the
+/// entry gets silently dropped for: a `routes.yml` typo in a CIDR
+/// should never boot up with that restriction quietly not applied —
+/// that would expose a route its author explicitly meant to lock down,
+/// which is worse than refusing to start.
+pub fn compile_ip_lists_on_routes(routes: &mut [RouteRule]) {
+    fn parse_all(prefix: &str, field: &str, entries: &[String]) -> Vec<IpNet> {
+        entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .parse::<IpNet>()
+                    .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "routes.yml: route \"{prefix}\": invalid entry \"{entry}\" in `{field}` — expected an IP address (e.g. \"10.0.0.5\") or a CIDR network (e.g. \"192.168.1.0/24\")"
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    for r in routes.iter_mut() {
+        r.allow_ips_compiled = parse_all(&r.prefix, "allow_ips", &r.allow_ips);
+        r.deny_ips_compiled = parse_all(&r.prefix, "deny_ips", &r.deny_ips);
+    }
+}
+
+/// `deny_ips` wins over `allow_ips`: a client matching a deny entry is
+/// always rejected, even if it would also match an allow entry. An
+/// empty `allow_ips` means "no allow-list restriction" — everyone not
+/// denied gets through, exactly like every route behaved before these
+/// fields existed. If the route configured either list but the
+/// client's IP couldn't be determined at all, this fails closed
+/// (rejects) rather than silently letting an unidentifiable client in.
+fn ip_allowed(ip: Option<IpAddr>, rule: &RouteRule) -> bool {
+    if rule.allow_ips_compiled.is_empty() && rule.deny_ips_compiled.is_empty() {
+        return true;
+    }
+    let Some(ip) = ip else {
+        return false;
+    };
+    if rule.deny_ips_compiled.iter().any(|net| net.contains(&ip)) {
+        return false;
+    }
+    if rule.allow_ips_compiled.is_empty() {
+        return true;
+    }
+    rule.allow_ips_compiled.iter().any(|net| net.contains(&ip))
+}
+
 pub fn init_routes_order(routes: &[RouteRule]) {
     let mut idx: Vec<usize> = (0..routes.len()).collect();
     idx.sort_by(|&i, &j| {
@@ -130,6 +186,7 @@ pub fn init_routes_order(routes: &[RouteRule]) {
 
 pub fn init_routes(routes: &mut [RouteRule]) {
     compile_filters_on_routes(routes);
+    compile_ip_lists_on_routes(routes);
     init_routes_order(routes);
 }
 
@@ -435,7 +492,29 @@ pub async fn global_proxy(
 
     let host = request_host(&req);
     if let Some(idx) = match_route_idx(path, host.as_deref(), &data.routes.routes) {
-        let use_proxy = data.routes.routes[idx].proxy;
+        let rule = &data.routes.routes[idx];
+        let has_ip_restriction =
+            !rule.allow_ips_compiled.is_empty() || !rule.deny_ips_compiled.is_empty();
+        if has_ip_restriction {
+            let resolved_ip = client_ip(&req, &data.config);
+            if !ip_allowed(resolved_ip, rule) {
+                warn!(
+                    "{} 403 {} {} {} — blocked by allow_ips/deny_ips on route \"{}\"",
+                    resolved_ip
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    method,
+                    path,
+                    user_agent,
+                    rule.prefix
+                );
+                return Ok(HttpResponse::Forbidden()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("403 Forbidden"));
+            }
+        }
+
+        let use_proxy = rule.proxy;
         if use_proxy {
             proxy_with_proxy(req, body, data, idx).await
         } else {
