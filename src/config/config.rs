@@ -101,7 +101,36 @@ pub struct RouteRule {
     #[serde(skip)]
     pub deny_ips_compiled: Vec<IpNet>,
 
+    /// Serves file(s) straight from disk instead of proxying to
+    /// `target` — ProxyAuth's equivalent of nginx's `root`/`alias`.
+    /// Point it at a **directory** to serve everything under it (the
+    /// remainder of the request path, after this route's `prefix`, is
+    /// resolved inside it — `..`/symlink escapes are rejected, and a
+    /// directory-shaped request falls back to `static_index`); or at a
+    /// single **file** to have this route always serve that one file
+    /// regardless of the request path (handy for a fixed endpoint like
+    /// `/robots.txt` or `/favicon.ico`). Which one it is is detected
+    /// from what's actually on disk — no separate mode to configure.
+    /// When set, `target`/`proxy`/`backends`/`cert` are simply ignored
+    /// for this route; only `required_login`/`username`/`groups`/`roles`,
+    /// `allow_ips`/`deny_ips` and `vhost` still apply, and only
+    /// `GET`/`HEAD` are served. The YAML key is `static` (the Rust field
+    /// is named `static_path` since `static` is a reserved word).
+    #[serde(default, rename = "static")]
+    pub static_path: Option<String>,
+
+    /// File served when `static` points at a directory and a request
+    /// resolves to a directory-shaped path within it (e.g. the route's
+    /// own prefix, or any path ending in `/`). Ignored when `static`
+    /// points at a single file, or isn't set at all.
+    #[serde(default = "default_static_index")]
+    pub static_index: String,
+
     pub prefix: String,
+
+    /// Backend URL for proxied routes. Not required when `static` is
+    /// set (a purely static route can omit it, or leave it empty).
+    #[serde(default)]
     pub target: String,
 
     /// Usernames allowed to access this route (when `required_login`
@@ -1033,6 +1062,10 @@ fn default_vhost() -> Vec<String> {
 
 fn default_vhost_cert() -> HashMap<String, String> {
     HashMap::new()
+}
+
+fn default_static_index() -> String {
+    "index.html".to_string()
 }
 
 /// Checks a raw `routes.yml` for the deprecated `secure` key, which was

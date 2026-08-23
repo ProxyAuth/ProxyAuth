@@ -23,6 +23,7 @@ use ipnet::IpNet;
 use once_cell::sync::Lazy;
 use std::convert::Infallible;
 use std::net::IpAddr;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::RwLock;
 use tokio::time::{Duration, timeout};
@@ -421,6 +422,237 @@ async fn incoming_to_boxbody(
     Ok(hyper::Response::from_parts(parts, boxed))
 }
 
+/// Very small extension → MIME map, good enough for the kind of static
+/// assets `static` is meant for (docs sites, SPA builds, downloads).
+/// Anything unrecognized falls back to `application/octet-stream`
+/// rather than a guess — serving an unknown file as `text/*` risks the
+/// browser sniffing it as HTML and executing it (stored XSS via file
+/// upload/download endpoints), which a wrong-but-inert binary MIME type
+/// avoids.
+fn guess_content_type(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Resolves `req_path` against `rule.static_path` and serves the
+/// file(s) — ProxyAuth's equivalent of nginx's `root`/`alias`. Uses
+/// `tokio::fs` (which itself runs the blocking syscalls on a
+/// background thread pool), so this never blocks the async worker.
+///
+/// `static_path` can point at a single file — served as-is for every
+/// request under this route, ignoring the rest of the path — or at a
+/// directory, in which case the remainder of the request path (after
+/// stripping this route's `prefix`) is resolved inside it, falling
+/// back to `static_index` for directory-shaped requests.
+///
+/// Path-traversal safety (directory mode): the root is canonicalized
+/// once up front; the candidate file is canonicalized too (resolving
+/// any `..`/symlinks), and the result must still start with the
+/// canonical root or the request is rejected outright. A raw `..`
+/// segment is also rejected before ever touching the filesystem, as a
+/// cheap first line of defense.
+async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
+    let Some(static_path) = rule.static_path.as_deref() else {
+        return HttpResponse::InternalServerError()
+            .append_header(("server", "ProxyAuth"))
+            .body("500 Internal Server Error");
+    };
+
+    let root = match tokio::fs::canonicalize(static_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "static \"{}\" (route \"{}\") is not readable: {e}",
+                static_path, rule.prefix
+            );
+            return HttpResponse::InternalServerError()
+                .append_header(("server", "ProxyAuth"))
+                .body("500 Internal Server Error");
+        }
+    };
+
+    let root_is_file = match tokio::fs::metadata(&root).await {
+        Ok(m) => m.is_file(),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .append_header(("server", "ProxyAuth"))
+                .body("500 Internal Server Error");
+        }
+    };
+
+    // Single-file mode: this route always serves exactly this file,
+    // whatever the request path under `prefix` looks like — like
+    // nginx's `alias` pointing straight at one file (e.g. a fixed
+    // `/robots.txt` or `/favicon.ico` route).
+    if root_is_file {
+        return match tokio::fs::read(&root).await {
+            Ok(bytes) => HttpResponse::Ok()
+                .append_header(("server", "ProxyAuth"))
+                .content_type(guess_content_type(&root))
+                .body(bytes),
+            Err(_) => HttpResponse::NotFound()
+                .append_header(("server", "ProxyAuth"))
+                .body("404 Not Found"),
+        };
+    }
+
+    // Directory mode.
+    let prefix_norm = canonicalize_prefix(&rule.prefix);
+    let remainder = if prefix_norm == "/" {
+        req_path.trim_start_matches('/')
+    } else {
+        req_path
+            .strip_prefix(&prefix_norm)
+            .unwrap_or(req_path)
+            .trim_start_matches('/')
+    };
+
+    if remainder.split('/').any(|seg| seg == "..") {
+        return HttpResponse::Forbidden()
+            .append_header(("server", "ProxyAuth"))
+            .body("403 Forbidden");
+    }
+
+    let mut candidate = root.join(remainder);
+
+    let is_dir = tokio::fs::metadata(&candidate)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if is_dir || remainder.is_empty() {
+        candidate = candidate.join(&rule.static_index);
+    }
+
+    let resolved = match tokio::fs::canonicalize(&candidate).await {
+        Ok(p) => p,
+        Err(_) => {
+            return HttpResponse::NotFound()
+                .append_header(("server", "ProxyAuth"))
+                .body("404 Not Found");
+        }
+    };
+
+    if !resolved.starts_with(&root) {
+        warn!(
+            "blocked path-traversal attempt on route \"{}\": {} resolved outside {}",
+            rule.prefix,
+            candidate.display(),
+            root.display()
+        );
+        return HttpResponse::Forbidden()
+            .append_header(("server", "ProxyAuth"))
+            .body("403 Forbidden");
+    }
+
+    match tokio::fs::read(&resolved).await {
+        Ok(bytes) => HttpResponse::Ok()
+            .append_header(("server", "ProxyAuth"))
+            .content_type(guess_content_type(&resolved))
+            .body(bytes),
+        Err(_) => HttpResponse::NotFound()
+            .append_header(("server", "ProxyAuth"))
+            .body("404 Not Found"),
+    }
+}
+
+/// Minimal `required_login` gate for static routes: the same
+/// Bearer-token / session-cookie extraction and
+/// `AppConfig::route_access_decision` check the proxied routes use,
+/// trimmed down — no CSRF (irrelevant to serving a file) and no "/"
+/// login-redirect special case. `Ok(())` means the request may proceed;
+/// `Err(resp)` is the response to send back instead.
+async fn check_static_auth(
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+    rule: &RouteRule,
+    ip: &str,
+) -> Result<(), HttpResponse> {
+    if !rule.required_login {
+        return Ok(());
+    }
+
+    let token_header = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| {
+            if !is_secure_request(req, &data.config) {
+                return None;
+            }
+            req.headers()
+                .get(header::COOKIE)
+                .and_then(|val| val.to_str().ok())
+                .and_then(|cookie_str| {
+                    cookie_str.split(';').find_map(|cookie| {
+                        let cookie = cookie.trim();
+                        let (key, value) = cookie.split_once('=')?;
+                        if key.trim() == "session_token" {
+                            Some(value.trim())
+                        } else {
+                            None
+                        }
+                    })
+                })
+        });
+
+    let Some(token_header) = token_header else {
+        return Err(HttpResponse::Unauthorized()
+            .append_header(("server", "ProxyAuth"))
+            .body("401 Unauthorized"));
+    };
+
+    let username = match validate_token(token_header, data, &data.config, ip).await {
+        Ok((username, _token_id, _expiry)) => username,
+        Err(_) => {
+            return Err(HttpResponse::Unauthorized()
+                .append_header(("server", "ProxyAuth"))
+                .append_header((
+                    "Set-Cookie",
+                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+                ))
+                .body("401 Unauthorized"));
+        }
+    };
+
+    if !data.config.route_access_decision(rule, &username).is_allowed() {
+        return Err(HttpResponse::Unauthorized()
+            .append_header(("server", "ProxyAuth"))
+            .body("401 Unauthorized"));
+    }
+
+    Ok(())
+}
+
 pub async fn global_proxy(
     req: HttpRequest,
     body: web::Bytes,
@@ -515,6 +747,21 @@ pub async fn global_proxy(
         }
 
         let use_proxy = rule.proxy;
+        if rule.static_path.is_some() {
+            let ip_str = client_ip(&req, &data.config)
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            if let Err(resp) = check_static_auth(&req, &data, rule, &ip_str).await {
+                return Ok(resp);
+            }
+            if method != "GET" && method != "HEAD" {
+                return Ok(HttpResponse::MethodNotAllowed()
+                    .append_header(("server", "ProxyAuth"))
+                    .append_header(("Allow", "GET, HEAD"))
+                    .body("405 Method Not Allowed"));
+            }
+            return Ok(serve_static_file(rule, path).await);
+        }
         if use_proxy {
             proxy_with_proxy(req, body, data, idx).await
         } else {

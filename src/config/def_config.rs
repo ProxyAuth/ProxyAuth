@@ -251,6 +251,15 @@ pub const DEFAULT_ROUTES_YML: &str = concat!(
     "  # over allow_ips (checked first).\n",
     "  # allow_ips: [\"192.168.1.0/24\", \"10.0.0.5\"]\n",
     "  # deny_ips: [\"192.168.1.66\"]\n",
+    "  # A route can also serve file(s) straight from disk instead of\n",
+    "  # proxying — set `static` (target is then ignored/optional). It can\n",
+    "  # point at a directory (served with static_index, default\n",
+    "  # \"index.html\", for directory-shaped requests) or at a single file\n",
+    "  # (always served as-is, e.g. a fixed /robots.txt). Only GET/HEAD.\n",
+    "  # - prefix: \"/docs\"\n",
+    "  #   static: \"/var/www/docs\"\n",
+    "  # - prefix: \"/robots.txt\"\n",
+    "  #   static: \"/var/www/robots.txt\"\n",
 );
 
 /// Default `config.json` written on first run when the file is missing.
