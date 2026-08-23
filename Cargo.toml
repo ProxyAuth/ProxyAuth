@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.0.3"
+version = "1.0.4-beta0"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -38,7 +38,7 @@ actix-service = "2"
 reqwest = { version = "0.13", features = ["rustls", "json", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.33"
-serde_json = "1.0.140"
+serde_json = { version = "1.0.140", features = ["preserve_order"] }
 base64 = "0.21"
 sha2 = "0.11.0-rc.2"
 tracing = "0.1.41"
@@ -104,7 +104,7 @@ hmac = "0.13.0-rc.2"
 cookie = "0.18"
 lettre = { version = "0.11.22", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
 rpassword = "7.3"
-arrayref = "=0.3.9"
+tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpki-roots"] }
 
 # Security-advisory floors, not exact pins — deliberately left as
 # ranges so the resolver can still pick up a future patched release

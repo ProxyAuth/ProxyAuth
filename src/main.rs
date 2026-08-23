@@ -20,6 +20,7 @@ mod databases;
 mod keystore;
 mod logs;
 mod network;
+mod proto;
 mod reset;
 mod revoke;
 mod smtp;
@@ -232,6 +233,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     that no longer exists.
     // Either can be set to 0 to disable it independently.
     //
+    // Both loops below additionally skip themselves entirely while
+    // Blakegate backup mode is active and connected (see
+    // `AppConfig::should_use_database_as_fallback`) — Blakegate, not
+    // this periodic refresh, is what's keeping memory current in that
+    // case; the database is a write-only backup target instead (see
+    // `proto::blakegate::apply_users_sync`). Note this does NOT cover
+    // `load_config`'s own initial synchronous load at startup, further
+    // up in this function — that one always runs regardless, as a
+    // cold-start bootstrap giving this instance *something* to
+    // authenticate against in the brief window before its first
+    // Blakegate connection is established. Any stale data from that
+    // initial load is superseded the moment the first `users_sync`
+    // arrives, via the same revocation mechanism a full database
+    // reload already uses for accounts no longer present.
+    //
     // Both refresh_db_users*() calls below are synchronous/blocking
     // (Diesel isn't async) — a database that's unreachable can take a
     // long time to fail a TCP connection attempt (tens of seconds, if
@@ -255,6 +271,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
+                    // Blakegate backup mode active (`blakegate` configured)
+                    // AND at least one connection currently up -> Blakegate
+                    // is supplying user data right now, so the database
+                    // must not also sync into memory on top of that. See
+                    // `AppConfig::should_use_database_as_fallback`.
+                    if !refresh_config.should_use_database_as_fallback() {
+                        continue;
+                    }
                     let refresh_config = Arc::clone(&refresh_config);
                     let _ = tokio::task::spawn_blocking(move || {
                         refresh_config.refresh_db_users_incremental();
@@ -273,6 +297,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
+                    // Same reasoning as the incremental refresh above.
+                    if !refresh_config.should_use_database_as_fallback() {
+                        continue;
+                    }
                     let refresh_config = Arc::clone(&refresh_config);
                     let _ = tokio::task::spawn_blocking(move || {
                         refresh_config.refresh_db_users();
@@ -418,10 +446,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     init_routes(&mut routes.routes);
+    let routes = Arc::new(routes);
+
+    // Pushes the in-memory config/routes state to every configured
+    // `blakegate` endpoint over WebSocket, near real-time — entirely
+    // decoupled from request handling below; see `blakegate`'s module
+    // doc comment for exactly what's sent (redacted) and the
+    // reconnect/polling model.
+    proto::blakegate::spawn_clients(Arc::clone(&config), Arc::clone(&routes));
 
     let state = web::Data::new(AppState {
         config: Arc::clone(&config),
-        routes: Arc::new(routes),
+        routes: Arc::clone(&routes),
         counter: counter_token,
         client_normal,
         client_with_cert,
