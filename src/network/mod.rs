@@ -16,6 +16,7 @@ pub mod canonical_url;
 pub mod config;
 pub mod cors;
 pub mod error;
+pub mod ipblocklist;
 pub mod loadbalancing;
 pub mod proxy;
 pub mod ratelimit;

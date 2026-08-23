@@ -332,9 +332,7 @@ fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
         return false;
     };
     let host_norm = normalize_host(host);
-    vhosts
-        .iter()
-        .any(|v| normalize_host(v) == host_norm)
+    vhosts.iter().any(|v| normalize_host(v) == host_norm)
 }
 
 /// Extracts and normalizes the `Host` the request came in on, from
@@ -363,7 +361,8 @@ pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule])
         if let Some(order) = guard.as_ref() {
             if order.iter().all(|&i| i < routes.len()) {
                 for &i in order {
-                    if vhost_matches(host, &routes[i].vhost) && matches_route(raw_path, &routes[i]) {
+                    if vhost_matches(host, &routes[i].vhost) && matches_route(raw_path, &routes[i])
+                    {
                         return Some(i);
                     }
                 }
@@ -382,7 +381,11 @@ pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule])
 }
 
 #[allow(dead_code)]
-pub fn match_route<'a>(raw_path: &str, host: Option<&str>, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
+pub fn match_route<'a>(
+    raw_path: &str,
+    host: Option<&str>,
+    routes: &'a [RouteRule],
+) -> Option<&'a RouteRule> {
     match_route_idx(raw_path, host, routes).map(|i| &routes[i])
 }
 
@@ -564,6 +567,29 @@ fn guess_content_type(path: &Path) -> &'static str {
 /// canonical root or the request is rejected outright. A raw `..`
 /// segment is also rejected before ever touching the filesystem, as a
 /// cheap first line of defense.
+/// Turns a filesystem error from serving a static file into the right
+/// response, and — for the case actually worth an admin's attention —
+/// a log line that says so plainly. A permission error almost always
+/// means the `proxyauth` user itself can't read the path (missing
+/// read, or missing execute/traverse on a parent directory), which
+/// looks identical to a 404 otherwise and is easy to mistake for a
+/// typo'd path instead of a permissions problem.
+fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> HttpResponse {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        warn!(
+            "static route \"{prefix}\": permission denied reading {} — the \"proxyauth\" user needs read (and, for directories, execute/traverse) access to this path",
+            path.display()
+        );
+        HttpResponse::InternalServerError()
+            .append_header(("server", "ProxyAuth"))
+            .body("500 Internal Server Error")
+    } else {
+        HttpResponse::NotFound()
+            .append_header(("server", "ProxyAuth"))
+            .body("404 Not Found")
+    }
+}
+
 async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
     let Some(static_path) = rule.static_path.as_deref() else {
         return HttpResponse::InternalServerError()
@@ -586,10 +612,8 @@ async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
 
     let root_is_file = match tokio::fs::metadata(&root).await {
         Ok(m) => m.is_file(),
-        Err(_) => {
-            return HttpResponse::InternalServerError()
-                .append_header(("server", "ProxyAuth"))
-                .body("500 Internal Server Error");
+        Err(e) => {
+            return static_read_error_response(&rule.prefix, &root, &e);
         }
     };
 
@@ -603,9 +627,7 @@ async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
                 .append_header(("server", "ProxyAuth"))
                 .content_type(guess_content_type(&root))
                 .body(bytes),
-            Err(_) => HttpResponse::NotFound()
-                .append_header(("server", "ProxyAuth"))
-                .body("404 Not Found"),
+            Err(e) => static_read_error_response(&rule.prefix, &root, &e),
         };
     }
 
@@ -620,7 +642,9 @@ async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
         match &rule.static_rewrite {
             Some(tpl) => {
                 remainder_owned = build_regex_target(re, tpl, req_path);
-                remainder_owned.trim_start_matches('/').trim_end_matches('/')
+                remainder_owned
+                    .trim_start_matches('/')
+                    .trim_end_matches('/')
             }
             None => "",
         }
@@ -654,10 +678,8 @@ async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
 
     let resolved = match tokio::fs::canonicalize(&candidate).await {
         Ok(p) => p,
-        Err(_) => {
-            return HttpResponse::NotFound()
-                .append_header(("server", "ProxyAuth"))
-                .body("404 Not Found");
+        Err(e) => {
+            return static_read_error_response(&rule.prefix, &candidate, &e);
         }
     };
 
@@ -678,9 +700,7 @@ async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
             .append_header(("server", "ProxyAuth"))
             .content_type(guess_content_type(&resolved))
             .body(bytes),
-        Err(_) => HttpResponse::NotFound()
-            .append_header(("server", "ProxyAuth"))
-            .body("404 Not Found"),
+        Err(e) => static_read_error_response(&rule.prefix, &resolved, &e),
     }
 }
 
@@ -744,7 +764,11 @@ async fn check_static_auth(
         }
     };
 
-    if !data.config.route_access_decision(rule, &username).is_allowed() {
+    if !data
+        .config
+        .route_access_decision(rule, &username)
+        .is_allowed()
+    {
         return Err(HttpResponse::Unauthorized()
             .append_header(("server", "ProxyAuth"))
             .body("401 Unauthorized"));
@@ -758,6 +782,23 @@ pub async fn global_proxy(
     body: web::Bytes,
     data: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
+    // Checked before anything else — including CORS preflight — so a
+    // known-abusive IP never gets any response beyond a flat 403,
+    // regardless of which route or method it's trying.
+    if let Some(ip) = client_ip(&req, &data.config) {
+        if data.ip_blocklist.load().iter().any(|net| net.contains(&ip)) {
+            warn!(
+                "{} 403 {} {} — blocked by ip_blocklist",
+                ip,
+                req.method(),
+                req.path()
+            );
+            return Ok(HttpResponse::Forbidden()
+                .append_header(("server", "ProxyAuth"))
+                .body("403 Forbidden"));
+        }
+    }
+
     if req.method() == actix_web::http::Method::OPTIONS {
         let origin_header = req.headers().get(header::ORIGIN);
         let origin = origin_header.and_then(|v| v.to_str().ok());
@@ -776,7 +817,7 @@ pub async fn global_proxy(
                 .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
                 .insert_header((
                     header::ACCESS_CONTROL_ALLOW_METHODS,
-                    "GET, POST, PUT, DELETE, OPTIONS",
+                    "GET, HEAD, POST, PUT, DELETE, OPTIONS",
                 ))
                 .insert_header((
                     header::ACCESS_CONTROL_ALLOW_HEADERS,
@@ -952,7 +993,7 @@ pub async fn proxy_with_proxy(
     }
 
     // ── CSRF ────────────────────────────────────────────────────────────────
-    if data.config.session_cookie && data.config.csrf_token && rule.need_csrf {
+    if data.config.session_cookie && data.config.csrf_token && rule.requires_csrf() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
             let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>invalid csrf request</h1></body></html>"#;
             let mut resp = HttpResponse::build(StatusCode::UNAUTHORIZED);
@@ -1113,7 +1154,11 @@ pub async fn proxy_with_proxy(
         // this route" — see `AppConfig::route_access_decision`. Also
         // what `proxyauth routes-audit`/`check-access` call, so that
         // tool can never silently disagree with what's enforced here.
-        if !data.config.route_access_decision(rule, &username).is_allowed() {
+        if !data
+            .config
+            .route_access_decision(rule, &username)
+            .is_allowed()
+        {
             warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
             let mut resp = HttpResponse::Unauthorized();
             resp.append_header(("server", "ProxyAuth"));
@@ -1153,22 +1198,29 @@ pub async fn proxy_with_proxy(
     // replaces.
     for (key, value) in req.headers() {
         let key_str = key.as_str();
+
         if key_str == "user-agent" {
             user_agent_fwd = value.to_str().unwrap_or("");
         }
-        if !is_hop_by_hop_header(key_str)
-            && key_str != "authorization"
-            && key_str != "user-agent"
+
+        // Authorization is consumed by ProxyAuth only when
+        // the route itself requires ProxyAuth authentication.
+        if key_str == "authorization" && rule.required_login {
+            continue;
+        }
+
+        if key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
-        {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            {
+                if let Ok(hv) =
+                    hyper::header::HeaderValue::from_bytes(value.as_bytes())
+                    {
+                        request_builder = request_builder.header(key_str, hv);
+                    }
             }
-        }
     }
-
     request_builder = request_builder
         .header("Connection", "close")
         .header(USER_AGENT, "ProxyAuth");
@@ -1327,12 +1379,16 @@ pub async fn proxy_without_proxy(
     let ip = client_ip(&req, &data.config)
         .unwrap_or(IpAddr::from([127, 0, 0, 1]))
         .to_string();
+
     let method_str = req.method().as_str();
+
     let user_agent = req
         .headers()
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
+
+    let is_head = req.method() == actix_web::http::Method::HEAD;
 
     let add_cors_headers = |resp: &mut HttpResponseBuilder, req: &HttpRequest| {
         if let Some(origin) = req
@@ -1341,6 +1397,7 @@ pub async fn proxy_without_proxy(
             .and_then(|v| v.to_str().ok())
         {
             let origin_trimmed = origin.trim_end_matches('/');
+
             let is_allowed = data
                 .config
                 .cors_origins
@@ -1350,13 +1407,20 @@ pub async fn proxy_without_proxy(
                         .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
                 })
                 .unwrap_or(false);
+
             if is_allowed {
                 resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, req.method().as_str()));
+
+                resp.insert_header((
+                    header::ACCESS_CONTROL_ALLOW_METHODS,
+                    "GET, HEAD, POST, PUT, DELETE, OPTIONS",
+                ));
+
                 resp.insert_header((
                     header::ACCESS_CONTROL_ALLOW_HEADERS,
                     "Authorization, Content-Type, Accept",
                 ));
+
                 resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
             }
         }
@@ -1365,65 +1429,94 @@ pub async fn proxy_without_proxy(
     // ── ACL ─────────────────────────────────────────────────────────
     if let Some(status) = apply_filters_regex_allow_only(rule, &req, &body) {
         let mut resp = HttpResponse::build(status);
+
         resp.insert_header(("server", "ProxyAuth"));
+
         add_cors_headers(&mut resp, &req);
+
         warn!(
             "[{}] - {} {} {} {}",
             ip, path, method_str, "403 acl no match", user_agent
         );
+
         return Ok(resp.body("403 Forbidden"));
     }
 
-    // ── Allow method ───────────────────────────────────────────────────
+    // ── Allow method ─────────────────────────────────────────────────
     if !is_method_allowed(rule.allow_methods.as_deref(), method_str) {
         let allow = build_allow_header(rule.allow_methods.as_deref());
+
         let mut resp = HttpResponse::build(StatusCode::METHOD_NOT_ALLOWED);
+
         resp.insert_header(("Allow", allow));
         resp.insert_header(("server", "ProxyAuth"));
+
         add_cors_headers(&mut resp, &req);
+
         warn!(
             "[{}] - {} {} {} {}",
             ip, path, method_str, "405 method not allowed", user_agent
         );
+
         return Ok(resp.body("405 Method Not Allowed"));
     }
 
-    // ── CSRF ────────────────────────────────────────────────────────────────
-    if data.config.session_cookie && data.config.csrf_token && rule.need_csrf {
+    // ── CSRF ─────────────────────────────────────────────────────────
+    if data.config.session_cookie && data.config.csrf_token && rule.requires_csrf() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
-            let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>invalid csrf request</h1></body></html>"#;
+            let html = r#"<!doctype html>
+                <html lang="en">
+                <head>
+                <meta charset="utf-8">
+                <title>401 Unauthorized</title>
+                </head>
+                <body>
+                <h1>invalid csrf request</h1>
+                </body>
+                </html>"#;
+
             let mut resp = HttpResponse::build(StatusCode::UNAUTHORIZED);
+
             resp.insert_header(("server", "ProxyAuth"));
             resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
+
             resp.insert_header((
                 header::CACHE_CONTROL,
                 "no-store, no-cache, must-revalidate, max-age=0",
             ));
+
             resp.insert_header(("Pragma", "no-cache"));
             resp.insert_header(("Expires", "0"));
+
             add_cors_headers(&mut resp, &req);
+
             warn!(
                 "[{}] - {} {} {} {}",
                 ip, path, method_str, "401 invalid csrf", user_agent
             );
+
             return Ok(resp.body(html));
         }
     }
 
-    // ── Build URL target ─────────────────────────────────────────
+    // ── Build URL target ─────────────────────────────────────────────
     let mut user_agent_fwd = "";
 
     let original_uri = req.uri();
     let path_no_query = original_uri.path();
+
     let prefix_norm = rule.prefix.trim_end_matches('/');
+
     let raw_forward = path_no_query
         .strip_prefix(prefix_norm)
         .unwrap_or(path_no_query);
+
     let cleaned_remainder = raw_forward.trim_start_matches('/').trim_end_matches('/');
 
     let forward_path = if !rule.secure_path {
         if rule.preserve_prefix {
             let p = path_no_query.trim_start_matches('/');
+
             if p.is_empty() {
                 String::new()
             } else {
@@ -1443,41 +1536,51 @@ pub async fn proxy_without_proxy(
     let mut target_url = if let Some(re) = &rule.regex_compiled {
         if rule.target.contains('{') {
             let rewritten = build_regex_target(re, &rule.target, path_no_query);
+
             if target_authority_tampered(&rule.target, &rewritten) {
                 warn!(
                     "[{}] {} {} 502 blocked: regex capture on route \"{}\" tried to change the target host ({} -> {})",
                     ip, path, method_str, rule.prefix, rule.target, rewritten
                 );
+
                 return Ok(HttpResponse::BadGateway()
                     .append_header(("server", "ProxyAuth"))
                     .body("502 Bad Gateway"));
             }
+
             rewritten
         } else {
             let mut t = rule.target.trim_end_matches('/').to_string();
+
             t.push_str(path_no_query);
+
             t
         }
     } else {
         let mut t = rule.target.trim_end_matches('/').to_string();
+
         t.push_str(&forward_path);
+
         t
     };
+
     if let Some(q) = original_uri.query() {
         if target_url.contains('?') {
             target_url.push('&');
         } else {
             target_url.push('?');
         }
+
         target_url.push_str(q);
     }
+
     let full_url = if target_url.starts_with("http://") || target_url.starts_with("https://") {
         target_url
     } else {
         format!("http://{}", target_url)
     };
 
-    // ── Client : cache global partagé, pas de thread-local ──────────────────
+    // ── Client : cache global partagé ────────────────────────────────
     let client_opts = if !rule.cert.is_empty() {
         ClientOptions {
             use_proxy: false,
@@ -1495,12 +1598,13 @@ pub async fn proxy_without_proxy(
             key_path: None,
         }
     };
+
     let client = get_or_build_client(client_opts, &data.config);
 
     let uri = Uri::from_str(&full_url)
         .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
 
-    // ── Auth────────────────────────────────────────────────────
+    // ── Auth ─────────────────────────────────────────────────────────
     let (username, token_id) = if rule.required_login {
         let token_header = req
             .headers()
@@ -1511,17 +1615,20 @@ pub async fn proxy_without_proxy(
                 if !is_secure_request(&req, &data.config) {
                     return None;
                 }
+
                 req.headers()
                     .get(header::COOKIE)
                     .and_then(|val| val.to_str().ok())
                     .and_then(|cookie_str| {
                         cookie_str.split(';').find_map(|cookie| {
                             let cookie = cookie.trim();
+
                             if let Some((key, value)) = cookie.split_once('=') {
                                 if key.trim() == "session_token" {
                                     return Some(value.trim());
                                 }
                             }
+
                             None
                         })
                     })
@@ -1531,53 +1638,72 @@ pub async fn proxy_without_proxy(
                     "[{}] {} {} 401 Unauthorized token attempt {}",
                     ip, path, method_str, user_agent
                 );
+
                 let mut resp = HttpResponse::Unauthorized();
+
                 resp.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut resp, &req);
+
                 error::InternalError::from_response("Missing token", resp.finish())
             })?;
 
         let (username, token_id, _expiry) =
             match validate_token(token_header, &data, &data.config, &ip).await {
                 Ok(result) => result,
+
                 Err(_err) => {
                     warn!(
                         "[{}] {} {} 401 Unauthorized token attempt {} {}",
                         ip, path, method_str, user_agent, _err
                     );
+
                     let mut resp = HttpResponse::Unauthorized();
+
                     resp.append_header(("server", "ProxyAuth"));
+
                     resp.append_header((
                         "Set-Cookie",
                         "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
                     ));
+
                     if req.uri() != "/" || req.uri() != "" {
                         resp.append_header(("location", "/"));
                     }
+
                     add_cors_headers(&mut resp, &req);
+
                     return Ok(resp.body("401 Unauthorized"));
                 }
             };
 
-        // Same single source of truth as proxy_with_proxy above — see
-        // `AppConfig::route_access_decision`.
-        if !data.config.route_access_decision(rule, &username).is_allowed() {
+        if !data
+            .config
+            .route_access_decision(rule, &username)
+            .is_allowed()
+        {
             info!(
                 "[{}] {} {} 401 Unauthorized token attempt {}",
                 ip, path, method_str, user_agent
             );
+
             let mut resp = HttpResponse::Unauthorized();
+
             resp.append_header(("server", "ProxyAuth"));
+
             resp.append_header((
                 "Set-Cookie",
                 "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
             ));
+
             add_cors_headers(&mut resp, &req);
+
             return Ok(resp.body("401 Unauthorized"));
         }
 
         if req.uri() == "/" || req.uri() == "" {
             let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+
             return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
                 .append_header(("location", redirect_target))
@@ -1589,55 +1715,99 @@ pub async fn proxy_without_proxy(
         (String::new(), String::new())
     };
 
-    // ── Build request hyper ────────────────────────────────────
+    // ── Build request Hyper ──────────────────────────────────────────
+    //
+    // IMPORTANT:
+    // Preserve the original HTTP method.
+    //
+    // GET  -> GET upstream
+    // HEAD -> HEAD upstream
+    // POST -> POST upstream
+    // etc.
+    //
     let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
+
     let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
 
     for (key, value) in req.headers() {
         let key_str = key.as_str();
+
         if key_str == "user-agent" {
             user_agent_fwd = value.to_str().unwrap_or("");
         }
-        if key_str != "authorization"
-            && key_str != "user-agent"
+
+        // Authorization is consumed by ProxyAuth only when
+        // the route itself requires ProxyAuth authentication.
+        if key_str == "authorization" && rule.required_login {
+            continue;
+        }
+
+        if key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
-        {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            {
+                if let Ok(hv) =
+                    hyper::header::HeaderValue::from_bytes(value.as_bytes())
+                    {
+                        request_builder = request_builder.header(key_str, hv);
+                    }
             }
-        }
     }
 
     request_builder = request_builder.header(USER_AGENT, "ProxyAuth");
+
     request_builder = inject_header(request_builder, &username, &data.config);
 
+    // ── Build request body ───────────────────────────────────────────
+    //
+    // HEAD MUST NOT have a request body.
+    //
     let hyper_req = if hyper_method == Method::GET || hyper_method == Method::HEAD {
         match request_builder.body(Empty::<Bytes>::new().boxed()) {
             Ok(req) => req,
+
             Err(e) => {
-                warn!(client_ip = %ip, target = %full_url, "Route fallback: 500 Internal error (GET/HEAD): {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Route fallback: 500 Internal error (GET/HEAD): {}",
+                      e
+                );
+
                 let mut builder = HttpResponse::InternalServerError();
+
                 builder.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut builder, &req);
+
                 return Ok(builder.finish());
             }
         }
     } else {
         match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
             Ok(req) => req,
+
             Err(e) => {
-                warn!(client_ip = %ip, target = %full_url, "Route fallback: 500 Internal error reason: {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Route fallback: 500 Internal error reason: {}",
+                    e
+                );
+
                 let mut builder = HttpResponse::InternalServerError();
+
                 builder.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut builder, &req);
+
                 return Ok(builder.finish());
             }
         }
     };
 
-    // ── send upstream ───────────────────────────────────────────────
+    // ── Send upstream ────────────────────────────────────────────────
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
             .backends
@@ -1647,93 +1817,177 @@ pub async fn proxy_without_proxy(
                     url: url.clone(),
                     weight: 1,
                 },
+
                 BackendInput::Detailed(cfg) => cfg.clone(),
             })
             .collect();
 
         match forward_failover(hyper_req, &backends, None).await {
             Ok(res) => res,
+
             Err(e) => {
-                warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Failover failed: {}",
+                    e
+                );
+
                 let mut builder = HttpResponse::ServiceUnavailable();
+
                 builder.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut builder, &req);
+
                 return Ok(builder.finish());
             }
         }
     } else {
         match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
             Ok(Ok(res)) => incoming_to_boxbody(res).await.map_err(|e| {
-                warn!(client_ip = %ip, target = %full_url, "Body collect error: {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Body collect error: {}",
+                    e
+                );
+
                 error::ErrorServiceUnavailable("503 Service Unavailable")
             })?,
+
             Ok(Err(e)) => {
-                warn!(client_ip = %ip, target = %full_url, "Route fallback reason (client error): {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Route fallback reason (client error): {}",
+                      e
+                );
+
                 let mut resp = HttpResponse::ServiceUnavailable();
+
                 resp.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut resp, &req);
+
                 return Ok(resp.finish());
             }
+
             Err(e) => {
-                warn!(client_ip = %ip, target = %full_url, "Route fallback reason (timeout): {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Route fallback reason (timeout): {}",
+                      e
+                );
+
                 let mut resp = HttpResponse::ServiceUnavailable();
+
                 resp.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut resp, &req);
+
                 return Ok(resp.finish());
             }
         }
     };
 
+    // ── Upstream status ──────────────────────────────────────────────
     let status = response_result.status();
+
     if status.is_server_error() {
-        warn!(client_ip = %ip, target = %full_url, "Upstream returned server error: {}", status);
+        warn!(
+            client_ip = %ip,
+            target = %full_url,
+            "Upstream returned server error: {}",
+            status
+        );
+
         let mut resp = HttpResponse::InternalServerError();
+
         resp.append_header(("server", "ProxyAuth"));
+
         add_cors_headers(&mut resp, &req);
+
         return Ok(resp.finish());
     }
 
+    // ── Split response ──────────────────────────────────────────────
     let (parts, resp_body) = response_result.into_parts();
+
     let status = parts.status;
     let headers: hyper::HeaderMap = parts.headers;
 
     let mut client_resp = HttpResponse::build(to_actix_status(status));
 
-    for (key, value) in &headers as &hyper::HeaderMap {
+    // Preserve upstream response headers.
+    //
+    // Content-Length is intentionally preserved for HEAD.
+    // The client needs to know the size the corresponding GET
+    // response would have had.
+    for (key, value) in &headers {
         let k = key.as_str();
+
         if k != "user-agent" && k != "authorization" && k != "server" {
             client_resp.append_header((k, value.as_bytes()));
         }
     }
 
-    let mut body_bytes: Bytes = resp_body
-        .collect()
-        .await
-        .map_err(|e| {
-            warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
-            error::ErrorInternalServerError("500 Internal Server Error")
-        })?
-        .to_bytes();
+    // ── Response body ───────────────────────────────────────────────
+    //
+    // HEAD:
+    //   Do NOT collect/download the upstream body.
+    //
+    // GET/other:
+    //   Collect normally.
+    //
+    let mut body_bytes: Bytes = if is_head {
+        Bytes::new()
+    } else {
+        resp_body
+            .collect()
+            .await
+            .map_err(|e| {
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Body read error: {}",
+                    e
+                );
 
+                error::ErrorInternalServerError("500 Internal Server Error")
+            })?
+            .to_bytes()
+    };
+
+    // ── Cache policy ────────────────────────────────────────────────
     if !rule.cache {
         client_resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
+
         client_resp.insert_header((
             header::CACHE_CONTROL,
             "no-store, no-cache, must-revalidate, max-age=0",
         ));
+
         client_resp.insert_header(("Pragma", "no-cache"));
+
         client_resp.insert_header(("Expires", "0"));
     }
 
-    if data.config.session_cookie && data.config.csrf_token {
+    // ── CSRF injection ──────────────────────────────────────────────
+    //
+    // Never modify a HEAD response body.
+    //
+    if !is_head && data.config.session_cookie && data.config.csrf_token {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {
             body_bytes = new_body;
+
             client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
         }
     }
 
+    // ── Logging ─────────────────────────────────────────────────────
     info!(
         "[{}] - {} {} {} {} {} [tid:{}] {}",
         ip,
@@ -1747,7 +2001,15 @@ pub async fn proxy_without_proxy(
     );
 
     add_cors_headers(&mut client_resp, &req);
+
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
+
+    // ── Final response ──────────────────────────────────────────────
+    //
+    // For HEAD, Actix receives an empty body while all relevant
+    // response headers (including Content-Length from upstream)
+    // remain intact.
+    //
     Ok(client_resp
         .append_header(("server", "ProxyAuth"))
         .body(body_bytes))

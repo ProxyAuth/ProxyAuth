@@ -44,20 +44,20 @@ impl FromRequest for EitherResetPassword {
 
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
         let content_type = req
-        .headers()
-        .get("Content-Type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
 
         if content_type.contains("application/json") {
             Json::<ResetPasswordRequest>::from_request(req, payload)
-            .map(|res| res.map(|json| EitherResetPassword::Json(json.into_inner())))
-            .boxed_local()
+                .map(|res| res.map(|json| EitherResetPassword::Json(json.into_inner())))
+                .boxed_local()
         } else if content_type.contains("application/x-www-form-urlencoded") {
             Form::<ResetPasswordRequest>::from_request(req, payload)
-            .map(|res| res.map(|form| EitherResetPassword::Form(form.into_inner())))
-            .boxed_local()
+                .map(|res| res.map(|form| EitherResetPassword::Form(form.into_inner())))
+                .boxed_local()
         } else {
             ready(Err(ErrorBadRequest("Unsupported Content-Type"))).boxed_local()
         }
@@ -94,8 +94,8 @@ pub async fn reset_password_route(
 
     if body.password != body.verif_password {
         return HttpResponse::BadRequest()
-        .append_header(("server", "ProxyAuth"))
-        .body("Passwords do not match");
+            .append_header(("server", "ProxyAuth"))
+            .body("Passwords do not match");
     }
 
     // Not full password-strength policy (no charset/entropy checks
@@ -104,18 +104,18 @@ pub async fn reset_password_route(
     const MIN_PASSWORD_LEN: usize = 12;
     if body.password.chars().count() < MIN_PASSWORD_LEN {
         return HttpResponse::BadRequest()
-        .append_header(("server", "ProxyAuth"))
-        .body(format!(
-            "Password must be at least {MIN_PASSWORD_LEN} characters long"
-        ));
+            .append_header(("server", "ProxyAuth"))
+            .body(format!(
+                "Password must be at least {MIN_PASSWORD_LEN} characters long"
+            ));
     }
 
     let username = match reset_db::validate_token(&body.token) {
         Ok(u) => u,
         Err(_) => {
             return HttpResponse::BadRequest()
-            .append_header(("server", "ProxyAuth"))
-            .body("Invalid or expired reset link");
+                .append_header(("server", "ProxyAuth"))
+                .body("Invalid or expired reset link");
         }
     };
 
@@ -124,8 +124,8 @@ pub async fn reset_password_route(
         Ok(h) => h.to_string(),
         Err(_) => {
             return HttpResponse::InternalServerError()
-            .append_header(("server", "ProxyAuth"))
-            .body("Failed to hash password");
+                .append_header(("server", "ProxyAuth"))
+                .body("Failed to hash password");
         }
     };
 
@@ -133,18 +133,15 @@ pub async fn reset_password_route(
     // only ever lives in one of the two, and we don't know which
     // without checking (mirrors how `combined_users()` treats both as
     // equally valid sources, file-first).
-    let file_updated = match set_user_password(
-        "/etc/proxyauth/config/config.json",
-        &username,
-        &hash,
-    ) {
-        Ok(updated) => updated,
-        Err(e) => {
-            return HttpResponse::InternalServerError()
-            .append_header(("server", "ProxyAuth"))
-            .body(format!("Failed to update password: {e}"));
-        }
-    };
+    let file_updated =
+        match set_user_password("/etc/proxyauth/config/config.json", &username, &hash) {
+            Ok(updated) => updated,
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                    .append_header(("server", "ProxyAuth"))
+                    .body(format!("Failed to update password: {e}"));
+            }
+        };
 
     if file_updated {
         // Reflect immediately for this and every other already-running
@@ -176,8 +173,8 @@ pub async fn reset_password_route(
             Ok(PersistOutcome::Updated) => {}
             Ok(PersistOutcome::NoDatabaseConfigured) | Ok(PersistOutcome::UnknownUser) => {
                 return HttpResponse::NotFound()
-                .append_header(("server", "ProxyAuth"))
-                .body("Unknown user");
+                    .append_header(("server", "ProxyAuth"))
+                    .body("Unknown user");
             }
             Ok(PersistOutcome::Error(e)) => {
                 // SECURITY: never return the raw Diesel/connection error
@@ -187,14 +184,14 @@ pub async fn reset_password_route(
                 // a generic message.
                 eprintln!("[reset-password] failed to update password: {e}");
                 return HttpResponse::InternalServerError()
-                .append_header(("server", "ProxyAuth"))
-                .body("Internal error updating password");
+                    .append_header(("server", "ProxyAuth"))
+                    .body("Internal error updating password");
             }
             Err(join_error) => {
                 eprintln!("[reset-password] blocking task failed: {join_error}");
                 return HttpResponse::InternalServerError()
-                .append_header(("server", "ProxyAuth"))
-                .body("Internal error updating password");
+                    .append_header(("server", "ProxyAuth"))
+                    .body("Internal error updating password");
             }
         }
     }
@@ -202,8 +199,8 @@ pub async fn reset_password_route(
     let _ = reset_db::consume_token(&body.token);
 
     HttpResponse::Ok()
-    .append_header(("server", "ProxyAuth"))
-    .json(serde_json::json!({ "status": "ok" }))
+        .append_header(("server", "ProxyAuth"))
+        .json(serde_json::json!({ "status": "ok" }))
 }
 
 /// Outcome of `persist_db_password_change`, letting the async caller
@@ -244,14 +241,12 @@ fn persist_db_password_change(data: &AppState, username: &str, hash: &str) -> Pe
             // this one specifically goes through with_connection too,
             // reusing the same shared connection rather than opening
             // another one just for this follow-up read.
-            if let Ok(Some(updated_user)) =
-                crate::databases::db::with_connection(db_cfg, |conn| {
-                    crate::databases::db::load_user_by_username(conn, username)
-                })
-                {
-                    data.config.upsert_db_user_now(updated_user);
-                }
-                PersistOutcome::Updated
+            if let Ok(Some(updated_user)) = crate::databases::db::with_connection(db_cfg, |conn| {
+                crate::databases::db::load_user_by_username(conn, username)
+            }) {
+                data.config.upsert_db_user_now(updated_user);
+            }
+            PersistOutcome::Updated
         }
         Ok(false) => PersistOutcome::UnknownUser,
         Err(e) => PersistOutcome::Error(e),
@@ -271,15 +266,15 @@ fn persist_db_password_change(data: &AppState, username: &str, hash: &str) -> Pe
 /// that's violated.
 pub fn find_user_email(users: &[User], username: &str) -> Option<String> {
     let emails = users
-    .iter()
-    .find(|u| u.username == username)
-    .and_then(|u| u.email.as_ref())?;
+        .iter()
+        .find(|u| u.username == username)
+        .and_then(|u| u.email.as_ref())?;
 
     emails
-    .iter()
-    .find(|e| e.primary)
-    .or_else(|| emails.first())
-    .map(|e| e.address.clone())
+        .iter()
+        .find(|e| e.primary)
+        .or_else(|| emails.first())
+        .map(|e| e.address.clone())
 }
 
 /// Unused directly by the route above (kept for symmetry / potential

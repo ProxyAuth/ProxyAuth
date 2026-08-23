@@ -47,7 +47,6 @@ use actix_web::{App, http::Method, web};
 use chrono::Local;
 use config::config::{AppConfig, AppState, RouteConfig, load_config};
 use config::def_config;
-use config::def_config::{ensure_running_as_proxyauth, switch_to_user};
 use dashmap::DashMap;
 use futures_util::future::join_all;
 use logs::{ChannelLogWriter, get_logs, log_collector};
@@ -198,11 +197,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // launch as user proxyauth
-    let _ = switch_to_user("proxyauth");
-
-    // detect if program is running proxyauth user
-    ensure_running_as_proxyauth();
+    // Root is needed for two things only: binding a listen socket on a
+    // privileged port (<1024, e.g. 443) and reading TLS certificate
+    // files that aren't readable by an unprivileged account (certbot's
+    // /etc/letsencrypt/live/*/privkey.pem is root-only by default).
+    // Both happen inside the instance loop below (`create_listener` /
+    // `bind_server`) — everything from here down to that loop, and the
+    // loop itself, still runs as whatever user started the process
+    // (root, typically, when installed as a system service). The drop
+    // to the configured run_user happens right after the loop, once
+    // every socket is bound and every certificate is loaded — nginx
+    // uses the same "bind/read privileged resources first, drop
+    // privileges before serving a single request" pattern, just via
+    // its master-then-fork model instead of ProxyAuth's single
+    // process. Nothing here should process untrusted network input
+    // before that point.
+    //
+    // Fail fast, with a clear explanation, if this process can't
+    // actually pull that off — instead of letting the real cause
+    // surface many steps later as a bare OS "Permission denied" on
+    // whatever privileged operation happens to run first (which looks
+    // identical to, say, a typo'd path, and gives zero indication the
+    // real issue is "this process isn't root").
+    let (peeked_run_user, _peeked_run_group) = def_config::peek_run_user_group();
+    def_config::ensure_can_become(&peeked_run_user);
 
     // create default config files on first run (never overwrites an existing file)
     def_config::create_default_file(
@@ -456,6 +474,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reconnect/polling model.
     proto::blakegate::spawn_clients(Arc::clone(&config), Arc::clone(&routes));
 
+    let ip_blocklist: Arc<arc_swap::ArcSwap<Vec<ipnet::IpNet>>> =
+        Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+    if !config.ip_blocklists.is_empty() {
+        let bl_config = Arc::clone(&config);
+        let bl_store = Arc::clone(&ip_blocklist);
+        tokio::spawn(async move {
+            let fresh = crate::network::ipblocklist::refresh_all(&bl_config).await;
+            println!(
+                "[ip_blocklist] loaded {} entr(y/ies) from {} source(s)",
+                fresh.len(),
+                bl_config.ip_blocklists.len()
+            );
+            bl_store.store(Arc::new(fresh));
+
+            if bl_config.ip_blocklist_refresh_interval_secs == 0 {
+                return;
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                bl_config.ip_blocklist_refresh_interval_secs,
+            ));
+            ticker.tick().await; // initial load above already covered the first fetch
+            loop {
+                ticker.tick().await;
+                let fresh = crate::network::ipblocklist::refresh_all(&bl_config).await;
+                println!("[ip_blocklist] refreshed: {} entr(y/ies)", fresh.len());
+                bl_store.store(Arc::new(fresh));
+            }
+        });
+    }
+
     let state = web::Data::new(AppState {
         config: Arc::clone(&config),
         routes: Arc::clone(&routes),
@@ -465,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_with_proxy,
         revoked_tokens,
         stats,
+        ip_blocklist,
         otp_overrides: Arc::new(DashMap::new()),
         password_overrides: Arc::new(DashMap::new()),
         must_change_overrides: Arc::new(DashMap::new()),
@@ -769,6 +818,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result
         }));
     }
+
+    // Every listener is bound and every TLS certificate (default +
+    // per-vhost) is already loaded into the running server instances
+    // above — nothing left needs root. Fix up ownership of anything
+    // that might have just been created while still root (fresh
+    // config.json/routes.yml/certs on a true first run), then drop to
+    // the configured `run_user`/`run_group` (defaults to
+    // `proxyauth`/its own group; set to e.g. `www-data` in
+    // config.json to inherit that account's read access to files
+    // instead of changing those files' permissions) before falling
+    // into the loop below that actually waits on (and, via the
+    // spawned tasks above, processes) real client connections.
+    // `setuid`/`setgid` change credentials for the whole process
+    // (every tokio worker thread), not just this one, so this covers
+    // every request handled from this point on.
+    def_config::reassert_ownership(config.effective_run_user(), config.effective_run_group());
+    let _ = def_config::switch_to_user_and_group(
+        config.effective_run_user(),
+        config.effective_run_group(),
+    );
+    def_config::ensure_running_as(config.effective_run_user());
 
     let results = join_all(server_futures).await;
     for r in results {

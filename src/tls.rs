@@ -26,8 +26,7 @@ use std::{
 use tokio::{sync::mpsc, task, time::sleep};
 use tracing::{info, warn};
 
-static LAST_LOGS: Lazy<Mutex<HashMap<String, Instant>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static LAST_LOGS: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// `tag` identifies *which* watcher is logging (e.g. the cert file
 /// path, or "default"), not just which kind of event — otherwise the
@@ -172,8 +171,24 @@ fn load_vhost_resolvers(routes: &[RouteRule]) -> HashMap<String, Arc<HotResolver
         if rule.vhost.is_empty() {
             continue;
         }
+        if rule.vhost_cert.is_empty() {
+            // No cert configured for this vhost at all — expected,
+            // it just falls back to the default certificate.
+            continue;
+        }
         let (Some(cert), Some(key)) = (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key"))
         else {
+            // vhost_cert IS set but missing "cert" and/or "key" — almost
+            // certainly a typo (e.g. "file" instead of "cert", copied
+            // from the unrelated backend-mTLS `cert` field which does
+            // use "file"/"key"). Without this warning this silently
+            // falls back to the default certificate with zero signal
+            // that anything is wrong.
+            warn!(
+                "vhost_cert for {:?} has keys {:?} but no \"cert\"/\"key\" — expected exactly those two keys (not e.g. \"file\"). Falling back to the default certificate for this vhost.",
+                rule.vhost,
+                rule.vhost_cert.keys().collect::<Vec<_>>()
+            );
             continue;
         };
 

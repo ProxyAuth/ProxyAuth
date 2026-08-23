@@ -5,6 +5,7 @@ use crate::revoke::db::RevokedTokenMap;
 use crate::smtp::smtp::SmtpConfig;
 use crate::stats::tokencount::CounterToken;
 use crate::token::auth::generate_random_string;
+use arc_swap::ArcSwap;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
 use dashmap::DashMap;
@@ -215,8 +216,16 @@ pub struct RouteRule {
     #[serde(default = "default_backends")]
     pub backends: Vec<BackendInput>,
 
-    #[serde(default = "default_need_csrf")]
-    pub need_csrf: bool,
+    /// Whether this route requires a valid CSRF token — `None` (the
+    /// default: not specified) means "inherit from the vhost group
+    /// this route belongs to (if any), otherwise the global default
+    /// (`true`)". An explicit `true`/`false` here always wins over the
+    /// group's own `need_csrf`. Use `RouteRule::requires_csrf` to
+    /// resolve the final value rather than reading this field
+    /// directly — it still needs `AppConfig.csrf_token` and
+    /// `session_cookie` to actually be enforced either way.
+    #[serde(default)]
+    pub need_csrf: Option<bool>,
 
     #[serde(default = "default_cache")]
     pub cache: bool,
@@ -235,6 +244,21 @@ pub struct RouteRule {
 
     #[serde(skip)]
     pub filters_compiled: Option<CompiledAllow>,
+}
+
+impl RouteRule {
+    /// Resolves the final CSRF requirement for this route: its own
+    /// explicit `need_csrf` if set (whether inherited from a `vhosts:`
+    /// group by `expand_vhost_groups` or set directly on the route —
+    /// both look the same by the time this runs), otherwise `true`,
+    /// matching this field's behavior before per-route/per-group
+    /// override existed. Callers should use this instead of reading
+    /// `need_csrf` directly. Still gated by `AppConfig.csrf_token` and
+    /// `session_cookie` — this only decides the per-route half of
+    /// whether CSRF actually gets enforced.
+    pub fn requires_csrf(&self) -> bool {
+        self.need_csrf.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -299,6 +323,30 @@ impl BlakegateEndpoint {
     }
 }
 
+/// One entry in `AppConfig.ip_blocklists` — see that field's doc
+/// comment. `source` is either an `http(s)://` URL or a local file
+/// path; format (plain text vs CSV, gzip or not) is handled the same
+/// way regardless of which.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IpBlocklistSource {
+    pub source: String,
+
+    /// Friendly name used for this source's local cache file
+    /// (`/etc/proxyauth/abuse/<name>.txt`) instead of one derived from
+    /// `source` itself. Purely cosmetic — doesn't affect matching.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Treat each non-comment line as CSV and take the IP/CIDR from
+    /// `csv_column` (0-indexed) instead of the first
+    /// whitespace-separated token on the line.
+    #[serde(default)]
+    pub csv: bool,
+
+    #[serde(default)]
+    pub csv_column: usize,
+}
+
 #[derive(Default, Debug, Deserialize)]
 pub struct RouteConfig {
     #[serde(default)]
@@ -328,18 +376,27 @@ pub struct VhostGroup {
     #[serde(default = "default_vhost_cert")]
     pub vhost_cert: HashMap<String, String>,
 
+    /// CSRF requirement applied to every route in this group that
+    /// doesn't set its own `need_csrf` — same override rules as
+    /// `RouteRule::need_csrf`/`requires_csrf`. `None` (not set at the
+    /// group level either) leaves each route to fall back to the
+    /// global default.
+    #[serde(default)]
+    pub need_csrf: Option<bool>,
+
     #[serde(default)]
     pub routes: Vec<RouteRule>,
 }
 
 impl RouteConfig {
     /// Moves every route out of `vhosts` groups and into `routes`,
-    /// stamping each one with its group's `vhost`/`vhost_cert` unless the
-    /// route already set its own (individual routes can still override a
-    /// group's default this way). Called once, right after parsing
-    /// `routes.yml`, so every other piece of code — matching, the SNI
-    /// certificate resolver, `proxyauth routes-audit`/`check-access` —
-    /// only ever sees the flat `routes` list it already understands.
+    /// stamping each one with its group's `vhost`/`vhost_cert`/
+    /// `need_csrf` unless the route already set its own (individual
+    /// routes can still override a group's default this way). Called
+    /// once, right after parsing `routes.yml`, so every other piece of
+    /// code — matching, the SNI certificate resolver, `proxyauth
+    /// routes-audit`/`check-access` — only ever sees the flat `routes`
+    /// list it already understands.
     pub fn expand_vhost_groups(mut self) -> Self {
         for group in self.vhosts.drain(..) {
             for mut route in group.routes {
@@ -348,6 +405,9 @@ impl RouteConfig {
                 }
                 if route.vhost_cert.is_empty() {
                     route.vhost_cert = group.vhost_cert.clone();
+                }
+                if route.need_csrf.is_none() {
+                    route.need_csrf = group.need_csrf;
                 }
                 self.routes.push(route);
             }
@@ -415,7 +475,7 @@ fn default_allow_true() -> bool {
 impl Serialize for User {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-    S: Serializer,
+        S: Serializer,
     {
         // Length hint was wrong (2, should match the actual field count)
         // and `roles` was serializing `self.allow`'s value instead of
@@ -542,10 +602,11 @@ impl DatabaseConfig {
     /// `type` (3306 for mysql/mariadb, 5432 otherwise/postgres) when
     /// `port` wasn't set.
     pub fn effective_port(&self) -> u16 {
-        self.port.unwrap_or_else(|| match self.db_type.to_lowercase().as_str() {
-            "mysql" | "mariadb" => 3306,
-            _ => 5432,
-        })
+        self.port
+            .unwrap_or_else(|| match self.db_type.to_lowercase().as_str() {
+                "mysql" | "mariadb" => 3306,
+                _ => 5432,
+            })
     }
 }
 
@@ -581,6 +642,41 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub trust_proxy_forward_for: Option<Vec<String>>,
+
+    /// System user the server process runs as, once startup's
+    /// privileged phase (binding low ports, reading root-only TLS
+    /// certs) is done — see `main.rs`'s startup ordering. Defaults to
+    /// `"proxyauth"`, the account `proxyauth prepare` sets up
+    /// automatically. Setting this to an existing user instead (e.g.
+    /// `"www-data"`/`"nginx"`) is a way to let ProxyAuth read that
+    /// user's files (a `static` route's directory, say) without
+    /// touching those files' permissions at all — it just runs as
+    /// whoever already has access. `prepare` only *verifies* a
+    /// non-default `run_user` exists rather than creating it, since an
+    /// account like `www-data` belongs to some other package.
+    #[serde(default = "default_run_user")]
+    pub run_user: String,
+
+    /// Group to run as instead of `run_user`'s own primary group.
+    /// `None` (the default) just uses that primary group.
+    #[serde(default)]
+    pub run_group: Option<String>,
+
+    /// External IP/CIDR abuse-blocklists (Spamhaus DROP, FireHOL,
+    /// AbuseIPDB exports, ...) checked against every request's
+    /// resolved client IP — reject on match, before any route
+    /// matching or auth work. Each source is a plain-text or CSV
+    /// list, gzip-compressed or not (auto-detected). Refreshed on the
+    /// interval below; empty means the feature is off, same as
+    /// before it existed.
+    #[serde(default)]
+    pub ip_blocklists: Vec<IpBlocklistSource>,
+
+    /// How often every `ip_blocklists` source is re-fetched, in
+    /// seconds. `0` fetches once at startup and never refreshes
+    /// again. Ignored when `ip_blocklists` is empty.
+    #[serde(default = "default_ip_blocklist_refresh_interval")]
+    pub ip_blocklist_refresh_interval_secs: u64,
 
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
@@ -751,7 +847,7 @@ pub struct AppConfig {
 impl Serialize for AppConfig {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-    S: Serializer,
+        S: Serializer,
     {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
         state.serialize_field("blakegate", &self.blakegate)?;
@@ -801,6 +897,14 @@ pub struct AppState {
     pub client_with_proxy: Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>,
     pub revoked_tokens: RevokedTokenMap,
     pub stats: Arc<RequestStats>,
+
+    /// Merged, deduplicated set of every `ip_blocklists` source,
+    /// hot-swapped by a background task on
+    /// `ip_blocklist_refresh_interval_secs` — see
+    /// `network::ipblocklist`. Empty (the default, no allocation of
+    /// note) when `ip_blocklists` isn't configured, so the per-request
+    /// check is just an empty-slice scan.
+    pub ip_blocklist: Arc<ArcSwap<Vec<IpNet>>>,
 
     /// Hot-reloadable overlay for per-user TOTP secrets. `AppState.config`
     /// is an immutable `Arc<AppConfig>` snapshot loaded once at startup —
@@ -857,26 +961,22 @@ pub fn resolve_password_override(
     config_password: &str,
 ) -> String {
     state
-    .password_overrides
-    .get(username)
-    .map(|entry| entry.clone())
-    .unwrap_or_else(|| config_password.to_string())
+        .password_overrides
+        .get(username)
+        .map(|entry| entry.clone())
+        .unwrap_or_else(|| config_password.to_string())
 }
 
 /// Resolves whether `username` currently must change their password,
 /// checking `must_change_overrides` before falling back to whatever
 /// `config_value` (from config.json/the database) said. See
 /// `AppState::must_change_overrides`.
-pub fn resolve_must_change_password(
-    state: &AppState,
-    username: &str,
-    config_value: bool,
-) -> bool {
+pub fn resolve_must_change_password(state: &AppState, username: &str, config_value: bool) -> bool {
     state
-    .must_change_overrides
-    .get(username)
-    .map(|entry| *entry)
-    .unwrap_or(config_value)
+        .must_change_overrides
+        .get(username)
+        .map(|entry| *entry)
+        .unwrap_or(config_value)
 }
 
 /// Writes a new Argon2 password hash for a file-based user directly
@@ -898,14 +998,14 @@ pub fn set_user_password(
     }
 
     let config_str = fs::read_to_string(config_path)
-    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
     let mut json: Value = serde_json::from_str(&config_str)
-    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+        .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
 
     let mut found = false;
 
@@ -916,12 +1016,9 @@ pub fn set_user_password(
             if let Some(obj) = user.as_object_mut() {
                 obj.insert(
                     "password".to_string(),
-                           Value::String(new_password_hash.to_string()),
+                    Value::String(new_password_hash.to_string()),
                 );
-                obj.insert(
-                    "must_change_password".to_string(),
-                           Value::Bool(false),
-                );
+                obj.insert("must_change_password".to_string(), Value::Bool(false));
             }
             break;
         }
@@ -932,9 +1029,9 @@ pub fn set_user_password(
     }
 
     let updated_str = serde_json::to_string_pretty(&json)
-    .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
     fs::write(config_path, updated_str)
-    .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
 
     Ok(true)
 }
@@ -1008,10 +1105,6 @@ fn default_tls() -> bool {
 }
 
 fn default_csrf_token() -> bool {
-    true
-}
-
-fn default_need_csrf() -> bool {
     true
 }
 
@@ -1099,6 +1192,14 @@ fn default_static_index() -> String {
     "index.html".to_string()
 }
 
+fn default_ip_blocklist_refresh_interval() -> u64 {
+    3600
+}
+
+fn default_run_user() -> String {
+    "proxyauth".to_string()
+}
+
 /// Checks a raw `routes.yml` for the deprecated `secure` key, which was
 /// renamed to `required_login`. Unlike a normal unknown field, `secure`
 /// used to control whether a route required authentication — silently
@@ -1106,37 +1207,37 @@ fn default_static_index() -> String {
 /// so we fail loudly instead of falling back to the `required_login`
 /// default.
 pub fn check_deprecated_secure_key(routes_str: &str) -> Result<(), String> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(routes_str)
-    .map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(routes_str).map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
 
     let routes = doc
-    .get("routes")
-    .and_then(|r| r.as_sequence())
-    .cloned()
-    .unwrap_or_default();
+        .get("routes")
+        .and_then(|r| r.as_sequence())
+        .cloned()
+        .unwrap_or_default();
 
     let offenders: Vec<String> = routes
-    .iter()
-    .filter_map(|route| {
-        let map = route.as_mapping()?;
-        if map.contains_key(serde_yaml::Value::String("secure".to_string())) {
-            let prefix = map
-            .get(serde_yaml::Value::String("prefix".to_string()))
-            .and_then(|p| p.as_str())
-            .unwrap_or("<unknown prefix>");
-            Some(prefix.to_string())
-        } else {
-            None
-        }
-    })
-    .collect();
+        .iter()
+        .filter_map(|route| {
+            let map = route.as_mapping()?;
+            if map.contains_key(serde_yaml::Value::String("secure".to_string())) {
+                let prefix = map
+                    .get(serde_yaml::Value::String("prefix".to_string()))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("<unknown prefix>");
+                Some(prefix.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
 
     if offenders.is_empty() {
         Ok(())
     } else {
         Err(format!(
             "routes.yml: 'secure' key is deprecated, rename it to 'required_login' (route(s): {}).",
-                    offenders.join(", ")
+            offenders.join(", ")
         ))
     }
 }
@@ -1204,6 +1305,31 @@ impl AppConfig {
         }
 
         RouteAccessDecision::Denied
+    }
+
+    /// `run_user`, treating an explicitly empty string
+    /// (`"run_user": ""` in `config.json`) the same as the field being
+    /// absent entirely — `#[serde(default = ...)]` only kicks in when
+    /// a field is *missing*, not when it's present but empty, so
+    /// without this an explicit `""` would otherwise be used verbatim
+    /// as a literal (nonexistent) username to switch to.
+    pub fn effective_run_user(&self) -> &str {
+        if self.run_user.trim().is_empty() {
+            "proxyauth"
+        } else {
+            self.run_user.trim()
+        }
+    }
+
+    /// Same normalization as `effective_run_user`, for `run_group`:
+    /// an explicit empty string is treated as `None` (use
+    /// `effective_run_user`'s own primary group), not as a literal
+    /// empty-named group to look up.
+    pub fn effective_run_group(&self) -> Option<&str> {
+        self.run_group
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
     }
 }
 
@@ -1292,9 +1418,9 @@ impl AppConfig {
     pub fn should_use_database_as_fallback(&self) -> bool {
         !self.blakegate_backup_mode_active()
             || self
-            .blakegate_connected
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
+                .blakegate_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
     }
 
     /// Applies a full, authoritative user list pushed by Blakegate —
@@ -1307,7 +1433,7 @@ impl AppConfig {
     /// the complete, current list, not an incremental diff.
     pub fn apply_blakegate_users(&self, fresh: &[User]) {
         let fresh_usernames: std::collections::HashSet<&str> =
-        fresh.iter().map(|u| u.username.as_str()).collect();
+            fresh.iter().map(|u| u.username.as_str()).collect();
 
         let Some(mut guard) = self.apply_upserts(fresh) else {
             return;
@@ -1445,7 +1571,7 @@ impl AppConfig {
         }
 
         let fresh_usernames: std::collections::HashSet<&str> =
-        fresh.iter().map(|u| u.username.as_str()).collect();
+            fresh.iter().map(|u| u.username.as_str()).collect();
 
         let Some(mut guard) = self.apply_upserts(fresh) else {
             return;
@@ -1611,7 +1737,7 @@ impl AppConfig {
 pub fn load_config(path: &str) -> Arc<AppConfig> {
     let config_str = fs::read_to_string(path).expect("Could not read config.json file");
     let mut config: AppConfig =
-    serde_json::from_str(&config_str).expect("Invalid config format config.json");
+        serde_json::from_str(&config_str).expect("Invalid config format config.json");
 
     let mut updated = false;
 
@@ -1619,12 +1745,12 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
         if !user.password.starts_with("$argon2") {
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
-            .hash_password(user.password.as_bytes(), &salt)
-            .expect(&format!(
-                "Password hashing failed for user {}",
-                user.username
-            ))
-            .to_string();
+                .hash_password(user.password.as_bytes(), &salt)
+                .expect(&format!(
+                    "Password hashing failed for user {}",
+                    user.username
+                ))
+                .to_string();
             user.password = hash;
             updated = true;
         }
@@ -1632,8 +1758,8 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
 
     let original_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
     config
-    .users
-    .sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
+        .users
+        .sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
 
     let sorted_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
     if original_order != sorted_order {
@@ -1685,14 +1811,14 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
     }
 
     let config_str = fs::read_to_string(config_path)
-    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
     let mut json: Value = serde_json::from_str(&config_str)
-    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+        .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
 
     let mut found = false;
     let mut cleared = false;
@@ -1719,9 +1845,9 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
 
     if cleared {
         let updated_str = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+            .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
         fs::write(config_path, updated_str)
-        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+            .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
     }
 
     Ok(cleared)
@@ -1735,14 +1861,14 @@ pub fn add_otpkey(config_path: &str, username: &str) {
     }
 
     let config_str =
-    fs::read_to_string(config_path).expect("Failed to read the configuration file.");
+        fs::read_to_string(config_path).expect("Failed to read the configuration file.");
     let mut json: Value =
-    serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
+        serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .expect("Missing 'users' field in configuration file.");
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .expect("Missing 'users' field in configuration file.");
 
     let mut updated = false;
 
@@ -1754,8 +1880,8 @@ pub fn add_otpkey(config_path: &str, username: &str) {
             } else {
                 let otpkey = generate_base32_secret(32);
                 user.as_object_mut()
-                .unwrap()
-                .insert("otpkey".to_string(), Value::String(otpkey.clone()));
+                    .unwrap()
+                    .insert("otpkey".to_string(), Value::String(otpkey.clone()));
                 println!(
                     "OTP key successfully generated for '{}': {}",
                     username, otpkey
@@ -1768,21 +1894,21 @@ pub fn add_otpkey(config_path: &str, username: &str) {
 
     if updated {
         let updated_str = serde_json::to_string_pretty(&json)
-        .expect("Failed to serialize the updated configuration.");
+            .expect("Failed to serialize the updated configuration.");
         fs::write(config_path, updated_str)
-        .expect("Failed to write the updated configuration file.");
+            .expect("Failed to write the updated configuration file.");
         println!("Configuration file has been updated.");
     } else if !users
         .iter()
         .any(|u| u.get("username").and_then(|n| n.as_str()) == Some(username))
-        {
-            eprintln!("User '{}' not found in the configuration file.", username);
-        }
+    {
+        eprintln!("User '{}' not found in the configuration file.", username);
+    }
 }
 
 fn deserialize_log_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
 where
-D: Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     struct LogMapVisitor;
 
@@ -1795,7 +1921,7 @@ D: Deserializer<'de>,
 
         fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
         where
-        M: MapAccess<'de>,
+            M: MapAccess<'de>,
         {
             let mut map = HashMap::new();
             while let Some((k, v)) = access.next_entry::<String, serde_json::Value>()? {
@@ -1862,7 +1988,7 @@ impl AllowRegexCfg {
         }
         Ok(CompiledAllow {
             default_allow: self.default_allow,
-                allow,
+            allow,
         })
     }
 }
