@@ -230,6 +230,22 @@ pub const DEFAULT_ROUTES_YML: &str = concat!(
     "    target: \"http://127.0.0.1:8000/myapp/\"\n",
     "    required_login: true\n",
     "    username: [\"admin\"]\n",
+    "  # vhost is optional. Leave it out (as above) and the route\n",
+    "  # matches any Host header, same as before this field existed.\n",
+    "  # List one or more hostnames to scope a route to specific\n",
+    "  # frontend domain(s) — several routes can reuse the same\n",
+    "  # prefix as long as their vhost lists don't overlap.\n",
+    "  # - prefix: \"/private\"\n",
+    "  #   vhost: [\"app.example.com\"]\n",
+    "  #   target: \"http://127.0.0.1:8001/myapp/\"\n",
+    "  #   required_login: true\n",
+    "  #   username: [\"admin\"]\n",
+    "  #   # Optional: serve a dedicated certificate for this vhost\n",
+    "  #   # (SNI). Omit it and this vhost falls back to the server's\n",
+    "  #   # global TLS certificate.\n",
+    "  #   vhost_cert:\n",
+    "  #     cert: \"/etc/proxyauth/certs/app.example.com/cert.pem\"\n",
+    "  #     key: \"/etc/proxyauth/certs/app.example.com/key.pem\"\n",
 );
 
 /// Default `config.json` written on first run when the file is missing.

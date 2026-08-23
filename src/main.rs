@@ -645,6 +645,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     listener,
                     &config,
+                    &routes.routes,
                 )?
             }
 
@@ -690,6 +691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     listener,
                     &config,
+                    &routes.routes,
                 )?
             }
 
@@ -746,6 +748,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     listener,
                     &config,
+                    &routes.routes,
                 )?
             }
 
@@ -753,6 +756,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 move || build_app!(state_cloned).default_service(web::to(global_proxy)),
                 listener,
                 &config,
+                &routes.routes,
             )?,
         };
 

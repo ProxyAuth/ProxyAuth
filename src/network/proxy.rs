@@ -142,13 +142,71 @@ fn matches_prefix(path: &str, prefix: &str) -> bool {
     path_norm == pref_norm || path_norm.starts_with(&(pref_norm.clone() + "/"))
 }
 
-pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
+/// Strips a trailing `:port` from a `Host` header value and lowercases
+/// the result, so `App.Example.com:8443` and `app.example.com` compare
+/// equal. IPv6 literals (`[::1]:8443`) are left as-is except for the
+/// trailing port, since hostnames in `vhost` are never expected to be
+/// bracketed IPv6 addresses.
+fn normalize_host(host: &str) -> String {
+    let without_port = if host.starts_with('[') {
+        match host.rfind(']') {
+            Some(end) => &host[..=end],
+            None => host,
+        }
+    } else {
+        match host.rfind(':') {
+            Some(pos) => &host[..pos],
+            None => host,
+        }
+    };
+    without_port.trim().to_ascii_lowercase()
+}
+
+/// A route with an empty `vhost` list is a catch-all — it matches
+/// regardless of the request's `Host` header, preserving the behavior
+/// every `routes.yml` had before `vhost` existed. A non-empty list
+/// requires an exact (case-insensitive, port-stripped) match against
+/// one of its entries.
+fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
+    if vhosts.is_empty() {
+        return true;
+    }
+    let Some(host) = host else {
+        return false;
+    };
+    let host_norm = normalize_host(host);
+    vhosts
+        .iter()
+        .any(|v| normalize_host(v) == host_norm)
+}
+
+/// Extracts and normalizes the `Host` the request came in on, from
+/// either the `Host` header or the request's connection info (which
+/// also accounts for `X-Forwarded-Host` when actix is configured to
+/// trust it). Returns `None` when no host is present at all, in which
+/// case only vhost-less (catch-all) routes can match.
+pub fn request_host(req: &HttpRequest) -> Option<String> {
+    let host = req.connection_info().host().to_string();
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// Finds the best route for `raw_path`/`host`.
+///
+/// Candidates are first narrowed to routes whose `vhost` matches the
+/// request's `Host` header (or that have no `vhost` at all, i.e.
+/// catch-all routes) — then, among those, the existing longest-prefix
+/// rule picks the winner, in the precomputed order from
+/// `init_routes_order` when available. A vhost-scoped route and a
+/// catch-all route can share the same prefix: whichever is reached
+/// first in prefix-length order wins, so put the more specific one
+/// first in `routes.yml` if both could otherwise match.
+pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule]) -> Option<usize> {
     {
         let guard = ORDERED_ROUTE_IDX.read().unwrap();
         if let Some(order) = guard.as_ref() {
             if order.iter().all(|&i| i < routes.len()) {
                 for &i in order {
-                    if matches_prefix(raw_path, &routes[i].prefix) {
+                    if vhost_matches(host, &routes[i].vhost) && matches_prefix(raw_path, &routes[i].prefix) {
                         return Some(i);
                     }
                 }
@@ -174,7 +232,7 @@ pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
         }
     });
     for &i in &idx {
-        if matches_prefix(raw_path, &routes[i].prefix) {
+        if vhost_matches(host, &routes[i].vhost) && matches_prefix(raw_path, &routes[i].prefix) {
             return Some(i);
         }
     }
@@ -182,8 +240,8 @@ pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
 }
 
 #[allow(dead_code)]
-pub fn match_route<'a>(raw_path: &str, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
-    match_route_idx(raw_path, routes).map(|i| &routes[i])
+pub fn match_route<'a>(raw_path: &str, host: Option<&str>, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
+    match_route_idx(raw_path, host, routes).map(|i| &routes[i])
 }
 
 pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -> Builder {
@@ -375,7 +433,8 @@ pub async fn global_proxy(
 
     data.stats.incr();
 
-    if let Some(idx) = match_route_idx(path, &data.routes.routes) {
+    let host = request_host(&req);
+    if let Some(idx) = match_route_idx(path, host.as_deref(), &data.routes.routes) {
         let use_proxy = data.routes.routes[idx].proxy;
         if use_proxy {
             proxy_with_proxy(req, body, data, idx).await

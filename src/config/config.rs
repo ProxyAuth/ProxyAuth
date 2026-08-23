@@ -42,6 +42,40 @@ pub enum RegexCond {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouteRule {
+    /// Virtual hosts this route answers on, matched against the
+    /// incoming request's `Host` header (port stripped, compared
+    /// case-insensitively) — e.g. `["app.example.com"]`.
+    ///
+    /// Left empty (the default), the route is a catch-all: it matches
+    /// on *any* host, exactly like before `vhost` existed. This keeps
+    /// every pre-existing `routes.yml` working unchanged.
+    ///
+    /// Several routes can share the same `prefix` as long as they list
+    /// different `vhost`s — the request's `Host` header picks which
+    /// one applies before the usual longest-prefix matching happens.
+    /// This is what lets one ProxyAuth instance front several
+    /// frontend domains, each proxying its own set of prefixes to its
+    /// own backend(s).
+    #[serde(default = "default_vhost")]
+    pub vhost: Vec<String>,
+
+    /// Optional TLS certificate/key ProxyAuth should present when a
+    /// client connects for one of the hostnames listed in `vhost`
+    /// (Server Name Indication) — lets each vhost serve its own
+    /// certificate instead of the single global one configured for
+    /// the server. Two keys are recognized:
+    ///   - `cert`: path to the PEM certificate (chain)
+    ///   - `key`:  path to the PEM private key
+    ///
+    /// Left empty (the default), connections for these hostnames fall
+    /// back to the server's global TLS certificate — exactly as if
+    /// `vhost_cert` had never been set. Ignored entirely when `vhost`
+    /// is empty, and when the server isn't running with `tls: true`.
+    /// Like the global certificate, files listed here are watched and
+    /// hot-reloaded without restarting the server.
+    #[serde(default = "default_vhost_cert")]
+    pub vhost_cert: HashMap<String, String>,
+
     pub prefix: String,
     pub target: String,
 
@@ -914,6 +948,14 @@ fn default_ratelimit_auth() -> HashMap<String, u64> {
 fn default_cert() -> HashMap<String, String> {
     let cert = HashMap::new();
     cert
+}
+
+fn default_vhost() -> Vec<String> {
+    Vec::new()
+}
+
+fn default_vhost_cert() -> HashMap<String, String> {
+    HashMap::new()
 }
 
 /// Checks a raw `routes.yml` for the deprecated `secure` key, which was
