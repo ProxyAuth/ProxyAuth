@@ -444,7 +444,21 @@ pub async fn auth(
                 }
             };
 
-            let totp_key = match user.otpkey.as_deref() {
+            // Consult the live overlay before the startup snapshot:
+            // `AppState.config` is an immutable Arc loaded once, so a
+            // key enrolled or revoked since then only exists in
+            // `otp_overrides`. Reading `user.otpkey` directly (as this
+            // did) meant a revoked — e.g. compromised — secret kept
+            // working until every worker restarted, defeating the
+            // point of the reset endpoint. See
+            // `AppState::otp_overrides`.
+            let resolved_otpkey = crate::config::config::resolve_otpkey(
+                &data,
+                &user.username,
+                user.otpkey.as_deref(),
+            );
+
+            let totp_key = match resolved_otpkey.as_deref() {
                 Some(key) => key,
                 None => {
                     warn!("[{}] Missing TOTP secret for user {}", ip, user.username);

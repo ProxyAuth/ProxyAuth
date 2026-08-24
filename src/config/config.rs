@@ -26,6 +26,13 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+// Re-exported here so the rest of the codebase keeps importing every
+// config type from a single path (`crate::config::config::*`), as it
+// already did before these two blocks were split into their own
+// modules to keep this file from growing further.
+pub use crate::config::compression::CompressionConfig;
+pub use crate::config::logging::LoggingConfig;
+
 #[derive(Debug, Clone)]
 pub struct CompiledAllow {
     pub default_allow: bool,
@@ -227,6 +234,31 @@ pub struct RouteRule {
     #[serde(default)]
     pub need_csrf: Option<bool>,
 
+    /// Access logging for this route. `None` means "inherit from the
+    /// `vhosts:` group this route belongs to (if any), otherwise the
+    /// global `logging.enabled`" — same override rules as `need_csrf`.
+    /// `false` silences the per-request access-log line for this route
+    /// only; `warn!`/`error!` diagnostics are unaffected, which is
+    /// usually what "disable logging on this noisy endpoint" actually
+    /// means — drop one line per request, without going blind to real
+    /// failures.
+    ///
+    /// `None` vs `Some(_)` is load-bearing, so this field is read
+    /// directly rather than through an accessor: the resolution order
+    /// is route `log` → `logging.routes[prefix]` → `logging.enabled`,
+    /// and only an unset route can fall through to the next level. See
+    /// `network::accesslog::route_logging_enabled`.
+    #[serde(default)]
+    pub log: Option<bool>,
+
+    /// Response compression for this route. `None` inherits from the
+    /// group, then from the global `compression` block in
+    /// `config.json`. Every field inside is itself optional, so a route
+    /// can override just `enabled: false` (or just `algorithm`) and
+    /// inherit the rest — see `CompressionConfig::merged_over`.
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
+
     #[serde(default = "default_cache")]
     pub cache: bool,
 
@@ -259,6 +291,7 @@ impl RouteRule {
     pub fn requires_csrf(&self) -> bool {
         self.need_csrf.unwrap_or(true)
     }
+
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -384,6 +417,16 @@ pub struct VhostGroup {
     #[serde(default)]
     pub need_csrf: Option<bool>,
 
+    /// Access logging applied to every route in this group that doesn't
+    /// set its own `log` — same override rules as `need_csrf`.
+    #[serde(default)]
+    pub log: Option<bool>,
+
+    /// Compression applied to every route in this group that doesn't
+    /// set its own `compression` — same override rules as `need_csrf`.
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
+
     #[serde(default)]
     pub routes: Vec<RouteRule>,
 }
@@ -408,6 +451,14 @@ impl RouteConfig {
                 }
                 if route.need_csrf.is_none() {
                     route.need_csrf = group.need_csrf;
+                }
+                if route.log.is_none() {
+                    route.log = group.log;
+                }
+                if route.compression.is_none() {
+                    // Cloned, not moved: the group applies to every
+                    // route under it, not just the first.
+                    route.compression = group.compression.clone();
                 }
                 self.routes.push(route);
             }
@@ -637,6 +688,24 @@ pub struct AppConfig {
     #[serde(deserialize_with = "deserialize_log_map")]
     pub log: HashMap<String, String>,
 
+    /// Access log: line format plus the global / per-vhost / per-route
+    /// on-off switches. Deliberately separate from `log` above, which
+    /// configures the `tracing` *transport* (`local`/`loki`/`http`/
+    /// `disabled`) for every log line, access and diagnostic alike.
+    ///
+    /// The practical consequence of keeping them apart: setting
+    /// `logging.enabled` to false drops the per-request access lines
+    /// while leaving `warn!`/`error!` intact — almost always what
+    /// "turn off logging on this endpoint" is meant to achieve.
+    /// `log.type: "disabled"` remains the way to silence everything.
+    #[serde(default)]
+    pub logging: LoggingConfig,
+
+    /// Response compression, global defaults. Overridden per route or
+    /// per `vhosts:` group in `routes.yml`; see `CompressionConfig`.
+    #[serde(default)]
+    pub compression: CompressionConfig,
+
     #[serde(default = "default_stats")]
     pub stats: bool,
 
@@ -852,12 +921,14 @@ impl Serialize for AppConfig {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
         state.serialize_field("blakegate", &self.blakegate)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
+        state.serialize_field("compression", &self.compression)?;
         state.serialize_field("cors_origins", &self.cors_origins)?;
         state.serialize_field("databases", &self.databases)?;
         state.serialize_field("fast", &self.fast)?;
         state.serialize_field("host", &self.host)?;
         state.serialize_field("keep_alive", &self.keep_alive)?;
         state.serialize_field("log", &self.log)?;
+        state.serialize_field("logging", &self.logging)?;
         state.serialize_field("max_age_session_cookie", &self.max_age_session_cookie)?;
         state.serialize_field("max_connections", &self.max_connections)?;
         state.serialize_field("max_idle_per_host", &self.max_idle_per_host)?;

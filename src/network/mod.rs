@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod accesslog;
 pub mod canonical_url;
+pub mod compression;
 pub mod config;
 pub mod cors;
 pub mod error;

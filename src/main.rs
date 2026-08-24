@@ -35,6 +35,8 @@ use crate::adm::stats::{get_proxy_sessions, get_proxy_stats};
 use crate::build::build_info::update_build_info;
 use crate::cli::prompt::prompt;
 use crate::keystore::import::decrypt_keystore;
+use crate::network::accesslog::{self, AccessLogger};
+use crate::network::compression::Compress;
 use crate::network::config::init_loadbalancer;
 use crate::network::cors::CorsMiddleware;
 use crate::network::proxy::init_routes;
@@ -161,6 +163,23 @@ macro_rules! build_app {
             .wrap(RateLimitLogger)
             .wrap(CorsMiddleware {
                 config: state.clone(),
+            })
+            // Ordering is deliberate. Actix runs `wrap`s in reverse
+            // registration order, so the last one registered is the
+            // outermost. AccessLogger must be outermost to observe the
+            // final status of *every* request — including 429s
+            // synthesized by actix-governor, responses produced by the
+            // CORS middleware, and errors converted by actix itself,
+            // none of which ever reach a handler. Compress sits just
+            // inside it, which means `[length]` logs the number of
+            // bytes actually put on the wire (compressed), matching
+            // nginx's `$body_bytes_sent` rather than the pre-encoding
+            // size.
+            .wrap(Compress {
+                state: state.clone(),
+            })
+            .wrap(AccessLogger {
+                state: state.clone(),
             })
             .service(
                 web::resource("/auth")
@@ -602,6 +621,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     init_logging(&config);
+
+    // Compiles the access-log format once, and starts the /proc
+    // sampler only if that format actually uses [cpu-usage] or
+    // [memory-usage]. Must run after init_logging so the tracing
+    // subscriber the access log writes through already exists.
+    accesslog::init(&config);
 
     // load SMTP template if smtp use
     if let Some(smtp_cfg) = &config.smtp {

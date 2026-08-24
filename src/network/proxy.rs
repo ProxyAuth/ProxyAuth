@@ -1,6 +1,7 @@
 use crate::config::config::BackendConfig;
 use crate::config::config::BackendInput;
 use crate::config::config::RouteRule;
+use crate::network::accesslog::LogContext;
 use crate::network::canonical_url::canonicalize_path_for_match;
 use crate::network::loadbalancing::forward_failover;
 use crate::network::shared_client::{
@@ -28,7 +29,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::RwLock;
 use tokio::time::{Duration, timeout};
-use tracing::{info, warn};
+use tracing::warn;
 
 static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock::new(None));
 
@@ -865,6 +866,9 @@ pub async fn global_proxy(
 
     let host = request_host(&req);
     if let Some(idx) = match_route_idx(path, host.as_deref(), &data.routes.routes) {
+        // Lets the access-log and compression middlewares resolve this
+        // route's settings without redoing the match themselves.
+        LogContext::set_route(&req, idx);
         let rule = &data.routes.routes[idx];
         let has_ip_restriction =
             !rule.allow_ips_compiled.is_empty() || !rule.deny_ips_compiled.is_empty();
@@ -909,7 +913,11 @@ pub async fn global_proxy(
             proxy_without_proxy(req, body, data, idx).await
         }
     } else {
-        info!("{} 404 {} {} {}", ip, method, path, user_agent);
+        // No ad-hoc line here any more: the access-log middleware logs
+        // this 404 in the configured format, like everything else. That
+        // is the point of the rework — not a fourth logger alongside
+        // the others, but the removal of the ones that emitted
+        // divergent formats on a subset of code paths.
         Ok(HttpResponse::NotFound()
             .append_header(("server", "ProxyAuth"))
             .body("404 Not Found"))
@@ -1015,8 +1023,6 @@ pub async fn proxy_with_proxy(
     }
 
     // ── URL TARGET ─────────────────────────────────────────
-    let mut user_agent_fwd = "";
-
     let original_uri = req.uri();
     let path_no_query = original_uri.path();
     let prefix_norm = rule.prefix.trim_end_matches('/');
@@ -1179,7 +1185,28 @@ pub async fn proxy_with_proxy(
         (String::new(), String::new())
     };
 
+    // Publishes the resolved identity for the access log's [username]
+    // and [token-id] placeholders. Takes and releases `extensions_mut`
+    // inside its own body — the `RefMut` must not be held across an
+    // `.await`, or the next borrow panics.
+    LogContext::set_user(&req, &username, &token_id);
+
     // ── Build hyper request ────────────────────────────────────
+    // Resolved once, ahead of the header loop. Without this, the
+    // `compression` block would look like it does nothing on proxied
+    // routes: the client's `Accept-Encoding` is relayed to the backend
+    // verbatim, the backend compresses first, and the compression
+    // middleware then (correctly) refuses to re-encode a body that
+    // already carries a `Content-Encoding`. Asking upstream for
+    // `identity` is what lets ProxyAuth apply the configured algorithm
+    // and level itself — nginx's `proxy_set_header Accept-Encoding ""`.
+    let route_compression = match &rule.compression {
+        Some(c) => c.merged_over(&data.config.compression),
+        None => data.config.compression.clone(),
+    };
+    let strip_accept_encoding =
+        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+
     let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
     let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
 
@@ -1199,20 +1226,27 @@ pub async fn proxy_with_proxy(
     for (key, value) in req.headers() {
         let key_str = key.as_str();
 
-        if key_str == "user-agent" {
-            user_agent_fwd = value.to_str().unwrap_or("");
-        }
-
         // Authorization is consumed by ProxyAuth only when
         // the route itself requires ProxyAuth authentication.
         if key_str == "authorization" && rule.required_login {
             continue;
         }
 
-        if key_str != "user-agent"
+        // `is_hop_by_hop_header` existed and was documented, but was
+        // never actually called — the SECURITY note above described a
+        // fix that had only half landed. Without this test, a client's
+        // own Content-Length / Transfer-Encoding / TE / Trailer /
+        // Upgrade / Keep-Alive / Proxy-* headers were relayed verbatim
+        // to the backend, alongside a body this proxy always
+        // re-serializes as fixed-length. Two HTTP implementations
+        // disagreeing on framing metadata is precisely what enables
+        // request smuggling.
+        if !is_hop_by_hop_header(key_str)
+            && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
+            && !(strip_accept_encoding && key_str == "accept-encoding")
             {
                 if let Ok(hv) =
                     hyper::header::HeaderValue::from_bytes(value.as_bytes())
@@ -1221,6 +1255,11 @@ pub async fn proxy_with_proxy(
                     }
             }
     }
+
+    if strip_accept_encoding {
+        request_builder = request_builder.header(hyper::header::ACCEPT_ENCODING, "identity");
+    }
+
     request_builder = request_builder
         .header("Connection", "close")
         .header(USER_AGENT, "ProxyAuth");
@@ -1344,18 +1383,6 @@ pub async fn proxy_with_proxy(
             client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
         }
     }
-
-    info!(
-        "{} - {} {} {} {} {} [tid:{}] {}",
-        ip,
-        path,
-        method_str,
-        status.as_u16(),
-        body_bytes.len(),
-        username,
-        token_id,
-        user_agent_fwd
-    );
 
     add_cors_headers(&mut client_resp, &req);
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
@@ -1500,8 +1527,6 @@ pub async fn proxy_without_proxy(
     }
 
     // ── Build URL target ─────────────────────────────────────────────
-    let mut user_agent_fwd = "";
-
     let original_uri = req.uri();
     let path_no_query = original_uri.path();
 
@@ -1634,11 +1659,6 @@ pub async fn proxy_without_proxy(
                     })
             })
             .ok_or_else(|| {
-                info!(
-                    "[{}] {} {} 401 Unauthorized token attempt {}",
-                    ip, path, method_str, user_agent
-                );
-
                 let mut resp = HttpResponse::Unauthorized();
 
                 resp.append_header(("server", "ProxyAuth"));
@@ -1682,11 +1702,6 @@ pub async fn proxy_without_proxy(
             .route_access_decision(rule, &username)
             .is_allowed()
         {
-            info!(
-                "[{}] {} {} 401 Unauthorized token attempt {}",
-                ip, path, method_str, user_agent
-            );
-
             let mut resp = HttpResponse::Unauthorized();
 
             resp.append_header(("server", "ProxyAuth"));
@@ -1715,6 +1730,24 @@ pub async fn proxy_without_proxy(
         (String::new(), String::new())
     };
 
+    // See the matching call in `proxy_with_proxy`.
+    LogContext::set_user(&req, &username, &token_id);
+
+    // Resolved once, ahead of the header loop. Without this, the
+    // `compression` block would look like it does nothing on proxied
+    // routes: the client's `Accept-Encoding` is relayed to the backend
+    // verbatim, the backend compresses first, and the compression
+    // middleware then (correctly) refuses to re-encode a body that
+    // already carries a `Content-Encoding`. Asking upstream for
+    // `identity` is what lets ProxyAuth apply the configured algorithm
+    // and level itself — nginx's `proxy_set_header Accept-Encoding ""`.
+    let route_compression = match &rule.compression {
+        Some(c) => c.merged_over(&data.config.compression),
+        None => data.config.compression.clone(),
+    };
+    let strip_accept_encoding =
+        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+
     // ── Build request Hyper ──────────────────────────────────────────
     //
     // IMPORTANT:
@@ -1732,20 +1765,27 @@ pub async fn proxy_without_proxy(
     for (key, value) in req.headers() {
         let key_str = key.as_str();
 
-        if key_str == "user-agent" {
-            user_agent_fwd = value.to_str().unwrap_or("");
-        }
-
         // Authorization is consumed by ProxyAuth only when
         // the route itself requires ProxyAuth authentication.
         if key_str == "authorization" && rule.required_login {
             continue;
         }
 
-        if key_str != "user-agent"
+        // `is_hop_by_hop_header` existed and was documented, but was
+        // never actually called — the SECURITY note above described a
+        // fix that had only half landed. Without this test, a client's
+        // own Content-Length / Transfer-Encoding / TE / Trailer /
+        // Upgrade / Keep-Alive / Proxy-* headers were relayed verbatim
+        // to the backend, alongside a body this proxy always
+        // re-serializes as fixed-length. Two HTTP implementations
+        // disagreeing on framing metadata is precisely what enables
+        // request smuggling.
+        if !is_hop_by_hop_header(key_str)
+            && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
+            && !(strip_accept_encoding && key_str == "accept-encoding")
             {
                 if let Ok(hv) =
                     hyper::header::HeaderValue::from_bytes(value.as_bytes())
@@ -1753,6 +1793,10 @@ pub async fn proxy_without_proxy(
                         request_builder = request_builder.header(key_str, hv);
                     }
             }
+    }
+
+    if strip_accept_encoding {
+        request_builder = request_builder.header(hyper::header::ACCEPT_ENCODING, "identity");
     }
 
     request_builder = request_builder.header(USER_AGENT, "ProxyAuth");
@@ -1986,19 +2030,6 @@ pub async fn proxy_without_proxy(
             client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
         }
     }
-
-    // ── Logging ─────────────────────────────────────────────────────
-    info!(
-        "[{}] - {} {} {} {} {} [tid:{}] {}",
-        ip,
-        path,
-        method_str,
-        status.as_u16(),
-        body_bytes.len(),
-        username,
-        token_id,
-        user_agent_fwd
-    );
 
     add_cors_headers(&mut client_resp, &req);
 

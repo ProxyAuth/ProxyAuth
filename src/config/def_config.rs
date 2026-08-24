@@ -359,12 +359,8 @@ pub fn switch_to_user_and_group(
 /// failure is logged and startup continues — whatever ownership
 /// already existed from a prior `proxyauth prepare` run is very likely
 /// still correct anyway.
-pub fn reassert_proxyauth_ownership() {
-    reassert_ownership("proxyauth", None);
-}
-
-/// Same as `reassert_proxyauth_ownership`, generalized to whatever
-/// `run_user`/`run_group` `config.json` configures.
+/// Applies to whatever `run_user`/`run_group` `config.json` configures
+/// (defaults to `proxyauth` and its own primary group).
 pub fn reassert_ownership(user: &str, group: Option<&str>) {
     if !Uid::effective().is_root() {
         // We were never root this run (e.g. already started as the
@@ -390,6 +386,15 @@ pub fn reassert_ownership(user: &str, group: Option<&str>) {
     }
 }
 
+/// Bootstraps `config.json` by downloading it from `url` on first run.
+///
+/// Currently has no caller outside this file's own tests — no CLI
+/// command or startup path invokes it. Kept rather than deleted because
+/// those three tests exercise it and it is plausibly a bootstrap path
+/// someone intends to wire up; `allow(dead_code)` so its warning stops
+/// masking genuinely unused code. Delete it (and its tests) if that
+/// bootstrap flow isn't planned.
+#[allow(dead_code)]
 pub async fn create_config(url: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     if Path::new(path).exists() {
         return Ok(());
@@ -490,6 +495,16 @@ pub const DEFAULT_CONFIG_JSON: &str = concat!(
     "  \"port\": 8080,\n",
     "  \"worker\": 8,\n",
     "  \"log\": {\"type\": \"disabled\"},\n",
+    "  \"logging\": {\n",
+    "    \"enabled\": true,\n",
+    "    \"format\": \"[vhost] [ip] [method] [path] [status] [length] [user-agent] [x-forwarded-for]\"\n",
+    "  },\n",
+    "  \"compression\": {\n",
+    "    \"enabled\": false,\n",
+    "    \"algorithm\": \"br, gzip\",\n",
+    "    \"level\": 5,\n",
+    "    \"min_size\": 1024\n",
+    "  },\n",
     "  \"stats\": false,\n",
     "  \"max_idle_per_host\": 500,\n",
     "  \"ratelimit_auth\": {\n",
