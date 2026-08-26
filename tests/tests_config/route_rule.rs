@@ -8,6 +8,8 @@ mod tests {
             target: target.to_string(),
             vhost: vec![],
             vhost_cert: std::collections::HashMap::new(),
+            certbot_renew: false,
+            headers: std::collections::HashMap::new(),
             allow_ips: vec![],
             deny_ips: vec![],
             allow_ips_compiled: vec![],

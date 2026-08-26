@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod acme;
 mod adm;
 mod build;
 mod cli;
@@ -74,6 +75,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::info;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -145,6 +147,113 @@ async fn create_listener(
     Ok(socket.into())
 }
 
+/// Handles ACME HTTP-01 challenge requests on plain port 80.
+///
+/// Let's Encrypt's validation servers always fetch
+/// `http://{vhost}/.well-known/acme-challenge/{token}` over plain
+/// HTTP on port 80 specifically — this isn't configurable on their
+/// end, so a TLS-only deployment (the common case: everything real
+/// served over 443, port 80 not listening at all) can never complete
+/// a renewal without *something* answering there. Everything else
+/// gets redirected to HTTPS, matching what operators generally expect
+/// from port 80 anyway on an otherwise HTTPS-only site.
+async fn acme_http01_responder(req: actix_web::HttpRequest) -> actix_web::HttpResponse {
+    if req.method() == actix_web::http::Method::GET {
+        if let Some(token) = crate::acme::challenge::extract_token(req.path()) {
+            let host = req.connection_info().host().to_string();
+            let vhost = crate::network::proxy::normalize_host(&host);
+            return match crate::acme::challenge::lookup(&vhost, token) {
+                Some(key_authorization) => actix_web::HttpResponse::Ok()
+                .append_header(("server", "ProxyAuth"))
+                .content_type("application/octet-stream")
+                .body(key_authorization),
+                // A genuinely unknown/expired token must be a plain
+                // 404 — NOT the HTTPS redirect below. Redirecting a
+                // failed challenge lookup just moves the "not found"
+                // problem to the main server on 443, where it can get
+                // entangled with completely unrelated routing rules
+                // (allow_ips, auth, etc.) that were never meant to
+                // apply to ACME validation at all — a real bug this
+                // comment is here specifically to prevent
+                // reintroducing: it once turned a should-be-404 into a
+                // confusing 403 from an `allow_ips`-restricted route.
+                None => actix_web::HttpResponse::NotFound()
+                .append_header(("server", "ProxyAuth"))
+                .finish(),
+            };
+        }
+    }
+
+    let host = crate::network::proxy::normalize_host(&req.connection_info().host().to_string());
+    let location = format!("https://{host}{}", req.uri());
+    actix_web::HttpResponse::MovedPermanently()
+    .append_header(("server", "ProxyAuth"))
+    .append_header(("Location", location))
+    .finish()
+}
+
+/// Spawns a minimal, plain-HTTP-only server bound to port 80, whose
+/// only job is `acme_http01_responder` above — entirely separate from
+/// the main server(s) (which may be TLS-only on 443), since actix
+/// doesn't support mixing TLS and plain-HTTP listeners within one
+/// `HttpServer` instance. Only spawned when at least one route has
+/// `certbot_renew: true` and the main server runs with `tls: true` — a
+/// plain-HTTP main server already answers ACME challenges itself
+/// (see the same check wired into `global_proxy`), so a second
+/// listener on the same port would be redundant, and nothing needs
+/// this at all if no vhost actually uses automatic renewal.
+///
+/// Must be called before privileges are dropped — like the main
+/// listener(s), binding port 80 needs root (or `CAP_NET_BIND_SERVICE`)
+/// on any port below 1024.
+async fn spawn_acme_http01_listener(
+    config: &AppConfig,
+    routes: &RouteConfig,
+    server_futures: &mut Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+) {
+    if !config.tls {
+        return;
+    }
+    if !routes.routes.iter().any(|r| r.certbot_renew) {
+        return;
+    }
+
+    for host in config.bind_addresses() {
+        let addr = socket_addr_string(&host, 80);
+        let listener = match create_listener(&addr, 4096, 4096, 128).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(
+                    "ACME: failed to bind the HTTP-01 challenge listener on {addr}: {e} — automatic renewal will keep failing until port 80 is reachable here"
+                );
+                continue;
+            }
+        };
+
+        info!("ACME: HTTP-01 challenge listener bound on {addr}");
+
+        let server = match actix_web::HttpServer::new(|| {
+            App::new().default_service(web::to(acme_http01_responder))
+        })
+        .listen(listener)
+        {
+            Ok(s) => s.run(),
+            Err(e) => {
+                error!("ACME: failed to start the HTTP-01 challenge listener on {addr}: {e}");
+                continue;
+            }
+        };
+
+        server_futures.push(tokio::spawn(async move {
+            let result = server.await;
+            if let Err(ref e) = result {
+                error!("ACME HTTP-01 listener terminated with error: {}", e);
+            }
+            result
+        }));
+    }
+}
+
 async fn wait_for_port(addr: &str, max_retries: u32, delay: Duration) {
     for attempt in 1..=max_retries {
         match create_listener(addr, 4096, 4096, 1).await {
@@ -154,11 +263,11 @@ async fn wait_for_port(addr: &str, max_retries: u32, delay: Duration) {
             Err(e) => {
                 warn!(
                     "Port {} not yet available (attempt {}/{}): {}. Retrying in {}s...",
-                    addr,
-                    attempt,
-                    max_retries,
-                    e,
-                    delay.as_secs()
+                      addr,
+                      attempt,
+                      max_retries,
+                      e,
+                      delay.as_secs()
                 );
                 tokio::time::sleep(delay).await;
             }
@@ -175,58 +284,58 @@ macro_rules! build_app {
     ($state:expr) => {{
         let state = $state.clone();
         App::new()
-            .app_data(state.clone())
-            .app_data(web::PayloadConfig::new(state.config.max_body_size))
-            .wrap(RateLimitLogger)
-            .wrap(CorsMiddleware {
-                config: state.clone(),
-            })
-            // Ordering is deliberate. Actix runs `wrap`s in reverse
-            // registration order, so the last one registered is the
-            // outermost. AccessLogger must be outermost to observe the
-            // final status of *every* request — including 429s
-            // synthesized by actix-governor, responses produced by the
-            // CORS middleware, and errors converted by actix itself,
-            // none of which ever reach a handler. Compress sits just
-            // inside it, which means `[length]` logs the number of
-            // bytes actually put on the wire (compressed), matching
-            // nginx's `$body_bytes_sent` rather than the pre-encoding
-            // size.
-            .wrap(Compress {
-                state: state.clone(),
-            })
-            .wrap(AccessLogger {
-                state: state.clone(),
-            })
-            .service(
-                web::resource("/auth")
-                    .route(web::post().to(auth))
-                    .route(web::method(Method::OPTIONS).to(auth_options)),
-            )
-            .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
-            .service(web::resource("/adm/stats").route(web::get().to(get_proxy_stats)))
-            .service(web::resource("/adm/stats/sessions").route(web::get().to(get_proxy_sessions)))
-            .service(web::resource("/adm/logs").route(web::get().to(get_logs)))
-            .service(web::resource("/adm/revoke").route(web::post().to(revoke_route)))
-            .service(web::resource("/adm/auth/totp/reset").route(web::post().to(reset_otp_route)))
-            .service(
-                web::resource("/logout")
-                    .route(web::get().to(logout_session))
-                    .route(web::method(Method::OPTIONS).to(logout_options)),
-            )
-            .service(
-                web::resource("/adm/auth/totp/get")
-                    .route(web::post().to(get_otpauth_uri))
-                    .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
-            )
+        .app_data(state.clone())
+        .app_data(web::PayloadConfig::new(state.config.max_body_size))
+        .wrap(RateLimitLogger)
+        .wrap(CorsMiddleware {
+            config: state.clone(),
+        })
+        // Ordering is deliberate. Actix runs `wrap`s in reverse
+        // registration order, so the last one registered is the
+        // outermost. AccessLogger must be outermost to observe the
+        // final status of *every* request — including 429s
+        // synthesized by actix-governor, responses produced by the
+        // CORS middleware, and errors converted by actix itself,
+        // none of which ever reach a handler. Compress sits just
+        // inside it, which means `[length]` logs the number of
+        // bytes actually put on the wire (compressed), matching
+        // nginx's `$body_bytes_sent` rather than the pre-encoding
+        // size.
+        .wrap(Compress {
+            state: state.clone(),
+        })
+        .wrap(AccessLogger {
+            state: state.clone(),
+        })
+        .service(
+            web::resource("/auth")
+            .route(web::post().to(auth))
+            .route(web::method(Method::OPTIONS).to(auth_options)),
+        )
+        .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
+        .service(web::resource("/adm/stats").route(web::get().to(get_proxy_stats)))
+        .service(web::resource("/adm/stats/sessions").route(web::get().to(get_proxy_sessions)))
+        .service(web::resource("/adm/logs").route(web::get().to(get_logs)))
+        .service(web::resource("/adm/revoke").route(web::post().to(revoke_route)))
+        .service(web::resource("/adm/auth/totp/reset").route(web::post().to(reset_otp_route)))
+        .service(
+            web::resource("/logout")
+            .route(web::get().to(logout_session))
+            .route(web::method(Method::OPTIONS).to(logout_options)),
+        )
+        .service(
+            web::resource("/adm/auth/totp/get")
+            .route(web::post().to(get_otpauth_uri))
+            .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
+        )
     }};
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+    .install_default()
+    .expect("Failed to install rustls crypto provider");
 
     if let Err(e) = prompt().await {
         eprintln!("Error: {}", e);
@@ -319,7 +428,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let interval_secs = db_cfg.refresh_interval_secs;
             tokio::spawn(async move {
                 let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 // First tick fires immediately; skip it since load_config
                 // already did an initial (full) load.
                 ticker.tick().await;
@@ -347,7 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let interval_secs = db_cfg.full_refresh_interval_secs;
             tokio::spawn(async move {
                 let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
@@ -374,7 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let interval_secs = db_cfg.purge_interval_secs;
             tokio::spawn(async move {
                 let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
@@ -417,8 +526,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ticker.tick().await;
             let _ = tokio::task::spawn_blocking(|| match reset::db::purge_expired() {
                 Ok(n) if n > 0 => println!("[reset] purged {n} expired password-reset token(s)"),
-                Ok(_) => {}
-                Err(e) => eprintln!("[reset] failed to purge expired tokens: {e}"),
+                                                Ok(_) => {}
+                                                Err(e) => eprintln!("[reset] failed to purge expired tokens: {e}"),
             })
             .await;
         }
@@ -427,7 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_loadbalancer(&config);
 
     let routes_str =
-        fs::read_to_string("/etc/proxyauth/config/routes.yml").expect("cannot read routes");
+    fs::read_to_string("/etc/proxyauth/config/routes.yml").expect("cannot read routes");
 
     if let Err(e) = config::config::check_deprecated_secure_key(&routes_str) {
         eprintln!("{}", e);
@@ -435,7 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let routes_parsed: RouteConfig =
-        serde_yaml::from_str(&routes_str).expect("Failed to parse routes.yml");
+    serde_yaml::from_str(&routes_str).expect("Failed to parse routes.yml");
     let mut routes: RouteConfig = routes_parsed.expand_vhost_groups();
 
     let counter_token = Arc::new(CounterToken::new());
@@ -472,8 +581,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     start_revoked_token_ttl(
         revoked_tokens.clone(),
-        std::time::Duration::from_secs(15),
-        config.redis.clone(),
+                            std::time::Duration::from_secs(15),
+                            config.redis.clone(),
     )
     .await;
 
@@ -493,9 +602,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ClientOptions {
             use_proxy: true,
             proxy_addr: Some("http://127.0.0.1:8888".to_string()),
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
+                                                     use_cert: false,
+                                                     cert_path: None,
+                                                     key_path: None,
         },
         &config,
     );
@@ -510,8 +619,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reconnect/polling model.
     proto::blakegate::spawn_clients(Arc::clone(&config), Arc::clone(&routes));
 
+    // Periodic Let's Encrypt renewal check for every `certbot_renew:
+    // true` vhost — see acme::spawn_periodic_scan's doc comment. A
+    // fresh Arc<Vec<RouteRule>> rather than passing `routes` (the
+    // Arc<RouteConfig> wrapper) directly, so this module only depends
+    // on the specific piece it actually needs.
+    crate::acme::spawn_periodic_scan(Arc::new(routes.routes.clone()), config.acme.clone());
+
     let ip_blocklist: Arc<arc_swap::ArcSwap<Vec<ipnet::IpNet>>> =
-        Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+    Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
     if !config.ip_blocklists.is_empty() {
         let bl_config = Arc::clone(&config);
         let bl_store = Arc::clone(&ip_blocklist);
@@ -519,8 +635,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fresh = crate::network::ipblocklist::refresh_all(&bl_config).await;
             println!(
                 "[ip_blocklist] loaded {} entr(y/ies) from {} source(s)",
-                fresh.len(),
-                bl_config.ip_blocklists.len()
+                     fresh.len(),
+                     bl_config.ip_blocklists.len()
             );
             bl_store.store(Arc::new(fresh));
 
@@ -542,17 +658,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = web::Data::new(AppState {
         config: Arc::clone(&config),
-        routes: Arc::clone(&routes),
-        counter: counter_token,
-        client_normal,
-        client_with_cert,
-        client_with_proxy,
-        revoked_tokens,
-        stats,
-        ip_blocklist,
-        otp_overrides: Arc::new(DashMap::new()),
-        password_overrides: Arc::new(DashMap::new()),
-        must_change_overrides: Arc::new(DashMap::new()),
+                               routes: Arc::clone(&routes),
+                               counter: counter_token,
+                               client_normal,
+                               client_with_cert,
+                               client_with_proxy,
+                               revoked_tokens,
+                               stats,
+                               ip_blocklist,
+                               otp_overrides: Arc::new(DashMap::new()),
+                               password_overrides: Arc::new(DashMap::new()),
+                               must_change_overrides: Arc::new(DashMap::new()),
     });
 
     init_derived_key(&config.secret);
@@ -560,15 +676,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // logs
     fn init_logging(config: &AppConfig) {
         let logs = config
-            .log
-            .get("type")
-            .map(|v| v.trim_matches('"'))
-            .unwrap_or("local");
+        .log
+        .get("type")
+        .map(|v| v.trim_matches('"'))
+        .unwrap_or("local");
 
         let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("proxyauth=trace"))
-            .add_directive("actix_web=warn".parse().unwrap())
-            .add_directive("actix_server=warn".parse().unwrap());
+        .unwrap_or_else(|_| EnvFilter::new("proxyauth=trace"))
+        .add_directive("actix_web=warn".parse().unwrap())
+        .add_directive("actix_server=warn".parse().unwrap());
 
         let base_registry = Registry::default().with(env_filter);
 
@@ -578,25 +694,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let url = Url::parse(host).expect("Invalid Loki URL");
 
                 let (loki_layer, task) = tracing_loki::builder()
-                    .label("app", "proxyauth")
-                    .expect("builder failed")
-                    .extra_field("pid", format!("{}", process::id()))
-                    .expect("extra_field failed")
-                    .build_url(url)
-                    .expect("build_url failed");
+                .label("app", "proxyauth")
+                .expect("builder failed")
+                .extra_field("pid", format!("{}", process::id()))
+                .expect("extra_field failed")
+                .build_url(url)
+                .expect("build_url failed");
 
                 let loki_filter = tracing_subscriber::filter::filter_fn(|meta| {
                     meta.target().starts_with("proxyauth")
                 });
 
                 let fmt_layer = fmt::Layer::new()
-                    .with_timer(LocalTime)
-                    .with_filter(loki_filter);
+                .with_timer(LocalTime)
+                .with_filter(loki_filter);
 
                 base_registry
-                    .with(loki_layer.with_filter(LevelFilter::INFO))
-                    .with(fmt_layer)
-                    .init();
+                .with(loki_layer.with_filter(LevelFilter::INFO))
+                .with(fmt_layer)
+                .init();
 
                 tokio::spawn(task);
             }
@@ -605,10 +721,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (tx, rx) = unbounded_channel::<String>();
 
                 let max_logs = config
-                    .log
-                    .get("write_max_logs")
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .expect("Invalid write_max_logs");
+                .log
+                .get("write_max_logs")
+                .and_then(|v| v.parse::<usize>().ok())
+                .expect("Invalid write_max_logs");
 
                 if max_logs >= 100_000 {
                     eprintln!("write_max_logs must be < 100000");
@@ -616,11 +732,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let fmt_layer =
-                    fmt::Layer::new()
-                        .with_timer(LocalTime)
-                        .with_writer(ChannelLogWriter {
-                            sender: tx.clone().into(),
-                        });
+                fmt::Layer::new()
+                .with_timer(LocalTime)
+                .with_writer(ChannelLogWriter {
+                    sender: tx.clone().into(),
+                });
 
                 base_registry.with(fmt_layer).init();
 
@@ -651,9 +767,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
 
                 let fmt_layer = fmt::Layer::new()
-                    .with_timer(LocalTime)
-                    .with_writer(crate::logs::ProxyAuthFileMakeWriter)
-                    .with_filter(local_filter);
+                .with_timer(LocalTime)
+                .with_writer(crate::logs::ProxyAuthFileMakeWriter)
+                .with_filter(local_filter);
 
                 base_registry.with(fmt_layer).init();
 
@@ -692,33 +808,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // configuration proxy ratelimit
     let requests_per_second_proxy_config = config
-        .ratelimit_proxy
-        .get("requests_per_second")
-        .copied()
-        .unwrap_or(0);
+    .ratelimit_proxy
+    .get("requests_per_second")
+    .copied()
+    .unwrap_or(0);
 
     let burst_proxy_config = config
-        .ratelimit_proxy
-        .get("burst")
-        .copied()
-        .unwrap_or(0)
-        .try_into()
-        .expect("bad burst_proxy value");
+    .ratelimit_proxy
+    .get("burst")
+    .copied()
+    .unwrap_or(0)
+    .try_into()
+    .expect("bad burst_proxy value");
 
     // configuration auth ratelimit
     let requests_per_second_auth_config = config
-        .ratelimit_auth
-        .get("requests_per_second")
-        .copied()
-        .unwrap_or(0);
+    .ratelimit_auth
+    .get("requests_per_second")
+    .copied()
+    .unwrap_or(0);
 
     let burst_auth_config = config
-        .ratelimit_auth
-        .get("burst")
-        .copied()
-        .unwrap_or(0)
-        .try_into()
-        .expect("bad burst_auth value");
+    .ratelimit_auth
+    .get("burst")
+    .copied()
+    .unwrap_or(0)
+    .try_into()
+    .expect("bad burst_auth value");
 
     let mode_actix = mode_actix_web(
         &requests_per_second_auth_config,
@@ -726,13 +842,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // One or more bind addresses (e.g. IPv4 + IPv6 together via
-    // `address: [...]` in config.json) — see AppConfig::bind_addresses
-    // for the fallback to the single `host` field when unset.
+    // `host: [...]` in config.json) — see AppConfig::bind_addresses.
     let bind_addrs = config.bind_addresses();
     let addrs: Vec<String> = bind_addrs
-        .iter()
-        .map(|h| socket_addr_string(h, config.port))
-        .collect();
+    .iter()
+    .map(|h| socket_addr_string(h, config.port))
+    .collect();
 
     for a in &addrs {
         wait_for_port(a, 5, Duration::from_secs(2)).await;
@@ -763,13 +878,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let server = match mode_actix.as_ref() {
             "NO_RATELIMIT_AUTH" => {
                 let seconds_per_request =
-                    Duration::from_secs_f64(1.0 / requests_per_second_proxy_config as f64);
+                Duration::from_secs_f64(1.0 / requests_per_second_proxy_config as f64);
                 let governor_proxy_conf = GovernorConfigBuilder::default()
-                    .burst_size(burst_proxy_config)
-                    .key_extractor(UserToken)
-                    .period(seconds_per_request)
-                    .finish()
-                    .unwrap();
+                .burst_size(burst_proxy_config)
+                .key_extractor(UserToken)
+                .period(seconds_per_request)
+                .finish()
+                .unwrap();
 
                 bind_server(
                     move || {
@@ -785,43 +900,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             "NO_RATELIMIT_PROXY" => {
                 let seconds_per_request =
-                    Duration::from_secs_f64(1.0 / requests_per_second_auth_config as f64);
+                Duration::from_secs_f64(1.0 / requests_per_second_auth_config as f64);
                 let governor_auth_conf = GovernorConfigBuilder::default()
-                    .burst_size(burst_auth_config)
-                    .use_headers()
-                    .period(seconds_per_request)
-                    .finish()
-                    .unwrap();
+                .burst_size(burst_auth_config)
+                .use_headers()
+                .period(seconds_per_request)
+                .finish()
+                .unwrap();
 
                 bind_server(
                     move || {
                         build_app!(state_cloned)
-                            .service(
-                                web::resource("/auth")
-                                    .route(
-                                        web::post()
-                                            .to(auth)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(auth_options)),
+                        .service(
+                            web::resource("/auth")
+                            .route(
+                                web::post()
+                                .to(auth)
+                                .wrap(Governor::new(&governor_auth_conf)),
                             )
-                            .service(
-                                web::resource("/reset-password").route(
-                                    web::post()
-                                        .to(reset_password_route)
-                                        .wrap(Governor::new(&governor_auth_conf)),
-                                ),
+                            .route(web::method(Method::OPTIONS).to(auth_options)),
+                        )
+                        .service(
+                            web::resource("/reset-password").route(
+                                web::post()
+                                .to(reset_password_route)
+                                .wrap(Governor::new(&governor_auth_conf)),
+                            ),
+                        )
+                        .service(
+                            web::resource("/adm/auth/totp/get")
+                            .route(
+                                web::post()
+                                .to(get_otpauth_uri)
+                                .wrap(Governor::new(&governor_auth_conf)),
                             )
-                            .service(
-                                web::resource("/adm/auth/totp/get")
-                                    .route(
-                                        web::post()
-                                            .to(get_otpauth_uri)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
-                            )
-                            .default_service(web::to(global_proxy))
+                            .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
+                        )
+                        .default_service(web::to(global_proxy))
                     },
                     listener,
                     &config,
@@ -831,54 +946,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             "RATELIMIT_GLOBAL_ON" | "RATELIMIT_GLOBAL_OFF" => {
                 let seconds_per_request_auth =
-                    Duration::from_secs_f64(1.0 / requests_per_second_auth_config as f64);
+                Duration::from_secs_f64(1.0 / requests_per_second_auth_config as f64);
                 let governor_auth_conf = GovernorConfigBuilder::default()
-                    .burst_size(burst_auth_config)
-                    .use_headers()
-                    .period(seconds_per_request_auth)
-                    .finish()
-                    .unwrap();
+                .burst_size(burst_auth_config)
+                .use_headers()
+                .period(seconds_per_request_auth)
+                .finish()
+                .unwrap();
 
                 let seconds_per_request_proxy =
-                    Duration::from_secs_f64(1.0 / requests_per_second_proxy_config as f64);
+                Duration::from_secs_f64(1.0 / requests_per_second_proxy_config as f64);
                 let governor_proxy_conf = GovernorConfigBuilder::default()
-                    .burst_size(burst_proxy_config)
-                    .key_extractor(UserToken)
-                    .period(seconds_per_request_proxy)
-                    .finish()
-                    .unwrap();
+                .burst_size(burst_proxy_config)
+                .key_extractor(UserToken)
+                .period(seconds_per_request_proxy)
+                .finish()
+                .unwrap();
 
                 bind_server(
                     move || {
                         build_app!(state_cloned)
-                            .service(
-                                web::resource("/auth")
-                                    .route(
-                                        web::post()
-                                            .to(auth)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(auth_options)),
+                        .service(
+                            web::resource("/auth")
+                            .route(
+                                web::post()
+                                .to(auth)
+                                .wrap(Governor::new(&governor_auth_conf)),
                             )
-                            .service(
-                                web::resource("/reset-password").route(
-                                    web::post()
-                                        .to(reset_password_route)
-                                        .wrap(Governor::new(&governor_auth_conf)),
-                                ),
+                            .route(web::method(Method::OPTIONS).to(auth_options)),
+                        )
+                        .service(
+                            web::resource("/reset-password").route(
+                                web::post()
+                                .to(reset_password_route)
+                                .wrap(Governor::new(&governor_auth_conf)),
+                            ),
+                        )
+                        .service(
+                            web::resource("/adm/auth/totp/get")
+                            .route(
+                                web::post()
+                                .to(get_otpauth_uri)
+                                .wrap(Governor::new(&governor_auth_conf)),
                             )
-                            .service(
-                                web::resource("/adm/auth/totp/get")
-                                    .route(
-                                        web::post()
-                                            .to(get_otpauth_uri)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
-                            )
-                            .default_service(
-                                web::to(global_proxy).wrap(Governor::new(&governor_proxy_conf)),
-                            )
+                            .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
+                        )
+                        .default_service(
+                            web::to(global_proxy).wrap(Governor::new(&governor_proxy_conf)),
+                        )
                     },
                     listener,
                     &config,
@@ -888,9 +1003,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             _ => bind_server(
                 move || build_app!(state_cloned).default_service(web::to(global_proxy)),
-                listener,
-                &config,
-                &routes.routes,
+                             listener,
+                             &config,
+                             &routes.routes,
             )?,
         };
 
@@ -902,6 +1017,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             result
         }));
     }
+
+    // Bound before privileges are dropped below — port 80 needs root,
+    // same reasoning as the main listener(s) above. A no-op (returns
+    // immediately) unless tls: true and at least one route has
+    // certbot_renew: true.
+    spawn_acme_http01_listener(&config, &routes, &mut server_futures).await;
 
     // Every listener is bound and every TLS certificate (default +
     // per-vhost) is already loaded into the running server instances
@@ -920,7 +1041,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     def_config::reassert_ownership(config.effective_run_user(), config.effective_run_group());
     let _ = def_config::switch_to_user_and_group(
         config.effective_run_user(),
-        config.effective_run_group(),
+                                                 config.effective_run_group(),
     );
     def_config::ensure_running_as(config.effective_run_user());
 
@@ -969,8 +1090,8 @@ mod tests {
     #[tokio::test]
     async fn create_listener_ipv4_accepts_connection() {
         let listener = create_listener("127.0.0.1:0", 64 * 1024, 64 * 1024, 128)
-            .await
-            .expect("failed to create IPv4 listener");
+        .await
+        .expect("failed to create IPv4 listener");
 
         let addr = listener.local_addr().expect("no local addr");
         assert_ne!(addr.port(), 0, "port should be assigned");

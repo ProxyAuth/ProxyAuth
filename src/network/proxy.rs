@@ -338,7 +338,7 @@ fn build_route_order(routes: &[RouteRule]) -> Vec<usize> {
 /// equal. IPv6 literals (`[::1]:8443`) are left as-is except for the
 /// trailing port, since hostnames in `vhost` are never expected to be
 /// bracketed IPv6 addresses.
-fn normalize_host(host: &str) -> String {
+pub fn normalize_host(host: &str) -> String {
     let without_port = if host.starts_with('[') {
         match host.rfind(']') {
             Some(end) => &host[..=end],
@@ -351,6 +351,60 @@ fn normalize_host(host: &str) -> String {
         }
     };
     without_port.trim().to_ascii_lowercase()
+}
+
+/// Adds every entry in `rule.headers` to a response still being built
+/// (the two proxy response paths below, which build via
+/// `HttpResponse::build(...)` and only finalize with `.body(...)` at
+/// the very end) — CSP, HSTS, or any other custom header an operator
+/// configured for this route in `routes.yml`. Deliberately the very
+/// last thing set before the response goes out, so a custom header
+/// here always wins over anything the backend itself might have sent
+/// for the same header name (`insert_header` replaces rather than
+/// appending a duplicate).
+fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, rule: &RouteRule) {
+    for (name, value) in &rule.headers {
+        // Validated explicitly rather than handed straight to
+        // `insert_header`: actix doesn't panic on a malformed
+        // name/value, but it does record the failure as the
+        // builder's stored error, which turns the *entire* response
+        // into a 500 once `.body()`/`.finish()` runs — far worse than
+        // a single bad header (e.g. a routes.yml typo) getting
+        // skipped on its own with a warning logged, which is what
+        // this achieves instead.
+        if let (Ok(header_name), Ok(header_value)) = (
+            actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
+            actix_web::http::header::HeaderValue::from_str(value),
+        ) {
+            builder.insert_header((header_name, header_value));
+        } else {
+            warn!(
+                "route \"{}\": custom header \"{name}\" or its value isn't valid for an HTTP header, skipping it",
+                rule.prefix
+            );
+        }
+    }
+}
+
+/// Same as `apply_custom_headers_builder`, for a response that's
+/// already been finalized into a concrete `HttpResponse` (the static
+/// file path, whose many internal early-returns make applying headers
+/// once at its single call site simpler than touching every one of
+/// them).
+fn apply_custom_headers(resp: &mut HttpResponse, rule: &RouteRule) {
+    for (name, value) in &rule.headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
+            actix_web::http::header::HeaderValue::from_str(value),
+        ) {
+            resp.headers_mut().insert(header_name, header_value);
+        } else {
+            warn!(
+                "route \"{}\": custom header \"{name}\" or its value isn't valid for an HTTP header, skipping it",
+                rule.prefix
+            );
+        }
+    }
 }
 
 /// A route with an empty `vhost` list is a catch-all — it matches
@@ -858,6 +912,25 @@ pub async fn global_proxy(
         }
     }
 
+    // ACME HTTP-01 challenge responses — checked ahead of everything
+    // else (auth, CSRF, normal routing) so an in-flight certificate
+    // renewal is never blocked by unrelated route config. Only ever
+    // matches while `acme::renew_certificate` has actually published
+    // something for this exact (vhost, token) pair — see
+    // `acme::challenge`'s module doc comment for why this is a
+    // separate overlay rather than a real routes.yml entry.
+    if req.method() == actix_web::http::Method::GET {
+        if let Some(token) = crate::acme::challenge::extract_token(req.path()) {
+            let host = req.connection_info().host().to_string();
+            let vhost = normalize_host(&host);
+            if let Some(key_authorization) = crate::acme::challenge::lookup(&vhost, token) {
+                return Ok(HttpResponse::Ok()
+                    .content_type("application/octet-stream")
+                    .body(key_authorization));
+            }
+        }
+    }
+
     if req.method() == actix_web::http::Method::OPTIONS {
         let origin_header = req.headers().get(header::ORIGIN);
         let origin = origin_header.and_then(|v| v.to_str().ok());
@@ -963,7 +1036,10 @@ pub async fn global_proxy(
                     .append_header(("Allow", "GET, HEAD"))
                     .body("405 Method Not Allowed"));
             }
-            return Ok(serve_static_file(rule, path, data.config.cache_duration_secs).await);
+            let mut static_resp =
+                serve_static_file(rule, path, data.config.cache_duration_secs).await;
+            apply_custom_headers(&mut static_resp, rule);
+            return Ok(static_resp);
         }
         if use_proxy {
             proxy_with_proxy(req, body, data, idx).await
@@ -1458,6 +1534,7 @@ pub async fn proxy_with_proxy(
 
     add_cors_headers(&mut client_resp, &req);
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
+    apply_custom_headers_builder(&mut client_resp, rule);
     Ok(client_resp
         .append_header(("server", "ProxyAuth"))
         .body(body_bytes))
@@ -2122,6 +2199,7 @@ pub async fn proxy_without_proxy(
     // response headers (including Content-Length from upstream)
     // remain intact.
     //
+    apply_custom_headers_builder(&mut client_resp, rule);
     Ok(client_resp
         .append_header(("server", "ProxyAuth"))
         .body(body_bytes))

@@ -31,6 +31,7 @@ use std::sync::Arc;
 // already did before these two blocks were split into their own
 // modules to keep this file from growing further.
 pub use crate::config::compression::CompressionConfig;
+pub use crate::config::acme::AcmeConfig;
 pub use crate::config::logging::LoggingConfig;
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,39 @@ pub struct RouteRule {
     /// hot-reloaded without restarting the server.
     #[serde(default = "default_vhost_cert")]
     pub vhost_cert: HashMap<String, String>,
+
+    /// Extra response headers to add for this route — CSP
+    /// (`Content-Security-Policy`), HSTS, `X-Frame-Options`,
+    /// `Referrer-Policy`, `Permissions-Policy`, or any other header
+    /// you want set. Each entry is `"Header-Name": "value"`; the
+    /// value is used verbatim (a CSP policy's semicolon-separated
+    /// directives all go in the one string, exactly as the header
+    /// itself is written on the wire — ProxyAuth doesn't parse or
+    /// validate CSP syntax, just sets what you give it). Applied to
+    /// every response this route produces — proxied, static, and
+    /// error/redirect responses alike. If this route belongs to a
+    /// `vhosts:` group that also sets `headers`, the two are merged;
+    /// this route's own value wins on a key both define.
+    #[serde(default = "default_headers")]
+    pub headers: HashMap<String, String>,
+
+    /// Enables automatic Let's Encrypt certificate renewal for this
+    /// vhost — see the `acme` module and `AppConfig.acme` for the
+    /// full mechanism. Requires `vhost` to be set (the certificate is
+    /// issued for those hostnames) and `vhost_cert` to already point
+    /// at `/etc/proxyauth/cert/{vhost}/fullchain.pem` and
+    /// `.../privkey.pem` — ACME writes to those exact paths, and the
+    /// *existing* `vhost_cert` file-watcher (the same one that
+    /// already hot-reloads a manually-replaced certificate) is what
+    /// actually picks up the renewed certificate; nothing new is
+    /// introduced for that part. If more than one route shares a
+    /// `vhost`, setting this on any one of them is enough — it's
+    /// treated as a per-vhost switch, not a per-route one.
+    ///
+    /// `certbot_rew` is also still accepted as an alias for this key,
+    /// matching this feature's original (misspelled) name.
+    #[serde(default, alias = "certbot_rew")]
+    pub certbot_renew: bool,
 
     /// IP/CIDR allow-list for this route (e.g. `["192.168.1.0/24",
     /// "10.0.0.5"]`) — when non-empty, only clients whose resolved IP
@@ -424,6 +458,13 @@ pub struct VhostGroup {
     #[serde(default = "default_vhost_cert")]
     pub vhost_cert: HashMap<String, String>,
 
+    /// Extra response headers applied to every route in this group —
+    /// see `RouteRule.headers` for the format and full semantics.
+    /// Merged with (not replaced by) each route's own `headers`; the
+    /// route's own value wins on a key both define.
+    #[serde(default = "default_headers")]
+    pub headers: HashMap<String, String>,
+
     /// CSRF requirement applied to every route in this group that
     /// doesn't set its own `need_csrf` — same override rules as
     /// `RouteRule::need_csrf`/`requires_csrf`. `None` (not set at the
@@ -453,6 +494,17 @@ pub struct VhostGroup {
     #[serde(default)]
     pub cache_duration_secs: Option<u64>,
 
+    /// Automatic Let's Encrypt renewal applied to every route in this
+    /// group that doesn't explicitly set its own `certbot_renew` —
+    /// same override rules as `need_csrf`/`log`, except this is a
+    /// plain `bool` (not `Option<bool>`) matching `RouteRule`'s own
+    /// field, so "inherit unless overridden" here specifically means
+    /// "unless the route itself is `true`, not group vs. individually
+    /// disabling within a group. `certbot_rew` also still accepted as
+    /// an alias, matching `RouteRule.certbot_renew`.
+    #[serde(default, alias = "certbot_rew")]
+    pub certbot_renew: bool,
+
     #[serde(default)]
     pub routes: Vec<RouteRule>,
 }
@@ -474,6 +526,18 @@ impl RouteConfig {
                 }
                 if route.vhost_cert.is_empty() {
                     route.vhost_cert = group.vhost_cert.clone();
+                }
+                // Merged, not "only if empty" like the fields above —
+                // a route commonly wants the group's baseline headers
+                // (e.g. HSTS set once for the whole vhost) *plus* one
+                // or two of its own on top, not a strict either/or.
+                // The route's own entries are inserted last, so they
+                // win on a key both define.
+                for (k, v) in &group.headers {
+                    route.headers.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                if !route.certbot_renew {
+                    route.certbot_renew = group.certbot_renew;
                 }
                 if route.need_csrf.is_none() {
                     route.need_csrf = group.need_csrf;
@@ -702,22 +766,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub token_admin: String,
 
-    #[serde(default = "default_host")]
-    pub host: String,
-
-    /// Bind to more than one address (e.g. IPv4 + IPv6 at once)
-    /// instead of just `host`. When set and non-empty, every entry
-    /// here is bound (each with its own listening socket, all served
-    /// by the same actix HttpServer instance — one shared worker
-    /// pool, not a separate server per address); `host` is ignored in
-    /// that case. Leave unset (the default) to keep the existing
-    /// single-address behavior via `host`.
-    ///
-    /// ```json
-    /// "address": ["0.0.0.0", "::1"]
-    /// ```
-    #[serde(default)]
-    pub address: Option<Vec<String>>,
+    /// Address(es) to listen on. Accepts either a single string
+    /// (`"host": "0.0.0.0"`, the pre-existing format — still fully
+    /// supported) or an array (`"host": ["0.0.0.0", "::1"]`) to bind
+    /// more than one at once, e.g. IPv4 + IPv6 together. Every entry
+    /// is bound with its own listening socket, all served by the same
+    /// actix HttpServer instance — one shared worker pool, not a
+    /// separate server per address.
+    #[serde(default = "default_hosts", deserialize_with = "deserialize_host")]
+    pub host: Vec<String>,
 
     #[serde(default = "default_port")]
     pub port: u16,
@@ -751,6 +808,18 @@ pub struct AppConfig {
     /// per `vhosts:` group in `routes.yml`; see `CompressionConfig`.
     #[serde(default)]
     pub compression: CompressionConfig,
+
+    /// Settings for automatic Let's Encrypt certificate renewal (see
+    /// `RouteRule.certbot_renew`). Global — every ACME-managed vhost
+    /// shares the same check interval, renewal threshold, and ACME
+    /// account. The JSON key is `letsencrypt` (not `acme`) — this
+    /// still uses `AcmeConfig`/`acme` internally since the underlying
+    /// protocol is ACME (Let's Encrypt is just its most common
+    /// provider), but the user-facing config key names the thing
+    /// operators actually care about. `acme` is still accepted as an
+    /// alias, matching this feature's original key name.
+    #[serde(default, rename = "letsencrypt", alias = "acme")]
+    pub acme: AcmeConfig,
 
     /// Default `Cache-Control: public, max-age=<N>` duration (in
     /// seconds) applied to every response whose route has `cache: true`
@@ -981,6 +1050,7 @@ impl Serialize for AppConfig {
         state.serialize_field("fast", &self.fast)?;
         state.serialize_field("host", &self.host)?;
         state.serialize_field("keep_alive", &self.keep_alive)?;
+        state.serialize_field("letsencrypt", &self.acme)?;
         state.serialize_field("log", &self.log)?;
         state.serialize_field("logging", &self.logging)?;
         state.serialize_field("max_age_session_cookie", &self.max_age_session_cookie)?;
@@ -1173,6 +1243,30 @@ fn default_host() -> String {
     "0.0.0.0".to_string()
 }
 
+fn default_hosts() -> Vec<String> {
+    vec![default_host()]
+}
+
+/// Accepts `"host": "0.0.0.0"` (a bare string, the pre-existing
+/// format) or `"host": ["0.0.0.0", "::1"]` (an array), normalizing
+/// either into `Vec<String>` — so existing `config.json` files with
+/// the old single-string form keep working unmodified.
+fn deserialize_host<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum HostField {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+    match HostField::deserialize(deserializer)? {
+        HostField::Single(s) => Ok(vec![s]),
+        HostField::Multiple(v) => Ok(v),
+    }
+}
+
 fn default_timezone() -> String {
     "Europe/Paris".to_string()
 }
@@ -1317,6 +1411,10 @@ fn default_vhost_cert() -> HashMap<String, String> {
     HashMap::new()
 }
 
+fn default_headers() -> HashMap<String, String> {
+    HashMap::new()
+}
+
 fn default_static_index() -> String {
     "index.html".to_string()
 }
@@ -1408,9 +1506,13 @@ impl AppConfig {
     /// non-empty, otherwise the single `host` for backward
     /// compatibility. Always returns at least one entry.
     pub fn bind_addresses(&self) -> Vec<String> {
-        match &self.address {
-            Some(addrs) if !addrs.is_empty() => addrs.clone(),
-            _ => vec![self.host.clone()],
+        if self.host.is_empty() {
+            // Defends against an explicit `"host": []` in config.json
+            // — always bind to *something* rather than silently
+            // listening nowhere.
+            vec![default_host()]
+        } else {
+            self.host.clone()
         }
     }
 

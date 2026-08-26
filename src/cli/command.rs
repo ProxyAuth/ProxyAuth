@@ -11,6 +11,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Certificate management (native ACME/Let's Encrypt integration
+    /// — see `certbot_renew` in routes.yml).
+    Certbot {
+        #[command(subcommand)]
+        action: CertbotAction,
+    },
     Prepare {
         #[arg(long)]
         insecure: bool,
@@ -170,5 +176,72 @@ pub enum Commands {
         /// --list`.
         #[arg(long)]
         list: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CertbotAction {
+    /// Renews the certificate for a single vhost right now, via the
+    /// same native ACME mechanism the periodic `certbot_renew: true`
+    /// scan uses — see the "Automatic Certificate Renewal (ACME)"
+    /// wiki page. `vhost` must already have `vhost_cert` (cert/key
+    /// paths) configured for it in routes.yml; `certbot_renew: true`
+    /// does *not* need to also be set — running this command by hand
+    /// is itself sufficient intent to renew.
+    Renew {
+        /// The vhost to renew, exactly as it appears in that route's
+        /// `vhost` list in routes.yml — or the literal value `all` to
+        /// renew every vhost that has both `certbot_renew: true` and a
+        /// usable `vhost_cert` (unlike a named single vhost, `all`
+        /// only considers vhosts that opted into automatic renewal;
+        /// a `vhost_cert`-only vhost without `certbot_renew: true`
+        /// isn't touched by `all` — name it directly instead).
+        vhost: String,
+
+        /// Renew even if the current certificate isn't due yet
+        /// (i.e. still has more than `renew_before_days` left).
+        /// Without this, a certificate that's not yet due is left
+        /// alone and the command exits without contacting Let's
+        /// Encrypt at all. Applies to every vhost touched when
+        /// `vhost` is `all`.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Prints certificate details for a vhost — subject, issuer,
+    /// validity window, days left, serial, and the hostnames it
+    /// actually covers (SAN). Read-only; works for any vhost with a
+    /// `vhost_cert` configured, whether it's ACME-managed
+    /// (`certbot_renew: true`) or not.
+    Check {
+        /// The vhost to inspect, exactly as it appears in that
+        /// route's `vhost` list in routes.yml — or `all` to check
+        /// every vhost that has a `vhost_cert` configured (`certbot_renew`
+        /// not required for `all` here, unlike `renew all`, since this
+        /// is read-only and applies equally to a manually-managed
+        /// certificate).
+        vhost: String,
+    },
+
+    /// Issues a certificate for a vhost that doesn't have one yet —
+    /// unconditionally, no `--force` needed (there's nothing to
+    /// compare against a renewal threshold for). Uses the exact same
+    /// mechanism as `renew`; the only difference is this always
+    /// issues, and doesn't accept `all` (name the vhost you're
+    /// setting up).
+    ///
+    /// If this vhost was *just* added to routes.yml (not already
+    /// running with some placeholder certificate at its `vhost_cert`
+    /// paths before this command), a restart is still needed
+    /// afterwards — the TLS layer's file watcher for a given vhost is
+    /// only ever set up once, at startup, from whatever `vhost_cert`
+    /// paths existed at that time. This command issues the
+    /// certificate; it can't retroactively make an already-running
+    /// server start watching a path it didn't know about yet.
+    New {
+        /// The vhost to issue a certificate for, exactly as it
+        /// appears in that route's `vhost` list in routes.yml.
+        /// `vhost_cert` (cert/key paths) must already be set for it.
+        vhost: String,
     },
 }

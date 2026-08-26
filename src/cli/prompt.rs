@@ -1,7 +1,7 @@
 use crate::cli::command::{Cli, Commands};
 use crate::config::config::{AppConfig, EmailEntry, User, load_config};
 use crate::config::def_config::{
-    ensure_run_user_exists, ensure_running_as_proxyauth, ensure_running_as_root,
+    ensure_run_user_exists, ensure_running_as, ensure_running_as_root,
     ensure_user_proxyauth_exists, peek_run_user_group, setup_proxyauth_db_directory,
     setup_proxyauth_directory, setup_proxyauth_directory_for, switch_to_user,
 };
@@ -62,10 +62,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::Stats) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let mut headers = HeaderMap::new();
             headers.insert("X-Auth-Token", HeaderValue::from_str(&config.token_admin)?);
@@ -97,10 +100,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             primary_email,
             must_change_password,
         }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let Some(db_cfg) = &config.databases else {
                 eprintln!("No 'databases' block configured in config.json — nothing to write to.");
@@ -188,10 +194,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::DbDeleteUser { username }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let Some(db_cfg) = &config.databases else {
                 eprintln!(
@@ -221,10 +230,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::DbRestoreFromCache { force }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let Some(db_cfg) = &config.databases else {
                 eprintln!(
@@ -292,8 +304,11 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::DbClearCache) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
+            // Loaded purely to read run_user — clear_snapshot() itself
+            // needs nothing else from config.json.
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             match crate::databases::cache::clear_snapshot() {
                 Ok(()) => {
@@ -310,10 +325,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::DbSyncCache { force }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let Some(db_cfg) = &config.databases else {
                 eprintln!("No 'databases' block configured in config.json — nothing to sync.");
@@ -361,10 +379,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::ResetPassword { username }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             // Check every prerequisite up front and report all of them
             // together, rather than bailing on the first one — nobody
@@ -458,11 +479,197 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Some(Commands::RoutesAudit) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
+        Some(Commands::Certbot { action }) => {
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
+            let routes = match crate::cli::audit::load_routes_for_cli() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
+
+            match action {
+                crate::cli::command::CertbotAction::Renew { vhost, force } => {
+                    if vhost.eq_ignore_ascii_case("all") {
+                        let managed = crate::acme::collect_managed_vhosts(&routes.routes);
+                        if managed.is_empty() {
+                            println!(
+                                "No vhost has both certbot_renew: true and a usable vhost_cert configured — nothing to renew."
+                            );
+                            std::process::exit(0);
+                        }
+
+                        let mut any_failed = false;
+                        for mv in &managed {
+                            print!("{}: ", mv.vhost);
+                            match crate::acme::check_and_maybe_renew(mv, &config.acme, *force)
+                                .await
+                            {
+                                crate::acme::RenewOutcome::NotDue { days_left } => {
+                                    println!(
+                                        "not due ({days_left} day(s) left, renew_before_days: {})",
+                                        config.acme.renew_before_days
+                                    );
+                                }
+                                crate::acme::RenewOutcome::Renewed => {
+                                    println!("renewed");
+                                }
+                                crate::acme::RenewOutcome::Failed(e) => {
+                                    println!("FAILED — currently valid certificate kept: {e}");
+                                    any_failed = true;
+                                }
+                            }
+                        }
+                        std::process::exit(if any_failed { 1 } else { 0 });
+                    }
+
+                    let Some((cert_path, key_path)) =
+                        crate::acme::find_vhost_cert_paths(&routes.routes, vhost)
+                    else {
+                        eprintln!(
+                            "No vhost_cert (cert/key) configured for '{vhost}' in routes.yml — nothing to renew into. Set vhost_cert on a route listing this vhost first. (Use 'all' to renew every certbot_renew: true vhost at once.)"
+                        );
+                        std::process::exit(1);
+                    };
+
+                    let mv = crate::acme::ManagedVhost {
+                        vhost: vhost.clone(),
+                        cert_path,
+                        key_path,
+                    };
+
+                    match crate::acme::check_and_maybe_renew(&mv, &config.acme, *force).await {
+                        crate::acme::RenewOutcome::NotDue { days_left } => {
+                            println!(
+                                "'{vhost}' has {days_left} day(s) left (renew_before_days: {}) — not due yet. Use --force to renew anyway.",
+                                config.acme.renew_before_days
+                            );
+                            std::process::exit(0);
+                        }
+                        crate::acme::RenewOutcome::Renewed => {
+                            println!(
+                                "Renewed successfully -> {} / {}",
+                                mv.cert_path.display(),
+                                mv.key_path.display()
+                            );
+                            std::process::exit(0);
+                        }
+                        crate::acme::RenewOutcome::Failed(e) => {
+                            eprintln!(
+                                "Renewal failed for '{vhost}' — the currently valid certificate keeps being used: {e}"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                crate::cli::command::CertbotAction::Check { vhost } => {
+                    let targets: Vec<crate::acme::ManagedVhost> = if vhost.eq_ignore_ascii_case("all")
+                    {
+                        crate::acme::collect_all_vhost_certs(&routes.routes)
+                    } else {
+                        match crate::acme::find_vhost_cert_paths(&routes.routes, vhost) {
+                            Some((cert_path, key_path)) => vec![crate::acme::ManagedVhost {
+                                vhost: vhost.clone(),
+                                cert_path,
+                                key_path,
+                            }],
+                            None => {
+                                eprintln!(
+                                    "No vhost_cert (cert/key) configured for '{vhost}' in routes.yml."
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    };
+
+                    if targets.is_empty() {
+                        println!("No vhost has a vhost_cert configured — nothing to check.");
+                        std::process::exit(0);
+                    }
+
+                    let mut any_error = false;
+                    for (i, mv) in targets.iter().enumerate() {
+                        if i > 0 {
+                            println!();
+                        }
+                        println!("{}", mv.vhost);
+                        println!("  cert file:  {}", mv.cert_path.display());
+                        match crate::acme::read_cert_info(&mv.cert_path) {
+                            Ok(info) => {
+                                println!("  subject:    {}", info.subject);
+                                println!("  issuer:     {}", info.issuer);
+                                println!("  valid from: {}", info.not_before);
+                                println!("  valid till: {}", info.not_after);
+                                println!("  days left:  {}", info.days_left);
+                                println!("  serial:     {}", info.serial);
+                                if !info.san.is_empty() {
+                                    println!("  covers:     {}", info.san.join(", "));
+                                }
+                            }
+                            Err(e) => {
+                                println!("  {e}");
+                                any_error = true;
+                            }
+                        }
+                    }
+                    std::process::exit(if any_error { 1 } else { 0 });
+                }
+
+                crate::cli::command::CertbotAction::New { vhost } => {
+                    let Some((cert_path, key_path)) =
+                        crate::acme::find_vhost_cert_paths(&routes.routes, vhost)
+                    else {
+                        eprintln!(
+                            "No vhost_cert (cert/key) configured for '{vhost}' in routes.yml — set that first, then run this again."
+                        );
+                        std::process::exit(1);
+                    };
+
+                    println!("Issuing a new certificate for '{vhost}'...");
+                    match crate::acme::renew::renew_certificate(
+                        vhost,
+                        &cert_path,
+                        &key_path,
+                        &config.acme,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            println!(
+                                "Issued successfully -> {} / {}",
+                                cert_path.display(),
+                                key_path.display()
+                            );
+                            println!(
+                                "If '{vhost}' was just added to routes.yml, restart ProxyAuth now — the TLS layer only starts watching a vhost's certificate files at startup, so an already-running server won't pick up a brand new vhost's certificate on its own."
+                            );
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to issue a certificate for '{vhost}': {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(Commands::RoutesAudit) => {
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let routes = match crate::cli::audit::load_routes_for_cli() {
                 Ok(r) => r,
@@ -477,10 +684,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::CheckAccess { username }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let routes = match crate::cli::audit::load_routes_for_cli() {
                 Ok(r) => r,
@@ -500,10 +710,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::CheckRoutes) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let routes = match crate::cli::audit::load_routes_for_cli() {
                 Ok(r) => r,
@@ -518,10 +731,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::Users { list }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let routes = match crate::cli::audit::load_routes_for_cli() {
                 Ok(r) => r,
@@ -536,10 +752,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::Groups { list }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let routes = match crate::cli::audit::load_routes_for_cli() {
                 Ok(r) => r,
@@ -554,10 +773,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Commands::Roles { list }) => {
-            switch_to_user("proxyauth")?;
-            ensure_running_as_proxyauth();
-
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            // Reads run_user from config.json (loaded above, while still
+            // root) — defaults to "proxyauth" when unset, same as before,
+            // but respects an explicit override so this command runs as
+            // whichever user the running server itself uses.
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
 
             let routes = match crate::cli::audit::load_routes_for_cli() {
                 Ok(r) => r,

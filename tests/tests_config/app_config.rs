@@ -27,7 +27,23 @@ mod tests {
     fn app_config_default_host() {
         let json = r#"{"token_expiry_seconds": 3600, "secret": "s", "users": [], "log": {}}"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.host, vec!["0.0.0.0".to_string()]);
+    }
+
+    #[test]
+    fn app_config_host_accepts_bare_string() {
+        // Backward compatibility: "host": "1.2.3.4" (the pre-existing
+        // format) must still work, not just the new array form.
+        let json = r#"{"token_expiry_seconds": 3600, "secret": "s", "users": [], "log": {}, "host": "1.2.3.4"}"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, vec!["1.2.3.4".to_string()]);
+    }
+
+    #[test]
+    fn app_config_host_accepts_array() {
+        let json = r#"{"token_expiry_seconds": 3600, "secret": "s", "users": [], "log": {}, "host": ["0.0.0.0", "::1"]}"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, vec!["0.0.0.0".to_string(), "::1".to_string()]);
     }
 
     #[test]
