@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub const DEFAULT_FORMAT: &str =
-    "[vhost] [ip] [method] [path] [status] [length] [user-agent] [x-forwarded-for] [error_detail]";
+    "[time] [[vhost]] [[ip]] - [method] [protocol] [status] [length] [path] [tid:[token-id]] '[user-agent]' '[referer]' [request-time-ns]";
 
 fn default_true() -> bool {
     true

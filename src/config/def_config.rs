@@ -497,7 +497,7 @@ pub const DEFAULT_CONFIG_JSON: &str = concat!(
     "  \"log\": {\"type\": \"disabled\"},\n",
     "  \"logging\": {\n",
     "    \"enabled\": true,\n",
-    "    \"format\": \"[vhost] [ip] [method] [path] [status] [length] [user-agent] [x-forwarded-for]\"\n",
+    "    \"format\": \"[time] [[vhost]] [[ip]] - [method] [protocol] [status] [length] [path] [tid:[token-id]] '[user-agent]' '[referer]' [request-time-ns]\"\n",
     "  },\n",
     "  \"compression\": {\n",
     "    \"enabled\": false,\n",

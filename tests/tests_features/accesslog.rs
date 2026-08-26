@@ -358,13 +358,13 @@ fn required_fields_from_default_config() {
         }
     }
 
-    // DEFAULT_FORMAT = "[vhost] [ip] [method] [path] [status] [length] [user-agent] [x-forwarded-for] [error_detail]"
+    // DEFAULT_FORMAT = "[time] [[vhost]] [[ip]] - [method] [protocol] [status] [length] [path] [tid:[token-id]] '[user-agent]' '[referer]' [request-time-ns]"
     assert!(req.ip);
     assert!(req.user_agent);
-    assert!(req.xff);
-    assert!(!req.referer);
+    assert!(!req.xff);
+    assert!(req.referer);
     assert!(!req.query);
-    assert!(!req.protocol);
+    assert!(req.protocol);
     assert!(!req.host);
     assert!(!req.cpu_usage);
     assert!(!req.memory_usage);
@@ -424,8 +424,35 @@ fn logging_config_alias_format_log() {
 #[test]
 fn default_format_compiles_all_known() {
     let segs = compile_format(&proxyauth::config::logging::DEFAULT_FORMAT);
+    // A genuinely unrecognized placeholder (a typo like "[stauts]")
+    // compiles down to one literal segment that starts with '[' and
+    // ends with ']', as a self-contained chunk — that's the actual
+    // signature of "this looked like a placeholder attempt but didn't
+    // match a known field name".
+    //
+    // A broader check ("contains both characters anywhere in the same
+    // literal") used to also flag DEFAULT_FORMAT's own deliberate
+    // adjacent-bracket style (`[[vhost]] [[ip]]` compiles to, among
+    // other things, a legitimate literal "] [" sitting between two
+    // correctly-recognized fields) as a false positive, even though
+    // nothing about it is actually unrecognized.
     let has_unknown = segs.iter().any(|s| {
-        matches!(s, Segment::Literal(l) if l.contains('[') && l.contains(']'))
+        if let Segment::Literal(l) = s {
+            // A well-ordered '[' followed later by a ']' within the
+            // SAME literal segment is the real signature of a failed
+            // placeholder attempt — regardless of what comes before the
+            // '[' or after the ']' in that literal (which can include
+            // ordinary separator text absorbed into the same segment
+            // before the next recognized field starts, e.g. a trailing
+            // space). Checking the whole literal starts-with/ends-with
+            // brackets is too strict: an unrecognized placeholder
+            // followed by more text — as it usually is in a real format
+            // — gets that trailing text folded into the same literal,
+            // so the segment rarely ends exactly on ']'.
+            l.find('[').is_some_and(|open| l[open + 1..].contains(']'))
+        } else {
+            false
+        }
     });
     assert!(!has_unknown, "DEFAULT_FORMAT should not contain unknown placeholders");
 }

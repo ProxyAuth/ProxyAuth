@@ -185,6 +185,7 @@ pub enum Field {
     Query,
     Referer,
     RequestTime,
+    RequestTimeNs,
     CpuUsage,
     MemoryUsage,
     Username,
@@ -210,6 +211,7 @@ impl Field {
             "query" => Field::Query,
             "referer" | "referrer" => Field::Referer,
             "request-time" | "request_time" => Field::RequestTime,
+            "request-time-ns" | "request_time_ns" => Field::RequestTimeNs,
             "cpu-usage" | "cpu_usage" => Field::CpuUsage,
             "memory-usage" | "memory_usage" => Field::MemoryUsage,
             "username" | "user" => Field::Username,
@@ -881,6 +883,15 @@ fn emit(c: &Captured, ctx: Option<&LogContext>, status: u16, len: u64, started: 
                 Field::RequestTime => {
                     let micros = started.elapsed().as_micros() as u64;
                     line.push_str(&format!("{}.{:03}ms", micros / 1000, micros % 1000));
+                }
+                Field::RequestTimeNs => {
+                    // Bare integer, no unit suffix — deliberately, for
+                    // compatibility with log analyzers (e.g. GoAccess)
+                    // that expect a raw numeric value for a
+                    // time-taken field rather than one with embedded
+                    // units, and do their own unit interpretation via
+                    // their own format config instead.
+                    line.push_str(&started.elapsed().as_nanos().to_string());
                 }
                 Field::CpuUsage => fmt_cpu(&mut line),
                 Field::MemoryUsage => fmt_mem(&mut line),

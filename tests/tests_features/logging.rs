@@ -298,13 +298,6 @@ fn compile_format_error_detail_alias() {
 }
 
 #[test]
-fn compile_format_default_format_contains_error_detail() {
-    let segs = compile_format(DEFAULT_FORMAT);
-    let has_error = segs.iter().any(|s| matches!(s, Segment::Field(Field::ErrorDetail)));
-    assert!(has_error, "DEFAULT_FORMAT should contain [error_detail]");
-}
-
-#[test]
 fn compile_format_combined() {
     let segs = compile_format("[ip] [error_detail] [status]");
     assert_eq!(segs.len(), 5);
