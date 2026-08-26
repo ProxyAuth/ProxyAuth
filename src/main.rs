@@ -613,9 +613,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "disabled" => {}
 
             _ => {
-                let fmt_layer = fmt::Layer::new().with_timer(LocalTime);
+                // "local" (the default): writes directly to
+                // /var/log/proxyauth/proxyauth.log via
+                // `logs::ProxyAuthFileMakeWriter`, rather than the
+                // implicit stdout default — so where these lines end
+                // up doesn't depend on how the process happens to be
+                // launched (an init script redirecting stdout, or not).
+                //
+                // Excludes the access-log target: those lines already
+                // have their own destination (`access.log`, or a
+                // per-vhost/route override) written directly by
+                // `network::accesslog::VhostLogWriter` — without this
+                // filter they'd *also* land here via the same
+                // `info!(target: "proxyauth::access", ...)` call,
+                // duplicating every request into both files instead of
+                // keeping "requests" and "everything else" separate,
+                // as intended.
+                let local_filter = tracing_subscriber::filter::filter_fn(|meta| {
+                    meta.target() != "proxyauth::access"
+                });
+
+                let fmt_layer = fmt::Layer::new()
+                    .with_timer(LocalTime)
+                    .with_writer(crate::logs::ProxyAuthFileMakeWriter)
+                    .with_filter(local_filter);
 
                 base_registry.with(fmt_layer).init();
+
+                tokio::spawn(crate::logs::spawn_proxyauth_log_flusher(
+                    config.logging.flush_interval_ms,
+                ));
             }
         }
     }
@@ -873,6 +900,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(Ok(())) => {}
         }
     }
+
+    // Every server future above has resolved — actix's own graceful
+    // shutdown (built in, triggered by SIGTERM/SIGINT) already drained
+    // in-flight requests by this point. One last flush so any
+    // per-vhost/route log line written just before exit isn't left
+    // sitting in a BufWriter that's about to be dropped without ever
+    // reaching disk.
+    accesslog::flush_vhost_writers();
+    logs::flush_proxyauth_log();
 
     Ok(())
 }

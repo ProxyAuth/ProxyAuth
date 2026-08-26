@@ -251,6 +251,14 @@ pub struct RouteRule {
     #[serde(default)]
     pub log: Option<bool>,
 
+    /// Per-route log file override.  When set, access-log lines for
+    /// this route are written to `/var/log/proxyauth/<log_file>` in
+    /// addition to the global access log.  `None` means "inherit from
+    /// the vhost group or the global `logging.log_file`".  Path-
+    /// traversal and absolute paths are rejected at startup.
+    #[serde(default)]
+    pub log_file: Option<String>,
+
     /// Response compression for this route. `None` inherits from the
     /// group, then from the global `compression` block in
     /// `config.json`. Every field inside is itself optional, so a route
@@ -261,6 +269,13 @@ pub struct RouteRule {
 
     #[serde(default = "default_cache")]
     pub cache: bool,
+
+    /// Per-route cache duration override.  When `Some(N)`, the
+    /// response will carry `Cache-Control: public, max-age=<N>` (if
+    /// `cache` is `true`).  `None` means "inherit from the vhost
+    /// group or the global `cache_duration_secs`".
+    #[serde(default)]
+    pub cache_duration_secs: Option<u64>,
 
     #[serde(default = "default_secure_path")]
     pub secure_path: bool,
@@ -422,10 +437,21 @@ pub struct VhostGroup {
     #[serde(default)]
     pub log: Option<bool>,
 
+    /// Log file applied to every route in this group that doesn't set
+    /// its own `log_file`.  Written into `/var/log/proxyauth/`
+    /// automatically — only the filename should be provided.
+    #[serde(default)]
+    pub log_file: Option<String>,
+
     /// Compression applied to every route in this group that doesn't
     /// set its own `compression` — same override rules as `need_csrf`.
     #[serde(default)]
     pub compression: Option<CompressionConfig>,
+
+    /// Per-route cache duration override.  `None` means "use the
+    /// global `cache_duration_secs` from `config.json`".
+    #[serde(default)]
+    pub cache_duration_secs: Option<u64>,
 
     #[serde(default)]
     pub routes: Vec<RouteRule>,
@@ -455,10 +481,16 @@ impl RouteConfig {
                 if route.log.is_none() {
                     route.log = group.log;
                 }
+                if route.log_file.is_none() {
+                    route.log_file = group.log_file.clone();
+                }
                 if route.compression.is_none() {
                     // Cloned, not moved: the group applies to every
                     // route under it, not just the first.
                     route.compression = group.compression.clone();
+                }
+                if route.cache_duration_secs.is_none() {
+                    route.cache_duration_secs = group.cache_duration_secs;
                 }
                 self.routes.push(route);
             }
@@ -705,6 +737,14 @@ pub struct AppConfig {
     /// per `vhosts:` group in `routes.yml`; see `CompressionConfig`.
     #[serde(default)]
     pub compression: CompressionConfig,
+
+    /// Default `Cache-Control: public, max-age=<N>` duration (in
+    /// seconds) applied to every response whose route has `cache: true`
+    /// and no per-route `cache_duration_secs` override.  `0` disables
+    /// caching at the HTTP layer even when `cache` is `true` (the
+    /// header becomes `max-age=0`).  Defaults to 300 (5 minutes).
+    #[serde(default = "default_cache_duration_secs")]
+    pub cache_duration_secs: u64,
 
     #[serde(default = "default_stats")]
     pub stats: bool,
@@ -1129,6 +1169,10 @@ fn default_port() -> u16 {
 
 fn default_cache() -> bool {
     true
+}
+
+fn default_cache_duration_secs() -> u64 {
+    300
 }
 
 fn default_secure_path() -> bool {

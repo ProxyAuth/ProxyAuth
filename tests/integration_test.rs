@@ -99,6 +99,7 @@ macro_rules! build_app {
                 otp_overrides: Arc::new(DashMap::new()),
                 password_overrides: Arc::new(DashMap::new()),
                 must_change_overrides: Arc::new(DashMap::new()),
+                ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
             });
 
             test::init_service(

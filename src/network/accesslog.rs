@@ -61,6 +61,7 @@
 
 use crate::AppState;
 use crate::config::config::AppConfig;
+use crate::config::logging::LOG_DIR;
 use crate::network::proxy::client_ip;
 use actix_service::{Service, Transform};
 use actix_web::body::{BodySize, MessageBody};
@@ -68,6 +69,11 @@ use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::http::header;
 use actix_web::{Error, HttpMessage, HttpRequest, web};
 use futures_util::future::{LocalBoxFuture, Ready, ok};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -94,6 +100,10 @@ pub struct LogContext {
     pub route_idx: Option<usize>,
     pub username: Option<String>,
     pub token_id: Option<String>,
+    /// Optional error detail string set by handlers when a request
+    /// results in an error response (4xx/5xx). Rendered as
+    /// `[error_detail]` in the access log format.
+    pub error_detail: Option<String>,
 }
 
 impl LogContext {
@@ -135,6 +145,21 @@ impl LogContext {
                     route_idx: None,
                     username: u,
                     token_id: t,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    /// Records an error detail string for the access log.
+    pub fn set_error_detail(req: &HttpRequest, detail: &str) {
+        let mut ext = req.extensions_mut();
+        match ext.get_mut::<LogContext>() {
+            Some(ctx) => ctx.error_detail = Some(detail.to_string()),
+            None => {
+                ext.insert(LogContext {
+                    error_detail: Some(detail.to_string()),
+                    ..Default::default()
                 });
             }
         }
@@ -166,6 +191,7 @@ pub enum Field {
     TokenId,
     Route,
     Time,
+    ErrorDetail,
 }
 
 impl Field {
@@ -190,6 +216,7 @@ impl Field {
             "token-id" | "tid" => Field::TokenId,
             "route" => Field::Route,
             "time" | "timestamp" => Field::Time,
+            "error_detail" | "error-detail" | "error" => Field::ErrorDetail,
             _ => return None,
         })
     }
@@ -243,6 +270,31 @@ pub fn compile_format(fmt: &str) -> Vec<Segment> {
 
 /// Compiled once at startup by `init`, read by every worker.
 static FORMAT: OnceLock<Vec<Segment>> = OnceLock::new();
+
+/// Per-vhost log-file writers, initialized once at startup.
+static VHOST_WRITERS: OnceLock<VhostLogWriter> = OnceLock::new();
+
+/// Bit-flags of fields actually present in the compiled format,
+/// computed once at startup so the middleware can skip capturing
+/// data that would never be rendered.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequiredFields {
+    pub ip: bool,
+    pub user_agent: bool,
+    pub xff: bool,
+    pub referer: bool,
+    pub query: bool,
+    pub protocol: bool,
+    pub host: bool,
+    pub cpu_usage: bool,
+    pub memory_usage: bool,
+}
+
+static REQUIRED: OnceLock<RequiredFields> = OnceLock::new();
+
+pub fn required_fields() -> RequiredFields {
+    REQUIRED.get().copied().unwrap_or_default()
+}
 
 fn format_segments() -> &'static [Segment] {
     FORMAT.get().map(|v| v.as_slice()).unwrap_or(&[])
@@ -329,6 +381,128 @@ fn fmt_mem(out: &mut String) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Per-vhost log-file writers
+// ─────────────────────────────────────────────────────────────────────
+
+/// Thread-safe, per-vhost file writer.  Each unique `log_file`
+/// filename gets its own `BufWriter<File>` behind a `Mutex`.
+/// Keys are the full path so writers are shared across vhosts/routes
+/// that resolve to the same file.
+pub struct VhostLogWriter {
+    writers: std::sync::RwLock<HashMap<String, Mutex<BufWriter<File>>>>,
+}
+
+impl VhostLogWriter {
+    /// Creates an empty writer map.  Actual files are opened lazily on
+    /// first write so that per-route `log_file` values from
+    /// `routes.yml` don't all need to be known at startup.
+    pub fn new() -> Self {
+        Self {
+            writers: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Writes a pre-rendered log line to the file for `log_path`.
+    /// Opens the file lazily on first use.  The trailing newline is
+    /// added here.
+    ///
+    /// Deliberately does **not** flush on every call — that would turn
+    /// every log line into its own `write(2)` syscall, defeating the
+    /// point of the `BufWriter`. Lines are flushed periodically instead
+    /// (see `spawn_flush_ticker`) and on shutdown (see `flush_all`
+    /// called from `main`'s shutdown path) — bounding how long a line
+    /// can sit unwritten to a small, known window instead of "until the
+    /// buffer happens to fill up", which for a quiet vhost's log file
+    /// could otherwise be minutes, or forever if the process is
+    /// killed before the buffer ever fills.
+    pub fn write(&self, log_path: &str, line: &str) {
+        if log_path.is_empty() {
+            return;
+        }
+        let full = format!("{}/{}", LOG_DIR, log_path);
+
+        // Fast path: file already opened.
+        {
+            if let Ok(map) = self.writers.read() {
+                if let Some(writer) = map.get(&full) {
+                    if let Ok(mut w) = writer.lock() {
+                        let _ = writeln!(w, "{}", line);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Slow path: open and insert.
+        if let Ok(mut map) = self.writers.write() {
+            if !map.contains_key(&full) {
+                let path = PathBuf::from(&full);
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                match File::options()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        map.insert(full.clone(), Mutex::new(BufWriter::with_capacity(8192, file)));
+                    }
+                    Err(e) => {
+                        eprintln!("[accesslog] failed to open log file {full}: {e}");
+                        return;
+                    }
+                }
+            }
+            if let Some(writer) = map.get(&full) {
+                if let Ok(mut w) = writer.lock() {
+                    let _ = writeln!(w, "{}", line);
+                }
+            }
+        }
+    }
+
+    /// Flushes every open writer. Called periodically by
+    /// `spawn_flush_ticker`, and once more on shutdown so a line
+    /// written just before exit isn't silently dropped.
+    pub fn flush_all(&self) {
+        let Ok(map) = self.writers.read() else {
+            return;
+        };
+        for writer in map.values() {
+            if let Ok(mut w) = writer.lock() {
+                let _ = w.flush();
+            }
+        }
+    }
+}
+
+/// Flushes every per-vhost/route log writer, if any exist. Safe to call
+/// even when no `log_file` was ever configured (the writer map is just
+/// empty) — used both by the periodic ticker below and by the
+/// shutdown path in `main`.
+pub fn flush_vhost_writers() {
+    if let Some(writers) = VHOST_WRITERS.get() {
+        writers.flush_all();
+    }
+}
+
+/// Flushes `VHOST_WRITERS` on a fixed interval so a buffered line never
+/// sits unwritten for longer than `interval_secs`, without paying a
+/// syscall on every single log line the way flushing inside `write`
+/// would. Spawned unconditionally by `init` — cheap to run even when no
+/// vhost/route ever sets a `log_file` (the writer map is simply empty,
+/// so each tick is a fast no-op).
+async fn flush_ticker(interval_ms: u64) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms.max(1)));
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        flush_vhost_writers();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Startup
 // ─────────────────────────────────────────────────────────────────────
 
@@ -352,7 +526,40 @@ pub fn init(config: &AppConfig) {
         )
     });
 
+    let mut req = RequiredFields::default();
+    for seg in &segments {
+        if let Segment::Field(f) = seg {
+            match f {
+                Field::Ip => req.ip = true,
+                Field::UserAgent => req.user_agent = true,
+                Field::XForwardedFor => req.xff = true,
+                Field::Referer => req.referer = true,
+                Field::Query => req.query = true,
+                Field::Protocol => req.protocol = true,
+                Field::Host => req.host = true,
+                Field::CpuUsage => req.cpu_usage = true,
+                Field::MemoryUsage => req.memory_usage = true,
+                _ => {}
+            }
+        }
+    }
+
     let _ = FORMAT.set(segments);
+    let _ = REQUIRED.set(req);
+
+    // Validate per-vhost log file paths before opening anything.
+    if let Err(e) = config.logging.validate_log_paths() {
+        panic!("logging config error: {e}");
+    }
+
+    // Create per-vhost/route log file writers (files opened lazily).
+    let _ = VHOST_WRITERS.set(VhostLogWriter::new());
+
+    // Periodic flush so a buffered line never sits unwritten for
+    // longer than `logging.flush_interval_ms` (default 500ms) — see
+    // `flush_ticker`'s doc comment for why this isn't just "flush on
+    // every write" instead.
+    tokio::spawn(flush_ticker(config.logging.flush_interval_ms));
 
     if needs_sampler && config.logging.enabled {
         let interval = config.logging.resource_sample_interval_secs.max(1);
@@ -397,6 +604,10 @@ pub struct AccessLoggerMiddleware<S> {
 /// request is consumed by the inner service. Kept as owned `String`s
 /// because the request is moved into `service.call` and the response
 /// future outlives this scope.
+///
+/// Fields are only populated when the compiled format actually
+/// references them (see `RequiredFields`), keeping the cost on the
+/// hot path proportional to the data that will be rendered.
 struct Captured {
     method: String,
     path: String,
@@ -457,26 +668,47 @@ where
             return Box::pin(async move { fut.await });
         }
 
-        let captured = Captured {
-            method: req.method().as_str().to_string(),
-            path: req.path().to_string(),
-            query: {
-                let q = req.query_string();
-                if q.is_empty() { "-".into() } else { q.to_string() }
-            },
-            protocol: format!("{:?}", req.version()),
-            vhost,
-            host,
-            // Trusted-proxy-aware: identical resolution to the rate
-            // limiter and the route IP allow/deny lists, so the address
-            // in the log is the one ProxyAuth actually acted on — not a
-            // spoofable raw header.
-            ip: client_ip(req.request(), &state.config)
-                .map(|i| i.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            user_agent: header_str(&req, "user-agent"),
-            xff: header_str(&req, "x-forwarded-for"),
-            referer: header_str(&req, "referer"),
+        let captured = {
+            let req_fields = required_fields();
+            Captured {
+                method: req.method().as_str().to_string(),
+                path: req.path().to_string(),
+                query: if req_fields.query {
+                    let q = req.query_string();
+                    if q.is_empty() { "-".into() } else { q.to_string() }
+                } else {
+                    String::new()
+                },
+                protocol: if req_fields.protocol {
+                    format!("{:?}", req.version())
+                } else {
+                    String::new()
+                },
+                vhost,
+                host: if req_fields.host { host } else { String::new() },
+                ip: if req_fields.ip {
+                    client_ip(req.request(), &state.config)
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                } else {
+                    String::new()
+                },
+                user_agent: if req_fields.user_agent {
+                    header_str(&req, "user-agent")
+                } else {
+                    String::new()
+                },
+                xff: if req_fields.xff {
+                    header_str(&req, "x-forwarded-for")
+                } else {
+                    String::new()
+                },
+                referer: if req_fields.referer {
+                    header_str(&req, "referer")
+                } else {
+                    String::new()
+                },
+            }
         };
 
         let started = Instant::now();
@@ -494,7 +726,8 @@ where
                     if route_logging_enabled(&state, ctx.as_ref()) {
                         let status = res.status().as_u16();
                         let len = body_len(&res);
-                        emit(&captured, ctx.as_ref(), status, len, started);
+                        let lf = resolve_log_file(&state, ctx.as_ref(), &captured.vhost);
+                        emit(&captured, ctx.as_ref(), status, len, started, &lf);
                     }
                     Ok(res)
                 }
@@ -505,7 +738,8 @@ where
                         BodySize::Sized(n) => n,
                         _ => 0,
                     };
-                    emit(&captured, None, status, len, started);
+                    let lf = resolve_log_file(&state, None, &captured.vhost);
+                    emit(&captured, None, status, len, started, &lf);
                     Err(e)
                 }
             }
@@ -586,7 +820,40 @@ fn route_logging_enabled(state: &web::Data<AppState>, ctx: Option<&LogContext>) 
     }
 }
 
-fn emit(c: &Captured, ctx: Option<&LogContext>, status: u16, len: u64, started: Instant) {
+/// Resolves the per-vhost/route log file for this request.  Priority
+/// order: route `log_file` (from `routes.yml`) → vhost group
+/// `log_file` → `logging.vhosts[vhost].log_file` (from `config.json`)
+/// → `logging.log_file` (global default).
+fn resolve_log_file(
+    state: &web::Data<AppState>,
+    ctx: Option<&LogContext>,
+    vhost: &str,
+) -> String {
+    // Per-route override (set in routes.yml).
+    if let Some(idx) = ctx.and_then(|c| c.route_idx) {
+        if let Some(rule) = state.routes.routes.get(idx) {
+            if let Some(ref lf) = rule.log_file {
+                if !lf.is_empty() {
+                    return lf.clone();
+                }
+            }
+        }
+    }
+
+    // Per-vhost override (from config.json).
+    if let Some(entry) = state.config.logging.vhosts.get(vhost) {
+        if let Some(ref lf) = entry.log_file {
+            if !lf.is_empty() {
+                return lf.clone();
+            }
+        }
+    }
+
+    // Global default.
+    state.config.logging.log_file.clone()
+}
+
+fn emit(c: &Captured, ctx: Option<&LogContext>, status: u16, len: u64, started: Instant, log_file: &str) {
     let segments = format_segments();
     if segments.is_empty() {
         return;
@@ -628,6 +895,9 @@ fn emit(c: &Captured, ctx: Option<&LogContext>, status: u16, len: u64, started: 
                         .map(|i| i.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                 ),
+                Field::ErrorDetail => {
+                    line.push_str(ctx.and_then(|c| c.error_detail.as_deref()).unwrap_or("-"))
+                }
                 Field::Time => {
                     line.push_str(&chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
                 }
@@ -640,6 +910,14 @@ fn emit(c: &Captured, ctx: Option<&LogContext>, status: u16, len: u64, started: 
     // where it goes, so this module stays transport-agnostic and the
     // existing `/adm/logs` endpoint keeps working unchanged.
     info!(target: "proxyauth::access", "{}", line);
+
+    // Per-vhost/route file writer: if this request resolved to a
+    // dedicated log file, also write the same pre-rendered line there.
+    if !log_file.is_empty() {
+        if let Some(writers) = VHOST_WRITERS.get() {
+            writers.write(log_file, &line);
+        }
+    }
 }
 
 /// Tiny integer-to-string helper that avoids `format!`'s machinery for

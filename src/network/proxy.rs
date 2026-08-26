@@ -171,10 +171,43 @@ pub fn init_routes_order(routes: &[RouteRule]) {
     *ORDERED_ROUTE_IDX.write().unwrap() = Some(build_route_order(routes));
 }
 
+/// Validates every `log_file` in routes: must be a simple filename
+/// (no `../`, no absolute path).  Panics on the first invalid entry
+/// so a typo is caught at startup rather than silently ignored.
+pub fn validate_route_log_files(routes: &[RouteRule]) {
+    for rule in routes {
+        if let Some(ref lf) = rule.log_file {
+            if lf.is_empty() {
+                continue;
+            }
+            let p = std::path::Path::new(lf);
+            if p.is_absolute() {
+                panic!(
+                    "routes.yml: route \"{}\": log_file must be a relative filename, not an absolute path (got \"{}\")",
+                    rule.prefix, lf
+                );
+            }
+            if lf.contains("..") {
+                panic!(
+                    "routes.yml: route \"{}\": log_file must not contain path traversal (got \"{}\")",
+                    rule.prefix, lf
+                );
+            }
+            if p.components().count() > 1 {
+                panic!(
+                    "routes.yml: route \"{}\": log_file must be a single filename, not a path (got \"{}\")",
+                    rule.prefix, lf
+                );
+            }
+        }
+    }
+}
+
 pub fn init_routes(routes: &mut [RouteRule]) {
     compile_filters_on_routes(routes);
     compile_ip_lists_on_routes(routes);
     compile_regex_on_routes(routes);
+    validate_route_log_files(routes);
     init_routes_order(routes);
 }
 
@@ -591,7 +624,7 @@ fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> 
     }
 }
 
-async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
+async fn serve_static_file(rule: &RouteRule, req_path: &str, cache_duration_secs: u64) -> HttpResponse {
     let Some(static_path) = rule.static_path.as_deref() else {
         return HttpResponse::InternalServerError()
             .append_header(("server", "ProxyAuth"))
@@ -622,12 +655,25 @@ async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
     // whatever the request path under `prefix` looks like — like
     // nginx's `alias` pointing straight at one file (e.g. a fixed
     // `/robots.txt` or `/favicon.ico` route).
+    let max_age = rule.cache_duration_secs.unwrap_or(cache_duration_secs);
     if root_is_file {
         return match tokio::fs::read(&root).await {
-            Ok(bytes) => HttpResponse::Ok()
-                .append_header(("server", "ProxyAuth"))
-                .content_type(guess_content_type(&root))
-                .body(bytes),
+            Ok(bytes) => {
+                let mut resp = HttpResponse::Ok();
+                resp.append_header(("server", "ProxyAuth"))
+                    .content_type(guess_content_type(&root));
+                if rule.cache {
+                    resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
+                } else {
+                    resp.append_header((
+                        header::CACHE_CONTROL,
+                        "no-store, no-cache, must-revalidate, max-age=0",
+                    ));
+                    resp.append_header(("Pragma", "no-cache"));
+                    resp.append_header(("Expires", "0"));
+                }
+                resp.body(bytes)
+            }
             Err(e) => static_read_error_response(&rule.prefix, &root, &e),
         };
     }
@@ -697,10 +743,22 @@ async fn serve_static_file(rule: &RouteRule, req_path: &str) -> HttpResponse {
     }
 
     match tokio::fs::read(&resolved).await {
-        Ok(bytes) => HttpResponse::Ok()
-            .append_header(("server", "ProxyAuth"))
-            .content_type(guess_content_type(&resolved))
-            .body(bytes),
+        Ok(bytes) => {
+            let mut resp = HttpResponse::Ok();
+            resp.append_header(("server", "ProxyAuth"))
+                .content_type(guess_content_type(&resolved));
+            if rule.cache {
+                resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
+            } else {
+                resp.append_header((
+                    header::CACHE_CONTROL,
+                    "no-store, no-cache, must-revalidate, max-age=0",
+                ));
+                resp.append_header(("Pragma", "no-cache"));
+                resp.append_header(("Expires", "0"));
+            }
+            resp.body(bytes)
+        }
         Err(e) => static_read_error_response(&rule.prefix, &resolved, &e),
     }
 }
@@ -905,7 +963,7 @@ pub async fn global_proxy(
                     .append_header(("Allow", "GET, HEAD"))
                     .body("405 Method Not Allowed"));
             }
-            return Ok(serve_static_file(rule, path).await);
+            return Ok(serve_static_file(rule, path, data.config.cache_duration_secs).await);
         }
         if use_proxy {
             proxy_with_proxy(req, body, data, idx).await
@@ -976,6 +1034,7 @@ pub async fn proxy_with_proxy(
 
     // ── ACL ─────────────────────────────────────────────────────────
     if let Some(status) = apply_filters_regex_allow_only(rule, &req, &body) {
+        LogContext::set_error_detail(&req, "acl filter rejected");
         let mut resp = HttpResponse::build(status);
         resp.insert_header(("server", "ProxyAuth"));
         add_cors_headers(&mut resp, &req);
@@ -989,6 +1048,7 @@ pub async fn proxy_with_proxy(
     // ── Allow Method ───────────────────────────────────────────────────
     if !is_method_allowed(rule.allow_methods.as_deref(), method_str) {
         let allow = build_allow_header(rule.allow_methods.as_deref());
+        LogContext::set_error_detail(&req, "method not allowed");
         let mut resp = HttpResponse::build(StatusCode::METHOD_NOT_ALLOWED);
         resp.insert_header(("Allow", allow));
         resp.insert_header(("server", "ProxyAuth"));
@@ -1003,6 +1063,7 @@ pub async fn proxy_with_proxy(
     // ── CSRF ────────────────────────────────────────────────────────────────
     if data.config.session_cookie && data.config.csrf_token && rule.requires_csrf() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
+            LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>invalid csrf request</h1></body></html>"#;
             let mut resp = HttpResponse::build(StatusCode::UNAUTHORIZED);
             resp.insert_header(("server", "ProxyAuth"));
@@ -1365,8 +1426,19 @@ pub async fn proxy_with_proxy(
         })?
         .to_bytes();
 
-    if !rule.cache {
-        client_resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
+    // ── Cache policy ────────────────────────────────────────────────
+    if rule.cache {
+        let max_age = rule
+            .cache_duration_secs
+            .unwrap_or(data.config.cache_duration_secs);
+        let cc = format!("public, max-age={}", max_age);
+        client_resp.insert_header((header::CACHE_CONTROL, cc));
+    } else {
+        // Deliberately NOT touching Content-Type here — it's already
+        // been forwarded from the upstream's real response headers a
+        // few lines up. Forcing it to text/html regardless of what the
+        // response actually is (JSON, an image, anything else) would
+        // corrupt every non-HTML response on a route with cache: false.
         client_resp.insert_header((
             header::CACHE_CONTROL,
             "no-store, no-cache, must-revalidate, max-age=0",
@@ -1455,6 +1527,7 @@ pub async fn proxy_without_proxy(
 
     // ── ACL ─────────────────────────────────────────────────────────
     if let Some(status) = apply_filters_regex_allow_only(rule, &req, &body) {
+        LogContext::set_error_detail(&req, "acl filter rejected");
         let mut resp = HttpResponse::build(status);
 
         resp.insert_header(("server", "ProxyAuth"));
@@ -1472,6 +1545,7 @@ pub async fn proxy_without_proxy(
     // ── Allow method ─────────────────────────────────────────────────
     if !is_method_allowed(rule.allow_methods.as_deref(), method_str) {
         let allow = build_allow_header(rule.allow_methods.as_deref());
+        LogContext::set_error_detail(&req, "method not allowed");
 
         let mut resp = HttpResponse::build(StatusCode::METHOD_NOT_ALLOWED);
 
@@ -1491,6 +1565,7 @@ pub async fn proxy_without_proxy(
     // ── CSRF ─────────────────────────────────────────────────────────
     if data.config.session_cookie && data.config.csrf_token && rule.requires_csrf() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
+            LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html>
                 <html lang="en">
                 <head>
@@ -2004,9 +2079,15 @@ pub async fn proxy_without_proxy(
     };
 
     // ── Cache policy ────────────────────────────────────────────────
-    if !rule.cache {
-        client_resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
-
+    if rule.cache {
+        let max_age = rule
+            .cache_duration_secs
+            .unwrap_or(data.config.cache_duration_secs);
+        let cc = format!("public, max-age={}", max_age);
+        client_resp.insert_header((header::CACHE_CONTROL, cc));
+    } else {
+        // Deliberately NOT touching Content-Type here — see the same
+        // comment at the other cache:false site above.
         client_resp.insert_header((
             header::CACHE_CONTROL,
             "no-store, no-cache, must-revalidate, max-age=0",

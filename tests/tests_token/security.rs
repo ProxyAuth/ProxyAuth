@@ -27,10 +27,9 @@ mod tests {
     use super::*;
     use actix_web::{http::Method, http::header, test, test::TestRequest};
     use bytes::Bytes;
-    use proxyauth::config::config::{AllowRegexCfg, BackendInput, RegexCondCfg, RouteRule};
+    use proxyauth::config::config::{AllowRegexCfg, RegexCondCfg, RouteRule};
     use regex::Regex;
     use serde_json::json;
-    use std::collections::HashMap;
 
     // ---------- parse_query_map ----------------------------------------------
 
@@ -49,16 +48,31 @@ mod tests {
         RouteRule {
             prefix: "/api".into(),
             target: "http://upstream".into(),
+            vhost: vec![],
+            vhost_cert: std::collections::HashMap::new(),
+            allow_ips: vec![],
+            deny_ips: vec![],
+            allow_ips_compiled: vec![],
+            deny_ips_compiled: vec![],
+            static_path: None,
+            static_index: "index.html".into(),
+            regex: None,
+            regex_compiled: None,
+            static_rewrite: None,
             username: vec![],
             groups: vec![],
             roles: vec![],
             required_login: false,
             proxy: false,
             proxy_config: String::new(),
-            cert: HashMap::new(),
-            backends: Vec::<BackendInput>::new(),
-            need_csrf: false,
+            cert: std::collections::HashMap::new(),
+            backends: vec![],
+            need_csrf: Some(false),
+            log: None,
+            log_file: None,
+            compression: None,
             cache: true,
+            cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
             allow_methods: None,
@@ -470,24 +484,38 @@ mod tests {
 #[cfg(test)]
 mod more_unit_tests {
     use super::*;
-    use proxyauth::config::config::{AllowRegexCfg, BackendInput, RouteRule};
-    use std::collections::HashMap;
+    use proxyauth::config::config::{AllowRegexCfg, RouteRule};
 
     fn mk_rule(filters: AllowRegexCfg) -> RouteRule {
         let compiled = filters.compile().ok();
         RouteRule {
             prefix: "/api".into(),
             target: "http://upstream".into(),
+            vhost: vec![],
+            vhost_cert: std::collections::HashMap::new(),
+            allow_ips: vec![],
+            deny_ips: vec![],
+            allow_ips_compiled: vec![],
+            deny_ips_compiled: vec![],
+            static_path: None,
+            static_index: "index.html".into(),
+            regex: None,
+            regex_compiled: None,
+            static_rewrite: None,
             username: vec![],
             groups: vec![],
             roles: vec![],
             required_login: false,
             proxy: false,
             proxy_config: String::new(),
-            cert: HashMap::new(),
-            backends: Vec::<BackendInput>::new(),
-            need_csrf: false,
+            cert: std::collections::HashMap::new(),
+            backends: vec![],
+            need_csrf: Some(false),
+            log: None,
+            log_file: None,
+            compression: None,
             cache: true,
+            cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
             allow_methods: None,
@@ -725,7 +753,7 @@ mod validate_token_path_tests {
             ..Default::default()
         };
 
-        let routes = RouteConfig { routes: vec![] };
+        let routes = RouteConfig { routes: vec![], ..Default::default() };
         let counter = Arc::new(CounterToken::new());
         let revoked = DashMap::<String, u64>::new();
 
@@ -744,6 +772,7 @@ mod validate_token_path_tests {
             otp_overrides: DashMap::<String, Option<String>>::new().into(),
             password_overrides: DashMap::<String, String>::new().into(),
             must_change_overrides: DashMap::<String, bool>::new().into(),
+            ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
         })
     }
 
@@ -982,7 +1011,7 @@ mod validate_token_path_tests {
 
         let st = web::Data::new(AppState {
             config: Arc::new(AppConfig::default()),
-            routes: Arc::new(RouteConfig { routes: vec![] }),
+            routes: Arc::new(RouteConfig::default()),
             counter: Arc::new(CounterToken::new()),
             client_normal: build_https_client_for_tests(),
             client_with_cert: build_https_client_for_tests(),
@@ -992,6 +1021,7 @@ mod validate_token_path_tests {
             otp_overrides: DashMap::<String, Option<String>>::new().into(),
             password_overrides: DashMap::<String, String>::new().into(),
             must_change_overrides: DashMap::<String, bool>::new().into(),
+            ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
         });
 
         let future = (Utc::now() + chrono::Duration::minutes(5))

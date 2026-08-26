@@ -160,7 +160,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(cfg),
-            routes: Arc::new(RouteConfig { routes }),
+            routes: Arc::new(RouteConfig { routes, ..Default::default() }),
             counter: Arc::new(CounterToken::new()),
             client_normal: https_client(),
             client_with_cert: https_client(),
@@ -170,6 +170,7 @@ mod tests {
             otp_overrides: Arc::new(DashMap::new()),
             password_overrides: Arc::new(DashMap::new()),
             must_change_overrides: Arc::new(DashMap::new()),
+            ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
         };
         actix_web::web::Data::new(state)
     }
@@ -186,13 +187,28 @@ mod tests {
             proxy_config: String::new(),
             cert: std::collections::HashMap::new(),
             backends: vec![],
-            need_csrf: false,
+            need_csrf: Some(false),
+            log: None,
+            log_file: None,
+            compression: None,
             cache: true,
+            cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
             allow_methods: None,
             filters: None,
             filters_compiled: None,
+            vhost: vec![],
+            vhost_cert: std::collections::HashMap::new(),
+            allow_ips: vec![],
+            deny_ips: vec![],
+            allow_ips_compiled: vec![],
+            deny_ips_compiled: vec![],
+            static_path: None,
+            static_index: "index.html".into(),
+            regex: None,
+            regex_compiled: None,
+            static_rewrite: None,
         }
     }
 
@@ -877,7 +893,7 @@ mod render_error_page_tests {
 
         let state = AppState {
             config: Arc::new(cfg),
-            routes: Arc::new(RouteConfig { routes }),
+            routes: Arc::new(RouteConfig { routes, ..Default::default() }),
             counter: Arc::new(CounterToken::new()),
             client_normal: https_client(),
             client_with_cert: https_client(),
@@ -887,6 +903,7 @@ mod render_error_page_tests {
             otp_overrides: Arc::new(DashMap::new()),
             password_overrides: Arc::new(DashMap::new()),
             must_change_overrides: Arc::new(DashMap::new()),
+            ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
         };
         actix_web::web::Data::new(state)
     }
@@ -938,13 +955,28 @@ mod render_error_page_tests {
             proxy_config: String::new(),
             cert: std::collections::HashMap::new(),
             backends: vec![],
-            need_csrf: false,
+            need_csrf: Some(false),
+            log: None,
+            log_file: None,
+            compression: None,
             cache: true,
+            cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
             allow_methods: None,
             filters: None,
             filters_compiled: None,
+            vhost: vec![],
+            vhost_cert: std::collections::HashMap::new(),
+            allow_ips: vec![],
+            deny_ips: vec![],
+            allow_ips_compiled: vec![],
+            deny_ips_compiled: vec![],
+            static_path: None,
+            static_index: "index.html".into(),
+            regex: None,
+            regex_compiled: None,
+            static_rewrite: None,
         }
     }
 

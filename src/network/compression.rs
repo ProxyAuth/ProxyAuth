@@ -424,10 +424,14 @@ where
             };
 
             // Cheap pre-check before buffering: if the handler already
-            // knows the length and it's under the threshold, skip
-            // without consuming the body at all.
+            // knows the length and it's outside the [min_size,
+            // max_size] window, skip without consuming the body at
+            // all — this matters more for max_size than min_size,
+            // since the whole point of a ceiling is usually to avoid
+            // ever buffering a very large body just to decide not to
+            // compress it.
             if let actix_web::body::BodySize::Sized(n) = res.response().body().size() {
-                if n < cfg.min_size as u64 {
+                if n < cfg.min_size as u64 || cfg.exceeds_max_size(n as usize) {
                     let mut res = res.map_into_boxed_body();
                     append_vary(&mut res);
                     return Ok(res);
@@ -436,6 +440,10 @@ where
 
             let (http_req, http_res) = res.into_parts();
             let (mut head, body) = http_res.into_parts();
+
+            // Determine if this is a static-file response *before*
+            // decomposing the response, since we need the request URI.
+            let is_static = cfg.is_static_file(http_req.uri().path());
 
             let original: Bytes = match to_bytes(body).await {
                 Ok(b) => b,
@@ -449,13 +457,13 @@ where
                 }
             };
 
-            if original.len() < cfg.min_size {
+            if original.len() < cfg.min_size || cfg.exceeds_max_size(original.len()) {
                 let mut res = ServiceResponse::new(http_req, head.set_body(BoxBody::new(original)));
                 append_vary(&mut res);
                 return Ok(res);
             }
 
-            let level = clamp_level(algo, cfg.level);
+            let level = clamp_level(algo, cfg.effective_level(is_static));
             let compressed = if original.len() >= cfg.spawn_blocking_threshold {
                 // Big body: hand the CPU work to the blocking pool so a
                 // slow compression can't hold a tokio worker (and every
@@ -529,9 +537,12 @@ mod tests {
             enabled: Some(true),
             algorithm: Some(algorithms.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")),
             level: 5,
+            level_static: None,
             min_size: 1024,
+            max_size: None,
             types: None,
             upstream_identity: Some(true),
+            file_static: Vec::new(),
             spawn_blocking_threshold: 262_144,
         }
     }
