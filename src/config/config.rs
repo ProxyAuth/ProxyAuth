@@ -705,6 +705,20 @@ pub struct AppConfig {
     #[serde(default = "default_host")]
     pub host: String,
 
+    /// Bind to more than one address (e.g. IPv4 + IPv6 at once)
+    /// instead of just `host`. When set and non-empty, every entry
+    /// here is bound (each with its own listening socket, all served
+    /// by the same actix HttpServer instance — one shared worker
+    /// pool, not a separate server per address); `host` is ignored in
+    /// that case. Leave unset (the default) to keep the existing
+    /// single-address behavior via `host`.
+    ///
+    /// ```json
+    /// "address": ["0.0.0.0", "::1"]
+    /// ```
+    #[serde(default)]
+    pub address: Option<Vec<String>>,
+
     #[serde(default = "default_port")]
     pub port: u16,
 
@@ -1390,6 +1404,16 @@ impl RouteAccessDecision {
 }
 
 impl AppConfig {
+    /// The address(es) to bind to — `address` (a list) if it's set and
+    /// non-empty, otherwise the single `host` for backward
+    /// compatibility. Always returns at least one entry.
+    pub fn bind_addresses(&self) -> Vec<String> {
+        match &self.address {
+            Some(addrs) if !addrs.is_empty() => addrs.clone(),
+            _ => vec![self.host.clone()],
+        }
+    }
+
     /// Decides whether `username` may access a route with these
     /// `username`/`groups`/`roles` settings — the single source of
     /// truth both `network::proxy`'s live access check and

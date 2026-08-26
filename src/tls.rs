@@ -309,7 +309,7 @@ pub fn check_port(addr: &str) -> bool {
 
 pub fn bind_server<T, F>(
     app_factory: F,
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     config: &AppConfig,
     routes: &[RouteRule],
 ) -> std::io::Result<actix_web::dev::Server>
@@ -323,7 +323,7 @@ where
         > + 'static,
     F: Fn() -> App<T> + Clone + Send + 'static,
 {
-    let builder = HttpServer::new(app_factory)
+    let mut builder = HttpServer::new(app_factory)
         .workers(config.worker as usize)
         .keep_alive(Duration::from_millis(config.keep_alive))
         .backlog(config.pending_connections_limit)
@@ -376,10 +376,20 @@ where
         let tls_cfg = build_rustls_config_with_resolver(resolver);
 
         // actix-web 4 avec rustls 0.23 : listen_rustls_0_23
-        let server = builder.listen_rustls_0_23(listener, tls_cfg)?;
+        //
+        // Bound once per configured address (see AppConfig::bind_addresses)
+        // — every listener here is served by this SAME HttpServer
+        // instance (one shared worker pool), not a separate server per
+        // address.
+        for listener in listeners {
+            builder = builder.listen_rustls_0_23(listener, tls_cfg.clone())?;
+        }
+        let server = builder;
         return Ok(server.run());
     }
 
-    let server = builder.listen(listener)?;
-    Ok(server.run())
+    for listener in listeners {
+        builder = builder.listen(listener)?;
+    }
+    Ok(builder.run())
 }

@@ -104,6 +104,23 @@ fn print_launcher(mode: &str, version: &str, worker: u8, addr: &str, id: &str) {
     );
 }
 
+/// Builds a `"host:port"` string suitable for `SocketAddr::parse`.
+///
+/// IPv6 literals need bracketing before a port is appended —
+/// `"::1:8080"` is not a valid `SocketAddr` (it's ambiguous with the
+/// address itself, since a bare IPv6 literal can itself contain many
+/// colons); `"[::1]:8080"` is unambiguous. IPv4 addresses and
+/// hostnames never contain a literal `:`, so its presence is a
+/// reliable signal for which case this is. Doesn't double-wrap if the
+/// operator already bracketed it themselves in `config.json`.
+fn socket_addr_string(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
 async fn create_listener(
     addr: &str,
     send_buf_size: usize,
@@ -708,23 +725,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &requests_per_second_proxy_config,
     );
 
-    let addr = format!("{}:{}", config.host, config.port);
-    wait_for_port(&addr, 5, Duration::from_secs(2)).await;
+    // One or more bind addresses (e.g. IPv4 + IPv6 together via
+    // `address: [...]` in config.json) — see AppConfig::bind_addresses
+    // for the fallback to the single `host` field when unset.
+    let bind_addrs = config.bind_addresses();
+    let addrs: Vec<String> = bind_addrs
+        .iter()
+        .map(|h| socket_addr_string(h, config.port))
+        .collect();
+
+    for a in &addrs {
+        wait_for_port(a, 5, Duration::from_secs(2)).await;
+    }
 
     let num_instances = config.num_instances;
 
     let mut server_futures = Vec::new();
 
-    print_launcher(mode_actix, VERSION, config.worker, &addr.to_string(), ID);
+    print_launcher(mode_actix, VERSION, config.worker, &addrs.join(", "), ID);
 
     for _instance_id in 0..num_instances {
-        let listener = create_listener(
-            &format!("{}:{}", config.host, config.port),
-            64 * 1024,
-            64 * 1024,
-            config.socket_listen.try_into().unwrap(),
-        )
-        .await?;
+        let mut listener = Vec::with_capacity(addrs.len());
+        for a in &addrs {
+            listener.push(
+                create_listener(
+                    a,
+                    64 * 1024,
+                    64 * 1024,
+                    config.socket_listen.try_into().unwrap(),
+                )
+                .await?,
+            );
+        }
 
         let state_cloned = state.clone();
 
