@@ -51,8 +51,16 @@ pub async fn render_error_page(
     data: web::Data<AppState>,
     error_text: &str,
 ) -> HttpResponse {
-    let logout_url: String = match &data.config.logout_redirect_url {
-        Some(u) if !u.is_empty() => u.clone(),
+    let vhost_route = crate::network::proxy::find_vhost_route(
+        crate::network::proxy::request_host(req).as_deref(),
+        &data.routes.routes,
+    );
+    let logout_redirect_url = vhost_route
+        .and_then(|r| r.resolved_logout_redirect_url(&data.config))
+        .or(data.config.logout_redirect_url.as_deref());
+
+    let logout_url: String = match logout_redirect_url {
+        Some(u) if !u.is_empty() => u.to_string(),
         _ => return HttpResponse::BadRequest().body("logout_redirect_url is not configured"),
     };
 
@@ -80,14 +88,60 @@ pub async fn render_error_page(
             (logout_url.clone(), None)
         };
 
-    let Some(rule) = data
-        .routes
-        .routes
-        .iter()
-        .find(|r| path.starts_with(&r.prefix))
-    else {
+    let request_host_str = crate::network::proxy::request_host(req);
+    let Some(rule) = data.routes.routes.iter().find(|r| {
+        path.starts_with(&r.prefix)
+            && crate::network::proxy::vhost_matches(request_host_str.as_deref(), &r.vhost)
+    }) else {
         return HttpResponse::BadRequest().body("No matching route for logout_redirect_url path");
     };
+
+    // Purely static route (no backend `target` at all) — serve the
+    // configured file directly with the error banner injected,
+    // instead of falling through to the backend-proxying logic below,
+    // which assumes `rule.target` is a real, reachable backend URL.
+    // Without this branch, a login/logout page served entirely as
+    // static files (no backend behind it) fails here with "Failed to
+    // build backend request" — the empty `target` doesn't parse into
+    // anything a real HTTP request could be built against.
+    if let Some(static_path) = &rule.static_path {
+        let file_path = match tokio::fs::metadata(static_path).await {
+            Ok(m) if m.is_file() => std::path::PathBuf::from(static_path),
+            _ => std::path::Path::new(static_path).join(&rule.static_index),
+        };
+        return match tokio::fs::read_to_string(&file_path).await {
+            Ok(html) => {
+                let mut html = toggle_error_block(html, error_text);
+                if rule.tag_proxyauth_enabled() {
+                    let ip = crate::network::proxy::client_ip(req, &data.config)
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let username =
+                        crate::network::proxy::extract_username_for_tags(req, &data, &ip).await;
+                    let csrf_token = crate::token::csrf::make_csrf_token(&data.config.secret);
+                    html = crate::network::proxy::substitute_proxyauth_tags(
+                        &html,
+                        username.as_deref(),
+                        Some(&csrf_token),
+                    );
+                }
+                HttpResponse::Ok()
+                    .append_header(("server", "ProxyAuth"))
+                    .content_type("text/html; charset=utf-8")
+                    .body(html)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "render_error_page: failed to read static file {} (route \"{}\"): {e}",
+                    file_path.display(),
+                    rule.prefix
+                );
+                HttpResponse::InternalServerError()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("500 Internal Server Error")
+            }
+        };
+    }
 
     let raw_forward = path
         .strip_prefix(&rule.prefix)
@@ -271,6 +325,18 @@ pub async fn render_error_page(
     };
 
     html = toggle_error_block(html, error_text);
+    if rule.tag_proxyauth_enabled() {
+        let ip = crate::network::proxy::client_ip(req, &data.config)
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let username = crate::network::proxy::extract_username_for_tags(req, &data, &ip).await;
+        let csrf_token = crate::token::csrf::make_csrf_token(&data.config.secret);
+        html = crate::network::proxy::substitute_proxyauth_tags(
+            &html,
+            username.as_deref(),
+            Some(&csrf_token),
+        );
+    }
 
     let mut plain: bytes::Bytes = bytes::Bytes::from(html.into_bytes());
 
@@ -295,7 +361,13 @@ pub async fn render_error_page(
         }
     }
 
-    if data.config.session_cookie && data.config.csrf_token {
+    let session_cookie_enabled = vhost_route
+        .map(|r| r.session_cookie_enabled(&data.config))
+        .unwrap_or(data.config.session_cookie);
+    let csrf_enabled = vhost_route
+        .map(|r| r.csrf_enabled(&data.config))
+        .unwrap_or(data.config.csrf_token);
+    if session_cookie_enabled && csrf_enabled {
         if let Some((new_body, _)) = inject_csrf_token(&inj_headers, &plain, &data.config.secret) {
             plain = new_body;
         }

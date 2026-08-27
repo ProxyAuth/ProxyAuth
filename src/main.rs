@@ -671,6 +671,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                must_change_overrides: Arc::new(DashMap::new()),
     });
 
+    // Local-only Unix socket for `proxyauth stats` to read live stats
+    // directly, without an HTTPS round-trip or the admin token —
+    // RequestStats/CounterToken are in-process memory with no other
+    // way for the separate, short-lived CLI process to reach them.
+    // Bound here, while still root (matching the ACME port-80
+    // listener's own reasoning) so it can chown the socket to
+    // run_user before the privilege drop further down.
+    {
+        let stats_clone = Arc::clone(&state.stats);
+        let counter_clone = Arc::clone(&state.counter);
+        let run_user = config.effective_run_user().to_string();
+        let run_group = config.effective_run_group().map(str::to_string);
+        tokio::spawn(async move {
+            let socket_path = std::path::Path::new(network::stats::STATS_SOCKET_PATH);
+            if let Err(e) = network::stats::spawn_stats_socket(
+                stats_clone,
+                counter_clone,
+                socket_path,
+                &run_user,
+                run_group.as_deref(),
+            )
+            .await
+            {
+                error!("stats socket ({}) stopped: {e}", socket_path.display());
+            }
+        });
+    }
+
     init_derived_key(&config.secret);
 
     // logs

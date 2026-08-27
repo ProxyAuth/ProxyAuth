@@ -58,6 +58,10 @@ where
             .get("origin")
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
+        // Captured now, alongside `origin` — `req` moves into
+        // `self.service.call(req)` below and isn't available anymore
+        // once the response is being awaited.
+        let host = crate::network::proxy::request_host(req.request());
 
         let fut = self.service.call(req);
 
@@ -65,7 +69,14 @@ where
             let mut res = fut.await?;
 
             if let Some(origin_str) = origin {
-                if let Some(cors) = &config.config.cors_origins {
+                let vhost_route = crate::network::proxy::find_vhost_route(
+                    host.as_deref(),
+                    &config.routes.routes,
+                );
+                let cors_origins = vhost_route
+                    .and_then(|r| r.resolved_cors_origins(&config.config))
+                    .or(config.config.cors_origins.as_ref());
+                if let Some(cors) = cors_origins {
                     let origin_trimmed = origin_str.trim_end_matches('/').to_ascii_lowercase();
                     if cors.iter().any(|allowed| {
                         allowed.trim_end_matches('/').to_ascii_lowercase() == origin_trimmed

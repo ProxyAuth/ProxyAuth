@@ -15,6 +15,26 @@ use reqwest::{
 };
 use std::sync::Arc;
 
+/// Formats a duration in seconds as e.g. "2d 3h 14m 05s" — trims
+/// leading zero units (an uptime under a minute just shows "42s", not
+/// "0d 0h 0m 42s"), for `proxyauth stats`.
+fn format_uptime(total_secs: u64) -> String {
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m {seconds:02}s")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -70,26 +90,50 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             switch_to_user(config.effective_run_user())?;
             ensure_running_as(config.effective_run_user());
 
-            let mut headers = HeaderMap::new();
-            headers.insert("X-Auth-Token", HeaderValue::from_str(&config.token_admin)?);
+            // Local Unix socket, not HTTPS — RequestStats/CounterToken
+            // are in-process memory in the running server; this socket
+            // (spawned by the server itself, see
+            // network::stats::spawn_stats_socket) is the channel that
+            // actually makes them reachable from this separate CLI
+            // process at all. No admin token needed either: the
+            // socket's own filesystem permissions (0600, inside
+            // /opt/proxyauth which is itself 700) are the
+            // authentication.
+            let socket_path = crate::network::stats::STATS_SOCKET_PATH;
+            let mut stream = match tokio::net::UnixStream::connect(socket_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "Failed to connect to {socket_path}: {e} — is ProxyAuth running? (the socket is created at server startup, not before)"
+                    );
+                    std::process::exit(1);
+                }
+            };
 
-            let client = ClientBuilder::new()
-                .danger_accept_invalid_certs(true)
-                .build()?;
-
-            let response = client
-                .get("https://127.0.0.1:8080/adm/stats")
-                .headers(headers)
-                .send()
-                .await?;
-
-            if response.status().is_success() {
-                let body = response.text().await?;
-                println!("{}", body);
-                std::process::exit(0);
-            } else {
-                eprintln!("Server responded with error status: {}", response.status());
+            let mut buf = Vec::new();
+            use tokio::io::AsyncReadExt;
+            if let Err(e) = stream.read_to_end(&mut buf).await {
+                eprintln!("Failed to read from {socket_path}: {e}");
                 std::process::exit(1);
+            }
+
+            match serde_json::from_slice::<crate::network::stats::ProxyStatsResponse>(&buf) {
+                Ok(resp) => {
+                    println!("requests/sec (last):  {}", resp.requests_per_second);
+                    println!("avg req/sec (10s):     {:.2}", resp.avg_rps_10s);
+                    println!("avg req/sec (60s):     {:.2}", resp.avg_rps_60s);
+                    println!("total requests:        {}", resp.total_requests);
+                    println!("active sessions:       {}", resp.active_sessions);
+                    println!(
+                        "uptime:                {}",
+                        format_uptime(resp.uptime_seconds)
+                    );
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Received malformed stats data from {socket_path}: {e}");
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -378,7 +422,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(0);
         }
 
-        Some(Commands::ResetPassword { username }) => {
+        Some(Commands::ResetPassword { username, vhost }) => {
             let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
             // Reads run_user from config.json (loaded above, while still
             // root) — defaults to "proxyauth" when unset, same as before,
@@ -386,6 +430,50 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             // whichever user the running server itself uses.
             switch_to_user(config.effective_run_user())?;
             ensure_running_as(config.effective_run_user());
+
+            // --vhost resolves this vhost's own smtp/page_change_password
+            // (from its route or `vhosts:` group), if it sets one — see
+            // the flag's own doc comment for why this can't be resolved
+            // automatically the way a live HTTP request's Host header
+            // would let it be. An unrecognized --vhost is an error, not
+            // a silent fall-through to the global config: the admin
+            // explicitly asked for that vhost's settings, so silently
+            // using something else instead could send the email via
+            // the wrong SMTP server without any indication that happened.
+            let vhost_route = if let Some(vhost_name) = vhost {
+                let routes = match crate::cli::audit::load_routes_for_cli() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                };
+                match crate::network::proxy::find_vhost_route(
+                    Some(vhost_name.as_str()),
+                    &routes.routes,
+                ) {
+                    Some(r) => Some(r.clone()),
+                    None => {
+                        eprintln!(
+                            "No route in routes.yml lists '{vhost_name}' in its vhost — check the spelling, or omit --vhost to use the global config.json default."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
+
+            let resolved_page_change_password = vhost_route
+                .as_ref()
+                .and_then(|r| r.resolved_page_change_password(&config))
+                .or(config.page_change_password.as_deref())
+                .map(str::to_string);
+            let resolved_smtp = vhost_route
+                .as_ref()
+                .and_then(|r| r.resolved_smtp(&config))
+                .or(config.smtp.as_ref())
+                .cloned();
 
             // Check every prerequisite up front and report all of them
             // together, rather than bailing on the first one — nobody
@@ -397,15 +485,15 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             // live, file or database.
             let mut problems = Vec::new();
 
-            if config.page_change_password.is_none() {
+            if resolved_page_change_password.is_none() {
                 problems.push(
-                    "'page_change_password' is not configured in config.json — nowhere to send the user.".to_string(),
+                    "'page_change_password' is not configured (checked the named --vhost, if any, then config.json) — nowhere to send the user.".to_string(),
                 );
             }
 
-            if config.smtp.is_none() {
+            if resolved_smtp.is_none() {
                 problems.push(
-                    "'smtp' is not configured in config.json — cannot send an email.".to_string(),
+                    "'smtp' is not configured (checked the named --vhost, if any, then config.json) — cannot send an email.".to_string(),
                 );
             }
 
@@ -431,8 +519,8 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             // All checks passed, so these are guaranteed Some by this
             // point — the branches above already covered every case
             // where they wouldn't be.
-            let page_change_password = config.page_change_password.as_ref().unwrap();
-            let smtp_cfg = config.smtp.as_ref().unwrap();
+            let page_change_password = resolved_page_change_password.unwrap();
+            let smtp_cfg = resolved_smtp.unwrap();
             let email = email.unwrap();
 
             // 1 hour is generous enough for someone to check their
@@ -456,7 +544,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             };
             let reset_link = format!("{page_change_password}{separator}token={token}");
 
-            let client = match crate::smtp::smtp::SmtpClient::new(smtp_cfg) {
+            let client = match crate::smtp::smtp::SmtpClient::new(&smtp_cfg) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to set up the SMTP client: {e}");
@@ -476,6 +564,53 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Failed to send the reset email: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+
+        Some(Commands::ResetOtp { username }) => {
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
+
+            if config.token_admin.is_empty() {
+                eprintln!(
+                    "'token_admin' is not configured in config.json — cannot authenticate to the admin endpoint."
+                );
+                std::process::exit(1);
+            }
+
+            let combined_users = config.combined_users();
+            if !combined_users.iter().any(|u| &u.username == username) {
+                eprintln!("No such user: '{username}'.");
+                std::process::exit(1);
+            }
+
+            let scheme = if config.tls { "https" } else { "http" };
+            let url = format!("{scheme}://127.0.0.1:{}/adm/auth/totp/reset", config.port);
+
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Auth-Token", HeaderValue::from_str(&config.token_admin)?);
+
+            let client = ClientBuilder::new()
+                .danger_accept_invalid_certs(true)
+                .build()?;
+
+            let response = client
+                .post(&url)
+                .headers(headers)
+                .json(&serde_json::json!({ "username": username }))
+                .send()
+                .await?;
+
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+
+            if status.is_success() {
+                println!("{body}");
+                std::process::exit(0);
+            } else {
+                eprintln!("Server responded with {status}: {body}");
+                std::process::exit(1);
             }
         }
 

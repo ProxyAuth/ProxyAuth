@@ -260,7 +260,13 @@ pub async fn auth_options(req: HttpRequest, data: web::Data<AppState>) -> impl R
     let origin_header = req.headers().get(header::ORIGIN);
     let origin = origin_header.and_then(|v| v.to_str().ok());
 
-    let allowed = data.config.cors_origins.as_ref();
+    let vhost_route = crate::network::proxy::find_vhost_route(
+        crate::network::proxy::request_host(&req).as_deref(),
+        &data.routes.routes,
+    );
+    let allowed = vhost_route
+        .and_then(|r| r.resolved_cors_origins(&data.config))
+        .or(data.config.cors_origins.as_ref());
 
     let is_allowed = match (origin, allowed) {
         (Some(o), Some(list)) => {
@@ -307,10 +313,26 @@ pub async fn existing_session_response(
     data: &web::Data<AppState>,
     ip: &str,
 ) -> Option<HttpResponse> {
-    if !data.config.session_cookie {
+    // Resolved once per request: which vhost this is for (by Host
+    // header), so session_cookie/login_redirect_url below can use
+    // that vhost's own override if routes.yml sets one, falling back
+    // to the global default otherwise. `/auth` isn't matched against
+    // routes.yml by path/prefix the way a proxied request is — this
+    // is what makes a per-vhost setting resolvable here at all.
+    let vhost_route = crate::network::proxy::find_vhost_route(
+        crate::network::proxy::request_host(req).as_deref(),
+        &data.routes.routes,
+    );
+
+    let session_cookie_enabled = vhost_route
+        .map(|r| r.session_cookie_enabled(&data.config))
+        .unwrap_or(data.config.session_cookie);
+    if !session_cookie_enabled {
         return None;
     }
-    let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+    let redirect_target = vhost_route
+        .and_then(|r| r.resolved_login_redirect_url(&data.config))
+        .unwrap_or(data.config.login_redirect_url.as_deref().unwrap_or("/"));
     let existing_cookie = req.cookie("session_token")?;
     let session_token = existing_cookie.value();
 
@@ -328,7 +350,10 @@ pub async fn existing_session_response(
 
             if let Some(origin_header) = req.headers().get(header::ORIGIN) {
                 if let Ok(origin_str) = origin_header.to_str() {
-                    if let Some(cors_origins) = &data.config.cors_origins {
+                    let cors_origins = vhost_route
+                        .and_then(|r| r.resolved_cors_origins(&data.config))
+                        .or(data.config.cors_origins.as_ref());
+                    if let Some(cors_origins) = cors_origins {
                         let origin_normalized = origin_str.trim_end_matches('/');
                         if cors_origins
                             .iter()
@@ -371,8 +396,34 @@ pub async fn auth(
     data: web::Data<AppState>,
     payload: EitherAuth,
 ) -> impl Responder {
-    if data.config.session_cookie
-        && data.config.csrf_token
+    // Resolved once per request — see existing_session_response's own
+    // copy of this comment for why `/auth` needs this at all, unlike
+    // a proxied request.
+    let vhost_route = crate::network::proxy::find_vhost_route(
+        crate::network::proxy::request_host(&req).as_deref(),
+        &data.routes.routes,
+    );
+    let session_cookie_enabled = vhost_route
+        .map(|r| r.session_cookie_enabled(&data.config))
+        .unwrap_or(data.config.session_cookie);
+    let csrf_enabled = vhost_route
+        .map(|r| r.csrf_enabled(&data.config))
+        .unwrap_or(data.config.csrf_token);
+    let login_redirect_target = vhost_route
+        .and_then(|r| r.resolved_login_redirect_url(&data.config))
+        .unwrap_or(data.config.login_redirect_url.as_deref().unwrap_or("/"));
+    let login_via_otp_enabled = vhost_route
+        .map(|r| r.resolved_login_via_otp(&data.config))
+        .unwrap_or(data.config.login_via_otp);
+    let page_change_password = vhost_route
+        .and_then(|r| r.resolved_page_change_password(&data.config))
+        .or(data.config.page_change_password.as_deref());
+    let max_age_session_cookie = vhost_route
+        .map(|r| r.resolved_max_age_session_cookie(&data.config))
+        .unwrap_or(data.config.max_age_session_cookie);
+
+    if session_cookie_enabled
+        && csrf_enabled
         && !validate_csrf(&req, &payload, &data.config.secret)
     {
         return render_error_page(&req, data.clone(), "invalid csrf request").await;
@@ -403,8 +454,8 @@ pub async fn auth(
         return resp;
     }
 
-    if data.config.session_cookie {
-        let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+    if session_cookie_enabled {
+        let redirect_target = login_redirect_target;
         if req.cookie("session_token").is_none() && !redirect_target.starts_with('/') {
             return HttpResponse::BadRequest()
                 .append_header(("server", "ProxyAuth"))
@@ -435,7 +486,7 @@ pub async fn auth(
         }
 
         // totp method
-        if data.config.login_via_otp {
+        if login_via_otp_enabled {
             let totp_code = match &auth.totp_code {
                 Some(code) => code.trim(),
                 None => {
@@ -503,7 +554,7 @@ pub async fn auth(
             user.must_change_password,
         );
         if must_change {
-            let Some(page_change_password) = &data.config.page_change_password else {
+            let Some(page_change_password) = page_change_password else {
                 warn!(
                     "[{}] user {} must change their password, but page_change_password isn't configured",
                     ip, user.username
@@ -543,7 +594,7 @@ pub async fn auth(
             // wouldn't naturally follow a 303 from a fetch/curl call
             // — it needs the same information back as data it can
             // act on itself instead.
-            if data.config.session_cookie {
+            if session_cookie_enabled {
                 return HttpResponse::SeeOther()
                     .append_header(("server", "ProxyAuth"))
                     .append_header((header::LOCATION, redirect_url))
@@ -591,11 +642,8 @@ pub async fn auth(
         let mut resp = HttpResponse::Ok();
         resp.append_header(("server", "ProxyAuth"));
 
-        if data.config.session_cookie {
-            let session_max_age = data
-                .config
-                .max_age_session_cookie
-                .min(data.config.token_expiry_seconds);
+        if session_cookie_enabled {
+            let session_max_age = max_age_session_cookie.min(data.config.token_expiry_seconds);
 
             let seconds = expiry
                 .signed_duration_since(Utc::now())
@@ -628,7 +676,10 @@ pub async fn auth(
             // check cors
             if let Some(origin_header) = req.headers().get(header::ORIGIN) {
                 if let Ok(origin_str) = origin_header.to_str() {
-                    if let Some(cors_origins) = &data.config.cors_origins {
+                    let cors_origins = vhost_route
+                        .and_then(|r| r.resolved_cors_origins(&data.config))
+                        .or(data.config.cors_origins.as_ref());
+                    if let Some(cors_origins) = cors_origins {
                         let origin_normalized = origin_str.trim_end_matches('/');
 
                         if cors_origins
@@ -645,7 +696,7 @@ pub async fn auth(
 
             resp.cookie(new_cookie);
 
-            let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+            let redirect_target = login_redirect_target;
 
             if redirect_target.starts_with('/') {
                 return resp

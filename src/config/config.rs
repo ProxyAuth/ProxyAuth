@@ -268,6 +268,98 @@ pub struct RouteRule {
     #[serde(default)]
     pub need_csrf: Option<bool>,
 
+    /// Whether CSRF protection is enabled *at all* for this vhost —
+    /// independent of the global `AppConfig.csrf_token` default,
+    /// unlike `need_csrf` (which only decides whether *this specific
+    /// route* participates once CSRF is already enabled somewhere).
+    /// `None` (the default) inherits from the `vhosts:` group, then
+    /// the global `csrf_token`. An explicit `true`/`false` here always
+    /// wins, in either direction — this can turn CSRF ON for one vhost
+    /// even while the global default is off, or OFF for one vhost
+    /// while every other vhost keeps it on. Use
+    /// `RouteRule::csrf_enabled` to resolve the final value.
+    #[serde(default)]
+    pub csrf_token: Option<bool>,
+
+    /// Per-vhost override of `AppConfig.session_cookie` (whether
+    /// ProxyAuth issues/checks a `session_token` cookie at all, vs.
+    /// bearer-token-only auth). `None` inherits from the `vhosts:`
+    /// group, then the global default. Same override rules as
+    /// `need_csrf`.
+    #[serde(default)]
+    pub session_cookie: Option<bool>,
+
+    /// Per-vhost override of `AppConfig.max_age_session_cookie` (the
+    /// session cookie's `Max-Age`, in seconds). `None` inherits from
+    /// the `vhosts:` group, then the global default.
+    #[serde(default)]
+    pub max_age_session_cookie: Option<i64>,
+
+    /// Per-vhost override of `AppConfig.login_redirect_url` — where an
+    /// already-authenticated visitor (a still-valid `session_token`
+    /// cookie) gets sent instead of the login form, and where a fresh
+    /// login redirects to on success. `None` inherits from the
+    /// `vhosts:` group, then the global default (`"/"` if that's also
+    /// unset).
+    #[serde(default)]
+    pub login_redirect_url: Option<String>,
+
+    /// Per-vhost override of `AppConfig.logout_redirect_url` — where
+    /// `/logout` sends the visitor afterward. `None` inherits from the
+    /// `vhosts:` group, then the global default.
+    #[serde(default)]
+    pub logout_redirect_url: Option<String>,
+
+    /// Per-vhost override of `AppConfig.login_via_otp` (whether a TOTP
+    /// code is required at login, in addition to username/password).
+    /// `None` inherits from the `vhosts:` group, then the global
+    /// default.
+    #[serde(default)]
+    pub login_via_otp: Option<bool>,
+
+    /// Per-vhost override of `AppConfig.page_change_password` — the
+    /// external page a password-reset link points visitors at. `None`
+    /// inherits from the `vhosts:` group, then the global default (and
+    /// if that's also unset, `proxyauth reset-password`/the
+    /// `/reset-password` flow is unavailable for this vhost, same as
+    /// today when it's unset globally).
+    #[serde(default)]
+    pub page_change_password: Option<String>,
+
+    /// Per-vhost override of `AppConfig.cors_origins` — the list of
+    /// origins allowed to make cross-origin requests to this vhost.
+    /// `None` inherits from the `vhosts:` group, then the global
+    /// default. Whole-list replacement, not merged with the global
+    /// list — set every origin this vhost should allow here if you
+    /// override it at all.
+    #[serde(default)]
+    pub cors_origins: Option<Vec<String>>,
+
+    /// Per-vhost override of `AppConfig.smtp` — lets different
+    /// domains send password-reset emails through different SMTP
+    /// servers. `None` inherits from the `vhosts:` group, then the
+    /// global default. Whole-object replacement (a vhost's own `smtp`
+    /// block must be complete on its own — host, port, credentials,
+    /// `from`, timeout — not merged field-by-field with the global
+    /// block). Only read by `proxyauth reset-password --vhost
+    /// <hostname>` today — see that command's own docs for why the
+    /// CLI needs the vhost named explicitly rather than resolving it
+    /// automatically the way a live HTTP request can.
+    #[serde(default)]
+    pub smtp: Option<crate::smtp::smtp::SmtpConfig>,
+
+    /// Enables `{{ username }}`/`{{ csrf_token }}` tag substitution in
+    /// this route's static files (and the shared error/logout page —
+    /// see `network::error::render_error_page`). `None`/unset means
+    /// `false` — deliberately conservative, not inherited-then-on:
+    /// scanning every response for tags has a real cost (reading the
+    /// whole body as text, running the substitution pass) that a
+    /// route with no ProxyAuth tags in its content shouldn't pay for
+    /// nothing. Turn it on explicitly per route or per `vhosts:`
+    /// group for exactly the content that actually uses these tags.
+    #[serde(default)]
+    pub tag_proxyauth: Option<bool>,
+
     /// Access logging for this route. `None` means "inherit from the
     /// `vhosts:` group this route belongs to (if any), otherwise the
     /// global `logging.enabled`" — same override rules as `need_csrf`.
@@ -334,11 +426,93 @@ impl RouteRule {
     /// both look the same by the time this runs), otherwise `true`,
     /// matching this field's behavior before per-route/per-group
     /// override existed. Callers should use this instead of reading
-    /// `need_csrf` directly. Still gated by `AppConfig.csrf_token` and
-    /// `session_cookie` — this only decides the per-route half of
-    /// whether CSRF actually gets enforced.
+    /// `need_csrf` directly. Combine with `csrf_enabled` — this only
+    /// decides whether *this specific route* participates once CSRF is
+    /// enabled for the vhost at all.
     pub fn requires_csrf(&self) -> bool {
         self.need_csrf.unwrap_or(true)
+    }
+
+    /// Resolves whether CSRF is enabled *at all* for this vhost: its
+    /// own `csrf_token` if set, otherwise `global.csrf_token`. Unlike
+    /// `requires_csrf`, this is genuinely independent per vhost — an
+    /// explicit `true`/`false` here overrides the global default in
+    /// either direction, not just opts out of an already-enabled
+    /// default.
+    pub fn csrf_enabled(&self, global: &AppConfig) -> bool {
+        self.csrf_token.unwrap_or(global.csrf_token)
+    }
+
+    /// Resolves `AppConfig.session_cookie` for this vhost: its own
+    /// `session_cookie` if set, otherwise the global default.
+    pub fn session_cookie_enabled(&self, global: &AppConfig) -> bool {
+        self.session_cookie.unwrap_or(global.session_cookie)
+    }
+
+    /// Resolves `AppConfig.max_age_session_cookie` for this vhost: its
+    /// own value if set, otherwise the global default.
+    pub fn resolved_max_age_session_cookie(&self, global: &AppConfig) -> i64 {
+        self.max_age_session_cookie
+            .unwrap_or(global.max_age_session_cookie)
+    }
+
+    /// Resolves `AppConfig.login_redirect_url` for this vhost: its own
+    /// value if set, otherwise the global default (which may itself be
+    /// unset — callers already handle that with their own
+    /// `.unwrap_or("/")`-style fallback).
+    pub fn resolved_login_redirect_url<'a>(&'a self, global: &'a AppConfig) -> Option<&'a str> {
+        self.login_redirect_url
+            .as_deref()
+            .or(global.login_redirect_url.as_deref())
+    }
+
+    /// Resolves `AppConfig.logout_redirect_url` for this vhost: its
+    /// own value if set, otherwise the global default.
+    pub fn resolved_logout_redirect_url<'a>(&'a self, global: &'a AppConfig) -> Option<&'a str> {
+        self.logout_redirect_url
+            .as_deref()
+            .or(global.logout_redirect_url.as_deref())
+    }
+
+    /// Resolves `AppConfig.login_via_otp` for this vhost: its own
+    /// value if set, otherwise the global default.
+    pub fn resolved_login_via_otp(&self, global: &AppConfig) -> bool {
+        self.login_via_otp.unwrap_or(global.login_via_otp)
+    }
+
+    /// Resolves `AppConfig.page_change_password` for this vhost: its
+    /// own value if set, otherwise the global default.
+    pub fn resolved_page_change_password<'a>(&'a self, global: &'a AppConfig) -> Option<&'a str> {
+        self.page_change_password
+            .as_deref()
+            .or(global.page_change_password.as_deref())
+    }
+
+    /// Resolves `AppConfig.cors_origins` for this vhost: its own list
+    /// if set, otherwise the global default. Whole-list — see the
+    /// field's own doc comment for why this doesn't merge the two.
+    pub fn resolved_cors_origins<'a>(&'a self, global: &'a AppConfig) -> Option<&'a Vec<String>> {
+        self.cors_origins.as_ref().or(global.cors_origins.as_ref())
+    }
+
+    /// Resolves `AppConfig.smtp` for this vhost: its own block if set,
+    /// otherwise the global default. Whole-object — see the field's
+    /// own doc comment for why this doesn't merge the two.
+    pub fn resolved_smtp<'a>(
+        &'a self,
+        global: &'a AppConfig,
+    ) -> Option<&'a crate::smtp::smtp::SmtpConfig> {
+        self.smtp.as_ref().or(global.smtp.as_ref())
+    }
+
+    /// Resolves whether `{{ username }}`/`{{ csrf_token }}` tag
+    /// substitution is enabled for this route. No global fallback —
+    /// unlike every other resolver here, this has no
+    /// `AppConfig`-level default to inherit from at all; unset means
+    /// `false`, full stop. See the field's own doc comment for why
+    /// that's the deliberately conservative choice.
+    pub fn tag_proxyauth_enabled(&self) -> bool {
+        self.tag_proxyauth.unwrap_or(false)
     }
 
 }
@@ -473,6 +647,60 @@ pub struct VhostGroup {
     #[serde(default)]
     pub need_csrf: Option<bool>,
 
+    /// Whether CSRF protection is enabled at all for every route in
+    /// this group that doesn't set its own `csrf_token` — same
+    /// override rules as `RouteRule::csrf_token`. Independent of
+    /// `need_csrf` above: this controls whether CSRF applies to the
+    /// vhost at all, `need_csrf` controls whether one specific route
+    /// within it participates once it's on.
+    #[serde(default)]
+    pub csrf_token: Option<bool>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::session_cookie`.
+    #[serde(default)]
+    pub session_cookie: Option<bool>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::max_age_session_cookie`.
+    #[serde(default)]
+    pub max_age_session_cookie: Option<i64>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::login_redirect_url`.
+    #[serde(default)]
+    pub login_redirect_url: Option<String>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::logout_redirect_url`.
+    #[serde(default)]
+    pub logout_redirect_url: Option<String>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::login_via_otp`.
+    #[serde(default)]
+    pub login_via_otp: Option<bool>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::page_change_password`.
+    #[serde(default)]
+    pub page_change_password: Option<String>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::cors_origins`.
+    #[serde(default)]
+    pub cors_origins: Option<Vec<String>>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::smtp`.
+    #[serde(default)]
+    pub smtp: Option<crate::smtp::smtp::SmtpConfig>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::tag_proxyauth`.
+    #[serde(default)]
+    pub tag_proxyauth: Option<bool>,
+
     /// Access logging applied to every route in this group that doesn't
     /// set its own `log` — same override rules as `need_csrf`.
     #[serde(default)]
@@ -541,6 +769,36 @@ impl RouteConfig {
                 }
                 if route.need_csrf.is_none() {
                     route.need_csrf = group.need_csrf;
+                }
+                if route.csrf_token.is_none() {
+                    route.csrf_token = group.csrf_token;
+                }
+                if route.session_cookie.is_none() {
+                    route.session_cookie = group.session_cookie;
+                }
+                if route.max_age_session_cookie.is_none() {
+                    route.max_age_session_cookie = group.max_age_session_cookie;
+                }
+                if route.login_redirect_url.is_none() {
+                    route.login_redirect_url = group.login_redirect_url.clone();
+                }
+                if route.logout_redirect_url.is_none() {
+                    route.logout_redirect_url = group.logout_redirect_url.clone();
+                }
+                if route.login_via_otp.is_none() {
+                    route.login_via_otp = group.login_via_otp;
+                }
+                if route.page_change_password.is_none() {
+                    route.page_change_password = group.page_change_password.clone();
+                }
+                if route.cors_origins.is_none() {
+                    route.cors_origins = group.cors_origins.clone();
+                }
+                if route.smtp.is_none() {
+                    route.smtp = group.smtp.clone();
+                }
+                if route.tag_proxyauth.is_none() {
+                    route.tag_proxyauth = group.tag_proxyauth;
                 }
                 if route.log.is_none() {
                     route.log = group.log;

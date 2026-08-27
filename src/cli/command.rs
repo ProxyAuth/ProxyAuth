@@ -114,6 +114,33 @@ pub enum Commands {
     ResetPassword {
         #[arg(long)]
         username: String,
+
+        /// Use this vhost's own `smtp`/`page_change_password` (from
+        /// its route or `vhosts:` group in routes.yml), if it sets
+        /// one, instead of the global config.json default. Unlike a
+        /// live HTTP request, this command has no request to resolve
+        /// a vhost from automatically — name it explicitly if the
+        /// user's account is associated with a specific vhost that
+        /// has its own SMTP server configured. Omit to use the global
+        /// default, same as before this flag existed.
+        #[arg(long)]
+        vhost: Option<String>,
+    },
+    /// Clears a user's TOTP/2FA secret, so they can re-enroll from
+    /// scratch via `/adm/auth/totp/get` — for when someone's lost
+    /// their authenticator device, or an admin needs to revoke a
+    /// possibly-compromised OTP secret. Only affects the one named
+    /// user; every other account's OTP setup is untouched.
+    ///
+    /// Hits the running server's own `/adm/auth/totp/reset` admin
+    /// endpoint (the admin token from config.json, not a separate
+    /// credential) rather than editing config.json directly — the
+    /// reset has to update both the persisted config *and* the live
+    /// server's in-memory state at the same time, or the old OTP
+    /// secret keeps working until the next restart.
+    ResetOtp {
+        #[arg(long)]
+        username: String,
     },
     /// Audits every route in routes.yml, showing exactly what secures
     /// it — an allow-listed username, groups, roles, "PUBLIC" (no
