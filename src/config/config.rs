@@ -360,6 +360,52 @@ pub struct RouteRule {
     #[serde(default)]
     pub tag_proxyauth: Option<bool>,
 
+    /// Usernames allowed to *log in* via this vhost's `/auth` — a
+    /// different, earlier gate than `RouteRule::username`/`groups`/
+    /// `roles` above, which only govern access to *this specific
+    /// route's content* for someone already logged in. This one
+    /// decides whether a login attempt on this vhost succeeds in the
+    /// first place, before any session or route access even enters
+    /// the picture.
+    ///
+    /// `allow_users`, `allow_groups`, and `allow_roles` combine as an
+    /// OR, same as the route-level fields — but **the default is the
+    /// opposite**: when all three are empty, login is **denied** for
+    /// this vhost, not allowed. A vhost grants no login access at all
+    /// until at least one of the three names someone in. This is
+    /// deliberate — an operator who forgets to set any of these on a
+    /// new vhost gets a vhost nobody can log into (safe, if
+    /// inconvenient) rather than one anyone with valid credentials
+    /// anywhere in the system can suddenly reach (unsafe by omission).
+    /// See `RouteRule::login_authorized` to resolve the final
+    /// decision rather than reading these fields directly.
+    #[serde(default)]
+    pub allow_users: Vec<String>,
+
+    /// See `allow_users` just above for how this combines with
+    /// `allow_users`/`allow_roles` and why the empty-means-denied
+    /// default is intentional here specifically, unlike the
+    /// route-level `groups` field.
+    #[serde(default)]
+    pub allow_groups: Vec<String>,
+
+    /// See `allow_users` above for how this combines with
+    /// `allow_users`/`allow_groups` and why the empty-means-denied
+    /// default is intentional here specifically, unlike the
+    /// route-level `roles` field.
+    #[serde(default)]
+    pub allow_roles: Vec<String>,
+
+    /// Usernames explicitly denied login on this vhost, regardless of
+    /// `allow_users`/`allow_groups`/`allow_roles` — an exclusion
+    /// always wins over an allow rule, even if the same username is
+    /// also separately allow-listed or belongs to an allowed group or
+    /// role. For carving out an exception without having to restructure
+    /// the allow lists themselves — e.g. every member of an allowed
+    /// group *except* one specific account.
+    #[serde(default)]
+    pub exclude_users: Vec<String>,
+
     /// Access logging for this route. `None` means "inherit from the
     /// `vhosts:` group this route belongs to (if any), otherwise the
     /// global `logging.enabled`" — same override rules as `need_csrf`.
@@ -513,6 +559,45 @@ impl RouteRule {
     /// that's the deliberately conservative choice.
     pub fn tag_proxyauth_enabled(&self) -> bool {
         self.tag_proxyauth.unwrap_or(false)
+    }
+
+    /// Resolves whether `username` is allowed to log in via this
+    /// vhost — see `allow_users`'s own doc comment for the full
+    /// semantics. Checked once, at login time in `token::auth::auth`,
+    /// before any session gets issued; unrelated to
+    /// `requires_csrf`/`csrf_enabled`/etc. above, which all govern
+    /// what happens to an *already-authenticated* session, not
+    /// whether logging in succeeds in the first place.
+    pub fn login_authorized(&self, username: &str, config: &AppConfig) -> bool {
+        if self.exclude_users.iter().any(|u| u == username) {
+            return false;
+        }
+
+        if self.allow_users.is_empty() && self.allow_groups.is_empty() && self.allow_roles.is_empty() {
+            return false;
+        }
+
+        if self.allow_users.iter().any(|u| u == username) {
+            return true;
+        }
+
+        if !self.allow_groups.is_empty() {
+            if let Some(user_groups) = config.groups_for_username(username) {
+                if user_groups.iter().any(|g| self.allow_groups.contains(g)) {
+                    return true;
+                }
+            }
+        }
+
+        if !self.allow_roles.is_empty() {
+            if let Some(user_roles) = config.roles_for_username(username) {
+                if user_roles.iter().any(|r| self.allow_roles.contains(r)) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
 }
@@ -701,6 +786,24 @@ pub struct VhostGroup {
     #[serde(default)]
     pub tag_proxyauth: Option<bool>,
 
+    /// The vhost-wide login authorization lists — see
+    /// `RouteRule::allow_users` for the full semantics (OR-combined
+    /// with `allow_groups`/`allow_roles`, empty-means-denied default,
+    /// `exclude_users` always wins). This is genuinely the intended
+    /// place to set these, not the per-route fields: login happens
+    /// once for the whole vhost, not per route, so setting these here
+    /// (rather than repeating them on every route under `routes:`) is
+    /// both less error-prone and more clearly expresses "this is a
+    /// vhost-wide policy".
+    #[serde(default)]
+    pub allow_users: Vec<String>,
+    #[serde(default)]
+    pub allow_groups: Vec<String>,
+    #[serde(default)]
+    pub allow_roles: Vec<String>,
+    #[serde(default)]
+    pub exclude_users: Vec<String>,
+
     /// Access logging applied to every route in this group that doesn't
     /// set its own `log` — same override rules as `need_csrf`.
     #[serde(default)]
@@ -799,6 +902,18 @@ impl RouteConfig {
                 }
                 if route.tag_proxyauth.is_none() {
                     route.tag_proxyauth = group.tag_proxyauth;
+                }
+                if route.allow_users.is_empty() {
+                    route.allow_users = group.allow_users.clone();
+                }
+                if route.allow_groups.is_empty() {
+                    route.allow_groups = group.allow_groups.clone();
+                }
+                if route.allow_roles.is_empty() {
+                    route.allow_roles = group.allow_roles.clone();
+                }
+                if route.exclude_users.is_empty() {
+                    route.exclude_users = group.exclude_users.clone();
                 }
                 if route.log.is_none() {
                     route.log = group.log;

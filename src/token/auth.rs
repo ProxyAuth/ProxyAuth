@@ -485,6 +485,27 @@ pub async fn auth(
             return render_error_page(&req, data.clone(), "Access denied").await;
         }
 
+        // Vhost-wide login authorization — separate from, and earlier
+        // than, any route-level username/groups/roles check: this
+        // decides whether this vhost lets this user log in *at all*,
+        // before a session or route access even enters the picture.
+        // Checked against the SAME vhost_route resolved at the top of
+        // this function. No vhost_route match (e.g. a bare-IP
+        // connection, or a vhost with no routes.yml entry at all)
+        // means there's nothing to authorize against — nothing is
+        // denied here that wasn't already going to fail some other
+        // way, so this only applies when a vhost is actually
+        // resolved.
+        if let Some(vr) = vhost_route {
+            if !vr.login_authorized(&user.username, &data.config) {
+                warn!(
+                    "[{}] Login denied for user {} — not authorized for this vhost (allow_users/allow_groups/allow_roles/exclude_users)",
+                    ip, user.username
+                );
+                return render_error_page(&req, data.clone(), "Access denied").await;
+            }
+        }
+
         // totp method
         if login_via_otp_enabled {
             let totp_code = match &auth.totp_code {
