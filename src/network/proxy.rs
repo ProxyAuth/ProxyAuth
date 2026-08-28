@@ -1,6 +1,7 @@
 use crate::config::config::BackendConfig;
 use crate::config::config::BackendInput;
 use crate::config::config::RouteRule;
+use crate::network::accesslog::LogContext;
 use crate::network::canonical_url::canonicalize_path_for_match;
 use crate::network::loadbalancing::forward_failover;
 use crate::network::shared_client::{
@@ -21,12 +22,14 @@ use hyper::http::request::Builder;
 use hyper::{Method, Request, Uri};
 use ipnet::IpNet;
 use once_cell::sync::Lazy;
+use regex::Regex;
 use std::convert::Infallible;
 use std::net::IpAddr;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::RwLock;
 use tokio::time::{Duration, timeout};
-use tracing::{info, warn};
+use tracing::warn;
 
 static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock::new(None));
 
@@ -108,28 +111,103 @@ pub fn compile_filters_on_routes(routes: &mut [RouteRule]) {
     }
 }
 
+/// Parses `allow_ips`/`deny_ips` into `IpNet`s once at startup, so the
+/// hot request path just does a `.contains()` check instead of
+/// re-parsing strings on every proxied request.
+///
+/// An entry that fails to parse is a **fatal** config error (panics
+/// with the offending route/field/value) rather than a warning the
+/// entry gets silently dropped for: a `routes.yml` typo in a CIDR
+/// should never boot up with that restriction quietly not applied —
+/// that would expose a route its author explicitly meant to lock down,
+/// which is worse than refusing to start.
+pub fn compile_ip_lists_on_routes(routes: &mut [RouteRule]) {
+    fn parse_all(prefix: &str, field: &str, entries: &[String]) -> Vec<IpNet> {
+        entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .parse::<IpNet>()
+                    .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "routes.yml: route \"{prefix}\": invalid entry \"{entry}\" in `{field}` — expected an IP address (e.g. \"10.0.0.5\") or a CIDR network (e.g. \"192.168.1.0/24\")"
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    for r in routes.iter_mut() {
+        r.allow_ips_compiled = parse_all(&r.prefix, "allow_ips", &r.allow_ips);
+        r.deny_ips_compiled = parse_all(&r.prefix, "deny_ips", &r.deny_ips);
+    }
+}
+
+/// `deny_ips` wins over `allow_ips`: a client matching a deny entry is
+/// always rejected, even if it would also match an allow entry. An
+/// empty `allow_ips` means "no allow-list restriction" — everyone not
+/// denied gets through, exactly like every route behaved before these
+/// fields existed. If the route configured either list but the
+/// client's IP couldn't be determined at all, this fails closed
+/// (rejects) rather than silently letting an unidentifiable client in.
+fn ip_allowed(ip: Option<IpAddr>, rule: &RouteRule) -> bool {
+    if rule.allow_ips_compiled.is_empty() && rule.deny_ips_compiled.is_empty() {
+        return true;
+    }
+    let Some(ip) = ip else {
+        return false;
+    };
+    if rule.deny_ips_compiled.iter().any(|net| net.contains(&ip)) {
+        return false;
+    }
+    if rule.allow_ips_compiled.is_empty() {
+        return true;
+    }
+    rule.allow_ips_compiled.iter().any(|net| net.contains(&ip))
+}
+
 pub fn init_routes_order(routes: &[RouteRule]) {
-    let mut idx: Vec<usize> = (0..routes.len()).collect();
-    idx.sort_by(|&i, &j| {
-        let pi = routes[i].prefix.as_str();
-        let pj = routes[j].prefix.as_str();
-        let ri = pi == "/";
-        let rj = pj == "/";
-        match (ri, rj) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => {
-                let li = norm_len(pi);
-                let lj = norm_len(pj);
-                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+    *ORDERED_ROUTE_IDX.write().unwrap() = Some(build_route_order(routes));
+}
+
+/// Validates every `log_file` in routes: must be a simple filename
+/// (no `../`, no absolute path).  Panics on the first invalid entry
+/// so a typo is caught at startup rather than silently ignored.
+pub fn validate_route_log_files(routes: &[RouteRule]) {
+    for rule in routes {
+        if let Some(ref lf) = rule.log_file {
+            if lf.is_empty() {
+                continue;
+            }
+            let p = std::path::Path::new(lf);
+            if p.is_absolute() {
+                panic!(
+                    "routes.yml: route \"{}\": log_file must be a relative filename, not an absolute path (got \"{}\")",
+                    rule.prefix, lf
+                );
+            }
+            if lf.contains("..") {
+                panic!(
+                    "routes.yml: route \"{}\": log_file must not contain path traversal (got \"{}\")",
+                    rule.prefix, lf
+                );
+            }
+            if p.components().count() > 1 {
+                panic!(
+                    "routes.yml: route \"{}\": log_file must be a single filename, not a path (got \"{}\")",
+                    rule.prefix, lf
+                );
             }
         }
-    });
-    *ORDERED_ROUTE_IDX.write().unwrap() = Some(idx);
+    }
 }
 
 pub fn init_routes(routes: &mut [RouteRule]) {
     compile_filters_on_routes(routes);
+    compile_ip_lists_on_routes(routes);
+    compile_regex_on_routes(routes);
+    validate_route_log_files(routes);
     init_routes_order(routes);
 }
 
@@ -142,13 +220,400 @@ fn matches_prefix(path: &str, prefix: &str) -> bool {
     path_norm == pref_norm || path_norm.starts_with(&(pref_norm.clone() + "/"))
 }
 
-pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
+/// Parses `regex` (when set) into a compiled `Regex`, so the hot
+/// request path just matches against it instead of recompiling the
+/// pattern on every request — ProxyAuth's equivalent of nginx's
+/// `location ~ pattern { ... }`. Like `allow_ips`/`deny_ips`, an
+/// invalid pattern is a fatal startup error rather than a silently
+/// disabled route.
+pub fn compile_regex_on_routes(routes: &mut [RouteRule]) {
+    for r in routes.iter_mut() {
+        r.regex_compiled = r.regex.as_deref().map(|pattern| {
+            Regex::new(pattern).unwrap_or_else(|e| {
+                panic!(
+                    "routes.yml: route \"{}\": invalid `regex` \"{pattern}\": {e}",
+                    r.prefix
+                )
+            })
+        });
+    }
+}
+
+/// Whether `rule` matches `path` — a compiled `regex` takes over
+/// entirely for a regex route (searched anywhere in the path, same as
+/// nginx's PCRE locations; anchor with `^`/`$` yourself for an exact
+/// match), otherwise the usual longest-prefix rule applies.
+/// Substitutes `{name}` placeholders in `template` with `re`'s named
+/// capture groups matched against `path`. A placeholder whose group
+/// didn't participate in the match (or isn't a named group at all) is
+/// left as literal text — makes a misconfigured template obvious in
+/// the resulting URL/path instead of silently vanishing.
+fn build_regex_target(re: &Regex, template: &str, path: &str) -> String {
+    let Some(caps) = re.captures(path) else {
+        return template.to_string();
+    };
+    let mut result = template.to_string();
+    for name in re.capture_names().flatten() {
+        if let Some(m) = caps.name(name) {
+            result = result.replace(&format!("{{{name}}}"), m.as_str());
+        }
+    }
+    result
+}
+
+/// The scheme+host+port `s` would resolve to, applying the same
+/// "assume http:// if no scheme was given" normalization the rest of
+/// the target-building code uses. `None` if `s` doesn't parse as a URI
+/// at all.
+fn authority_of(s: &str) -> Option<String> {
+    let normalized = if s.starts_with("http://") || s.starts_with("https://") {
+        s.to_string()
+    } else {
+        format!("http://{s}")
+    };
+    Uri::from_str(&normalized)
+        .ok()
+        .and_then(|u| u.authority().map(|a| a.to_string()))
+}
+
+/// Guards against a regex capture smuggling a *different host* into a
+/// rewritten `target` — e.g. a capture containing `@evil.com` landing
+/// right after the authority turns `http://backend/{x}` into
+/// `http://backend@evil.com/...`, which a URI parser reads as
+/// "userinfo=backend, host=evil.com": a captured value from the
+/// client's own request path ends up choosing where the request is
+/// sent. Comparing the rewritten URL's authority against the
+/// template's own literal authority catches this regardless of which
+/// special character (`@`, a stray `:port`, ...) did it — a capture is
+/// only ever allowed to affect the *path*, never the host.
+fn target_authority_tampered(original_target: &str, rewritten: &str) -> bool {
+    authority_of(rewritten) != authority_of(original_target)
+}
+
+fn matches_route(path: &str, rule: &RouteRule) -> bool {
+    match &rule.regex_compiled {
+        Some(re) => re.is_match(path),
+        None => matches_prefix(path, &rule.prefix),
+    }
+}
+
+/// Route evaluation order: every `regex` route is tried first, in the
+/// order it appears in `routes.yml` (first match wins, like nginx
+/// tries regex locations in file order and takes the first that
+/// matches) — then every plain-prefix route, longest prefix first,
+/// exactly as before `regex` existed. Shared by `init_routes_order`
+/// (the common case, precomputed once) and `match_route_idx`'s
+/// fallback for when that cache isn't ready yet.
+fn build_route_order(routes: &[RouteRule]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..routes.len()).collect();
+    idx.sort_by(|&i, &j| {
+        let ri = routes[i].regex_compiled.is_some();
+        let rj = routes[j].regex_compiled.is_some();
+        match (ri, rj) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => i.cmp(&j),
+            (false, false) => {
+                let pi = routes[i].prefix.as_str();
+                let pj = routes[j].prefix.as_str();
+                let root_i = pi == "/";
+                let root_j = pj == "/";
+                match (root_i, root_j) {
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    _ => {
+                        let li = norm_len(pi);
+                        let lj = norm_len(pj);
+                        if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+                    }
+                }
+            }
+        }
+    });
+    idx
+}
+
+/// Strips a trailing `:port` from a `Host` header value and lowercases
+/// the result, so `App.Example.com:8443` and `app.example.com` compare
+/// equal. IPv6 literals (`[::1]:8443`) are left as-is except for the
+/// trailing port, since hostnames in `vhost` are never expected to be
+/// bracketed IPv6 addresses.
+pub fn normalize_host(host: &str) -> String {
+    let without_port = if host.starts_with('[') {
+        match host.rfind(']') {
+            Some(end) => &host[..=end],
+            None => host,
+        }
+    } else {
+        match host.rfind(':') {
+            Some(pos) => &host[..pos],
+            None => host,
+        }
+    };
+    without_port.trim().to_ascii_lowercase()
+}
+
+/// Adds every entry in `rule.headers` to a response still being built
+/// (the two proxy response paths below, which build via
+/// `HttpResponse::build(...)` and only finalize with `.body(...)` at
+/// the very end) — CSP, HSTS, or any other custom header an operator
+/// configured for this route in `routes.yml`. Deliberately the very
+/// last thing set before the response goes out, so a custom header
+/// here always wins over anything the backend itself might have sent
+/// for the same header name (`insert_header` replaces rather than
+/// appending a duplicate).
+fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, rule: &RouteRule) {
+    for (name, value) in &rule.headers {
+        // Validated explicitly rather than handed straight to
+        // `insert_header`: actix doesn't panic on a malformed
+        // name/value, but it does record the failure as the
+        // builder's stored error, which turns the *entire* response
+        // into a 500 once `.body()`/`.finish()` runs — far worse than
+        // a single bad header (e.g. a routes.yml typo) getting
+        // skipped on its own with a warning logged, which is what
+        // this achieves instead.
+        if let (Ok(header_name), Ok(header_value)) = (
+            actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
+            actix_web::http::header::HeaderValue::from_str(value),
+        ) {
+            builder.insert_header((header_name, header_value));
+        } else {
+            warn!(
+                "route \"{}\": custom header \"{name}\" or its value isn't valid for an HTTP header, skipping it",
+                rule.prefix
+            );
+        }
+    }
+}
+
+/// Same as `apply_custom_headers_builder`, for a response that's
+/// already been finalized into a concrete `HttpResponse` (the static
+/// file path, whose many internal early-returns make applying headers
+/// once at its single call site simpler than touching every one of
+/// them).
+fn apply_custom_headers(resp: &mut HttpResponse, rule: &RouteRule) {
+    for (name, value) in &rule.headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
+            actix_web::http::header::HeaderValue::from_str(value),
+        ) {
+            resp.headers_mut().insert(header_name, header_value);
+        } else {
+            warn!(
+                "route \"{}\": custom header \"{name}\" or its value isn't valid for an HTTP header, skipping it",
+                rule.prefix
+            );
+        }
+    }
+}
+
+/// Best-effort session lookup for `{{ username }}` tag substitution —
+/// deliberately independent of `check_static_auth`'s own token
+/// extraction/validation (which *gates access* to a route when
+/// `required_login: true`): this looks for a valid session
+/// regardless of whether the current route requires one at all, since
+/// a *public* static page can still reasonably want to show "signed
+/// in as X" if the visitor happens to already have a valid session
+/// from elsewhere on the same vhost. Returns `None` — silently, no
+/// error response — for anything short of a fully valid session
+/// (missing, malformed, expired token): this is a display nicety, not
+/// a security gate, so there's nothing to reject here.
+pub async fn extract_username_for_tags(
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+    ip: &str,
+) -> Option<String> {
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_string)
+        .or_else(|| {
+            if !is_secure_request(req, &data.config) {
+                return None;
+            }
+            req.headers()
+                .get(header::COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|cookie_str| {
+                    cookie_str.split(';').find_map(|cookie| {
+                        let cookie = cookie.trim();
+                        let (key, value) = cookie.split_once('=')?;
+                        if key.trim() == "session_token" {
+                            Some(value.trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+        })?;
+
+    match crate::token::security::validate_token(&token, data, &data.config, ip).await {
+        Ok((username, _token_id, time_expire)) if time_expire > 0 => Some(username),
+        _ => None,
+    }
+}
+
+/// Substitutes `{{ username }}`, `{{ csrf_token }}`,
+/// `{{ proxyauth_version }}`, and `{{ proxyauth_id }}` (each spelled
+/// with or without the inner spaces, matching the existing
+/// `inject_csrf_token`'s own convention for `csrf_token`) in `content`
+/// with `username`/`csrf_token`/the running build's version and
+/// instance ID, when present. A tag with no available value (e.g.
+/// `{{ username }}` on a page nobody is signed into) is left exactly
+/// as-is in the output, unreplaced — showing the literal tag text is
+/// a more honest, debuggable outcome for a misconfigured page than
+/// silently replacing it with an empty string, which would look like
+/// a blank rendering bug rather than a missing value. Unlike
+/// `username`/`csrf_token` (genuinely request-specific, so callers
+/// pass them in), `proxyauth_version`/`proxyauth_id` are the same for
+/// every call in this process — read directly from `crate::VERSION`/
+/// `crate::ID` rather than needing to be threaded through as
+/// parameters too.
+pub fn substitute_proxyauth_tags(content: &str, username: Option<&str>, csrf_token: Option<&str>) -> String {
+    let mut out = content.to_string();
+    if let Some(u) = username {
+        out = out.replace("{{ username }}", u).replace("{{username}}", u);
+    }
+    if let Some(t) = csrf_token {
+        out = out
+            .replace("{{ csrf_token }}", t)
+            .replace("{{csrf_token}}", t);
+    }
+    out = out
+        .replace("{{ proxyauth_version }}", crate::VERSION)
+        .replace("{{proxyauth_version}}", crate::VERSION);
+    out = out
+        .replace("{{ proxyauth_id }}", crate::ID)
+        .replace("{{proxyauth_id}}", crate::ID);
+    out
+}
+
+/// Resolves the token to pass as `substitute_proxyauth_tags`'s
+/// `csrf_token` argument under the `tag_proxyauth` mechanism
+/// specifically — `None` (leaving `{{ csrf_token }}` untouched in the
+/// output) whenever CSRF protection itself is off for this route's
+/// vhost (`rule.csrf_enabled` false), rather than generating and
+/// splicing in a token regardless.
+///
+/// This exists as its own named function specifically because it's a
+/// regression guard: an earlier version of every call site below
+/// generated a token unconditionally whenever `tag_proxyauth` was on,
+/// whether or not `csrf_token`/CSRF protection was actually enabled
+/// for that vhost — meaning `csrf_token: false` didn't fully disable
+/// CSRF-related behavior the way an operator would reasonably expect,
+/// since `/auth` never checks a token nobody asked ProxyAuth to
+/// generate. See `tests_network/proxy.rs` for the regression test.
+pub fn resolve_tag_csrf_token(rule: &RouteRule, config: &AppConfig) -> Option<String> {
+    rule.csrf_enabled(config)
+        .then(|| crate::token::csrf::make_csrf_token(&config.secret))
+}
+
+/// A route with an empty `vhost` list is a catch-all — it matches
+/// regardless of the request's `Host` header, preserving the behavior
+/// every `routes.yml` had before `vhost` existed. A non-empty list
+/// requires an exact (case-insensitive, port-stripped) match against
+/// one of its entries.
+pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
+    if vhosts.is_empty() {
+        return true;
+    }
+    let Some(host) = host else {
+        return false;
+    };
+    let host_norm = normalize_host(host);
+    vhosts.iter().any(|v| normalize_host(v) == host_norm)
+}
+
+/// Finds the first route that explicitly declares `host` in its
+/// `vhost` list — used to resolve vhost-level settings
+/// (`session_cookie`, `csrf_token`, the redirect URLs, ...) for
+/// requests that aren't matched against `routes.yml` by path/prefix
+/// the way proxied requests are: `/auth`, `/logout`, and error pages.
+///
+/// Deliberately excludes catch-all routes (an empty `vhost` list,
+/// which `vhost_matches` alone treats as "matches everything") —
+/// unlike proxying a specific path, there's no path here to break a
+/// tie with, so including catch-alls would make the result depend on
+/// routes.yml's ordering (whichever route — vhost-specific or
+/// catch-all — happens to come first) rather than genuinely reflect
+/// "does a vhost-scoped config exist for this host". No match already
+/// correctly falls back to the global default via every
+/// `RouteRule::resolved_*`/`*_enabled` method's own `.unwrap_or(...)`.
+pub fn find_vhost_route<'a>(host: Option<&str>, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
+    let host = host?;
+    routes
+        .iter()
+        .find(|r| !r.vhost.is_empty() && vhost_matches(Some(host), &r.vhost))
+}
+
+/// Finds the route that should actually *serve* `path` on `host` —
+/// unlike `find_vhost_route` (which deliberately excludes catch-all
+/// routes to resolve vhost-level *settings*), this matches like real
+/// request routing does: by path prefix, filtered to routes whose
+/// `vhost` either matches `host` or is empty (a catch-all, matching
+/// any host). Used by `render_error_page` to find the route backing
+/// `logout_redirect_url`'s path — this exists as its own named,
+/// tested function specifically because of a real bug this fixed:
+/// matching by path prefix alone, with no vhost filtering at all,
+/// meant that on a multi-vhost instance where more than one vhost has
+/// its own route at the same prefix (e.g. every vhost's own "/"), the
+/// *first one in routes.yml* would win regardless of which vhost the
+/// current request was actually for — silently serving one vhost's
+/// content (or, worse, a completely unrelated site's) on another
+/// vhost's error/logout page.
+/// Finds the route that should actually *serve* `path` on `host` —
+/// used by `render_error_page` to find the route backing
+/// `logout_redirect_url`'s path. Reuses `match_route` (the same
+/// longest-prefix-first, root-goes-last ordering real request routing
+/// uses via `match_route_idx`/`build_route_order`) rather than a
+/// naive `path.starts_with(&r.prefix)` scan in list order — an
+/// earlier version of this fix did exactly that naive scan, and while
+/// it *did* fix the original bug (no vhost filtering at all), writing
+/// real tests for it surfaced a subtler one: a plain first-match scan
+/// lets a route's `/` prefix or an earlier-listed catch-all shadow a
+/// more specific route like `/app`, depending purely on routes.yml's
+/// ordering — inconsistent with how every other request actually
+/// gets routed, and confusing to debug since it'd only misbehave for
+/// specific orderings.
+#[allow(dead_code)] // genuinely called (render_error_page -> auth(), registered via .to(auth) in main.rs) — the bin target's dead-code check can't prove reachability through actix's handler-wrapping indirection, even though the lib target's own check (satisfied by pub-ness, confirmed by tests_network/proxy.rs) shows no such warning
+pub fn find_route_for_redirect_path<'a>(
+    path: &str,
+    host: Option<&str>,
+    routes: &'a [RouteRule],
+) -> Option<&'a RouteRule> {
+    match_route(path, host, routes)
+}
+
+/// Extracts and normalizes the `Host` the request came in on, from
+/// either the `Host` header or the request's connection info (which
+/// also accounts for `X-Forwarded-Host` when actix is configured to
+/// trust it). Returns `None` when no host is present at all, in which
+/// case only vhost-less (catch-all) routes can match.
+pub fn request_host(req: &HttpRequest) -> Option<String> {
+    let host = req.connection_info().host().to_string();
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// Finds the best route for `raw_path`/`host`.
+///
+/// Candidates are first narrowed to routes whose `vhost` matches the
+/// request's `Host` header (or that have no `vhost` at all, i.e.
+/// catch-all routes) — then, among those, the existing longest-prefix
+/// rule picks the winner, in the precomputed order from
+/// `init_routes_order` when available. A vhost-scoped route and a
+/// catch-all route can share the same prefix: whichever is reached
+/// first in prefix-length order wins, so put the more specific one
+/// first in `routes.yml` if both could otherwise match.
+pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule]) -> Option<usize> {
     {
         let guard = ORDERED_ROUTE_IDX.read().unwrap();
         if let Some(order) = guard.as_ref() {
             if order.iter().all(|&i| i < routes.len()) {
                 for &i in order {
-                    if matches_prefix(raw_path, &routes[i].prefix) {
+                    if vhost_matches(host, &routes[i].vhost) && matches_route(raw_path, &routes[i])
+                    {
                         return Some(i);
                     }
                 }
@@ -157,33 +622,22 @@ pub fn match_route_idx(raw_path: &str, routes: &[RouteRule]) -> Option<usize> {
         }
     }
 
-    let mut idx: Vec<usize> = (0..routes.len()).collect();
-    idx.sort_by(|&i, &j| {
-        let pi = routes[i].prefix.as_str();
-        let pj = routes[j].prefix.as_str();
-        let ri = pi == "/";
-        let rj = pj == "/";
-        match (ri, rj) {
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            _ => {
-                let li = norm_len(pi);
-                let lj = norm_len(pj);
-                if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
-            }
-        }
-    });
+    let idx = build_route_order(routes);
     for &i in &idx {
-        if matches_prefix(raw_path, &routes[i].prefix) {
+        if vhost_matches(host, &routes[i].vhost) && matches_route(raw_path, &routes[i]) {
             return Some(i);
         }
     }
     None
 }
 
-#[allow(dead_code)]
-pub fn match_route<'a>(raw_path: &str, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
-    match_route_idx(raw_path, routes).map(|i| &routes[i])
+#[allow(dead_code)] // same reason as find_route_for_redirect_path just above — genuinely used (by that same function), the bin target's check just can't prove it through actix's handler indirection
+pub fn match_route<'a>(
+    raw_path: &str,
+    host: Option<&str>,
+    routes: &'a [RouteRule],
+) -> Option<&'a RouteRule> {
+    match_route_idx(raw_path, host, routes).map(|i| &routes[i])
 }
 
 pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -> Builder {
@@ -306,15 +760,393 @@ async fn incoming_to_boxbody(
     Ok(hyper::Response::from_parts(parts, boxed))
 }
 
+/// Very small extension → MIME map, good enough for the kind of static
+/// assets `static` is meant for (docs sites, SPA builds, downloads).
+/// Anything unrecognized falls back to `application/octet-stream`
+/// rather than a guess — serving an unknown file as `text/*` risks the
+/// browser sniffing it as HTML and executing it (stored XSS via file
+/// upload/download endpoints), which a wrong-but-inert binary MIME type
+/// avoids.
+fn guess_content_type(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Resolves `req_path` against `rule.static_path` and serves the
+/// file(s) — ProxyAuth's equivalent of nginx's `root`/`alias`. Uses
+/// `tokio::fs` (which itself runs the blocking syscalls on a
+/// background thread pool), so this never blocks the async worker.
+///
+/// `static_path` can point at a single file — served as-is for every
+/// request under this route, ignoring the rest of the path — or at a
+/// directory, in which case the remainder of the request path (after
+/// stripping this route's `prefix`) is resolved inside it, falling
+/// back to `static_index` for directory-shaped requests.
+///
+/// Path-traversal safety (directory mode): the root is canonicalized
+/// once up front; the candidate file is canonicalized too (resolving
+/// any `..`/symlinks), and the result must still start with the
+/// canonical root or the request is rejected outright. A raw `..`
+/// segment is also rejected before ever touching the filesystem, as a
+/// cheap first line of defense.
+/// Turns a filesystem error from serving a static file into the right
+/// response, and — for the case actually worth an admin's attention —
+/// a log line that says so plainly. A permission error almost always
+/// means the `proxyauth` user itself can't read the path (missing
+/// read, or missing execute/traverse on a parent directory), which
+/// looks identical to a 404 otherwise and is easy to mistake for a
+/// typo'd path instead of a permissions problem.
+fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> HttpResponse {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        warn!(
+            "static route \"{prefix}\": permission denied reading {} — the \"proxyauth\" user needs read (and, for directories, execute/traverse) access to this path",
+            path.display()
+        );
+        HttpResponse::InternalServerError()
+            .append_header(("server", "ProxyAuth"))
+            .body("500 Internal Server Error")
+    } else {
+        HttpResponse::NotFound()
+            .append_header(("server", "ProxyAuth"))
+            .body("404 Not Found")
+    }
+}
+
+async fn serve_static_file(
+    rule: &RouteRule,
+    req_path: &str,
+    cache_duration_secs: u64,
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+    ip: &str,
+) -> HttpResponse {
+    let Some(static_path) = rule.static_path.as_deref() else {
+        return HttpResponse::InternalServerError()
+            .append_header(("server", "ProxyAuth"))
+            .body("500 Internal Server Error");
+    };
+
+    let root = match tokio::fs::canonicalize(static_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "static \"{}\" (route \"{}\") is not readable: {e}",
+                static_path, rule.prefix
+            );
+            return HttpResponse::InternalServerError()
+                .append_header(("server", "ProxyAuth"))
+                .body("500 Internal Server Error");
+        }
+    };
+
+    let root_is_file = match tokio::fs::metadata(&root).await {
+        Ok(m) => m.is_file(),
+        Err(e) => {
+            return static_read_error_response(&rule.prefix, &root, &e);
+        }
+    };
+
+    // Single-file mode: this route always serves exactly this file,
+    // whatever the request path under `prefix` looks like — like
+    // nginx's `alias` pointing straight at one file (e.g. a fixed
+    // `/robots.txt` or `/favicon.ico` route).
+    let max_age = rule.cache_duration_secs.unwrap_or(cache_duration_secs);
+    if root_is_file {
+        return match tokio::fs::read(&root).await {
+            Ok(bytes) => {
+                let content_type = guess_content_type(&root);
+                let bytes = if rule.tag_proxyauth_enabled() && content_type.starts_with("text/html") {
+                    match String::from_utf8(bytes) {
+                        Ok(text) => {
+                            let username = extract_username_for_tags(req, data, ip).await;
+                            // Independent of `username` — a login page,
+                            // where nobody is authenticated yet, is
+                            // exactly the case that most needs a CSRF
+                            // token (for the login form's own POST).
+                            // But NOT independent of csrf_token itself —
+                            // injecting a token when CSRF protection is
+                            // deliberately off for this vhost would be a
+                            // pointless, confusing no-op at best (the
+                            // token gets generated and spliced in, but
+                            // /auth never actually checks it).
+                            let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+                            substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                                .into_bytes()
+                        }
+                        Err(e) => e.into_bytes(),
+                    }
+                } else {
+                    bytes
+                };
+                let mut resp = HttpResponse::Ok();
+                resp.append_header(("server", "ProxyAuth"))
+                    .content_type(content_type);
+                if rule.cache {
+                    resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
+                } else {
+                    resp.append_header((
+                        header::CACHE_CONTROL,
+                        "no-store, no-cache, must-revalidate, max-age=0",
+                    ));
+                    resp.append_header(("Pragma", "no-cache"));
+                    resp.append_header(("Expires", "0"));
+                }
+                resp.body(bytes)
+            }
+            Err(e) => static_read_error_response(&rule.prefix, &root, &e),
+        };
+    }
+
+    // Directory mode.
+    let remainder_owned;
+    let remainder: &str = if let Some(re) = &rule.regex_compiled {
+        // Regex route: there's no `prefix` to strip — the subpath under
+        // `static` comes from `static_rewrite`, filled in from the
+        // regex's named captures (nginx's `$name` rewrite equivalent).
+        // No template configured just means "serve the directory
+        // itself" (falls through to `static_index` below).
+        match &rule.static_rewrite {
+            Some(tpl) => {
+                remainder_owned = build_regex_target(re, tpl, req_path);
+                remainder_owned
+                    .trim_start_matches('/')
+                    .trim_end_matches('/')
+            }
+            None => "",
+        }
+    } else {
+        let prefix_norm = canonicalize_prefix(&rule.prefix);
+        if prefix_norm == "/" {
+            req_path.trim_start_matches('/')
+        } else {
+            req_path
+                .strip_prefix(&prefix_norm)
+                .unwrap_or(req_path)
+                .trim_start_matches('/')
+        }
+    };
+
+    if remainder.split('/').any(|seg| seg == "..") {
+        return HttpResponse::Forbidden()
+            .append_header(("server", "ProxyAuth"))
+            .body("403 Forbidden");
+    }
+
+    let mut candidate = root.join(remainder);
+
+    let is_dir = tokio::fs::metadata(&candidate)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if is_dir || remainder.is_empty() {
+        candidate = candidate.join(&rule.static_index);
+    }
+
+    let resolved = match tokio::fs::canonicalize(&candidate).await {
+        Ok(p) => p,
+        Err(e) => {
+            return static_read_error_response(&rule.prefix, &candidate, &e);
+        }
+    };
+
+    if !resolved.starts_with(&root) {
+        warn!(
+            "blocked path-traversal attempt on route \"{}\": {} resolved outside {}",
+            rule.prefix,
+            candidate.display(),
+            root.display()
+        );
+        return HttpResponse::Forbidden()
+            .append_header(("server", "ProxyAuth"))
+            .body("403 Forbidden");
+    }
+
+    match tokio::fs::read(&resolved).await {
+        Ok(bytes) => {
+            let content_type = guess_content_type(&resolved);
+            let bytes = if rule.tag_proxyauth_enabled() && content_type.starts_with("text/html") {
+                match String::from_utf8(bytes) {
+                    Ok(text) => {
+                        let username = extract_username_for_tags(req, data, ip).await;
+                        let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+                        substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                            .into_bytes()
+                    }
+                    Err(e) => e.into_bytes(),
+                }
+            } else {
+                bytes
+            };
+            let mut resp = HttpResponse::Ok();
+            resp.append_header(("server", "ProxyAuth"))
+                .content_type(content_type);
+            if rule.cache {
+                resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
+            } else {
+                resp.append_header((
+                    header::CACHE_CONTROL,
+                    "no-store, no-cache, must-revalidate, max-age=0",
+                ));
+                resp.append_header(("Pragma", "no-cache"));
+                resp.append_header(("Expires", "0"));
+            }
+            resp.body(bytes)
+        }
+        Err(e) => static_read_error_response(&rule.prefix, &resolved, &e),
+    }
+}
+
+/// Minimal `required_login` gate for static routes: the same
+/// Bearer-token / session-cookie extraction and
+/// `AppConfig::route_access_decision` check the proxied routes use,
+/// trimmed down — no CSRF (irrelevant to serving a file) and no "/"
+/// login-redirect special case. `Ok(())` means the request may proceed;
+/// `Err(resp)` is the response to send back instead.
+async fn check_static_auth(
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+    rule: &RouteRule,
+    ip: &str,
+) -> Result<(), HttpResponse> {
+    if !rule.required_login {
+        return Ok(());
+    }
+
+    let token_header = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| {
+            if !is_secure_request(req, &data.config) {
+                return None;
+            }
+            req.headers()
+                .get(header::COOKIE)
+                .and_then(|val| val.to_str().ok())
+                .and_then(|cookie_str| {
+                    cookie_str.split(';').find_map(|cookie| {
+                        let cookie = cookie.trim();
+                        let (key, value) = cookie.split_once('=')?;
+                        if key.trim() == "session_token" {
+                            Some(value.trim())
+                        } else {
+                            None
+                        }
+                    })
+                })
+        });
+
+    let Some(token_header) = token_header else {
+        return Err(HttpResponse::Unauthorized()
+            .append_header(("server", "ProxyAuth"))
+            .body("401 Unauthorized"));
+    };
+
+    let username = match validate_token(token_header, data, &data.config, ip).await {
+        Ok((username, _token_id, _expiry)) => username,
+        Err(_) => {
+            return Err(HttpResponse::Unauthorized()
+                .append_header(("server", "ProxyAuth"))
+                .append_header((
+                    "Set-Cookie",
+                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+                ))
+                .body("401 Unauthorized"));
+        }
+    };
+
+    if !data
+        .config
+        .route_access_decision(rule, &username)
+        .is_allowed()
+    {
+        return Err(HttpResponse::Unauthorized()
+            .append_header(("server", "ProxyAuth"))
+            .body("401 Unauthorized"));
+    }
+
+    Ok(())
+}
+
 pub async fn global_proxy(
     req: HttpRequest,
     body: web::Bytes,
     data: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
+    // Checked before anything else — including CORS preflight — so a
+    // known-abusive IP never gets any response beyond a flat 403,
+    // regardless of which route or method it's trying.
+    if let Some(ip) = client_ip(&req, &data.config) {
+        if data.ip_blocklist.load().iter().any(|net| net.contains(&ip)) {
+            warn!(
+                "{} 403 {} {} — blocked by ip_blocklist",
+                ip,
+                req.method(),
+                req.path()
+            );
+            return Ok(HttpResponse::Forbidden()
+                .append_header(("server", "ProxyAuth"))
+                .body("403 Forbidden"));
+        }
+    }
+
+    // ACME HTTP-01 challenge responses — checked ahead of everything
+    // else (auth, CSRF, normal routing) so an in-flight certificate
+    // renewal is never blocked by unrelated route config. Only ever
+    // matches while `acme::renew_certificate` has actually published
+    // something for this exact (vhost, token) pair — see
+    // `acme::challenge`'s module doc comment for why this is a
+    // separate overlay rather than a real routes.yml entry.
+    if req.method() == actix_web::http::Method::GET {
+        if let Some(token) = crate::acme::challenge::extract_token(req.path()) {
+            let host = req.connection_info().host().to_string();
+            let vhost = normalize_host(&host);
+            if let Some(key_authorization) = crate::acme::challenge::lookup(&vhost, token) {
+                return Ok(HttpResponse::Ok()
+                    .content_type("application/octet-stream")
+                    .body(key_authorization));
+            }
+        }
+    }
+
     if req.method() == actix_web::http::Method::OPTIONS {
         let origin_header = req.headers().get(header::ORIGIN);
         let origin = origin_header.and_then(|v| v.to_str().ok());
-        let allowed = data.config.cors_origins.as_ref();
+        let preflight_vhost_route =
+            find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
+        let allowed = preflight_vhost_route
+            .and_then(|r| r.resolved_cors_origins(&data.config))
+            .or(data.config.cors_origins.as_ref());
         let is_allowed = match (origin, allowed) {
             (Some(o), Some(list)) => {
                 let origin_normalized = o.trim_end_matches('/');
@@ -329,7 +1161,7 @@ pub async fn global_proxy(
                 .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
                 .insert_header((
                     header::ACCESS_CONTROL_ALLOW_METHODS,
-                    "GET, POST, PUT, DELETE, OPTIONS",
+                    "GET, HEAD, POST, PUT, DELETE, OPTIONS",
                 ))
                 .insert_header((
                     header::ACCESS_CONTROL_ALLOW_HEADERS,
@@ -361,9 +1193,21 @@ pub async fn global_proxy(
     // still actually authenticated is confusing. Any other path is left
     // completely untouched (still goes through normal routes.yml matching
     // below), so this only affects these two specific landing pages.
-    if data.config.session_cookie {
-        let is_home_or_logout_page =
-            path == "/" || data.config.logout_redirect_url.as_deref() == Some(path);
+    //
+    // No route has been matched yet at this point (that happens further
+    // down) — find_vhost_route resolves this vhost's own
+    // session_cookie/logout_redirect_url override, if routes.yml sets
+    // one, the same way the auth flow itself does.
+    let early_vhost_route =
+        find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
+    let early_session_cookie_enabled = early_vhost_route
+        .map(|r| r.session_cookie_enabled(&data.config))
+        .unwrap_or(data.config.session_cookie);
+    if early_session_cookie_enabled {
+        let early_logout_redirect_url = early_vhost_route
+            .and_then(|r| r.resolved_logout_redirect_url(&data.config))
+            .or(data.config.logout_redirect_url.as_deref());
+        let is_home_or_logout_page = path == "/" || early_logout_redirect_url == Some(path);
         if is_home_or_logout_page {
             if let Some(resp) =
                 crate::token::auth::existing_session_response(&req, &data, &ip).await
@@ -375,15 +1219,64 @@ pub async fn global_proxy(
 
     data.stats.incr();
 
-    if let Some(idx) = match_route_idx(path, &data.routes.routes) {
-        let use_proxy = data.routes.routes[idx].proxy;
+    let host = request_host(&req);
+    if let Some(idx) = match_route_idx(path, host.as_deref(), &data.routes.routes) {
+        // Lets the access-log and compression middlewares resolve this
+        // route's settings without redoing the match themselves.
+        LogContext::set_route(&req, idx);
+        let rule = &data.routes.routes[idx];
+        let has_ip_restriction =
+            !rule.allow_ips_compiled.is_empty() || !rule.deny_ips_compiled.is_empty();
+        if has_ip_restriction {
+            let resolved_ip = client_ip(&req, &data.config);
+            if !ip_allowed(resolved_ip, rule) {
+                warn!(
+                    "{} 403 {} {} {} — blocked by allow_ips/deny_ips on route \"{}\"",
+                    resolved_ip
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    method,
+                    path,
+                    user_agent,
+                    rule.prefix
+                );
+                return Ok(HttpResponse::Forbidden()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("403 Forbidden"));
+            }
+        }
+
+        let use_proxy = rule.proxy;
+        if rule.static_path.is_some() {
+            let ip_str = client_ip(&req, &data.config)
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            if let Err(resp) = check_static_auth(&req, &data, rule, &ip_str).await {
+                return Ok(resp);
+            }
+            if method != "GET" && method != "HEAD" {
+                return Ok(HttpResponse::MethodNotAllowed()
+                    .append_header(("server", "ProxyAuth"))
+                    .append_header(("Allow", "GET, HEAD"))
+                    .body("405 Method Not Allowed"));
+            }
+            let mut static_resp =
+                serve_static_file(rule, path, data.config.cache_duration_secs, &req, &data, &ip_str)
+                    .await;
+            apply_custom_headers(&mut static_resp, rule);
+            return Ok(static_resp);
+        }
         if use_proxy {
             proxy_with_proxy(req, body, data, idx).await
         } else {
             proxy_without_proxy(req, body, data, idx).await
         }
     } else {
-        info!("{} 404 {} {} {}", ip, method, path, user_agent);
+        // No ad-hoc line here any more: the access-log middleware logs
+        // this 404 in the configured format, like everything else. That
+        // is the point of the rework — not a fourth logger alongside
+        // the others, but the removal of the ones that emitted
+        // divergent formats on a subset of code paths.
         Ok(HttpResponse::NotFound()
             .append_header(("server", "ProxyAuth"))
             .body("404 Not Found"))
@@ -419,10 +1312,8 @@ pub async fn proxy_with_proxy(
             .and_then(|v| v.to_str().ok())
         {
             let origin_trimmed = origin.trim_end_matches('/');
-            let is_allowed = data
-                .config
-                .cors_origins
-                .as_ref()
+            let is_allowed = rule
+                .resolved_cors_origins(&data.config)
                 .map(|list| {
                     list.iter()
                         .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
@@ -442,6 +1333,7 @@ pub async fn proxy_with_proxy(
 
     // ── ACL ─────────────────────────────────────────────────────────
     if let Some(status) = apply_filters_regex_allow_only(rule, &req, &body) {
+        LogContext::set_error_detail(&req, "acl filter rejected");
         let mut resp = HttpResponse::build(status);
         resp.insert_header(("server", "ProxyAuth"));
         add_cors_headers(&mut resp, &req);
@@ -455,6 +1347,7 @@ pub async fn proxy_with_proxy(
     // ── Allow Method ───────────────────────────────────────────────────
     if !is_method_allowed(rule.allow_methods.as_deref(), method_str) {
         let allow = build_allow_header(rule.allow_methods.as_deref());
+        LogContext::set_error_detail(&req, "method not allowed");
         let mut resp = HttpResponse::build(StatusCode::METHOD_NOT_ALLOWED);
         resp.insert_header(("Allow", allow));
         resp.insert_header(("server", "ProxyAuth"));
@@ -467,8 +1360,9 @@ pub async fn proxy_with_proxy(
     }
 
     // ── CSRF ────────────────────────────────────────────────────────────────
-    if data.config.session_cookie && data.config.csrf_token && rule.need_csrf {
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
+            LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>invalid csrf request</h1></body></html>"#;
             let mut resp = HttpResponse::build(StatusCode::UNAUTHORIZED);
             resp.insert_header(("server", "ProxyAuth"));
@@ -489,8 +1383,6 @@ pub async fn proxy_with_proxy(
     }
 
     // ── URL TARGET ─────────────────────────────────────────
-    let mut user_agent_fwd = "";
-
     let original_uri = req.uri();
     let path_no_query = original_uri.path();
     let prefix_norm = rule.prefix.trim_end_matches('/');
@@ -518,8 +1410,29 @@ pub async fn proxy_with_proxy(
         String::new()
     };
 
-    let mut target_url = rule.target.trim_end_matches('/').to_string();
-    target_url.push_str(&forward_path);
+    let mut target_url = if let Some(re) = &rule.regex_compiled {
+        if rule.target.contains('{') {
+            let rewritten = build_regex_target(re, &rule.target, path_no_query);
+            if target_authority_tampered(&rule.target, &rewritten) {
+                warn!(
+                    "[{}] {} {} 502 blocked: regex capture on route \"{}\" tried to change the target host ({} -> {})",
+                    ip, path, method_str, rule.prefix, rule.target, rewritten
+                );
+                return Ok(HttpResponse::BadGateway()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("502 Bad Gateway"));
+            }
+            rewritten
+        } else {
+            let mut t = rule.target.trim_end_matches('/').to_string();
+            t.push_str(path_no_query);
+            t
+        }
+    } else {
+        let mut t = rule.target.trim_end_matches('/').to_string();
+        t.push_str(&forward_path);
+        t
+    };
     if let Some(q) = original_uri.query() {
         if target_url.contains('?') {
             target_url.push('&');
@@ -607,7 +1520,11 @@ pub async fn proxy_with_proxy(
         // this route" — see `AppConfig::route_access_decision`. Also
         // what `proxyauth routes-audit`/`check-access` call, so that
         // tool can never silently disagree with what's enforced here.
-        if !data.config.route_access_decision(rule, &username).is_allowed() {
+        if !data
+            .config
+            .route_access_decision(rule, &username)
+            .is_allowed()
+        {
             warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
             let mut resp = HttpResponse::Unauthorized();
             resp.append_header(("server", "ProxyAuth"));
@@ -628,7 +1545,28 @@ pub async fn proxy_with_proxy(
         (String::new(), String::new())
     };
 
+    // Publishes the resolved identity for the access log's [username]
+    // and [token-id] placeholders. Takes and releases `extensions_mut`
+    // inside its own body — the `RefMut` must not be held across an
+    // `.await`, or the next borrow panics.
+    LogContext::set_user(&req, &username, &token_id);
+
     // ── Build hyper request ────────────────────────────────────
+    // Resolved once, ahead of the header loop. Without this, the
+    // `compression` block would look like it does nothing on proxied
+    // routes: the client's `Accept-Encoding` is relayed to the backend
+    // verbatim, the backend compresses first, and the compression
+    // middleware then (correctly) refuses to re-encode a body that
+    // already carries a `Content-Encoding`. Asking upstream for
+    // `identity` is what lets ProxyAuth apply the configured algorithm
+    // and level itself — nginx's `proxy_set_header Accept-Encoding ""`.
+    let route_compression = match &rule.compression {
+        Some(c) => c.merged_over(&data.config.compression),
+        None => data.config.compression.clone(),
+    };
+    let strip_accept_encoding =
+        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+
     let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
     let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
 
@@ -647,20 +1585,39 @@ pub async fn proxy_with_proxy(
     // replaces.
     for (key, value) in req.headers() {
         let key_str = key.as_str();
-        if key_str == "user-agent" {
-            user_agent_fwd = value.to_str().unwrap_or("");
+
+        // Authorization is consumed by ProxyAuth only when
+        // the route itself requires ProxyAuth authentication.
+        if key_str == "authorization" && rule.required_login {
+            continue;
         }
+
+        // `is_hop_by_hop_header` existed and was documented, but was
+        // never actually called — the SECURITY note above described a
+        // fix that had only half landed. Without this test, a client's
+        // own Content-Length / Transfer-Encoding / TE / Trailer /
+        // Upgrade / Keep-Alive / Proxy-* headers were relayed verbatim
+        // to the backend, alongside a body this proxy always
+        // re-serializes as fixed-length. Two HTTP implementations
+        // disagreeing on framing metadata is precisely what enables
+        // request smuggling.
         if !is_hop_by_hop_header(key_str)
-            && key_str != "authorization"
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
-        {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            && !(strip_accept_encoding && key_str == "accept-encoding")
+            {
+                if let Ok(hv) =
+                    hyper::header::HeaderValue::from_bytes(value.as_bytes())
+                    {
+                        request_builder = request_builder.header(key_str, hv);
+                    }
             }
-        }
+    }
+
+    if strip_accept_encoding {
+        request_builder = request_builder.header(hyper::header::ACCEPT_ENCODING, "identity");
     }
 
     request_builder = request_builder
@@ -768,8 +1725,19 @@ pub async fn proxy_with_proxy(
         })?
         .to_bytes();
 
-    if !rule.cache {
-        client_resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
+    // ── Cache policy ────────────────────────────────────────────────
+    if rule.cache {
+        let max_age = rule
+            .cache_duration_secs
+            .unwrap_or(data.config.cache_duration_secs);
+        let cc = format!("public, max-age={}", max_age);
+        client_resp.insert_header((header::CACHE_CONTROL, cc));
+    } else {
+        // Deliberately NOT touching Content-Type here — it's already
+        // been forwarded from the upstream's real response headers a
+        // few lines up. Forcing it to text/html regardless of what the
+        // response actually is (JSON, an image, anything else) would
+        // corrupt every non-HTML response on a route with cache: false.
         client_resp.insert_header((
             header::CACHE_CONTROL,
             "no-store, no-cache, must-revalidate, max-age=0",
@@ -778,7 +1746,7 @@ pub async fn proxy_with_proxy(
         client_resp.insert_header(("Expires", "0"));
     }
 
-    if data.config.session_cookie && data.config.csrf_token {
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {
@@ -787,20 +1755,34 @@ pub async fn proxy_with_proxy(
         }
     }
 
-    info!(
-        "{} - {} {} {} {} {} [tid:{}] {}",
-        ip,
-        path,
-        method_str,
-        status.as_u16(),
-        body_bytes.len(),
-        username,
-        token_id,
-        user_agent_fwd
-    );
+    // `{{ username }}`/`{{ proxyauth_version }}`/`{{ proxyauth_id }}`
+    // (and `{{ csrf_token }}` too, independent of whatever
+    // session_cookie/csrf_token resolved to just above — tag_proxyauth
+    // is its own, separate opt-in) — same tags as static files, now
+    // also available in whatever HTML the backend itself returns, so
+    // a target's own page can use them too, not just ProxyAuth's own
+    // static content.
+    if rule.tag_proxyauth_enabled() {
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if ct.to_ascii_lowercase().starts_with("text/html") {
+            if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
+                let username = extract_username_for_tags(&req, &data, &ip).await;
+                let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+                let substituted =
+                    substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                let new_len = substituted.len();
+                body_bytes = Bytes::from(substituted.into_bytes());
+                client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
+            }
+        }
+    }
 
     add_cors_headers(&mut client_resp, &req);
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
+    apply_custom_headers_builder(&mut client_resp, rule);
     Ok(client_resp
         .append_header(("server", "ProxyAuth"))
         .body(body_bytes))
@@ -821,12 +1803,16 @@ pub async fn proxy_without_proxy(
     let ip = client_ip(&req, &data.config)
         .unwrap_or(IpAddr::from([127, 0, 0, 1]))
         .to_string();
+
     let method_str = req.method().as_str();
+
     let user_agent = req
         .headers()
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
+
+    let is_head = req.method() == actix_web::http::Method::HEAD;
 
     let add_cors_headers = |resp: &mut HttpResponseBuilder, req: &HttpRequest| {
         if let Some(origin) = req
@@ -835,22 +1821,28 @@ pub async fn proxy_without_proxy(
             .and_then(|v| v.to_str().ok())
         {
             let origin_trimmed = origin.trim_end_matches('/');
-            let is_allowed = data
-                .config
-                .cors_origins
-                .as_ref()
+
+            let is_allowed = rule
+                .resolved_cors_origins(&data.config)
                 .map(|list| {
                     list.iter()
                         .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
                 })
                 .unwrap_or(false);
+
             if is_allowed {
                 resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, req.method().as_str()));
+
+                resp.insert_header((
+                    header::ACCESS_CONTROL_ALLOW_METHODS,
+                    "GET, HEAD, POST, PUT, DELETE, OPTIONS",
+                ));
+
                 resp.insert_header((
                     header::ACCESS_CONTROL_ALLOW_HEADERS,
                     "Authorization, Content-Type, Accept",
                 ));
+
                 resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
             }
         }
@@ -858,66 +1850,96 @@ pub async fn proxy_without_proxy(
 
     // ── ACL ─────────────────────────────────────────────────────────
     if let Some(status) = apply_filters_regex_allow_only(rule, &req, &body) {
+        LogContext::set_error_detail(&req, "acl filter rejected");
         let mut resp = HttpResponse::build(status);
+
         resp.insert_header(("server", "ProxyAuth"));
+
         add_cors_headers(&mut resp, &req);
+
         warn!(
             "[{}] - {} {} {} {}",
             ip, path, method_str, "403 acl no match", user_agent
         );
+
         return Ok(resp.body("403 Forbidden"));
     }
 
-    // ── Allow method ───────────────────────────────────────────────────
+    // ── Allow method ─────────────────────────────────────────────────
     if !is_method_allowed(rule.allow_methods.as_deref(), method_str) {
         let allow = build_allow_header(rule.allow_methods.as_deref());
+        LogContext::set_error_detail(&req, "method not allowed");
+
         let mut resp = HttpResponse::build(StatusCode::METHOD_NOT_ALLOWED);
+
         resp.insert_header(("Allow", allow));
         resp.insert_header(("server", "ProxyAuth"));
+
         add_cors_headers(&mut resp, &req);
+
         warn!(
             "[{}] - {} {} {} {}",
             ip, path, method_str, "405 method not allowed", user_agent
         );
+
         return Ok(resp.body("405 Method Not Allowed"));
     }
 
-    // ── CSRF ────────────────────────────────────────────────────────────────
-    if data.config.session_cookie && data.config.csrf_token && rule.need_csrf {
+    // ── CSRF ─────────────────────────────────────────────────────────
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
-            let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>invalid csrf request</h1></body></html>"#;
+            LogContext::set_error_detail(&req, "invalid csrf token");
+            let html = r#"<!doctype html>
+                <html lang="en">
+                <head>
+                <meta charset="utf-8">
+                <title>401 Unauthorized</title>
+                </head>
+                <body>
+                <h1>invalid csrf request</h1>
+                </body>
+                </html>"#;
+
             let mut resp = HttpResponse::build(StatusCode::UNAUTHORIZED);
+
             resp.insert_header(("server", "ProxyAuth"));
             resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
+
             resp.insert_header((
                 header::CACHE_CONTROL,
                 "no-store, no-cache, must-revalidate, max-age=0",
             ));
+
             resp.insert_header(("Pragma", "no-cache"));
             resp.insert_header(("Expires", "0"));
+
             add_cors_headers(&mut resp, &req);
+
             warn!(
                 "[{}] - {} {} {} {}",
                 ip, path, method_str, "401 invalid csrf", user_agent
             );
+
             return Ok(resp.body(html));
         }
     }
 
-    // ── Build URL target ─────────────────────────────────────────
-    let mut user_agent_fwd = "";
-
+    // ── Build URL target ─────────────────────────────────────────────
     let original_uri = req.uri();
     let path_no_query = original_uri.path();
+
     let prefix_norm = rule.prefix.trim_end_matches('/');
+
     let raw_forward = path_no_query
         .strip_prefix(prefix_norm)
         .unwrap_or(path_no_query);
+
     let cleaned_remainder = raw_forward.trim_start_matches('/').trim_end_matches('/');
 
     let forward_path = if !rule.secure_path {
         if rule.preserve_prefix {
             let p = path_no_query.trim_start_matches('/');
+
             if p.is_empty() {
                 String::new()
             } else {
@@ -934,23 +1956,54 @@ pub async fn proxy_without_proxy(
         String::new()
     };
 
-    let mut target_url = rule.target.trim_end_matches('/').to_string();
-    target_url.push_str(&forward_path);
+    let mut target_url = if let Some(re) = &rule.regex_compiled {
+        if rule.target.contains('{') {
+            let rewritten = build_regex_target(re, &rule.target, path_no_query);
+
+            if target_authority_tampered(&rule.target, &rewritten) {
+                warn!(
+                    "[{}] {} {} 502 blocked: regex capture on route \"{}\" tried to change the target host ({} -> {})",
+                    ip, path, method_str, rule.prefix, rule.target, rewritten
+                );
+
+                return Ok(HttpResponse::BadGateway()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("502 Bad Gateway"));
+            }
+
+            rewritten
+        } else {
+            let mut t = rule.target.trim_end_matches('/').to_string();
+
+            t.push_str(path_no_query);
+
+            t
+        }
+    } else {
+        let mut t = rule.target.trim_end_matches('/').to_string();
+
+        t.push_str(&forward_path);
+
+        t
+    };
+
     if let Some(q) = original_uri.query() {
         if target_url.contains('?') {
             target_url.push('&');
         } else {
             target_url.push('?');
         }
+
         target_url.push_str(q);
     }
+
     let full_url = if target_url.starts_with("http://") || target_url.starts_with("https://") {
         target_url
     } else {
         format!("http://{}", target_url)
     };
 
-    // ── Client : cache global partagé, pas de thread-local ──────────────────
+    // ── Client : cache global partagé ────────────────────────────────
     let client_opts = if !rule.cert.is_empty() {
         ClientOptions {
             use_proxy: false,
@@ -968,12 +2021,13 @@ pub async fn proxy_without_proxy(
             key_path: None,
         }
     };
+
     let client = get_or_build_client(client_opts, &data.config);
 
     let uri = Uri::from_str(&full_url)
         .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
 
-    // ── Auth────────────────────────────────────────────────────
+    // ── Auth ─────────────────────────────────────────────────────────
     let (username, token_id) = if rule.required_login {
         let token_header = req
             .headers()
@@ -984,73 +2038,85 @@ pub async fn proxy_without_proxy(
                 if !is_secure_request(&req, &data.config) {
                     return None;
                 }
+
                 req.headers()
                     .get(header::COOKIE)
                     .and_then(|val| val.to_str().ok())
                     .and_then(|cookie_str| {
                         cookie_str.split(';').find_map(|cookie| {
                             let cookie = cookie.trim();
+
                             if let Some((key, value)) = cookie.split_once('=') {
                                 if key.trim() == "session_token" {
                                     return Some(value.trim());
                                 }
                             }
+
                             None
                         })
                     })
             })
             .ok_or_else(|| {
-                info!(
-                    "[{}] {} {} 401 Unauthorized token attempt {}",
-                    ip, path, method_str, user_agent
-                );
                 let mut resp = HttpResponse::Unauthorized();
+
                 resp.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut resp, &req);
+
                 error::InternalError::from_response("Missing token", resp.finish())
             })?;
 
         let (username, token_id, _expiry) =
             match validate_token(token_header, &data, &data.config, &ip).await {
                 Ok(result) => result,
+
                 Err(_err) => {
                     warn!(
                         "[{}] {} {} 401 Unauthorized token attempt {} {}",
                         ip, path, method_str, user_agent, _err
                     );
+
                     let mut resp = HttpResponse::Unauthorized();
+
                     resp.append_header(("server", "ProxyAuth"));
+
                     resp.append_header((
                         "Set-Cookie",
                         "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
                     ));
+
                     if req.uri() != "/" || req.uri() != "" {
                         resp.append_header(("location", "/"));
                     }
+
                     add_cors_headers(&mut resp, &req);
+
                     return Ok(resp.body("401 Unauthorized"));
                 }
             };
 
-        // Same single source of truth as proxy_with_proxy above — see
-        // `AppConfig::route_access_decision`.
-        if !data.config.route_access_decision(rule, &username).is_allowed() {
-            info!(
-                "[{}] {} {} 401 Unauthorized token attempt {}",
-                ip, path, method_str, user_agent
-            );
+        if !data
+            .config
+            .route_access_decision(rule, &username)
+            .is_allowed()
+        {
             let mut resp = HttpResponse::Unauthorized();
+
             resp.append_header(("server", "ProxyAuth"));
+
             resp.append_header((
                 "Set-Cookie",
                 "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
             ));
+
             add_cors_headers(&mut resp, &req);
+
             return Ok(resp.body("401 Unauthorized"));
         }
 
         if req.uri() == "/" || req.uri() == "" {
             let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+
             return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
                 .append_header(("location", redirect_target))
@@ -1062,55 +2128,128 @@ pub async fn proxy_without_proxy(
         (String::new(), String::new())
     };
 
-    // ── Build request hyper ────────────────────────────────────
+    // See the matching call in `proxy_with_proxy`.
+    LogContext::set_user(&req, &username, &token_id);
+
+    // Resolved once, ahead of the header loop. Without this, the
+    // `compression` block would look like it does nothing on proxied
+    // routes: the client's `Accept-Encoding` is relayed to the backend
+    // verbatim, the backend compresses first, and the compression
+    // middleware then (correctly) refuses to re-encode a body that
+    // already carries a `Content-Encoding`. Asking upstream for
+    // `identity` is what lets ProxyAuth apply the configured algorithm
+    // and level itself — nginx's `proxy_set_header Accept-Encoding ""`.
+    let route_compression = match &rule.compression {
+        Some(c) => c.merged_over(&data.config.compression),
+        None => data.config.compression.clone(),
+    };
+    let strip_accept_encoding =
+        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+
+    // ── Build request Hyper ──────────────────────────────────────────
+    //
+    // IMPORTANT:
+    // Preserve the original HTTP method.
+    //
+    // GET  -> GET upstream
+    // HEAD -> HEAD upstream
+    // POST -> POST upstream
+    // etc.
+    //
     let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
+
     let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
 
     for (key, value) in req.headers() {
         let key_str = key.as_str();
-        if key_str == "user-agent" {
-            user_agent_fwd = value.to_str().unwrap_or("");
+
+        // Authorization is consumed by ProxyAuth only when
+        // the route itself requires ProxyAuth authentication.
+        if key_str == "authorization" && rule.required_login {
+            continue;
         }
-        if key_str != "authorization"
+
+        // `is_hop_by_hop_header` existed and was documented, but was
+        // never actually called — the SECURITY note above described a
+        // fix that had only half landed. Without this test, a client's
+        // own Content-Length / Transfer-Encoding / TE / Trailer /
+        // Upgrade / Keep-Alive / Proxy-* headers were relayed verbatim
+        // to the backend, alongside a body this proxy always
+        // re-serializes as fixed-length. Two HTTP implementations
+        // disagreeing on framing metadata is precisely what enables
+        // request smuggling.
+        if !is_hop_by_hop_header(key_str)
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
-        {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            && !(strip_accept_encoding && key_str == "accept-encoding")
+            {
+                if let Ok(hv) =
+                    hyper::header::HeaderValue::from_bytes(value.as_bytes())
+                    {
+                        request_builder = request_builder.header(key_str, hv);
+                    }
             }
-        }
+    }
+
+    if strip_accept_encoding {
+        request_builder = request_builder.header(hyper::header::ACCEPT_ENCODING, "identity");
     }
 
     request_builder = request_builder.header(USER_AGENT, "ProxyAuth");
+
     request_builder = inject_header(request_builder, &username, &data.config);
 
+    // ── Build request body ───────────────────────────────────────────
+    //
+    // HEAD MUST NOT have a request body.
+    //
     let hyper_req = if hyper_method == Method::GET || hyper_method == Method::HEAD {
         match request_builder.body(Empty::<Bytes>::new().boxed()) {
             Ok(req) => req,
+
             Err(e) => {
-                warn!(client_ip = %ip, target = %full_url, "Route fallback: 500 Internal error (GET/HEAD): {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Route fallback: 500 Internal error (GET/HEAD): {}",
+                      e
+                );
+
                 let mut builder = HttpResponse::InternalServerError();
+
                 builder.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut builder, &req);
+
                 return Ok(builder.finish());
             }
         }
     } else {
         match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
             Ok(req) => req,
+
             Err(e) => {
-                warn!(client_ip = %ip, target = %full_url, "Route fallback: 500 Internal error reason: {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Route fallback: 500 Internal error reason: {}",
+                    e
+                );
+
                 let mut builder = HttpResponse::InternalServerError();
+
                 builder.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut builder, &req);
+
                 return Ok(builder.finish());
             }
         }
     };
 
-    // ── send upstream ───────────────────────────────────────────────
+    // ── Send upstream ────────────────────────────────────────────────
     let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
             .backends
@@ -1120,107 +2259,216 @@ pub async fn proxy_without_proxy(
                     url: url.clone(),
                     weight: 1,
                 },
+
                 BackendInput::Detailed(cfg) => cfg.clone(),
             })
             .collect();
 
         match forward_failover(hyper_req, &backends, None).await {
             Ok(res) => res,
+
             Err(e) => {
-                warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Failover failed: {}",
+                    e
+                );
+
                 let mut builder = HttpResponse::ServiceUnavailable();
+
                 builder.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut builder, &req);
+
                 return Ok(builder.finish());
             }
         }
     } else {
         match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
             Ok(Ok(res)) => incoming_to_boxbody(res).await.map_err(|e| {
-                warn!(client_ip = %ip, target = %full_url, "Body collect error: {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Body collect error: {}",
+                    e
+                );
+
                 error::ErrorServiceUnavailable("503 Service Unavailable")
             })?,
+
             Ok(Err(e)) => {
-                warn!(client_ip = %ip, target = %full_url, "Route fallback reason (client error): {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Route fallback reason (client error): {}",
+                      e
+                );
+
                 let mut resp = HttpResponse::ServiceUnavailable();
+
                 resp.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut resp, &req);
+
                 return Ok(resp.finish());
             }
+
             Err(e) => {
-                warn!(client_ip = %ip, target = %full_url, "Route fallback reason (timeout): {}", e);
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Route fallback reason (timeout): {}",
+                      e
+                );
+
                 let mut resp = HttpResponse::ServiceUnavailable();
+
                 resp.append_header(("server", "ProxyAuth"));
+
                 add_cors_headers(&mut resp, &req);
+
                 return Ok(resp.finish());
             }
         }
     };
 
+    // ── Upstream status ──────────────────────────────────────────────
     let status = response_result.status();
+
     if status.is_server_error() {
-        warn!(client_ip = %ip, target = %full_url, "Upstream returned server error: {}", status);
+        warn!(
+            client_ip = %ip,
+            target = %full_url,
+            "Upstream returned server error: {}",
+            status
+        );
+
         let mut resp = HttpResponse::InternalServerError();
+
         resp.append_header(("server", "ProxyAuth"));
+
         add_cors_headers(&mut resp, &req);
+
         return Ok(resp.finish());
     }
 
+    // ── Split response ──────────────────────────────────────────────
     let (parts, resp_body) = response_result.into_parts();
+
     let status = parts.status;
     let headers: hyper::HeaderMap = parts.headers;
 
     let mut client_resp = HttpResponse::build(to_actix_status(status));
 
-    for (key, value) in &headers as &hyper::HeaderMap {
+    // Preserve upstream response headers.
+    //
+    // Content-Length is intentionally preserved for HEAD.
+    // The client needs to know the size the corresponding GET
+    // response would have had.
+    for (key, value) in &headers {
         let k = key.as_str();
+
         if k != "user-agent" && k != "authorization" && k != "server" {
             client_resp.append_header((k, value.as_bytes()));
         }
     }
 
-    let mut body_bytes: Bytes = resp_body
-        .collect()
-        .await
-        .map_err(|e| {
-            warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
-            error::ErrorInternalServerError("500 Internal Server Error")
-        })?
-        .to_bytes();
+    // ── Response body ───────────────────────────────────────────────
+    //
+    // HEAD:
+    //   Do NOT collect/download the upstream body.
+    //
+    // GET/other:
+    //   Collect normally.
+    //
+    let mut body_bytes: Bytes = if is_head {
+        Bytes::new()
+    } else {
+        resp_body
+            .collect()
+            .await
+            .map_err(|e| {
+                warn!(
+                    client_ip = %ip,
+                    target = %full_url,
+                    "Body read error: {}",
+                    e
+                );
 
-    if !rule.cache {
-        client_resp.insert_header((header::CONTENT_TYPE, "text/html; charset=utf-8"));
+                error::ErrorInternalServerError("500 Internal Server Error")
+            })?
+            .to_bytes()
+    };
+
+    // ── Cache policy ────────────────────────────────────────────────
+    if rule.cache {
+        let max_age = rule
+            .cache_duration_secs
+            .unwrap_or(data.config.cache_duration_secs);
+        let cc = format!("public, max-age={}", max_age);
+        client_resp.insert_header((header::CACHE_CONTROL, cc));
+    } else {
+        // Deliberately NOT touching Content-Type here — see the same
+        // comment at the other cache:false site above.
         client_resp.insert_header((
             header::CACHE_CONTROL,
             "no-store, no-cache, must-revalidate, max-age=0",
         ));
+
         client_resp.insert_header(("Pragma", "no-cache"));
+
         client_resp.insert_header(("Expires", "0"));
     }
 
-    if data.config.session_cookie && data.config.csrf_token {
+    // ── CSRF injection ──────────────────────────────────────────────
+    //
+    // Never modify a HEAD response body.
+    //
+    if !is_head && rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {
             body_bytes = new_body;
+
             client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
         }
     }
 
-    info!(
-        "[{}] - {} {} {} {} {} [tid:{}] {}",
-        ip,
-        path,
-        method_str,
-        status.as_u16(),
-        body_bytes.len(),
-        username,
-        token_id,
-        user_agent_fwd
-    );
+    // `{{ username }}`/`{{ csrf_token }}`/`{{ proxyauth_version }}`/
+    // `{{ proxyauth_id }}` — same tag_proxyauth-gated substitution as
+    // static files and the other proxied-response path, so a target's
+    // own HTML can use these tags too, not just ProxyAuth's own static
+    // content.
+    if !is_head && rule.tag_proxyauth_enabled() {
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if ct.to_ascii_lowercase().starts_with("text/html") {
+            if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
+                let username = extract_username_for_tags(&req, &data, &ip).await;
+                let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+                let substituted =
+                    substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                let new_len = substituted.len();
+                body_bytes = Bytes::from(substituted.into_bytes());
+                client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
+            }
+        }
+    }
 
     add_cors_headers(&mut client_resp, &req);
+
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
+
+    // ── Final response ──────────────────────────────────────────────
+    //
+    // For HEAD, Actix receives an empty body while all relevant
+    // response headers (including Content-Length from upstream)
+    // remain intact.
+    //
+    apply_custom_headers_builder(&mut client_resp, rule);
     Ok(client_resp
         .append_header(("server", "ProxyAuth"))
         .body(body_bytes))

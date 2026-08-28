@@ -75,7 +75,9 @@ pub fn load_routes_for_cli() -> Result<RouteConfig, String> {
     let routes_str = std::fs::read_to_string("/etc/proxyauth/config/routes.yml")
         .map_err(|e| format!("Failed to read routes.yml: {e}"))?;
     crate::config::config::check_deprecated_secure_key(&routes_str)?;
-    serde_yaml::from_str(&routes_str).map_err(|e| format!("Failed to parse routes.yml: {e}"))
+    let parsed: RouteConfig = serde_yaml::from_str(&routes_str)
+        .map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
+    Ok(parsed.expand_vhost_groups())
 }
 
 fn describe_restrictions(rule: &RouteRule) -> String {
@@ -114,10 +116,7 @@ pub fn print_routes_audit(config: &AppConfig, routes: &RouteConfig) {
         );
 
         if !rule.required_login {
-            println!(
-                "  required_login : {}no{}",
-                p.yellow, p.reset
-            );
+            println!("  required_login : {}no{}", p.yellow, p.reset);
             println!(
                 "  {}{}⚠ PUBLIC{} — no authentication required at all",
                 p.bold, p.red, p.reset
@@ -149,10 +148,18 @@ pub fn print_routes_audit(config: &AppConfig, routes: &RouteConfig) {
     let total = routes.routes.len();
     println!(
         "{}{} route(s) checked{} — {}{} public{}, {}{} open-to-any-authenticated-account{}, {}{} restricted{}",
-        p.bold, total, p.reset,
-        p.red, public_count, p.reset,
-        p.yellow, open_count, p.reset,
-        p.green, restricted_count, p.reset,
+        p.bold,
+        total,
+        p.reset,
+        p.red,
+        public_count,
+        p.reset,
+        p.yellow,
+        open_count,
+        p.reset,
+        p.green,
+        restricted_count,
+        p.reset,
     );
 
     // Silences an unused-import warning if `config` ever stops being
@@ -188,7 +195,12 @@ pub fn print_check_access(config: &AppConfig, routes: &RouteConfig, username: &s
         if !rule.required_login {
             println!(
                 "{}✓{} {:<width$}  {}allowed{} — public route, no authentication required",
-                p.green, p.reset, rule.prefix, p.dim, p.reset, width = name_width
+                p.green,
+                p.reset,
+                rule.prefix,
+                p.dim,
+                p.reset,
+                width = name_width
             );
             allowed_count += 1;
             continue;
@@ -200,35 +212,61 @@ pub fn print_check_access(config: &AppConfig, routes: &RouteConfig, username: &s
             RouteAccessDecision::AllowedByUsername => {
                 println!(
                     "{}✓{} {:<width$}  {}allowed{} — username explicitly listed",
-                    p.green, p.reset, rule.prefix, p.dim, p.reset, width = name_width
+                    p.green,
+                    p.reset,
+                    rule.prefix,
+                    p.dim,
+                    p.reset,
+                    width = name_width
                 );
                 allowed_count += 1;
             }
             RouteAccessDecision::AllowedByGroup(g) => {
                 println!(
                     "{}✓{} {:<width$}  {}allowed{} — member of group '{}'",
-                    p.green, p.reset, rule.prefix, p.dim, p.reset, g, width = name_width
+                    p.green,
+                    p.reset,
+                    rule.prefix,
+                    p.dim,
+                    p.reset,
+                    g,
+                    width = name_width
                 );
                 allowed_count += 1;
             }
             RouteAccessDecision::AllowedByRole(r) => {
                 println!(
                     "{}✓{} {:<width$}  {}allowed{} — has role '{}'",
-                    p.green, p.reset, rule.prefix, p.dim, p.reset, r, width = name_width
+                    p.green,
+                    p.reset,
+                    rule.prefix,
+                    p.dim,
+                    p.reset,
+                    r,
+                    width = name_width
                 );
                 allowed_count += 1;
             }
             RouteAccessDecision::AllowedNoRestrictionConfigured => {
                 println!(
                     "{}✓{} {:<width$}  {}allowed{} — no restriction configured on this route",
-                    p.green, p.reset, rule.prefix, p.dim, p.reset, width = name_width
+                    p.green,
+                    p.reset,
+                    rule.prefix,
+                    p.dim,
+                    p.reset,
+                    width = name_width
                 );
                 allowed_count += 1;
             }
             RouteAccessDecision::Denied => {
                 println!(
                     "{}✗{} {:<width$}  {}denied{}  — requires {}",
-                    p.red, p.reset, rule.prefix, p.red, p.reset,
+                    p.red,
+                    p.reset,
+                    rule.prefix,
+                    p.red,
+                    p.reset,
                     describe_restrictions(rule),
                     width = name_width
                 );
@@ -240,10 +278,16 @@ pub fn print_check_access(config: &AppConfig, routes: &RouteConfig, username: &s
     println!();
     println!(
         "{}{} route(s) checked{} — {} can access {}{}{}, denied on {}{}{}",
-        p.bold, routes.routes.len(), p.reset,
+        p.bold,
+        routes.routes.len(),
+        p.reset,
         username,
-        p.green, allowed_count, p.reset,
-        p.red, denied_count, p.reset,
+        p.green,
+        allowed_count,
+        p.reset,
+        p.red,
+        denied_count,
+        p.reset,
     );
 }
 
@@ -304,7 +348,9 @@ pub fn print_check_routes(config: &AppConfig, routes: &RouteConfig) {
                 RouteAccessDecision::AllowedByUsername => Some("listed".to_string()),
                 RouteAccessDecision::AllowedByGroup(g) => Some(format!("group '{g}'")),
                 RouteAccessDecision::AllowedByRole(r) => Some(format!("role '{r}'")),
-                RouteAccessDecision::AllowedNoRestrictionConfigured => Some("open route".to_string()),
+                RouteAccessDecision::AllowedNoRestrictionConfigured => {
+                    Some("open route".to_string())
+                }
                 RouteAccessDecision::Denied => None,
             };
             if let Some(reason) = reason {
@@ -316,12 +362,18 @@ pub fn print_check_routes(config: &AppConfig, routes: &RouteConfig) {
         if no_restriction {
             println!(
                 "  {}{}⚠ OPEN{} — no restriction configured: all {} known account(s) can reach this route",
-                p.bold, p.yellow, p.reset, reachable.len()
+                p.bold,
+                p.yellow,
+                p.reset,
+                reachable.len()
             );
         } else if reachable.is_empty() {
             println!(
                 "  {}{}⚠ UNREACHABLE{} — secured by {}, but no current account matches: nobody can get in right now",
-                p.bold, p.red, p.reset, describe_restrictions(rule)
+                p.bold,
+                p.red,
+                p.reset,
+                describe_restrictions(rule)
             );
             unreachable_routes.push(rule.prefix.clone());
         } else {
@@ -370,7 +422,14 @@ fn print_box_header(name: &str, p: &Palette) {
     } else {
         1
     };
-    println!("{}{}┌{}{}{}", p.bold, p.cyan, title, "─".repeat(dashes), p.reset);
+    println!(
+        "{}{}┌{}{}{}",
+        p.bold,
+        p.cyan,
+        title,
+        "─".repeat(dashes),
+        p.reset
+    );
 }
 
 fn print_box_field(label: &str, value: &str, p: &Palette) {
@@ -385,7 +444,13 @@ fn print_box_field_warn(label: &str, value: &str, p: &Palette) {
 }
 
 fn print_box_footer(p: &Palette) {
-    println!("{}{}└{}{}", p.bold, p.cyan, "─".repeat(BOX_WIDTH + 1), p.reset);
+    println!(
+        "{}{}└{}{}",
+        p.bold,
+        p.cyan,
+        "─".repeat(BOX_WIDTH + 1),
+        p.reset
+    );
     println!();
 }
 
@@ -415,7 +480,10 @@ pub fn print_users(config: &AppConfig, routes: &RouteConfig, list_only: bool) {
 
     println!(
         "{}{}Users{} ({} known account(s))",
-        p.bold, p.cyan, p.reset, users.len()
+        p.bold,
+        p.cyan,
+        p.reset,
+        users.len()
     );
     println!();
 
@@ -506,7 +574,13 @@ pub fn print_groups(config: &AppConfig, routes: &RouteConfig, list_only: bool) {
 
     let p = palette();
 
-    println!("{}{}Groups{} ({} known)", p.bold, p.cyan, p.reset, all_groups.len());
+    println!(
+        "{}{}Groups{} ({} known)",
+        p.bold,
+        p.cyan,
+        p.reset,
+        all_groups.len()
+    );
     println!();
 
     if all_groups.is_empty() {
@@ -535,7 +609,11 @@ pub fn print_groups(config: &AppConfig, routes: &RouteConfig, list_only: bool) {
             .collect();
 
         if members.is_empty() {
-            print_box_field_warn("members", "(none — nobody currently belongs to this group)", p);
+            print_box_field_warn(
+                "members",
+                "(none — nobody currently belongs to this group)",
+                p,
+            );
         } else {
             print_box_field(
                 "members",
@@ -588,7 +666,13 @@ pub fn print_roles(config: &AppConfig, routes: &RouteConfig, list_only: bool) {
 
     let p = palette();
 
-    println!("{}{}Roles{} ({} known)", p.bold, p.cyan, p.reset, all_roles.len());
+    println!(
+        "{}{}Roles{} ({} known)",
+        p.bold,
+        p.cyan,
+        p.reset,
+        all_roles.len()
+    );
     println!();
 
     if all_roles.is_empty() {
@@ -631,7 +715,11 @@ pub fn print_roles(config: &AppConfig, routes: &RouteConfig, list_only: bool) {
         } else {
             print_box_field(
                 "routes",
-                &format!("{}  [{}]", granting_routes.join(", "), granting_routes.len()),
+                &format!(
+                    "{}  [{}]",
+                    granting_routes.join(", "),
+                    granting_routes.len()
+                ),
                 p,
             );
         }

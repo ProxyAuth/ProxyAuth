@@ -59,7 +59,14 @@ impl KeyExtractor for UserToken {
                 extract_token_user(token, &app_data.config, ip.clone()).ok()
             })
             .or_else(|| {
-                if app_data.config.session_cookie {
+                let vhost_route = crate::network::proxy::find_vhost_route(
+                    crate::network::proxy::request_host(req.request()).as_deref(),
+                    &app_data.routes.routes,
+                );
+                let session_cookie_enabled = vhost_route
+                    .map(|r| r.session_cookie_enabled(&app_data.config))
+                    .unwrap_or(app_data.config.session_cookie);
+                if session_cookie_enabled {
                     match req.cookie("session_token") {
                         Some(cookie) => {
                             let value = cookie.value();

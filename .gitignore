@@ -6,4 +6,6 @@ docker-compose.yml
 /coverage
 /.cargo/*
 !/.cargo/audit.toml
+work.ai
+src/src.zip
 

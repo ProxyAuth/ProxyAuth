@@ -121,7 +121,7 @@ pub fn spawn_stats_ticker(stats: Arc<RequestStats>) {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 pub struct ProxyStatsResponse {
     pub requests_per_second: u64,
     pub avg_rps_10s: f64,
@@ -155,3 +155,78 @@ pub fn build_stats_response(stats: &RequestStats, active_sessions: usize) -> Pro
         active_sessions,
     }
 }
+
+/// Default path for the local stats control socket — see
+/// `spawn_stats_socket`.
+pub const STATS_SOCKET_PATH: &str = "/opt/proxyauth/run/stats.sock";
+
+/// Serves `ProxyStatsResponse` as JSON over a Unix domain socket at
+/// `socket_path`, for `proxyauth stats` (see `cli::prompt`) to read
+/// directly — no HTTPS handshake, no admin token, not even a TCP
+/// connection. `RequestStats`/`CounterToken` only ever exist as
+/// in-process memory in the running server, so the CLI (a separate,
+/// short-lived process each time it runs) has no way to read them
+/// except through *some* channel; a Unix socket is the lightest one
+/// available; and its own filesystem permissions are the
+/// authentication (the socket lives inside `/opt/proxyauth`, `0700`
+/// and owned by `run_user` — see `def_config::setup_stats_socket_dir`
+/// — so only that user, or root, can even open it), rather than
+/// needing the admin token this same data is already gated behind
+/// over HTTPS at `/adm/stats`.
+///
+/// One-shot protocol: a client connects, this writes exactly one JSON
+/// object, then closes the connection — no request line needed since
+/// this socket only ever serves the one thing.
+pub async fn spawn_stats_socket(
+    stats: std::sync::Arc<RequestStats>,
+    counter: std::sync::Arc<crate::CounterToken>,
+    socket_path: &std::path::Path,
+    run_user: &str,
+    run_group: Option<&str>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixListener;
+
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // A stale socket file from a previous run (e.g. after a crash
+    // that skipped normal cleanup) makes bind() fail with "address in
+    // use" even though nothing is actually listening — remove it
+    // first. Safe: a *live* socket can't be unlinked out from under
+    // an accepted connection, only prevents binding a fresh listener
+    // at the same path.
+    let _ = std::fs::remove_file(socket_path);
+
+    let listener = UnixListener::bind(socket_path)?;
+
+    // Called while still root (see main.rs — this is spawned before
+    // the privilege drop, same as the ACME port-80 listener), so the
+    // socket starts out root-owned regardless of what `run_user` ends
+    // up being. Chown it to match — `proxyauth stats` connects as
+    // `run_user` (after its own switch_to_user), and needs write
+    // access to the socket to do that.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let owner_spec = format!("{run_user}:{}", run_group.unwrap_or(run_user));
+        let _ = std::process::Command::new("chown")
+            .args([owner_spec, socket_path.to_string_lossy().to_string()])
+            .status();
+        let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    loop {
+        let (mut stream, _addr) = listener.accept().await?;
+        let stats = stats.clone();
+        let counter = counter.clone();
+        tokio::spawn(async move {
+            let active_sessions = counter.count_active_sessions();
+            let resp = build_stats_response(&stats, active_sessions);
+            if let Ok(json) = serde_json::to_vec(&resp) {
+                let _ = stream.write_all(&json).await;
+            }
+        });
+    }
+}
+

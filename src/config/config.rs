@@ -5,6 +5,7 @@ use crate::revoke::db::RevokedTokenMap;
 use crate::smtp::smtp::SmtpConfig;
 use crate::stats::tokencount::CounterToken;
 use crate::token::auth::generate_random_string;
+use arc_swap::ArcSwap;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
 use dashmap::DashMap;
@@ -12,6 +13,7 @@ use hyper_http_proxy::ProxyConnector;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
+use ipnet::IpNet;
 use regex::Regex;
 use serde::Deserializer;
 use serde::de::MapAccess;
@@ -23,6 +25,14 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+
+// Re-exported here so the rest of the codebase keeps importing every
+// config type from a single path (`crate::config::config::*`), as it
+// already did before these two blocks were split into their own
+// modules to keep this file from growing further.
+pub use crate::config::compression::CompressionConfig;
+pub use crate::config::acme::AcmeConfig;
+pub use crate::config::logging::LoggingConfig;
 
 #[derive(Debug, Clone)]
 pub struct CompiledAllow {
@@ -42,7 +52,158 @@ pub enum RegexCond {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouteRule {
+    /// Virtual hosts this route answers on, matched against the
+    /// incoming request's `Host` header (port stripped, compared
+    /// case-insensitively) — e.g. `["app.example.com"]`.
+    ///
+    /// Left empty (the default), the route is a catch-all: it matches
+    /// on *any* host, exactly like before `vhost` existed. This keeps
+    /// every pre-existing `routes.yml` working unchanged.
+    ///
+    /// Several routes can share the same `prefix` as long as they list
+    /// different `vhost`s — the request's `Host` header picks which
+    /// one applies before the usual longest-prefix matching happens.
+    /// This is what lets one ProxyAuth instance front several
+    /// frontend domains, each proxying its own set of prefixes to its
+    /// own backend(s).
+    #[serde(default = "default_vhost")]
+    pub vhost: Vec<String>,
+
+    /// Optional TLS certificate/key ProxyAuth should present when a
+    /// client connects for one of the hostnames listed in `vhost`
+    /// (Server Name Indication) — lets each vhost serve its own
+    /// certificate instead of the single global one configured for
+    /// the server. Two keys are recognized:
+    ///   - `cert`: path to the PEM certificate (chain)
+    ///   - `key`:  path to the PEM private key
+    ///
+    /// Left empty (the default), connections for these hostnames fall
+    /// back to the server's global TLS certificate — exactly as if
+    /// `vhost_cert` had never been set. Ignored entirely when `vhost`
+    /// is empty, and when the server isn't running with `tls: true`.
+    /// Like the global certificate, files listed here are watched and
+    /// hot-reloaded without restarting the server.
+    #[serde(default = "default_vhost_cert")]
+    pub vhost_cert: HashMap<String, String>,
+
+    /// Extra response headers to add for this route — CSP
+    /// (`Content-Security-Policy`), HSTS, `X-Frame-Options`,
+    /// `Referrer-Policy`, `Permissions-Policy`, or any other header
+    /// you want set. Each entry is `"Header-Name": "value"`; the
+    /// value is used verbatim (a CSP policy's semicolon-separated
+    /// directives all go in the one string, exactly as the header
+    /// itself is written on the wire — ProxyAuth doesn't parse or
+    /// validate CSP syntax, just sets what you give it). Applied to
+    /// every response this route produces — proxied, static, and
+    /// error/redirect responses alike. If this route belongs to a
+    /// `vhosts:` group that also sets `headers`, the two are merged;
+    /// this route's own value wins on a key both define.
+    #[serde(default = "default_headers")]
+    pub headers: HashMap<String, String>,
+
+    /// Enables automatic Let's Encrypt certificate renewal for this
+    /// vhost — see the `acme` module and `AppConfig.acme` for the
+    /// full mechanism. Requires `vhost` to be set (the certificate is
+    /// issued for those hostnames) and `vhost_cert` to already point
+    /// at `/etc/proxyauth/cert/{vhost}/fullchain.pem` and
+    /// `.../privkey.pem` — ACME writes to those exact paths, and the
+    /// *existing* `vhost_cert` file-watcher (the same one that
+    /// already hot-reloads a manually-replaced certificate) is what
+    /// actually picks up the renewed certificate; nothing new is
+    /// introduced for that part. If more than one route shares a
+    /// `vhost`, setting this on any one of them is enough — it's
+    /// treated as a per-vhost switch, not a per-route one.
+    ///
+    /// `certbot_rew` is also still accepted as an alias for this key,
+    /// matching this feature's original (misspelled) name.
+    #[serde(default, alias = "certbot_rew")]
+    pub certbot_renew: bool,
+
+    /// IP/CIDR allow-list for this route (e.g. `["192.168.1.0/24",
+    /// "10.0.0.5"]`) — when non-empty, only clients whose resolved IP
+    /// (same trusted-proxy-aware resolution the rate limiter and
+    /// `X-Forwarded-For` handling already use) falls inside one of these
+    /// networks may reach this route; everyone else gets a 403, before
+    /// any auth/CSRF/backend work happens. Empty (the default) means no
+    /// restriction — identical to every route's behavior before this
+    /// field existed.
+    #[serde(default)]
+    pub allow_ips: Vec<String>,
+
+    /// IP/CIDR deny-list, checked before `allow_ips` — a client matching
+    /// an entry here is always rejected, even if `allow_ips` would
+    /// otherwise let them through. Useful for "everyone in this range
+    /// except this one host". Empty (the default) denies nobody.
+    #[serde(default)]
+    pub deny_ips: Vec<String>,
+
+    #[serde(skip)]
+    pub allow_ips_compiled: Vec<IpNet>,
+
+    #[serde(skip)]
+    pub deny_ips_compiled: Vec<IpNet>,
+
+    /// Serves file(s) straight from disk instead of proxying to
+    /// `target` — ProxyAuth's equivalent of nginx's `root`/`alias`.
+    /// Point it at a **directory** to serve everything under it (the
+    /// remainder of the request path, after this route's `prefix`, is
+    /// resolved inside it — `..`/symlink escapes are rejected, and a
+    /// directory-shaped request falls back to `static_index`); or at a
+    /// single **file** to have this route always serve that one file
+    /// regardless of the request path (handy for a fixed endpoint like
+    /// `/robots.txt` or `/favicon.ico`). Which one it is is detected
+    /// from what's actually on disk — no separate mode to configure.
+    /// When set, `target`/`proxy`/`backends`/`cert` are simply ignored
+    /// for this route; only `required_login`/`username`/`groups`/`roles`,
+    /// `allow_ips`/`deny_ips` and `vhost` still apply, and only
+    /// `GET`/`HEAD` are served. The YAML key is `static` (the Rust field
+    /// is named `static_path` since `static` is a reserved word).
+    #[serde(default, rename = "static")]
+    pub static_path: Option<String>,
+
+    /// File served when `static` points at a directory and a request
+    /// resolves to a directory-shaped path within it (e.g. the route's
+    /// own prefix, or any path ending in `/`). Ignored when `static`
+    /// points at a single file, or isn't set at all.
+    #[serde(default = "default_static_index")]
+    pub static_index: String,
+
+    /// Full regex the request path must match for this route to apply,
+    /// instead of the plain-prefix matching every other route uses —
+    /// ProxyAuth's equivalent of nginx's `location ~ pattern { ... }`.
+    /// Searched anywhere in the path by default (add `^`/`$` yourself
+    /// for an exact match, same convention as nginx/PCRE). Regex routes
+    /// are always tried before every plain-prefix route; among several,
+    /// the first one in `routes.yml` that matches wins.
+    ///
+    /// Use named capture groups (`(?<name>...)`) and reference them as
+    /// `{name}` in `target` (proxy routes) or `static_rewrite` (static
+    /// routes) to rewrite the upstream/file path from what was
+    /// captured — nginx's `$name` equivalent. A proxy route's `target`
+    /// with no `{...}` placeholder just gets the full original request
+    /// path appended, unchanged (nginx's behavior for a `proxy_pass`
+    /// with no URI part).
+    #[serde(default)]
+    pub regex: Option<String>,
+
+    #[serde(skip)]
+    pub regex_compiled: Option<Regex>,
+
+    /// For a regex route whose `static` points at a directory: since
+    /// there's no `prefix` to strip off to get a file path, this
+    /// template (filled in from the regex's named captures, e.g.
+    /// `"{major}.{minor}.x/{file}"`) supplies the path *under* `static`
+    /// instead — same traversal protection as plain directory mode
+    /// still applies to the result. Ignored for non-regex routes, and
+    /// when `static` points at a single file.
+    #[serde(default)]
+    pub static_rewrite: Option<String>,
+
     pub prefix: String,
+
+    /// Backend URL for proxied routes. Not required when `static` is
+    /// set (a purely static route can omit it, or leave it empty).
+    #[serde(default)]
     pub target: String,
 
     /// Usernames allowed to access this route (when `required_login`
@@ -96,11 +257,243 @@ pub struct RouteRule {
     #[serde(default = "default_backends")]
     pub backends: Vec<BackendInput>,
 
-    #[serde(default = "default_need_csrf")]
-    pub need_csrf: bool,
+    /// Whether this route requires a valid CSRF token — `None` (the
+    /// default: not specified) means "inherit from the vhost group
+    /// this route belongs to (if any), otherwise the global default
+    /// (`true`)". An explicit `true`/`false` here always wins over the
+    /// group's own `need_csrf`. Use `RouteRule::requires_csrf` to
+    /// resolve the final value rather than reading this field
+    /// directly — it still needs `AppConfig.csrf_token` and
+    /// `session_cookie` to actually be enforced either way.
+    #[serde(default)]
+    pub need_csrf: Option<bool>,
+
+    /// Whether CSRF protection is enabled *at all* for this vhost — both
+    /// the server-side check on `/auth` submissions and every automatic
+    /// token injection (the older `inject_csrf_token` mechanism on
+    /// proxied responses, and the `tag_proxyauth` mechanism's own
+    /// `{{ csrf_token }}` substitution alike) — independent of the
+    /// global `AppConfig.csrf_token` default, and unlike `need_csrf`
+    /// (which only decides whether *this specific route* participates
+    /// once CSRF is already enabled somewhere).
+    ///
+    /// Named `tag_csrf_token` rather than reusing `csrf_token` (which
+    /// the global `AppConfig` field is already called) specifically to
+    /// avoid the two being confused for each other — this one is the
+    /// full on/off switch for CSRF on this route, not just a
+    /// tag-substitution detail despite the name's `tag_` prefix
+    /// (kept for consistency with `tag_proxyauth`, since setting this
+    /// to `false` is most often done alongside `tag_proxyauth: false`
+    /// on the same static/proxied route).
+    ///
+    /// `None` (the default) inherits from the `vhosts:` group, then
+    /// the global `csrf_token`. An explicit `true`/`false` here always
+    /// wins, in either direction — this can turn CSRF ON for one vhost
+    /// even while the global default is off, or OFF for one vhost
+    /// while every other vhost keeps it on. Use
+    /// `RouteRule::csrf_enabled` to resolve the final value.
+    #[serde(default, alias = "csrf_token")]
+    pub tag_csrf_token: Option<bool>,
+
+    /// Per-vhost override of `AppConfig.session_cookie` (whether
+    /// ProxyAuth issues/checks a `session_token` cookie at all, vs.
+    /// bearer-token-only auth). `None` inherits from the `vhosts:`
+    /// group, then the global default. Same override rules as
+    /// `need_csrf`.
+    #[serde(default)]
+    pub session_cookie: Option<bool>,
+
+    /// Per-vhost override of `AppConfig.max_age_session_cookie` (the
+    /// session cookie's `Max-Age`, in seconds). `None` inherits from
+    /// the `vhosts:` group, then the global default.
+    #[serde(default)]
+    pub max_age_session_cookie: Option<i64>,
+
+    /// Per-vhost override of `AppConfig.login_redirect_url` — where an
+    /// already-authenticated visitor (a still-valid `session_token`
+    /// cookie) gets sent instead of the login form, and where a fresh
+    /// login redirects to on success. `None` inherits from the
+    /// `vhosts:` group, then the global default (`"/"` if that's also
+    /// unset).
+    #[serde(default)]
+    pub login_redirect_url: Option<String>,
+
+    /// Per-vhost override of `AppConfig.logout_redirect_url` — where
+    /// `/logout` sends the visitor afterward. `None` inherits from the
+    /// `vhosts:` group, then the global default.
+    #[serde(default)]
+    pub logout_redirect_url: Option<String>,
+
+    /// Per-vhost override of `AppConfig.login_via_otp` (whether a TOTP
+    /// code is required at login, in addition to username/password).
+    /// `None` inherits from the `vhosts:` group, then the global
+    /// default.
+    #[serde(default)]
+    pub login_via_otp: Option<bool>,
+
+    /// Per-vhost override of `AppConfig.page_change_password` — the
+    /// external page a password-reset link points visitors at. `None`
+    /// inherits from the `vhosts:` group, then the global default (and
+    /// if that's also unset, `proxyauth reset-password`/the
+    /// `/reset-password` flow is unavailable for this vhost, same as
+    /// today when it's unset globally).
+    #[serde(default)]
+    pub page_change_password: Option<String>,
+
+    /// Per-vhost override of `AppConfig.cors_origins` — the list of
+    /// origins allowed to make cross-origin requests to this vhost.
+    /// `None` inherits from the `vhosts:` group, then the global
+    /// default. Whole-list replacement, not merged with the global
+    /// list — set every origin this vhost should allow here if you
+    /// override it at all.
+    #[serde(default)]
+    pub cors_origins: Option<Vec<String>>,
+
+    /// Per-vhost override of `AppConfig.smtp` — lets different
+    /// domains send password-reset emails through different SMTP
+    /// servers. `None` inherits from the `vhosts:` group, then the
+    /// global default. Whole-object replacement (a vhost's own `smtp`
+    /// block must be complete on its own — host, port, credentials,
+    /// `from`, timeout — not merged field-by-field with the global
+    /// block). Only read by `proxyauth reset-password --vhost
+    /// <hostname>` today — see that command's own docs for why the
+    /// CLI needs the vhost named explicitly rather than resolving it
+    /// automatically the way a live HTTP request can.
+    #[serde(default)]
+    pub smtp: Option<crate::smtp::smtp::SmtpConfig>,
+
+    /// Enables `{{ username }}`/`{{ csrf_token }}` tag substitution in
+    /// this route's static files (and the shared error/logout page —
+    /// see `network::error::render_error_page`). `None`/unset means
+    /// `false` — deliberately conservative, not inherited-then-on:
+    /// scanning every response for tags has a real cost (reading the
+    /// whole body as text, running the substitution pass) that a
+    /// route with no ProxyAuth tags in its content shouldn't pay for
+    /// nothing. Turn it on explicitly per route or per `vhosts:`
+    /// group for exactly the content that actually uses these tags.
+    #[serde(default)]
+    pub tag_proxyauth: Option<bool>,
+
+    /// Usernames allowed to *log in* via this vhost's `/auth` — a
+    /// different, earlier gate than `RouteRule::username`/`groups`/
+    /// `roles` above, which only govern access to *this specific
+    /// route's content* for someone already logged in. This one
+    /// decides whether a login attempt on this vhost succeeds in the
+    /// first place, before any session or route access even enters
+    /// the picture.
+    ///
+    /// `allow_users`, `allow_groups`, and `allow_roles` combine as an
+    /// OR, same as the route-level fields — but **the default is the
+    /// opposite**: when all three are empty, login is **denied** for
+    /// this vhost, not allowed. A vhost grants no login access at all
+    /// until at least one of the three names someone in. This is
+    /// deliberate — an operator who forgets to set any of these on a
+    /// new vhost gets a vhost nobody can log into (safe, if
+    /// inconvenient) rather than one anyone with valid credentials
+    /// anywhere in the system can suddenly reach (unsafe by omission).
+    /// See `RouteRule::login_authorized` to resolve the final
+    /// decision rather than reading these fields directly.
+    #[serde(default)]
+    pub allow_users: Vec<String>,
+
+    /// See `allow_users` just above for how this combines with
+    /// `allow_users`/`allow_roles` and why the empty-means-denied
+    /// default is intentional here specifically, unlike the
+    /// route-level `groups` field.
+    #[serde(default)]
+    pub allow_groups: Vec<String>,
+
+    /// See `allow_users` above for how this combines with
+    /// `allow_users`/`allow_groups` and why the empty-means-denied
+    /// default is intentional here specifically, unlike the
+    /// route-level `roles` field.
+    #[serde(default)]
+    pub allow_roles: Vec<String>,
+
+    /// Usernames explicitly denied login on this vhost, regardless of
+    /// `allow_users`/`allow_groups`/`allow_roles` — an exclusion
+    /// always wins over an allow rule, even if the same username is
+    /// also separately allow-listed or belongs to an allowed group or
+    /// role. For carving out an exception without having to restructure
+    /// the allow lists themselves — e.g. every member of an allowed
+    /// group *except* one specific account.
+    #[serde(default)]
+    pub exclude_users: Vec<String>,
+
+    /// ⚠️ **Security trade-off, opt-in and off by default.** When
+    /// `true`, a user who already has a TOTP secret enrolled can
+    /// re-enroll — getting a brand-new secret and QR/URI, silently
+    /// replacing the old one — via `/adm/auth/totp/get` using nothing
+    /// but their username and password, the same way first-time
+    /// enrollment already works. Normally that endpoint refuses with
+    /// `409 Conflict` once a secret already exists specifically to
+    /// prevent this: without this flag, only an admin can clear an
+    /// existing secret (`proxyauth reset-otp` /
+    /// `/adm/auth/totp/reset`, gated by `token_admin`) before
+    /// re-enrollment is possible again.
+    ///
+    /// Turning this on means **anyone who obtains a user's password
+    /// can also take over their TOTP factor** — no admin, no
+    /// possession of the old authenticator app, no separate approval
+    /// step. For an account this is true for, TOTP no longer protects
+    /// against a stolen/guessed password the way two-factor
+    /// authentication is meant to; it only continues to protect
+    /// against an attacker who has the password but doesn't yet want
+    /// to be noticed replacing the victim's TOTP device. Understand
+    /// that trade-off for the specific accounts/vhost this applies to
+    /// before enabling it — this is not a general-purpose
+    /// self-service convenience toggle, it's a deliberate, narrow
+    /// exception to how ProxyAuth's TOTP re-enrollment is designed to
+    /// require admin involvement.
+    ///
+    /// No global fallback — like `tag_proxyauth`, unset means `false`
+    /// with nothing to inherit from beyond this route's own
+    /// `vhosts:` group. See `RouteRule::totp_reenroll_allowed`.
+    #[serde(default)]
+    pub allow_totp_reenroll: Option<bool>,
+
+    /// Access logging for this route. `None` means "inherit from the
+    /// `vhosts:` group this route belongs to (if any), otherwise the
+    /// global `logging.enabled`" — same override rules as `need_csrf`.
+    /// `false` silences the per-request access-log line for this route
+    /// only; `warn!`/`error!` diagnostics are unaffected, which is
+    /// usually what "disable logging on this noisy endpoint" actually
+    /// means — drop one line per request, without going blind to real
+    /// failures.
+    ///
+    /// `None` vs `Some(_)` is load-bearing, so this field is read
+    /// directly rather than through an accessor: the resolution order
+    /// is route `log` → `logging.routes[prefix]` → `logging.enabled`,
+    /// and only an unset route can fall through to the next level. See
+    /// `network::accesslog::route_logging_enabled`.
+    #[serde(default)]
+    pub log: Option<bool>,
+
+    /// Per-route log file override.  When set, access-log lines for
+    /// this route are written to `/var/log/proxyauth/<log_file>` in
+    /// addition to the global access log.  `None` means "inherit from
+    /// the vhost group or the global `logging.log_file`".  Path-
+    /// traversal and absolute paths are rejected at startup.
+    #[serde(default)]
+    pub log_file: Option<String>,
+
+    /// Response compression for this route. `None` inherits from the
+    /// group, then from the global `compression` block in
+    /// `config.json`. Every field inside is itself optional, so a route
+    /// can override just `enabled: false` (or just `algorithm`) and
+    /// inherit the rest — see `CompressionConfig::merged_over`.
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
 
     #[serde(default = "default_cache")]
     pub cache: bool,
+
+    /// Per-route cache duration override.  When `Some(N)`, the
+    /// response will carry `Cache-Control: public, max-age=<N>` (if
+    /// `cache` is `true`).  `None` means "inherit from the vhost
+    /// group or the global `cache_duration_secs`".
+    #[serde(default)]
+    pub cache_duration_secs: Option<u64>,
 
     #[serde(default = "default_secure_path")]
     pub secure_path: bool,
@@ -116,6 +509,153 @@ pub struct RouteRule {
 
     #[serde(skip)]
     pub filters_compiled: Option<CompiledAllow>,
+}
+
+impl RouteRule {
+    /// Resolves the final CSRF requirement for this route: its own
+    /// explicit `need_csrf` if set (whether inherited from a `vhosts:`
+    /// group by `expand_vhost_groups` or set directly on the route —
+    /// both look the same by the time this runs), otherwise `true`,
+    /// matching this field's behavior before per-route/per-group
+    /// override existed. Callers should use this instead of reading
+    /// `need_csrf` directly. Combine with `csrf_enabled` — this only
+    /// decides whether *this specific route* participates once CSRF is
+    /// enabled for the vhost at all.
+    pub fn requires_csrf(&self) -> bool {
+        self.need_csrf.unwrap_or(true)
+    }
+
+    /// Resolves whether CSRF is enabled *at all* for this vhost: its
+    /// own `csrf_token` if set, otherwise `global.csrf_token`. Unlike
+    /// `requires_csrf`, this is genuinely independent per vhost — an
+    /// explicit `true`/`false` here overrides the global default in
+    /// either direction, not just opts out of an already-enabled
+    /// default.
+    pub fn csrf_enabled(&self, global: &AppConfig) -> bool {
+        self.tag_csrf_token.unwrap_or(global.csrf_token)
+    }
+
+    /// Resolves `AppConfig.session_cookie` for this vhost: its own
+    /// `session_cookie` if set, otherwise the global default.
+    pub fn session_cookie_enabled(&self, global: &AppConfig) -> bool {
+        self.session_cookie.unwrap_or(global.session_cookie)
+    }
+
+    /// Resolves `AppConfig.max_age_session_cookie` for this vhost: its
+    /// own value if set, otherwise the global default.
+    pub fn resolved_max_age_session_cookie(&self, global: &AppConfig) -> i64 {
+        self.max_age_session_cookie
+            .unwrap_or(global.max_age_session_cookie)
+    }
+
+    /// Resolves `AppConfig.login_redirect_url` for this vhost: its own
+    /// value if set, otherwise the global default (which may itself be
+    /// unset — callers already handle that with their own
+    /// `.unwrap_or("/")`-style fallback).
+    pub fn resolved_login_redirect_url<'a>(&'a self, global: &'a AppConfig) -> Option<&'a str> {
+        self.login_redirect_url
+            .as_deref()
+            .or(global.login_redirect_url.as_deref())
+    }
+
+    /// Resolves `AppConfig.logout_redirect_url` for this vhost: its
+    /// own value if set, otherwise the global default.
+    pub fn resolved_logout_redirect_url<'a>(&'a self, global: &'a AppConfig) -> Option<&'a str> {
+        self.logout_redirect_url
+            .as_deref()
+            .or(global.logout_redirect_url.as_deref())
+    }
+
+    /// Resolves `AppConfig.login_via_otp` for this vhost: its own
+    /// value if set, otherwise the global default.
+    pub fn resolved_login_via_otp(&self, global: &AppConfig) -> bool {
+        self.login_via_otp.unwrap_or(global.login_via_otp)
+    }
+
+    /// Resolves `AppConfig.page_change_password` for this vhost: its
+    /// own value if set, otherwise the global default.
+    pub fn resolved_page_change_password<'a>(&'a self, global: &'a AppConfig) -> Option<&'a str> {
+        self.page_change_password
+            .as_deref()
+            .or(global.page_change_password.as_deref())
+    }
+
+    /// Resolves `AppConfig.cors_origins` for this vhost: its own list
+    /// if set, otherwise the global default. Whole-list — see the
+    /// field's own doc comment for why this doesn't merge the two.
+    pub fn resolved_cors_origins<'a>(&'a self, global: &'a AppConfig) -> Option<&'a Vec<String>> {
+        self.cors_origins.as_ref().or(global.cors_origins.as_ref())
+    }
+
+    /// Resolves `AppConfig.smtp` for this vhost: its own block if set,
+    /// otherwise the global default. Whole-object — see the field's
+    /// own doc comment for why this doesn't merge the two.
+    pub fn resolved_smtp<'a>(
+        &'a self,
+        global: &'a AppConfig,
+    ) -> Option<&'a crate::smtp::smtp::SmtpConfig> {
+        self.smtp.as_ref().or(global.smtp.as_ref())
+    }
+
+    /// Resolves whether `{{ username }}`/`{{ csrf_token }}` tag
+    /// substitution is enabled for this route. No global fallback —
+    /// unlike every other resolver here, this has no
+    /// `AppConfig`-level default to inherit from at all; unset means
+    /// `false`, full stop. See the field's own doc comment for why
+    /// that's the deliberately conservative choice.
+    pub fn tag_proxyauth_enabled(&self) -> bool {
+        self.tag_proxyauth.unwrap_or(false)
+    }
+
+    /// Resolves whether `username` is allowed to log in via this
+    /// vhost — see `allow_users`'s own doc comment for the full
+    /// semantics. Checked once, at login time in `token::auth::auth`,
+    /// before any session gets issued; unrelated to
+    /// `requires_csrf`/`csrf_enabled`/etc. above, which all govern
+    /// what happens to an *already-authenticated* session, not
+    /// whether logging in succeeds in the first place.
+    pub fn login_authorized(&self, username: &str, config: &AppConfig) -> bool {
+        if self.exclude_users.iter().any(|u| u == username) {
+            return false;
+        }
+
+        if self.allow_users.is_empty() && self.allow_groups.is_empty() && self.allow_roles.is_empty() {
+            return false;
+        }
+
+        if self.allow_users.iter().any(|u| u == username) {
+            return true;
+        }
+
+        if !self.allow_groups.is_empty() {
+            if let Some(user_groups) = config.groups_for_username(username) {
+                if user_groups.iter().any(|g| self.allow_groups.contains(g)) {
+                    return true;
+                }
+            }
+        }
+
+        if !self.allow_roles.is_empty() {
+            if let Some(user_roles) = config.roles_for_username(username) {
+                if user_roles.iter().any(|r| self.allow_roles.contains(r)) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Resolves whether self-service TOTP re-enrollment (username +
+    /// password alone, no admin, no clearing the old secret first) is
+    /// allowed for this vhost — see `allow_totp_reenroll`'s own doc
+    /// comment for the full security trade-off before turning this
+    /// on. No global fallback, same reasoning as
+    /// `tag_proxyauth_enabled`: unset means `false`, full stop.
+    pub fn totp_reenroll_allowed(&self) -> bool {
+        self.allow_totp_reenroll.unwrap_or(false)
+    }
+
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -180,9 +720,288 @@ impl BlakegateEndpoint {
     }
 }
 
+/// One entry in `AppConfig.ip_blocklists` — see that field's doc
+/// comment. `source` is either an `http(s)://` URL or a local file
+/// path; format (plain text vs CSV, gzip or not) is handled the same
+/// way regardless of which.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IpBlocklistSource {
+    pub source: String,
+
+    /// Friendly name used for this source's local cache file
+    /// (`/etc/proxyauth/abuse/<name>.txt`) instead of one derived from
+    /// `source` itself. Purely cosmetic — doesn't affect matching.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Treat each non-comment line as CSV and take the IP/CIDR from
+    /// `csv_column` (0-indexed) instead of the first
+    /// whitespace-separated token on the line.
+    #[serde(default)]
+    pub csv: bool,
+
+    #[serde(default)]
+    pub csv_column: usize,
+}
+
 #[derive(Default, Debug, Deserialize)]
 pub struct RouteConfig {
+    #[serde(default)]
     pub routes: Vec<RouteRule>,
+
+    /// Alternative, less repetitive way to write `routes.yml`: group
+    /// routes under a shared `vhost`/`vhost_cert` declared once, instead
+    /// of repeating them on every single route. Purely an authoring
+    /// convenience — `expand_vhost_groups` flattens every group into
+    /// `routes` right after parsing, so nothing downstream (routing, TLS
+    /// SNI resolution, the CLI audit tools) needs to know this form
+    /// exists. Mixing both styles in one file is fine; a route inside a
+    /// group can still set its own `vhost`/`vhost_cert` to override the
+    /// group's.
+    #[serde(default)]
+    pub vhosts: Vec<VhostGroup>,
+}
+
+/// One `vhosts:` entry in `routes.yml` — a `vhost`/`vhost_cert` applied
+/// to every route listed under it. See `RouteConfig::vhosts` and
+/// `RouteConfig::expand_vhost_groups`.
+#[derive(Debug, Default, Deserialize)]
+pub struct VhostGroup {
+    #[serde(default = "default_vhost")]
+    pub vhost: Vec<String>,
+
+    #[serde(default = "default_vhost_cert")]
+    pub vhost_cert: HashMap<String, String>,
+
+    /// Extra response headers applied to every route in this group —
+    /// see `RouteRule.headers` for the format and full semantics.
+    /// Merged with (not replaced by) each route's own `headers`; the
+    /// route's own value wins on a key both define.
+    #[serde(default = "default_headers")]
+    pub headers: HashMap<String, String>,
+
+    /// CSRF requirement applied to every route in this group that
+    /// doesn't set its own `need_csrf` — same override rules as
+    /// `RouteRule::need_csrf`/`requires_csrf`. `None` (not set at the
+    /// group level either) leaves each route to fall back to the
+    /// global default.
+    #[serde(default)]
+    pub need_csrf: Option<bool>,
+
+    /// Whether CSRF protection — injection and validation alike — is
+    /// enabled at all for every route in this group that doesn't set
+    /// its own `tag_csrf_token`. Same override rules as
+    /// `RouteRule::tag_csrf_token`. Independent of `need_csrf` above:
+    /// this controls whether CSRF applies to the vhost at all,
+    /// `need_csrf` controls whether one specific route within it
+    /// participates once it's on.
+    #[serde(default, alias = "csrf_token")]
+    pub tag_csrf_token: Option<bool>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::session_cookie`.
+    #[serde(default)]
+    pub session_cookie: Option<bool>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::max_age_session_cookie`.
+    #[serde(default)]
+    pub max_age_session_cookie: Option<i64>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::login_redirect_url`.
+    #[serde(default)]
+    pub login_redirect_url: Option<String>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::logout_redirect_url`.
+    #[serde(default)]
+    pub logout_redirect_url: Option<String>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::login_via_otp`.
+    #[serde(default)]
+    pub login_via_otp: Option<bool>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::page_change_password`.
+    #[serde(default)]
+    pub page_change_password: Option<String>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::cors_origins`.
+    #[serde(default)]
+    pub cors_origins: Option<Vec<String>>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::smtp`.
+    #[serde(default)]
+    pub smtp: Option<crate::smtp::smtp::SmtpConfig>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::tag_proxyauth`.
+    #[serde(default)]
+    pub tag_proxyauth: Option<bool>,
+
+    /// The vhost-wide login authorization lists — see
+    /// `RouteRule::allow_users` for the full semantics (OR-combined
+    /// with `allow_groups`/`allow_roles`, empty-means-denied default,
+    /// `exclude_users` always wins). This is genuinely the intended
+    /// place to set these, not the per-route fields: login happens
+    /// once for the whole vhost, not per route, so setting these here
+    /// (rather than repeating them on every route under `routes:`) is
+    /// both less error-prone and more clearly expresses "this is a
+    /// vhost-wide policy".
+    #[serde(default)]
+    pub allow_users: Vec<String>,
+    #[serde(default)]
+    pub allow_groups: Vec<String>,
+    #[serde(default)]
+    pub allow_roles: Vec<String>,
+    #[serde(default)]
+    pub exclude_users: Vec<String>,
+
+    /// ⚠️ Applied to every route in this group that doesn't set its
+    /// own — see `RouteRule::allow_totp_reenroll` for the full
+    /// security trade-off this opts into. Same as everywhere else on
+    /// this group: usually the right place to set it, since TOTP
+    /// enrollment is a vhost-wide concern, not a per-route one.
+    #[serde(default)]
+    pub allow_totp_reenroll: Option<bool>,
+
+    /// Access logging applied to every route in this group that doesn't
+    /// set its own `log` — same override rules as `need_csrf`.
+    #[serde(default)]
+    pub log: Option<bool>,
+
+    /// Log file applied to every route in this group that doesn't set
+    /// its own `log_file`.  Written into `/var/log/proxyauth/`
+    /// automatically — only the filename should be provided.
+    #[serde(default)]
+    pub log_file: Option<String>,
+
+    /// Compression applied to every route in this group that doesn't
+    /// set its own `compression` — same override rules as `need_csrf`.
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
+
+    /// Per-route cache duration override.  `None` means "use the
+    /// global `cache_duration_secs` from `config.json`".
+    #[serde(default)]
+    pub cache_duration_secs: Option<u64>,
+
+    /// Automatic Let's Encrypt renewal applied to every route in this
+    /// group that doesn't explicitly set its own `certbot_renew` —
+    /// same override rules as `need_csrf`/`log`, except this is a
+    /// plain `bool` (not `Option<bool>`) matching `RouteRule`'s own
+    /// field, so "inherit unless overridden" here specifically means
+    /// "unless the route itself is `true`, not group vs. individually
+    /// disabling within a group. `certbot_rew` also still accepted as
+    /// an alias, matching `RouteRule.certbot_renew`.
+    #[serde(default, alias = "certbot_rew")]
+    pub certbot_renew: bool,
+
+    #[serde(default)]
+    pub routes: Vec<RouteRule>,
+}
+
+impl RouteConfig {
+    /// Moves every route out of `vhosts` groups and into `routes`,
+    /// stamping each one with its group's `vhost`/`vhost_cert`/
+    /// `need_csrf` unless the route already set its own (individual
+    /// routes can still override a group's default this way). Called
+    /// once, right after parsing `routes.yml`, so every other piece of
+    /// code — matching, the SNI certificate resolver, `proxyauth
+    /// routes-audit`/`check-access` — only ever sees the flat `routes`
+    /// list it already understands.
+    pub fn expand_vhost_groups(mut self) -> Self {
+        for group in self.vhosts.drain(..) {
+            for mut route in group.routes {
+                if route.vhost.is_empty() {
+                    route.vhost = group.vhost.clone();
+                }
+                if route.vhost_cert.is_empty() {
+                    route.vhost_cert = group.vhost_cert.clone();
+                }
+                // Merged, not "only if empty" like the fields above —
+                // a route commonly wants the group's baseline headers
+                // (e.g. HSTS set once for the whole vhost) *plus* one
+                // or two of its own on top, not a strict either/or.
+                // The route's own entries are inserted last, so they
+                // win on a key both define.
+                for (k, v) in &group.headers {
+                    route.headers.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                if !route.certbot_renew {
+                    route.certbot_renew = group.certbot_renew;
+                }
+                if route.need_csrf.is_none() {
+                    route.need_csrf = group.need_csrf;
+                }
+                if route.tag_csrf_token.is_none() {
+                    route.tag_csrf_token = group.tag_csrf_token;
+                }
+                if route.session_cookie.is_none() {
+                    route.session_cookie = group.session_cookie;
+                }
+                if route.max_age_session_cookie.is_none() {
+                    route.max_age_session_cookie = group.max_age_session_cookie;
+                }
+                if route.login_redirect_url.is_none() {
+                    route.login_redirect_url = group.login_redirect_url.clone();
+                }
+                if route.logout_redirect_url.is_none() {
+                    route.logout_redirect_url = group.logout_redirect_url.clone();
+                }
+                if route.login_via_otp.is_none() {
+                    route.login_via_otp = group.login_via_otp;
+                }
+                if route.page_change_password.is_none() {
+                    route.page_change_password = group.page_change_password.clone();
+                }
+                if route.cors_origins.is_none() {
+                    route.cors_origins = group.cors_origins.clone();
+                }
+                if route.smtp.is_none() {
+                    route.smtp = group.smtp.clone();
+                }
+                if route.tag_proxyauth.is_none() {
+                    route.tag_proxyauth = group.tag_proxyauth;
+                }
+                if route.allow_users.is_empty() {
+                    route.allow_users = group.allow_users.clone();
+                }
+                if route.allow_groups.is_empty() {
+                    route.allow_groups = group.allow_groups.clone();
+                }
+                if route.allow_roles.is_empty() {
+                    route.allow_roles = group.allow_roles.clone();
+                }
+                if route.exclude_users.is_empty() {
+                    route.exclude_users = group.exclude_users.clone();
+                }
+                if route.allow_totp_reenroll.is_none() {
+                    route.allow_totp_reenroll = group.allow_totp_reenroll;
+                }
+                if route.log.is_none() {
+                    route.log = group.log;
+                }
+                if route.log_file.is_none() {
+                    route.log_file = group.log_file.clone();
+                }
+                if route.compression.is_none() {
+                    // Cloned, not moved: the group applies to every
+                    // route under it, not just the first.
+                    route.compression = group.compression.clone();
+                }
+                if route.cache_duration_secs.is_none() {
+                    route.cache_duration_secs = group.cache_duration_secs;
+                }
+                self.routes.push(route);
+            }
+        }
+        self
+    }
 }
 
 /// One email address on file for a user, with an explicit `primary`
@@ -244,7 +1063,7 @@ fn default_allow_true() -> bool {
 impl Serialize for User {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-    S: Serializer,
+        S: Serializer,
     {
         // Length hint was wrong (2, should match the actual field count)
         // and `roles` was serializing `self.allow`'s value instead of
@@ -371,10 +1190,11 @@ impl DatabaseConfig {
     /// `type` (3306 for mysql/mariadb, 5432 otherwise/postgres) when
     /// `port` wasn't set.
     pub fn effective_port(&self) -> u16 {
-        self.port.unwrap_or_else(|| match self.db_type.to_lowercase().as_str() {
-            "mysql" | "mariadb" => 3306,
-            _ => 5432,
-        })
+        self.port
+            .unwrap_or_else(|| match self.db_type.to_lowercase().as_str() {
+                "mysql" | "mariadb" => 3306,
+                _ => 5432,
+            })
     }
 }
 
@@ -387,8 +1207,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub token_admin: String,
 
-    #[serde(default = "default_host")]
-    pub host: String,
+    /// Address(es) to listen on. Accepts either a single string
+    /// (`"host": "0.0.0.0"`, the pre-existing format — still fully
+    /// supported) or an array (`"host": ["0.0.0.0", "::1"]`) to bind
+    /// more than one at once, e.g. IPv4 + IPv6 together. Every entry
+    /// is bound with its own listening socket, all served by the same
+    /// actix HttpServer instance — one shared worker pool, not a
+    /// separate server per address.
+    #[serde(default = "default_hosts", deserialize_with = "deserialize_host")]
+    pub host: Vec<String>,
 
     #[serde(default = "default_port")]
     pub port: u16,
@@ -405,11 +1232,84 @@ pub struct AppConfig {
     #[serde(deserialize_with = "deserialize_log_map")]
     pub log: HashMap<String, String>,
 
+    /// Access log: line format plus the global / per-vhost / per-route
+    /// on-off switches. Deliberately separate from `log` above, which
+    /// configures the `tracing` *transport* (`local`/`loki`/`http`/
+    /// `disabled`) for every log line, access and diagnostic alike.
+    ///
+    /// The practical consequence of keeping them apart: setting
+    /// `logging.enabled` to false drops the per-request access lines
+    /// while leaving `warn!`/`error!` intact — almost always what
+    /// "turn off logging on this endpoint" is meant to achieve.
+    /// `log.type: "disabled"` remains the way to silence everything.
+    #[serde(default)]
+    pub logging: LoggingConfig,
+
+    /// Response compression, global defaults. Overridden per route or
+    /// per `vhosts:` group in `routes.yml`; see `CompressionConfig`.
+    #[serde(default)]
+    pub compression: CompressionConfig,
+
+    /// Settings for automatic Let's Encrypt certificate renewal (see
+    /// `RouteRule.certbot_renew`). Global — every ACME-managed vhost
+    /// shares the same check interval, renewal threshold, and ACME
+    /// account. The JSON key is `letsencrypt` (not `acme`) — this
+    /// still uses `AcmeConfig`/`acme` internally since the underlying
+    /// protocol is ACME (Let's Encrypt is just its most common
+    /// provider), but the user-facing config key names the thing
+    /// operators actually care about. `acme` is still accepted as an
+    /// alias, matching this feature's original key name.
+    #[serde(default, rename = "letsencrypt", alias = "acme")]
+    pub acme: AcmeConfig,
+
+    /// Default `Cache-Control: public, max-age=<N>` duration (in
+    /// seconds) applied to every response whose route has `cache: true`
+    /// and no per-route `cache_duration_secs` override.  `0` disables
+    /// caching at the HTTP layer even when `cache` is `true` (the
+    /// header becomes `max-age=0`).  Defaults to 300 (5 minutes).
+    #[serde(default = "default_cache_duration_secs")]
+    pub cache_duration_secs: u64,
+
     #[serde(default = "default_stats")]
     pub stats: bool,
 
     #[serde(default)]
     pub trust_proxy_forward_for: Option<Vec<String>>,
+
+    /// System user the server process runs as, once startup's
+    /// privileged phase (binding low ports, reading root-only TLS
+    /// certs) is done — see `main.rs`'s startup ordering. Defaults to
+    /// `"proxyauth"`, the account `proxyauth prepare` sets up
+    /// automatically. Setting this to an existing user instead (e.g.
+    /// `"www-data"`/`"nginx"`) is a way to let ProxyAuth read that
+    /// user's files (a `static` route's directory, say) without
+    /// touching those files' permissions at all — it just runs as
+    /// whoever already has access. `prepare` only *verifies* a
+    /// non-default `run_user` exists rather than creating it, since an
+    /// account like `www-data` belongs to some other package.
+    #[serde(default = "default_run_user")]
+    pub run_user: String,
+
+    /// Group to run as instead of `run_user`'s own primary group.
+    /// `None` (the default) just uses that primary group.
+    #[serde(default)]
+    pub run_group: Option<String>,
+
+    /// External IP/CIDR abuse-blocklists (Spamhaus DROP, FireHOL,
+    /// AbuseIPDB exports, ...) checked against every request's
+    /// resolved client IP — reject on match, before any route
+    /// matching or auth work. Each source is a plain-text or CSV
+    /// list, gzip-compressed or not (auto-detected). Refreshed on the
+    /// interval below; empty means the feature is off, same as
+    /// before it existed.
+    #[serde(default)]
+    pub ip_blocklists: Vec<IpBlocklistSource>,
+
+    /// How often every `ip_blocklists` source is re-fetched, in
+    /// seconds. `0` fetches once at startup and never refreshes
+    /// again. Ignored when `ip_blocklists` is empty.
+    #[serde(default = "default_ip_blocklist_refresh_interval")]
+    pub ip_blocklist_refresh_interval_secs: u64,
 
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
@@ -580,17 +1480,20 @@ pub struct AppConfig {
 impl Serialize for AppConfig {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-    S: Serializer,
+        S: Serializer,
     {
         let mut state = serializer.serialize_struct("AppConfig", 7)?;
         state.serialize_field("blakegate", &self.blakegate)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
+        state.serialize_field("compression", &self.compression)?;
         state.serialize_field("cors_origins", &self.cors_origins)?;
         state.serialize_field("databases", &self.databases)?;
         state.serialize_field("fast", &self.fast)?;
         state.serialize_field("host", &self.host)?;
         state.serialize_field("keep_alive", &self.keep_alive)?;
+        state.serialize_field("letsencrypt", &self.acme)?;
         state.serialize_field("log", &self.log)?;
+        state.serialize_field("logging", &self.logging)?;
         state.serialize_field("max_age_session_cookie", &self.max_age_session_cookie)?;
         state.serialize_field("max_connections", &self.max_connections)?;
         state.serialize_field("max_idle_per_host", &self.max_idle_per_host)?;
@@ -630,6 +1533,14 @@ pub struct AppState {
     pub client_with_proxy: Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>,
     pub revoked_tokens: RevokedTokenMap,
     pub stats: Arc<RequestStats>,
+
+    /// Merged, deduplicated set of every `ip_blocklists` source,
+    /// hot-swapped by a background task on
+    /// `ip_blocklist_refresh_interval_secs` — see
+    /// `network::ipblocklist`. Empty (the default, no allocation of
+    /// note) when `ip_blocklists` isn't configured, so the per-request
+    /// check is just an empty-slice scan.
+    pub ip_blocklist: Arc<ArcSwap<Vec<IpNet>>>,
 
     /// Hot-reloadable overlay for per-user TOTP secrets. `AppState.config`
     /// is an immutable `Arc<AppConfig>` snapshot loaded once at startup —
@@ -686,26 +1597,22 @@ pub fn resolve_password_override(
     config_password: &str,
 ) -> String {
     state
-    .password_overrides
-    .get(username)
-    .map(|entry| entry.clone())
-    .unwrap_or_else(|| config_password.to_string())
+        .password_overrides
+        .get(username)
+        .map(|entry| entry.clone())
+        .unwrap_or_else(|| config_password.to_string())
 }
 
 /// Resolves whether `username` currently must change their password,
 /// checking `must_change_overrides` before falling back to whatever
 /// `config_value` (from config.json/the database) said. See
 /// `AppState::must_change_overrides`.
-pub fn resolve_must_change_password(
-    state: &AppState,
-    username: &str,
-    config_value: bool,
-) -> bool {
+pub fn resolve_must_change_password(state: &AppState, username: &str, config_value: bool) -> bool {
     state
-    .must_change_overrides
-    .get(username)
-    .map(|entry| *entry)
-    .unwrap_or(config_value)
+        .must_change_overrides
+        .get(username)
+        .map(|entry| *entry)
+        .unwrap_or(config_value)
 }
 
 /// Writes a new Argon2 password hash for a file-based user directly
@@ -727,14 +1634,14 @@ pub fn set_user_password(
     }
 
     let config_str = fs::read_to_string(config_path)
-    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
     let mut json: Value = serde_json::from_str(&config_str)
-    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+        .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
 
     let mut found = false;
 
@@ -745,12 +1652,9 @@ pub fn set_user_password(
             if let Some(obj) = user.as_object_mut() {
                 obj.insert(
                     "password".to_string(),
-                           Value::String(new_password_hash.to_string()),
+                    Value::String(new_password_hash.to_string()),
                 );
-                obj.insert(
-                    "must_change_password".to_string(),
-                           Value::Bool(false),
-                );
+                obj.insert("must_change_password".to_string(), Value::Bool(false));
             }
             break;
         }
@@ -761,9 +1665,9 @@ pub fn set_user_password(
     }
 
     let updated_str = serde_json::to_string_pretty(&json)
-    .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
     fs::write(config_path, updated_str)
-    .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
 
     Ok(true)
 }
@@ -780,6 +1684,30 @@ fn default_host() -> String {
     "0.0.0.0".to_string()
 }
 
+fn default_hosts() -> Vec<String> {
+    vec![default_host()]
+}
+
+/// Accepts `"host": "0.0.0.0"` (a bare string, the pre-existing
+/// format) or `"host": ["0.0.0.0", "::1"]` (an array), normalizing
+/// either into `Vec<String>` — so existing `config.json` files with
+/// the old single-string form keep working unmodified.
+fn deserialize_host<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum HostField {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+    match HostField::deserialize(deserializer)? {
+        HostField::Single(s) => Ok(vec![s]),
+        HostField::Multiple(v) => Ok(v),
+    }
+}
+
 fn default_timezone() -> String {
     "Europe/Paris".to_string()
 }
@@ -790,6 +1718,10 @@ fn default_port() -> u16 {
 
 fn default_cache() -> bool {
     true
+}
+
+fn default_cache_duration_secs() -> u64 {
+    300
 }
 
 fn default_secure_path() -> bool {
@@ -837,10 +1769,6 @@ fn default_tls() -> bool {
 }
 
 fn default_csrf_token() -> bool {
-    true
-}
-
-fn default_need_csrf() -> bool {
     true
 }
 
@@ -916,6 +1844,30 @@ fn default_cert() -> HashMap<String, String> {
     cert
 }
 
+fn default_vhost() -> Vec<String> {
+    Vec::new()
+}
+
+fn default_vhost_cert() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+fn default_headers() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+fn default_static_index() -> String {
+    "index.html".to_string()
+}
+
+fn default_ip_blocklist_refresh_interval() -> u64 {
+    3600
+}
+
+fn default_run_user() -> String {
+    "proxyauth".to_string()
+}
+
 /// Checks a raw `routes.yml` for the deprecated `secure` key, which was
 /// renamed to `required_login`. Unlike a normal unknown field, `secure`
 /// used to control whether a route required authentication — silently
@@ -923,37 +1875,37 @@ fn default_cert() -> HashMap<String, String> {
 /// so we fail loudly instead of falling back to the `required_login`
 /// default.
 pub fn check_deprecated_secure_key(routes_str: &str) -> Result<(), String> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(routes_str)
-    .map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(routes_str).map_err(|e| format!("Failed to parse routes.yml: {e}"))?;
 
     let routes = doc
-    .get("routes")
-    .and_then(|r| r.as_sequence())
-    .cloned()
-    .unwrap_or_default();
+        .get("routes")
+        .and_then(|r| r.as_sequence())
+        .cloned()
+        .unwrap_or_default();
 
     let offenders: Vec<String> = routes
-    .iter()
-    .filter_map(|route| {
-        let map = route.as_mapping()?;
-        if map.contains_key(serde_yaml::Value::String("secure".to_string())) {
-            let prefix = map
-            .get(serde_yaml::Value::String("prefix".to_string()))
-            .and_then(|p| p.as_str())
-            .unwrap_or("<unknown prefix>");
-            Some(prefix.to_string())
-        } else {
-            None
-        }
-    })
-    .collect();
+        .iter()
+        .filter_map(|route| {
+            let map = route.as_mapping()?;
+            if map.contains_key(serde_yaml::Value::String("secure".to_string())) {
+                let prefix = map
+                    .get(serde_yaml::Value::String("prefix".to_string()))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("<unknown prefix>");
+                Some(prefix.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
 
     if offenders.is_empty() {
         Ok(())
     } else {
         Err(format!(
             "routes.yml: 'secure' key is deprecated, rename it to 'required_login' (route(s): {}).",
-                    offenders.join(", ")
+            offenders.join(", ")
         ))
     }
 }
@@ -991,6 +1943,20 @@ impl RouteAccessDecision {
 }
 
 impl AppConfig {
+    /// The address(es) to bind to — `address` (a list) if it's set and
+    /// non-empty, otherwise the single `host` for backward
+    /// compatibility. Always returns at least one entry.
+    pub fn bind_addresses(&self) -> Vec<String> {
+        if self.host.is_empty() {
+            // Defends against an explicit `"host": []` in config.json
+            // — always bind to *something* rather than silently
+            // listening nowhere.
+            vec![default_host()]
+        } else {
+            self.host.clone()
+        }
+    }
+
     /// Decides whether `username` may access a route with these
     /// `username`/`groups`/`roles` settings — the single source of
     /// truth both `network::proxy`'s live access check and
@@ -1021,6 +1987,31 @@ impl AppConfig {
         }
 
         RouteAccessDecision::Denied
+    }
+
+    /// `run_user`, treating an explicitly empty string
+    /// (`"run_user": ""` in `config.json`) the same as the field being
+    /// absent entirely — `#[serde(default = ...)]` only kicks in when
+    /// a field is *missing*, not when it's present but empty, so
+    /// without this an explicit `""` would otherwise be used verbatim
+    /// as a literal (nonexistent) username to switch to.
+    pub fn effective_run_user(&self) -> &str {
+        if self.run_user.trim().is_empty() {
+            "proxyauth"
+        } else {
+            self.run_user.trim()
+        }
+    }
+
+    /// Same normalization as `effective_run_user`, for `run_group`:
+    /// an explicit empty string is treated as `None` (use
+    /// `effective_run_user`'s own primary group), not as a literal
+    /// empty-named group to look up.
+    pub fn effective_run_group(&self) -> Option<&str> {
+        self.run_group
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
     }
 }
 
@@ -1109,9 +2100,9 @@ impl AppConfig {
     pub fn should_use_database_as_fallback(&self) -> bool {
         !self.blakegate_backup_mode_active()
             || self
-            .blakegate_connected
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
+                .blakegate_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
     }
 
     /// Applies a full, authoritative user list pushed by Blakegate —
@@ -1124,7 +2115,7 @@ impl AppConfig {
     /// the complete, current list, not an incremental diff.
     pub fn apply_blakegate_users(&self, fresh: &[User]) {
         let fresh_usernames: std::collections::HashSet<&str> =
-        fresh.iter().map(|u| u.username.as_str()).collect();
+            fresh.iter().map(|u| u.username.as_str()).collect();
 
         let Some(mut guard) = self.apply_upserts(fresh) else {
             return;
@@ -1262,7 +2253,7 @@ impl AppConfig {
         }
 
         let fresh_usernames: std::collections::HashSet<&str> =
-        fresh.iter().map(|u| u.username.as_str()).collect();
+            fresh.iter().map(|u| u.username.as_str()).collect();
 
         let Some(mut guard) = self.apply_upserts(fresh) else {
             return;
@@ -1428,7 +2419,7 @@ impl AppConfig {
 pub fn load_config(path: &str) -> Arc<AppConfig> {
     let config_str = fs::read_to_string(path).expect("Could not read config.json file");
     let mut config: AppConfig =
-    serde_json::from_str(&config_str).expect("Invalid config format config.json");
+        serde_json::from_str(&config_str).expect("Invalid config format config.json");
 
     let mut updated = false;
 
@@ -1436,12 +2427,12 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
         if !user.password.starts_with("$argon2") {
             let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
-            .hash_password(user.password.as_bytes(), &salt)
-            .expect(&format!(
-                "Password hashing failed for user {}",
-                user.username
-            ))
-            .to_string();
+                .hash_password(user.password.as_bytes(), &salt)
+                .expect(&format!(
+                    "Password hashing failed for user {}",
+                    user.username
+                ))
+                .to_string();
             user.password = hash;
             updated = true;
         }
@@ -1449,8 +2440,8 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
 
     let original_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
     config
-    .users
-    .sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
+        .users
+        .sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
 
     let sorted_order: Vec<String> = config.users.iter().map(|u| u.username.clone()).collect();
     if original_order != sorted_order {
@@ -1502,14 +2493,14 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
     }
 
     let config_str = fs::read_to_string(config_path)
-    .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+        .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
     let mut json: Value = serde_json::from_str(&config_str)
-    .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
+        .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
 
     let mut found = false;
     let mut cleared = false;
@@ -1536,9 +2527,9 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
 
     if cleared {
         let updated_str = serde_json::to_string_pretty(&json)
-        .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
+            .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
         fs::write(config_path, updated_str)
-        .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
+            .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
     }
 
     Ok(cleared)
@@ -1552,14 +2543,14 @@ pub fn add_otpkey(config_path: &str, username: &str) {
     }
 
     let config_str =
-    fs::read_to_string(config_path).expect("Failed to read the configuration file.");
+        fs::read_to_string(config_path).expect("Failed to read the configuration file.");
     let mut json: Value =
-    serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
+        serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
 
     let users = json
-    .get_mut("users")
-    .and_then(|u| u.as_array_mut())
-    .expect("Missing 'users' field in configuration file.");
+        .get_mut("users")
+        .and_then(|u| u.as_array_mut())
+        .expect("Missing 'users' field in configuration file.");
 
     let mut updated = false;
 
@@ -1571,8 +2562,8 @@ pub fn add_otpkey(config_path: &str, username: &str) {
             } else {
                 let otpkey = generate_base32_secret(32);
                 user.as_object_mut()
-                .unwrap()
-                .insert("otpkey".to_string(), Value::String(otpkey.clone()));
+                    .unwrap()
+                    .insert("otpkey".to_string(), Value::String(otpkey.clone()));
                 println!(
                     "OTP key successfully generated for '{}': {}",
                     username, otpkey
@@ -1585,21 +2576,21 @@ pub fn add_otpkey(config_path: &str, username: &str) {
 
     if updated {
         let updated_str = serde_json::to_string_pretty(&json)
-        .expect("Failed to serialize the updated configuration.");
+            .expect("Failed to serialize the updated configuration.");
         fs::write(config_path, updated_str)
-        .expect("Failed to write the updated configuration file.");
+            .expect("Failed to write the updated configuration file.");
         println!("Configuration file has been updated.");
     } else if !users
         .iter()
         .any(|u| u.get("username").and_then(|n| n.as_str()) == Some(username))
-        {
-            eprintln!("User '{}' not found in the configuration file.", username);
-        }
+    {
+        eprintln!("User '{}' not found in the configuration file.", username);
+    }
 }
 
 fn deserialize_log_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
 where
-D: Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     struct LogMapVisitor;
 
@@ -1612,7 +2603,7 @@ D: Deserializer<'de>,
 
         fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
         where
-        M: MapAccess<'de>,
+            M: MapAccess<'de>,
         {
             let mut map = HashMap::new();
             while let Some((k, v)) = access.next_entry::<String, serde_json::Value>()? {
@@ -1679,7 +2670,7 @@ impl AllowRegexCfg {
         }
         Ok(CompiledAllow {
             default_allow: self.default_allow,
-                allow,
+            allow,
         })
     }
 }

@@ -166,3 +166,50 @@ pub(super) fn read_snapshot_with_fallback_log() -> Option<Vec<User>> {
         }
     }
 }
+
+/// Patches one user's `otpkey` in the cached snapshot, in place,
+/// without waiting for the next full database read to naturally
+/// refresh it.
+///
+/// Why this needs to exist at all: the module doc above describes
+/// this cache as only ever updated by a *full* snapshot write, on a
+/// successful complete database read — by design, since it exists
+/// purely as a startup/outage fallback, not routine operational data.
+/// But a *targeted*, single-user write (`databases::db::update_otpkey`,
+/// via TOTP enrollment/reset/self-service re-enrollment) doesn't
+/// trigger one of those full reads on its own. Without this, the
+/// window is real, if narrow: enroll or reset a database-backed
+/// user's OTP secret, then have the database go unreachable before
+/// the next periodic full refresh happens to run, and this cache
+/// would still hand back the *old* secret if ProxyAuth ever had to
+/// fall back to it — silently reintroducing a cleared/replaced
+/// secret during exactly the kind of outage this cache exists to
+/// help ride out.
+///
+/// Best-effort, matching every other operation in this file: no
+/// cached snapshot yet (nothing has succeeded long enough to populate
+/// one) is not treated as an error, just nothing to patch. A genuine
+/// LMDB failure is returned for the caller to log, same as
+/// `write_snapshot`'s own convention — this only ever runs after the
+/// real database write already succeeded, so a cache-patch failure
+/// here should never block the response to whoever's enrolling; it's
+/// reported, not propagated as the operation's own failure.
+pub fn patch_otpkey(username: &str, new_otpkey: Option<&str>) -> Result<(), String> {
+    let mut users = match read_snapshot() {
+        Ok(users) => users,
+        Err(_) => return Ok(()), // nothing cached yet — nothing to patch
+    };
+
+    let Some(user) = users.iter_mut().find(|u| u.username == username) else {
+        // Not in the cached snapshot at all (e.g. created after the
+        // last full refresh) — nothing to patch here either; the next
+        // full refresh will pick them up with their current otpkey
+        // already correct, since that read goes straight to the
+        // database.
+        return Ok(());
+    };
+
+    user.otpkey = new_otpkey.map(|s| s.to_string());
+    write_snapshot(&users)
+}
+

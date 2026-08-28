@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.0.4-beta0"
+version = "1.1.0"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -97,7 +97,7 @@ regex = "1"
 serial_test = "3" # it's for coverage code
 notify = "6"
 arc-swap = "1.8.0"
-diesel = { version = "2.1", features = ["postgres", "mysql", "chrono"] }
+diesel = { version = "2.3", features = ["postgres", "mysql", "chrono"] }
 http = "1"
 hyper-tls = "0.5"
 hmac = "0.13.0-rc.2"
@@ -105,6 +105,9 @@ cookie = "0.18"
 lettre = { version = "0.11.22", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
 rpassword = "7.3"
 tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpki-roots"] }
+instant-acme = "0.8"
+rcgen = "0.13"
+x509-parser = "0.16"
 
 # Security-advisory floors, not exact pins — deliberately left as
 # ranges so the resolver can still pick up a future patched release

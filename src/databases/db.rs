@@ -169,7 +169,7 @@ struct IdRow {
 /// `connect_timeout_secs` was meant to solve, just re-introduced by a
 /// pile of abandoned attempts instead of one long one.
 static INFLIGHT_CONNECT_ATTEMPTS: std::sync::atomic::AtomicUsize =
-std::sync::atomic::AtomicUsize::new(0);
+    std::sync::atomic::AtomicUsize::new(0);
 const MAX_INFLIGHT_CONNECT_ATTEMPTS: usize = 3;
 
 /// Opens a connection to the database described by `cfg`.
@@ -217,7 +217,7 @@ pub fn connect(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
         Ok(result) => result,
         Err(_) => Err(format!(
             "Database connection attempt did not complete within {}s — giving up (the database may be unreachable, or the connect_timeout_secs setting may need adjusting for your network)",
-                              timeout.as_secs()
+            timeout.as_secs()
         )),
     }
 }
@@ -231,11 +231,11 @@ fn connect_inner(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
                 cfg.password,
                 cfg.host,
                 cfg.effective_port(),
-                              cfg.db_name,
-                              cfg.connect_timeout_secs.max(1),
+                cfg.db_name,
+                cfg.connect_timeout_secs.max(1),
             );
             let conn = PgConnection::establish(&url)
-            .map_err(|e| format!("Postgres connection failed: {e}"))?;
+                .map_err(|e| format!("Postgres connection failed: {e}"))?;
             Ok(DbConnection::Postgres(conn))
         }
         "mysql" | "mariadb" => {
@@ -245,10 +245,10 @@ fn connect_inner(cfg: &DatabaseConfig) -> Result<DbConnection, String> {
                 cfg.password,
                 cfg.host,
                 cfg.effective_port(),
-                              cfg.db_name
+                cfg.db_name
             );
             let conn = MysqlConnection::establish(&url)
-            .map_err(|e| format!("MySQL connection failed: {e}"))?;
+                .map_err(|e| format!("MySQL connection failed: {e}"))?;
             Ok(DbConnection::MySql(conn))
         }
         other => Err(format!(
@@ -477,9 +477,7 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
                 "CREATE INDEX IF NOT EXISTS idx_deleted_users_log_deleted_at
                 ON deleted_users_log (deleted_at)",
             )
-            .map_err(|e| {
-                format!("Failed to create deleted_users_log index (postgres): {e}")
-            })?;
+            .map_err(|e| format!("Failed to create deleted_users_log index (postgres): {e}"))?;
 
             c.batch_execute(
                 "CREATE OR REPLACE FUNCTION log_deleted_user() RETURNS TRIGGER AS $$
@@ -499,7 +497,7 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
             // success rather than a hard failure — the trigger being
             // present is all we actually care about.
             c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete ON users")
-            .map_err(|e| format!("Failed to drop trg_log_user_delete (postgres): {e}"))?;
+                .map_err(|e| format!("Failed to drop trg_log_user_delete (postgres): {e}"))?;
             if let Err(e) = c.batch_execute(
                 "CREATE TRIGGER trg_log_user_delete
                 AFTER DELETE ON users
@@ -507,7 +505,9 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
             ) {
                 let msg = e.to_string().to_lowercase();
                 if !msg.contains("already exists") {
-                    return Err(format!("Failed to create trg_log_user_delete (postgres): {e}"));
+                    return Err(format!(
+                        "Failed to create trg_log_user_delete (postgres): {e}"
+                    ));
                 }
             }
 
@@ -546,8 +546,8 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
                 if let Err(e) = c.batch_execute(stmt) {
                     let msg = e.to_string().to_lowercase();
                     let already_there = msg.contains("duplicate column")
-                    || msg.contains("duplicate key name")
-                    || msg.contains("already exists");
+                        || msg.contains("duplicate key name")
+                        || msg.contains("already exists");
                     if !already_there {
                         return Err(format!(
                             "Failed to migrate users.created_at/modified_at/deleted (mysql): {e}"
@@ -633,7 +633,7 @@ fn ensure_schema_inner(conn: &mut DbConnection) -> Result<(), String> {
             // exists" as success rather than a hard failure — the
             // trigger being present is all we actually care about.
             c.batch_execute("DROP TRIGGER IF EXISTS trg_log_user_delete")
-            .map_err(|e| format!("Failed to drop trg_log_user_delete (mysql): {e}"))?;
+                .map_err(|e| format!("Failed to drop trg_log_user_delete (mysql): {e}"))?;
             if let Err(e) = c.batch_execute(
                 "CREATE TRIGGER trg_log_user_delete
                 AFTER DELETE ON users
@@ -723,18 +723,18 @@ pub fn load_users(conn: &mut DbConnection) -> Result<Vec<User>, String> {
     }
 
     Ok(user_rows
-    .into_iter()
-    .map(|r| User {
-        username: r.username,
-         password: r.password,
-         otpkey: r.otpkey,
-         allow: allow_map.remove(&r.id),
-         roles: roles_map.remove(&r.id),
-         groups: groups_map.remove(&r.id),
-         email: email_map.remove(&r.id),
-         must_change_password: r.must_change_password,
-    })
-    .collect())
+        .into_iter()
+        .map(|r| User {
+            username: r.username,
+            password: r.password,
+            otpkey: r.otpkey,
+            allow: allow_map.remove(&r.id),
+            roles: roles_map.remove(&r.id),
+            groups: groups_map.remove(&r.id),
+            email: email_map.remove(&r.id),
+            must_change_password: r.must_change_password,
+        })
+        .collect())
 }
 
 /// Inserts or updates the `users` row itself, returning its `id`.
@@ -788,8 +788,8 @@ fn upsert_user_row(conn: &mut DbConnection, user: &User) -> Result<i64, String> 
             .map_err(|e| format!("Failed to upsert user (mysql): {e}"))?;
 
             let row: IdRow = sql_query("SELECT LAST_INSERT_ID() AS id")
-            .get_result(c)
-            .map_err(|e| format!("Failed to fetch inserted user id (mysql): {e}"))?;
+                .get_result(c)
+                .map_err(|e| format!("Failed to fetch inserted user id (mysql): {e}"))?;
             Ok(row.id)
         }
     }
@@ -806,28 +806,28 @@ fn replace_user_allow(
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM user_allow WHERE user_id = $1")
-            .bind::<BigInt, _>(user_id)
-            .execute(c)
-            .map_err(|e| format!("Failed to clear user_allow (postgres): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to clear user_allow (postgres): {e}"))?;
             for cidr in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_allow (user_id, cidr) VALUES ($1, $2)")
-                .bind::<BigInt, _>(user_id)
-                .bind::<Text, _>(cidr)
-                .execute(c)
-                .map_err(|e| format!("Failed to insert user_allow (postgres): {e}"))?;
+                    .bind::<BigInt, _>(user_id)
+                    .bind::<Text, _>(cidr)
+                    .execute(c)
+                    .map_err(|e| format!("Failed to insert user_allow (postgres): {e}"))?;
             }
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM user_allow WHERE user_id = ?")
-            .bind::<BigInt, _>(user_id)
-            .execute(c)
-            .map_err(|e| format!("Failed to clear user_allow (mysql): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to clear user_allow (mysql): {e}"))?;
             for cidr in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_allow (user_id, cidr) VALUES (?, ?)")
-                .bind::<BigInt, _>(user_id)
-                .bind::<Text, _>(cidr)
-                .execute(c)
-                .map_err(|e| format!("Failed to insert user_allow (mysql): {e}"))?;
+                    .bind::<BigInt, _>(user_id)
+                    .bind::<Text, _>(cidr)
+                    .execute(c)
+                    .map_err(|e| format!("Failed to insert user_allow (mysql): {e}"))?;
             }
         }
     }
@@ -843,28 +843,28 @@ fn replace_user_roles(
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM user_roles WHERE user_id = $1")
-            .bind::<BigInt, _>(user_id)
-            .execute(c)
-            .map_err(|e| format!("Failed to clear user_roles (postgres): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to clear user_roles (postgres): {e}"))?;
             for role in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_roles (user_id, role) VALUES ($1, $2)")
-                .bind::<BigInt, _>(user_id)
-                .bind::<Text, _>(role)
-                .execute(c)
-                .map_err(|e| format!("Failed to insert user_roles (postgres): {e}"))?;
+                    .bind::<BigInt, _>(user_id)
+                    .bind::<Text, _>(role)
+                    .execute(c)
+                    .map_err(|e| format!("Failed to insert user_roles (postgres): {e}"))?;
             }
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM user_roles WHERE user_id = ?")
-            .bind::<BigInt, _>(user_id)
-            .execute(c)
-            .map_err(|e| format!("Failed to clear user_roles (mysql): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to clear user_roles (mysql): {e}"))?;
             for role in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_roles (user_id, role) VALUES (?, ?)")
-                .bind::<BigInt, _>(user_id)
-                .bind::<Text, _>(role)
-                .execute(c)
-                .map_err(|e| format!("Failed to insert user_roles (mysql): {e}"))?;
+                    .bind::<BigInt, _>(user_id)
+                    .bind::<Text, _>(role)
+                    .execute(c)
+                    .map_err(|e| format!("Failed to insert user_roles (mysql): {e}"))?;
             }
         }
     }
@@ -904,8 +904,10 @@ fn ensure_group_id(conn: &mut DbConnection, name: &str) -> Result<i64, String> {
             .map_err(|e| format!("Failed to upsert group '{name}' (mysql): {e}"))?;
 
             let row: IdRow = sql_query("SELECT LAST_INSERT_ID() AS id")
-            .get_result(c)
-            .map_err(|e| format!("Failed to read LAST_INSERT_ID for group '{name}' (mysql): {e}"))?;
+                .get_result(c)
+                .map_err(|e| {
+                    format!("Failed to read LAST_INSERT_ID for group '{name}' (mysql): {e}")
+                })?;
             Ok(row.id)
         }
     }
@@ -932,28 +934,28 @@ fn replace_user_groups(
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM user_groups WHERE user_id = $1")
-            .bind::<BigInt, _>(user_id)
-            .execute(c)
-            .map_err(|e| format!("Failed to clear user_groups (postgres): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to clear user_groups (postgres): {e}"))?;
             for group_id in &group_ids {
                 sql_query("INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2)")
-                .bind::<BigInt, _>(user_id)
-                .bind::<BigInt, _>(*group_id)
-                .execute(c)
-                .map_err(|e| format!("Failed to insert user_groups (postgres): {e}"))?;
+                    .bind::<BigInt, _>(user_id)
+                    .bind::<BigInt, _>(*group_id)
+                    .execute(c)
+                    .map_err(|e| format!("Failed to insert user_groups (postgres): {e}"))?;
             }
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM user_groups WHERE user_id = ?")
-            .bind::<BigInt, _>(user_id)
-            .execute(c)
-            .map_err(|e| format!("Failed to clear user_groups (mysql): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to clear user_groups (mysql): {e}"))?;
             for group_id in &group_ids {
                 sql_query("INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)")
-                .bind::<BigInt, _>(user_id)
-                .bind::<BigInt, _>(*group_id)
-                .execute(c)
-                .map_err(|e| format!("Failed to insert user_groups (mysql): {e}"))?;
+                    .bind::<BigInt, _>(user_id)
+                    .bind::<BigInt, _>(*group_id)
+                    .execute(c)
+                    .map_err(|e| format!("Failed to insert user_groups (mysql): {e}"))?;
             }
         }
     }
@@ -972,11 +974,13 @@ fn replace_user_email(
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM user_email WHERE user_id = $1")
-            .bind::<BigInt, _>(user_id)
-            .execute(c)
-            .map_err(|e| format!("Failed to clear user_email (postgres): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to clear user_email (postgres): {e}"))?;
             for entry in values.unwrap_or_default() {
-                sql_query("INSERT INTO user_email (user_id, email, is_primary) VALUES ($1, $2, $3)")
+                sql_query(
+                    "INSERT INTO user_email (user_id, email, is_primary) VALUES ($1, $2, $3)",
+                )
                 .bind::<BigInt, _>(user_id)
                 .bind::<Text, _>(&entry.address)
                 .bind::<diesel::sql_types::Bool, _>(entry.primary)
@@ -986,16 +990,16 @@ fn replace_user_email(
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM user_email WHERE user_id = ?")
-            .bind::<BigInt, _>(user_id)
-            .execute(c)
-            .map_err(|e| format!("Failed to clear user_email (mysql): {e}"))?;
+                .bind::<BigInt, _>(user_id)
+                .execute(c)
+                .map_err(|e| format!("Failed to clear user_email (mysql): {e}"))?;
             for entry in values.unwrap_or_default() {
                 sql_query("INSERT INTO user_email (user_id, email, is_primary) VALUES (?, ?, ?)")
-                .bind::<BigInt, _>(user_id)
-                .bind::<Text, _>(&entry.address)
-                .bind::<diesel::sql_types::Bool, _>(entry.primary)
-                .execute(c)
-                .map_err(|e| format!("Failed to insert user_email (mysql): {e}"))?;
+                    .bind::<BigInt, _>(user_id)
+                    .bind::<Text, _>(&entry.address)
+                    .bind::<diesel::sql_types::Bool, _>(entry.primary)
+                    .execute(c)
+                    .map_err(|e| format!("Failed to insert user_email (mysql): {e}"))?;
             }
         }
     }
@@ -1039,17 +1043,17 @@ pub fn mark_user_deleted(conn: &mut DbConnection, username: &str) -> Result<(), 
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("UPDATE users SET deleted = TRUE, modified_at = now() WHERE username = $1")
-            .bind::<Text, _>(username)
-            .execute(c)
-            .map_err(|e| format!("Failed to soft-delete user (postgres): {e}"))?;
+                .bind::<Text, _>(username)
+                .execute(c)
+                .map_err(|e| format!("Failed to soft-delete user (postgres): {e}"))?;
         }
         DbConnection::MySql(c) => {
             // No explicit modified_at needed — ON UPDATE CURRENT_TIMESTAMP
             // fires automatically for this UPDATE.
             sql_query("UPDATE users SET deleted = TRUE WHERE username = ?")
-            .bind::<Text, _>(username)
-            .execute(c)
-            .map_err(|e| format!("Failed to soft-delete user (mysql): {e}"))?;
+                .bind::<Text, _>(username)
+                .execute(c)
+                .map_err(|e| format!("Failed to soft-delete user (mysql): {e}"))?;
         }
     }
     Ok(())
@@ -1084,6 +1088,40 @@ pub fn update_password(
         .bind::<Text, _>(username)
         .execute(c)
         .map_err(|e| format!("Failed to update password (mysql): {e}"))?,
+    };
+    Ok(affected > 0)
+}
+
+/// Sets (or clears, with `new_otpkey: None`) a user's TOTP secret —
+/// the database-backed counterpart to `config::config::add_otpkey`/
+/// `clear_otpkey`, which only ever operate on `config.json` and have
+/// no way to reach a database-backed account at all. Same
+/// `Ok(false)`-means-"no such user" convention as `update_password`,
+/// and the same narrow, single-column `UPDATE` rather than a full
+/// `upsert_user` round-trip — no need to touch `allow`/`roles`/
+/// `groups`/`email` just to change one field.
+pub fn update_otpkey(
+    conn: &mut DbConnection,
+    username: &str,
+    new_otpkey: Option<&str>,
+) -> Result<bool, String> {
+    let affected = match conn {
+        DbConnection::Postgres(c) => sql_query(
+            "UPDATE users SET otpkey = $1, modified_at = now()
+        WHERE username = $2 AND deleted = FALSE",
+        )
+        .bind::<Nullable<Text>, _>(new_otpkey)
+        .bind::<Text, _>(username)
+        .execute(c)
+        .map_err(|e| format!("Failed to update otpkey (postgres): {e}"))?,
+        DbConnection::MySql(c) => sql_query(
+            "UPDATE users SET otpkey = ?
+            WHERE username = ? AND deleted = FALSE",
+        )
+        .bind::<Nullable<Text>, _>(new_otpkey)
+        .bind::<Text, _>(username)
+        .execute(c)
+        .map_err(|e| format!("Failed to update otpkey (mysql): {e}"))?,
     };
     Ok(affected > 0)
 }
@@ -1129,10 +1167,14 @@ pub fn load_user_by_username(
         password: row.password,
         otpkey: row.otpkey,
         allow: if allow.is_empty() { None } else { Some(allow) },
-            roles: if roles.is_empty() { None } else { Some(roles) },
-            groups: if groups.is_empty() { None } else { Some(groups) },
-            email: if email.is_empty() { None } else { Some(email) },
-            must_change_password: row.must_change_password,
+        roles: if roles.is_empty() { None } else { Some(roles) },
+        groups: if groups.is_empty() {
+            None
+        } else {
+            Some(groups)
+        },
+        email: if email.is_empty() { None } else { Some(email) },
+        must_change_password: row.must_change_password,
     }))
 }
 
@@ -1150,17 +1192,17 @@ pub fn purge_deleted_users(conn: &mut DbConnection, retention_secs: i64) -> Resu
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("DELETE FROM users WHERE deleted = TRUE AND modified_at < $1")
-            .bind::<Timestamp, _>(cutoff)
-            .execute(c)
-            .map(|n| n as u64)
-            .map_err(|e| format!("Failed to purge deleted users (postgres): {e}"))
+                .bind::<Timestamp, _>(cutoff)
+                .execute(c)
+                .map(|n| n as u64)
+                .map_err(|e| format!("Failed to purge deleted users (postgres): {e}"))
         }
         DbConnection::MySql(c) => {
             sql_query("DELETE FROM users WHERE deleted = TRUE AND modified_at < ?")
-            .bind::<Timestamp, _>(cutoff)
-            .execute(c)
-            .map(|n| n as u64)
-            .map_err(|e| format!("Failed to purge deleted users (mysql): {e}"))
+                .bind::<Timestamp, _>(cutoff)
+                .execute(c)
+                .map(|n| n as u64)
+                .map_err(|e| format!("Failed to purge deleted users (mysql): {e}"))
         }
     }
 }
@@ -1173,16 +1215,18 @@ pub fn purge_deleted_users(conn: &mut DbConnection, retention_secs: i64) -> Resu
 pub fn purge_deletion_log(conn: &mut DbConnection, retention_secs: i64) -> Result<u64, String> {
     let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(retention_secs);
     match conn {
-        DbConnection::Postgres(c) => sql_query("DELETE FROM deleted_users_log WHERE deleted_at < $1")
-        .bind::<Timestamp, _>(cutoff)
-        .execute(c)
-        .map(|n| n as u64)
-        .map_err(|e| format!("Failed to purge deleted_users_log (postgres): {e}")),
+        DbConnection::Postgres(c) => {
+            sql_query("DELETE FROM deleted_users_log WHERE deleted_at < $1")
+                .bind::<Timestamp, _>(cutoff)
+                .execute(c)
+                .map(|n| n as u64)
+                .map_err(|e| format!("Failed to purge deleted_users_log (postgres): {e}"))
+        }
         DbConnection::MySql(c) => sql_query("DELETE FROM deleted_users_log WHERE deleted_at < ?")
-        .bind::<Timestamp, _>(cutoff)
-        .execute(c)
-        .map(|n| n as u64)
-        .map_err(|e| format!("Failed to purge deleted_users_log (mysql): {e}")),
+            .bind::<Timestamp, _>(cutoff)
+            .execute(c)
+            .map(|n| n as u64)
+            .map_err(|e| format!("Failed to purge deleted_users_log (mysql): {e}")),
     }
 }
 
@@ -1205,7 +1249,6 @@ pub fn mark_user_deleted_in_config(cfg: &DatabaseConfig, username: &str) -> Resu
         mark_user_deleted(conn, username)
     })
 }
-
 
 /// Loads the users whose `modified_at` falls at or after `cutoff` — the
 /// incremental counterpart to `load_users`, used for frequent refreshes
@@ -1261,10 +1304,14 @@ pub fn load_recently_changed_users(
             password: row.password,
             otpkey: row.otpkey,
             allow: if allow.is_empty() { None } else { Some(allow) },
-                                            roles: if roles.is_empty() { None } else { Some(roles) },
-                                            groups: if groups.is_empty() { None } else { Some(groups) },
-                                            email: if email.is_empty() { None } else { Some(email) },
-                                            must_change_password: row.must_change_password,
+            roles: if roles.is_empty() { None } else { Some(roles) },
+            groups: if groups.is_empty() {
+                None
+            } else {
+                Some(groups)
+            },
+            email: if email.is_empty() { None } else { Some(email) },
+            must_change_password: row.must_change_password,
         }));
     }
 
@@ -1280,21 +1327,24 @@ pub fn load_recently_changed_users(
 /// `ensure_schema`). May return the same username more than once if it
 /// was deleted, re-created, and deleted again within the window;
 /// callers revoking by username handle that fine (idempotent).
-fn load_recent_deletions(conn: &mut DbConnection, cutoff: NaiveDateTime) -> Result<Vec<String>, String> {
+fn load_recent_deletions(
+    conn: &mut DbConnection,
+    cutoff: NaiveDateTime,
+) -> Result<Vec<String>, String> {
     match conn {
         DbConnection::Postgres(c) => {
             sql_query("SELECT username FROM deleted_users_log WHERE deleted_at >= $1")
-            .bind::<Timestamp, _>(cutoff)
-            .load::<DeletedLogRow>(c)
-            .map(|rows| rows.into_iter().map(|r| r.username).collect())
-            .map_err(|e| format!("Failed to load deleted_users_log (postgres): {e}"))
+                .bind::<Timestamp, _>(cutoff)
+                .load::<DeletedLogRow>(c)
+                .map(|rows| rows.into_iter().map(|r| r.username).collect())
+                .map_err(|e| format!("Failed to load deleted_users_log (postgres): {e}"))
         }
         DbConnection::MySql(c) => {
             sql_query("SELECT username FROM deleted_users_log WHERE deleted_at >= ?")
-            .bind::<Timestamp, _>(cutoff)
-            .load::<DeletedLogRow>(c)
-            .map(|rows| rows.into_iter().map(|r| r.username).collect())
-            .map_err(|e| format!("Failed to load deleted_users_log (mysql): {e}"))
+                .bind::<Timestamp, _>(cutoff)
+                .load::<DeletedLogRow>(c)
+                .map(|rows| rows.into_iter().map(|r| r.username).collect())
+                .map_err(|e| format!("Failed to load deleted_users_log (mysql): {e}"))
         }
     }
 }
@@ -1312,15 +1362,15 @@ fn load_values_for_user(
     let query = format!("SELECT {column} AS value FROM {table} WHERE user_id = ");
     match conn {
         DbConnection::Postgres(c) => sql_query(format!("{query}$1"))
-        .bind::<BigInt, _>(user_id)
-        .load::<UserIdValueRow>(c)
-        .map(|rows| rows.into_iter().map(|r| r.value).collect())
-        .map_err(|e| format!("Failed to load {table} for user (postgres): {e}")),
+            .bind::<BigInt, _>(user_id)
+            .load::<UserIdValueRow>(c)
+            .map(|rows| rows.into_iter().map(|r| r.value).collect())
+            .map_err(|e| format!("Failed to load {table} for user (postgres): {e}")),
         DbConnection::MySql(c) => sql_query(format!("{query}?"))
-        .bind::<BigInt, _>(user_id)
-        .load::<UserIdValueRow>(c)
-        .map(|rows| rows.into_iter().map(|r| r.value).collect())
-        .map_err(|e| format!("Failed to load {table} for user (mysql): {e}")),
+            .bind::<BigInt, _>(user_id)
+            .load::<UserIdValueRow>(c)
+            .map(|rows| rows.into_iter().map(|r| r.value).collect())
+            .map_err(|e| format!("Failed to load {table} for user (mysql): {e}")),
     }
 }
 
@@ -1359,32 +1409,29 @@ fn load_groups_for_user(conn: &mut DbConnection, user_id: i64) -> Result<Vec<Str
 }
 
 /// Loads every `user_email` row for one user, `is_primary` included.
-fn load_emails_for_user(
-    conn: &mut DbConnection,
-    user_id: i64,
-) -> Result<Vec<EmailEntry>, String> {
+fn load_emails_for_user(conn: &mut DbConnection, user_id: i64) -> Result<Vec<EmailEntry>, String> {
     let rows: Vec<UserEmailRow> = match conn {
-        DbConnection::Postgres(c) => {
-            sql_query("SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = $1")
-            .bind::<BigInt, _>(user_id)
-            .load(c)
-            .map_err(|e| format!("Failed to load user_email for user (postgres): {e}"))?
-        }
-        DbConnection::MySql(c) => {
-            sql_query("SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = ?")
-            .bind::<BigInt, _>(user_id)
-            .load(c)
-            .map_err(|e| format!("Failed to load user_email for user (mysql): {e}"))?
-        }
+        DbConnection::Postgres(c) => sql_query(
+            "SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = $1",
+        )
+        .bind::<BigInt, _>(user_id)
+        .load(c)
+        .map_err(|e| format!("Failed to load user_email for user (postgres): {e}"))?,
+        DbConnection::MySql(c) => sql_query(
+            "SELECT user_id, email AS address, is_primary FROM user_email WHERE user_id = ?",
+        )
+        .bind::<BigInt, _>(user_id)
+        .load(c)
+        .map_err(|e| format!("Failed to load user_email for user (mysql): {e}"))?,
     };
 
     Ok(rows
-    .into_iter()
-    .map(|r| EmailEntry {
-        address: r.address,
-         primary: r.is_primary,
-    })
-    .collect())
+        .into_iter()
+        .map(|r| EmailEntry {
+            address: r.address,
+            primary: r.is_primary,
+        })
+        .collect())
 }
 
 /// Connects, ensures the schema exists, and returns only the changes

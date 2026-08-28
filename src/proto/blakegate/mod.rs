@@ -67,7 +67,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
@@ -266,20 +266,22 @@ impl<'a> ConnectedGuard<'a> {
 
 impl Drop for ConnectedGuard<'_> {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-async fn run_client(url: String, accept_self_signed: bool, config: Arc<AppConfig>, routes: Arc<RouteConfig>) {
+async fn run_client(
+    url: String,
+    accept_self_signed: bool,
+    config: Arc<AppConfig>,
+    routes: Arc<RouteConfig>,
+) {
     let connector = build_connector(accept_self_signed);
     loop {
-        let connect_result = tokio_tungstenite::connect_async_tls_with_config(
-            &url,
-            None,
-            false,
-            connector.clone(),
-        )
-        .await;
+        let connect_result =
+            tokio_tungstenite::connect_async_tls_with_config(&url, None, false, connector.clone())
+                .await;
         match connect_result {
             Ok((stream, _response)) => {
                 println!("[blakegate] connected to {url}");
@@ -359,7 +361,10 @@ async fn drive_connection(
 /// its first real use.
 async fn handle_incoming_message(text: &str, config: &Arc<AppConfig>) {
     let parsed: Option<Value> = serde_json::from_str(text).ok();
-    let kind = parsed.as_ref().and_then(|v| v.get("kind")).and_then(|v| v.as_str());
+    let kind = parsed
+        .as_ref()
+        .and_then(|v| v.get("kind"))
+        .and_then(|v| v.as_str());
 
     match kind {
         Some("backup_users") => backup_users_to_database(config).await,
@@ -398,7 +403,9 @@ fn acknowledge_routes_sync(parsed: Option<&Value>) {
         Some(n) => println!(
             "[blakegate] routes_sync: received {n} route(s) — acknowledged, but NOT applied to the live routing table yet (route hot-reload isn't implemented)."
         ),
-        None => eprintln!("[blakegate] routes_sync: message is missing a \"routes\" array, ignoring."),
+        None => {
+            eprintln!("[blakegate] routes_sync: message is missing a \"routes\" array, ignoring.")
+        }
     }
 }
 
@@ -427,10 +434,14 @@ fn acknowledge_config_sync(parsed: Option<&Value>) {
             let field_count = cfg.as_object().map(|o| o.len());
             println!(
                 "[blakegate] config_sync: received a config object ({} field(s)) — acknowledged, but NOT applied to this instance's live settings yet (config hot-reload isn't implemented).",
-                field_count.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string())
+                field_count
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".to_string())
             );
         }
-        None => eprintln!("[blakegate] config_sync: message is missing a \"config\" object, ignoring."),
+        None => {
+            eprintln!("[blakegate] config_sync: message is missing a \"config\" object, ignoring.")
+        }
     }
 }
 
@@ -576,12 +587,21 @@ mod tests {
 
     #[test]
     fn leaves_ws_and_wss_untouched() {
-        assert_eq!(to_websocket_url("wss://already-ws.example.com"), "wss://already-ws.example.com");
-        assert_eq!(to_websocket_url("ws://already-ws.example.com"), "ws://already-ws.example.com");
+        assert_eq!(
+            to_websocket_url("wss://already-ws.example.com"),
+            "wss://already-ws.example.com"
+        );
+        assert_eq!(
+            to_websocket_url("ws://already-ws.example.com"),
+            "ws://already-ws.example.com"
+        );
     }
 
     #[test]
     fn defaults_schemeless_url_to_wss() {
-        assert_eq!(to_websocket_url("blakegate.example.com"), "wss://blakegate.example.com");
+        assert_eq!(
+            to_websocket_url("blakegate.example.com"),
+            "wss://blakegate.example.com"
+        );
     }
 }

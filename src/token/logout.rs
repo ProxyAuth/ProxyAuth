@@ -12,7 +12,13 @@ pub async fn logout_options(
     let origin_header = req.headers().get(header::ORIGIN);
     let origin = origin_header.and_then(|v| v.to_str().ok());
 
-    let allowed = data.config.cors_origins.as_ref();
+    let vhost_route = crate::network::proxy::find_vhost_route(
+        crate::network::proxy::request_host(&req).as_deref(),
+        &data.routes.routes,
+    );
+    let allowed = vhost_route
+        .and_then(|r| r.resolved_cors_origins(&data.config))
+        .or(data.config.cors_origins.as_ref());
 
     let is_allowed = match (origin, allowed) {
         (Some(o), Some(list)) => {
@@ -82,10 +88,18 @@ pub async fn logout_session(req: HttpRequest, data: web::Data<AppState>) -> Http
         expires_str
     );
 
-    let mut resp = if let Some(url) = &data.config.logout_redirect_url {
+    let vhost_route = crate::network::proxy::find_vhost_route(
+        crate::network::proxy::request_host(&req).as_deref(),
+        &data.routes.routes,
+    );
+    let logout_redirect_url = vhost_route
+        .and_then(|r| r.resolved_logout_redirect_url(&data.config))
+        .or(data.config.logout_redirect_url.as_deref());
+
+    let mut resp = if let Some(url) = logout_redirect_url {
         if !url.is_empty() {
             let mut r = HttpResponse::Found();
-            r.insert_header((header::LOCATION, url.as_str()));
+            r.insert_header((header::LOCATION, url));
             r
         } else {
             HttpResponse::Ok()
