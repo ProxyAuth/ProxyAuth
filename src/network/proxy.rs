@@ -490,6 +490,26 @@ pub fn substitute_proxyauth_tags(content: &str, username: Option<&str>, csrf_tok
     out
 }
 
+/// Resolves the token to pass as `substitute_proxyauth_tags`'s
+/// `csrf_token` argument under the `tag_proxyauth` mechanism
+/// specifically — `None` (leaving `{{ csrf_token }}` untouched in the
+/// output) whenever CSRF protection itself is off for this route's
+/// vhost (`rule.csrf_enabled` false), rather than generating and
+/// splicing in a token regardless.
+///
+/// This exists as its own named function specifically because it's a
+/// regression guard: an earlier version of every call site below
+/// generated a token unconditionally whenever `tag_proxyauth` was on,
+/// whether or not `csrf_token`/CSRF protection was actually enabled
+/// for that vhost — meaning `csrf_token: false` didn't fully disable
+/// CSRF-related behavior the way an operator would reasonably expect,
+/// since `/auth` never checks a token nobody asked ProxyAuth to
+/// generate. See `tests_network/proxy.rs` for the regression test.
+pub fn resolve_tag_csrf_token(rule: &RouteRule, config: &AppConfig) -> Option<String> {
+    rule.csrf_enabled(config)
+        .then(|| crate::token::csrf::make_csrf_token(&config.secret))
+}
+
 /// A route with an empty `vhost` list is a catch-all — it matches
 /// regardless of the request's `Host` header, preserving the behavior
 /// every `routes.yml` had before `vhost` existed. A non-empty list
@@ -872,8 +892,14 @@ async fn serve_static_file(
                             // where nobody is authenticated yet, is
                             // exactly the case that most needs a CSRF
                             // token (for the login form's own POST).
-                            let csrf_token = crate::token::csrf::make_csrf_token(&data.config.secret);
-                            substitute_proxyauth_tags(&text, username.as_deref(), Some(&csrf_token))
+                            // But NOT independent of csrf_token itself —
+                            // injecting a token when CSRF protection is
+                            // deliberately off for this vhost would be a
+                            // pointless, confusing no-op at best (the
+                            // token gets generated and spliced in, but
+                            // /auth never actually checks it).
+                            let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+                            substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
                                 .into_bytes()
                         }
                         Err(e) => e.into_bytes(),
@@ -971,8 +997,8 @@ async fn serve_static_file(
                 match String::from_utf8(bytes) {
                     Ok(text) => {
                         let username = extract_username_for_tags(req, data, ip).await;
-                        let csrf_token = crate::token::csrf::make_csrf_token(&data.config.secret);
-                        substitute_proxyauth_tags(&text, username.as_deref(), Some(&csrf_token))
+                        let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+                        substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
                             .into_bytes()
                     }
                     Err(e) => e.into_bytes(),
@@ -1744,8 +1770,9 @@ pub async fn proxy_with_proxy(
         if ct.to_ascii_lowercase().starts_with("text/html") {
             if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
                 let username = extract_username_for_tags(&req, &data, &ip).await;
-                let csrf_token = crate::token::csrf::make_csrf_token(&data.config.secret);
-                let substituted = substitute_proxyauth_tags(&text, username.as_deref(), Some(&csrf_token));
+                let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+                let substituted =
+                    substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
                 let new_len = substituted.len();
                 body_bytes = Bytes::from(substituted.into_bytes());
                 client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
@@ -2421,8 +2448,9 @@ pub async fn proxy_without_proxy(
         if ct.to_ascii_lowercase().starts_with("text/html") {
             if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
                 let username = extract_username_for_tags(&req, &data, &ip).await;
-                let csrf_token = crate::token::csrf::make_csrf_token(&data.config.secret);
-                let substituted = substitute_proxyauth_tags(&text, username.as_deref(), Some(&csrf_token));
+                let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+                let substituted =
+                    substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
                 let new_len = substituted.len();
                 body_bytes = Bytes::from(substituted.into_bytes());
                 client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));

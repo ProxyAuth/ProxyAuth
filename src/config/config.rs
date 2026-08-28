@@ -268,18 +268,32 @@ pub struct RouteRule {
     #[serde(default)]
     pub need_csrf: Option<bool>,
 
-    /// Whether CSRF protection is enabled *at all* for this vhost —
-    /// independent of the global `AppConfig.csrf_token` default,
-    /// unlike `need_csrf` (which only decides whether *this specific
-    /// route* participates once CSRF is already enabled somewhere).
+    /// Whether CSRF protection is enabled *at all* for this vhost — both
+    /// the server-side check on `/auth` submissions and every automatic
+    /// token injection (the older `inject_csrf_token` mechanism on
+    /// proxied responses, and the `tag_proxyauth` mechanism's own
+    /// `{{ csrf_token }}` substitution alike) — independent of the
+    /// global `AppConfig.csrf_token` default, and unlike `need_csrf`
+    /// (which only decides whether *this specific route* participates
+    /// once CSRF is already enabled somewhere).
+    ///
+    /// Named `tag_csrf_token` rather than reusing `csrf_token` (which
+    /// the global `AppConfig` field is already called) specifically to
+    /// avoid the two being confused for each other — this one is the
+    /// full on/off switch for CSRF on this route, not just a
+    /// tag-substitution detail despite the name's `tag_` prefix
+    /// (kept for consistency with `tag_proxyauth`, since setting this
+    /// to `false` is most often done alongside `tag_proxyauth: false`
+    /// on the same static/proxied route).
+    ///
     /// `None` (the default) inherits from the `vhosts:` group, then
     /// the global `csrf_token`. An explicit `true`/`false` here always
     /// wins, in either direction — this can turn CSRF ON for one vhost
     /// even while the global default is off, or OFF for one vhost
     /// while every other vhost keeps it on. Use
     /// `RouteRule::csrf_enabled` to resolve the final value.
-    #[serde(default)]
-    pub csrf_token: Option<bool>,
+    #[serde(default, alias = "csrf_token")]
+    pub tag_csrf_token: Option<bool>,
 
     /// Per-vhost override of `AppConfig.session_cookie` (whether
     /// ProxyAuth issues/checks a `session_token` cookie at all, vs.
@@ -486,7 +500,7 @@ impl RouteRule {
     /// either direction, not just opts out of an already-enabled
     /// default.
     pub fn csrf_enabled(&self, global: &AppConfig) -> bool {
-        self.csrf_token.unwrap_or(global.csrf_token)
+        self.tag_csrf_token.unwrap_or(global.csrf_token)
     }
 
     /// Resolves `AppConfig.session_cookie` for this vhost: its own
@@ -732,14 +746,15 @@ pub struct VhostGroup {
     #[serde(default)]
     pub need_csrf: Option<bool>,
 
-    /// Whether CSRF protection is enabled at all for every route in
-    /// this group that doesn't set its own `csrf_token` — same
-    /// override rules as `RouteRule::csrf_token`. Independent of
-    /// `need_csrf` above: this controls whether CSRF applies to the
-    /// vhost at all, `need_csrf` controls whether one specific route
-    /// within it participates once it's on.
-    #[serde(default)]
-    pub csrf_token: Option<bool>,
+    /// Whether CSRF protection — injection and validation alike — is
+    /// enabled at all for every route in this group that doesn't set
+    /// its own `tag_csrf_token`. Same override rules as
+    /// `RouteRule::tag_csrf_token`. Independent of `need_csrf` above:
+    /// this controls whether CSRF applies to the vhost at all,
+    /// `need_csrf` controls whether one specific route within it
+    /// participates once it's on.
+    #[serde(default, alias = "csrf_token")]
+    pub tag_csrf_token: Option<bool>,
 
     /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::session_cookie`.
@@ -873,8 +888,8 @@ impl RouteConfig {
                 if route.need_csrf.is_none() {
                     route.need_csrf = group.need_csrf;
                 }
-                if route.csrf_token.is_none() {
-                    route.csrf_token = group.csrf_token;
+                if route.tag_csrf_token.is_none() {
+                    route.tag_csrf_token = group.tag_csrf_token;
                 }
                 if route.session_cookie.is_none() {
                     route.session_cookie = group.session_cookie;

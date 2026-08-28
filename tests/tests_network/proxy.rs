@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use proxyauth::config::config::RouteRule;
-    use proxyauth::network::proxy::find_route_for_redirect_path;
+    use proxyauth::config::config::{AppConfig, RouteRule};
+    use proxyauth::network::proxy::{find_route_for_redirect_path, resolve_tag_csrf_token};
 
     /// `prefix` is `RouteRule`'s one genuinely required field (no
     /// serde default) — every other field does have one, so a minimal
@@ -17,6 +17,33 @@ mod tests {
         let json = format!(r#"{{"prefix": "{prefix}", "vhost": [{vhost_json}]}}"#);
         serde_json::from_str(&json)
             .expect("RouteRule must deserialize given just prefix/vhost — every other field has a serde default")
+    }
+
+    /// Same idea for `RouteRule`, but adding a `csrf_token` override —
+    /// `None` (the JSON key omitted) leaves it unset (inherits the
+    /// global default), `Some(b)` sets it explicitly.
+    fn rule_with_csrf(prefix: &str, csrf_token: Option<bool>) -> RouteRule {
+        let csrf_field = match csrf_token {
+            Some(b) => format!(r#","csrf_token": {b}"#),
+            None => String::new(),
+        };
+        let json = format!(r#"{{"prefix": "{prefix}"{csrf_field}}}"#);
+        serde_json::from_str(&json).expect("RouteRule must deserialize with just prefix + optional csrf_token")
+    }
+
+    /// `token_expiry_seconds`/`secret`/`users` are `AppConfig`'s only
+    /// fields without a serde default — everything else, including
+    /// `csrf_token` (defaults to `true`), falls back on its own if
+    /// omitted from the JSON.
+    fn global_config(csrf_token: Option<bool>) -> AppConfig {
+        let csrf_field = match csrf_token {
+            Some(b) => format!(r#","csrf_token": {b}"#),
+            None => String::new(),
+        };
+        let json = format!(
+            r#"{{"token_expiry_seconds": 3600, "secret": "test-secret", "users": []{csrf_field}}}"#
+        );
+        serde_json::from_str(&json).expect("AppConfig must deserialize with just the 3 required fields + optional csrf_token")
     }
 
     #[test]
@@ -130,5 +157,57 @@ mod tests {
         ];
         let found = find_route_for_redirect_path("/app", Some("demo.proxyauth.app"), &routes);
         assert_eq!(found.unwrap().prefix, "/app");
+    }
+
+    // ── resolve_tag_csrf_token ──────────────────────────────────────
+    //
+    // Regression tests for a real reported bug: the tag_proxyauth
+    // mechanism's {{ csrf_token }} substitution generated a token
+    // unconditionally whenever tag_proxyauth was on, ignoring
+    // csrf_token/csrf_enabled entirely — so `csrf_token: false`
+    // didn't fully disable CSRF-related behavior the way an operator
+    // would reasonably expect. resolve_tag_csrf_token is the fix:
+    // None (a token that never gets generated at all) whenever CSRF
+    // protection is off for the resolved route/vhost.
+
+    #[test]
+    fn resolve_tag_csrf_token_none_when_globally_disabled_and_route_has_no_override() {
+        let global = global_config(Some(false));
+        let route = rule_with_csrf("/", None);
+        assert_eq!(resolve_tag_csrf_token(&route, &global), None);
+    }
+
+    #[test]
+    fn resolve_tag_csrf_token_some_when_globally_enabled_and_route_has_no_override() {
+        let global = global_config(Some(true));
+        let route = rule_with_csrf("/", None);
+        assert!(resolve_tag_csrf_token(&route, &global).is_some());
+    }
+
+    #[test]
+    fn resolve_tag_csrf_token_none_when_route_overrides_off_despite_global_on() {
+        // The exact reported scenario: csrf protection turned off for
+        // this specific route/vhost (via its own csrf_token: false),
+        // even though the global default is on. Must NOT generate a
+        // token — this is precisely the case the original bug got
+        // wrong (a token was generated here regardless).
+        let global = global_config(Some(true));
+        let route = rule_with_csrf("/", Some(false));
+        assert_eq!(
+            resolve_tag_csrf_token(&route, &global),
+            None,
+            "a route/vhost that explicitly disables csrf_token must not get a tag_proxyauth-injected CSRF token, even though the global default is on"
+        );
+    }
+
+    #[test]
+    fn resolve_tag_csrf_token_some_when_route_overrides_on_despite_global_off() {
+        // The inverse: a route/vhost can also turn csrf ON
+        // independently of a globally-off default — confirms this
+        // isn't just "global wins", the route's own resolved value is
+        // what's actually checked.
+        let global = global_config(Some(false));
+        let route = rule_with_csrf("/", Some(true));
+        assert!(resolve_tag_csrf_token(&route, &global).is_some());
     }
 }

@@ -89,10 +89,11 @@ pub async fn render_error_page(
         };
 
     let request_host_str = crate::network::proxy::request_host(req);
-    let Some(rule) = data.routes.routes.iter().find(|r| {
-        path.starts_with(&r.prefix)
-            && crate::network::proxy::vhost_matches(request_host_str.as_deref(), &r.vhost)
-    }) else {
+    let Some(rule) = crate::network::proxy::find_route_for_redirect_path(
+        &path,
+        request_host_str.as_deref(),
+        &data.routes.routes,
+    ) else {
         return HttpResponse::BadRequest().body("No matching route for logout_redirect_url path");
     };
 
@@ -118,11 +119,11 @@ pub async fn render_error_page(
                         .unwrap_or_else(|| "-".to_string());
                     let username =
                         crate::network::proxy::extract_username_for_tags(req, &data, &ip).await;
-                    let csrf_token = crate::token::csrf::make_csrf_token(&data.config.secret);
+                    let csrf_token = crate::network::proxy::resolve_tag_csrf_token(rule, &data.config);
                     html = crate::network::proxy::substitute_proxyauth_tags(
                         &html,
                         username.as_deref(),
-                        Some(&csrf_token),
+                        csrf_token.as_deref(),
                     );
                 }
                 HttpResponse::Ok()
@@ -330,11 +331,11 @@ pub async fn render_error_page(
             .map(|i| i.to_string())
             .unwrap_or_else(|| "-".to_string());
         let username = crate::network::proxy::extract_username_for_tags(req, &data, &ip).await;
-        let csrf_token = crate::token::csrf::make_csrf_token(&data.config.secret);
+        let csrf_token = crate::network::proxy::resolve_tag_csrf_token(rule, &data.config);
         html = crate::network::proxy::substitute_proxyauth_tags(
             &html,
             username.as_deref(),
-            Some(&csrf_token),
+            csrf_token.as_deref(),
         );
     }
 
