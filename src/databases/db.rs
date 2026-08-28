@@ -1092,6 +1092,40 @@ pub fn update_password(
     Ok(affected > 0)
 }
 
+/// Sets (or clears, with `new_otpkey: None`) a user's TOTP secret —
+/// the database-backed counterpart to `config::config::add_otpkey`/
+/// `clear_otpkey`, which only ever operate on `config.json` and have
+/// no way to reach a database-backed account at all. Same
+/// `Ok(false)`-means-"no such user" convention as `update_password`,
+/// and the same narrow, single-column `UPDATE` rather than a full
+/// `upsert_user` round-trip — no need to touch `allow`/`roles`/
+/// `groups`/`email` just to change one field.
+pub fn update_otpkey(
+    conn: &mut DbConnection,
+    username: &str,
+    new_otpkey: Option<&str>,
+) -> Result<bool, String> {
+    let affected = match conn {
+        DbConnection::Postgres(c) => sql_query(
+            "UPDATE users SET otpkey = $1, modified_at = now()
+        WHERE username = $2 AND deleted = FALSE",
+        )
+        .bind::<Nullable<Text>, _>(new_otpkey)
+        .bind::<Text, _>(username)
+        .execute(c)
+        .map_err(|e| format!("Failed to update otpkey (postgres): {e}"))?,
+        DbConnection::MySql(c) => sql_query(
+            "UPDATE users SET otpkey = ?
+            WHERE username = ? AND deleted = FALSE",
+        )
+        .bind::<Nullable<Text>, _>(new_otpkey)
+        .bind::<Text, _>(username)
+        .execute(c)
+        .map_err(|e| format!("Failed to update otpkey (mysql): {e}"))?,
+    };
+    Ok(affected > 0)
+}
+
 /// Fetches a single non-deleted user by username, with its `allow`/
 /// `roles`. Used to refresh the in-memory `db_users` snapshot for one
 /// user immediately after a write (e.g. `update_password`), without

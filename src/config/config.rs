@@ -420,6 +420,38 @@ pub struct RouteRule {
     #[serde(default)]
     pub exclude_users: Vec<String>,
 
+    /// ⚠️ **Security trade-off, opt-in and off by default.** When
+    /// `true`, a user who already has a TOTP secret enrolled can
+    /// re-enroll — getting a brand-new secret and QR/URI, silently
+    /// replacing the old one — via `/adm/auth/totp/get` using nothing
+    /// but their username and password, the same way first-time
+    /// enrollment already works. Normally that endpoint refuses with
+    /// `409 Conflict` once a secret already exists specifically to
+    /// prevent this: without this flag, only an admin can clear an
+    /// existing secret (`proxyauth reset-otp` /
+    /// `/adm/auth/totp/reset`, gated by `token_admin`) before
+    /// re-enrollment is possible again.
+    ///
+    /// Turning this on means **anyone who obtains a user's password
+    /// can also take over their TOTP factor** — no admin, no
+    /// possession of the old authenticator app, no separate approval
+    /// step. For an account this is true for, TOTP no longer protects
+    /// against a stolen/guessed password the way two-factor
+    /// authentication is meant to; it only continues to protect
+    /// against an attacker who has the password but doesn't yet want
+    /// to be noticed replacing the victim's TOTP device. Understand
+    /// that trade-off for the specific accounts/vhost this applies to
+    /// before enabling it — this is not a general-purpose
+    /// self-service convenience toggle, it's a deliberate, narrow
+    /// exception to how ProxyAuth's TOTP re-enrollment is designed to
+    /// require admin involvement.
+    ///
+    /// No global fallback — like `tag_proxyauth`, unset means `false`
+    /// with nothing to inherit from beyond this route's own
+    /// `vhosts:` group. See `RouteRule::totp_reenroll_allowed`.
+    #[serde(default)]
+    pub allow_totp_reenroll: Option<bool>,
+
     /// Access logging for this route. `None` means "inherit from the
     /// `vhosts:` group this route belongs to (if any), otherwise the
     /// global `logging.enabled`" — same override rules as `need_csrf`.
@@ -612,6 +644,16 @@ impl RouteRule {
         }
 
         false
+    }
+
+    /// Resolves whether self-service TOTP re-enrollment (username +
+    /// password alone, no admin, no clearing the old secret first) is
+    /// allowed for this vhost — see `allow_totp_reenroll`'s own doc
+    /// comment for the full security trade-off before turning this
+    /// on. No global fallback, same reasoning as
+    /// `tag_proxyauth_enabled`: unset means `false`, full stop.
+    pub fn totp_reenroll_allowed(&self) -> bool {
+        self.allow_totp_reenroll.unwrap_or(false)
     }
 
 }
@@ -819,6 +861,14 @@ pub struct VhostGroup {
     #[serde(default)]
     pub exclude_users: Vec<String>,
 
+    /// ⚠️ Applied to every route in this group that doesn't set its
+    /// own — see `RouteRule::allow_totp_reenroll` for the full
+    /// security trade-off this opts into. Same as everywhere else on
+    /// this group: usually the right place to set it, since TOTP
+    /// enrollment is a vhost-wide concern, not a per-route one.
+    #[serde(default)]
+    pub allow_totp_reenroll: Option<bool>,
+
     /// Access logging applied to every route in this group that doesn't
     /// set its own `log` — same override rules as `need_csrf`.
     #[serde(default)]
@@ -929,6 +979,9 @@ impl RouteConfig {
                 }
                 if route.exclude_users.is_empty() {
                     route.exclude_users = group.exclude_users.clone();
+                }
+                if route.allow_totp_reenroll.is_none() {
+                    route.allow_totp_reenroll = group.allow_totp_reenroll;
                 }
                 if route.log.is_none() {
                     route.log = group.log;
