@@ -91,21 +91,33 @@ fn load_keys(path: &str) -> Result<Vec<PrivateKeyDer<'static>>, Box<dyn std::err
         .collect())
 }
 
-pub fn get_or_build_client(opts: ClientOptions, state: &Arc<AppConfig>) -> HttpsClient {
+/// Returns a pooled HTTPS client for `opts`, building and caching one
+/// if this is the first request needing this exact configuration.
+///
+/// SECURITY FIX: when `opts.use_cert` is set and `state.strict_mtls` is
+/// on, a broken certificate/key now surfaces as an `Err` here instead
+/// of a silently-degraded client — see `build_hyper_client_cert`'s doc
+/// comment. Nothing is cached on that failure, so a transient issue
+/// (e.g. the cert file briefly unreadable during a rotation) can
+/// succeed on a later request without needing a restart.
+pub fn get_or_build_client(
+    opts: ClientOptions,
+    state: &Arc<AppConfig>,
+) -> Result<HttpsClient, String> {
     let key = ClientKey::from_options(&opts);
 
     if let Some(client) = CLIENT_CACHE.get(&key) {
-        return client.clone();
+        return Ok(client.clone());
     }
 
     let client = if opts.use_cert {
-        build_hyper_client_cert(opts.clone(), state)
+        build_hyper_client_cert(opts.clone(), state)?
     } else {
         build_hyper_client_normal(state)
     };
 
     CLIENT_CACHE.insert(key, client.clone());
-    client
+    Ok(client)
 }
 
 pub fn get_or_build_client_proxy(opts: ClientOptions, state: &Arc<AppConfig>) -> ProxyClient {
@@ -132,7 +144,24 @@ pub fn build_hyper_client_normal(state: &Arc<AppConfig>) -> HttpsClient {
         .build::<_, BoxBody>(https)
 }
 
-pub fn build_hyper_client_cert(opts: ClientOptions, state: &Arc<AppConfig>) -> HttpsClient {
+/// Builds an HTTPS client presenting a client certificate for mTLS to a
+/// backend. Returns `Err` when the certificate/key can't be loaded or
+/// paired *and* `state.strict_mtls` is `true` — otherwise (the default)
+/// falls back to a client with no client authentication at all, same
+/// as before, just still logged via `tracing::warn!` either way.
+///
+/// SECURITY FIX: this used to silently fall back unconditionally, with
+/// no way for a caller (or an operator without log access) to tell "no
+/// cert configured" apart from "cert configured but broken" from the
+/// outside — a backend relying on mTLS to authenticate ProxyAuth as a
+/// legitimate caller would silently accept connections from a
+/// ProxyAuth instance whose certificate path was simply misconfigured.
+/// `strict_mtls: true` turns that into a loud, request-failing error
+/// instead.
+pub fn build_hyper_client_cert(
+    opts: ClientOptions,
+    state: &Arc<AppConfig>,
+) -> Result<HttpsClient, String> {
     let keep = Duration::from_millis(state.keep_alive);
 
     let want_cert = opts.use_cert
@@ -148,22 +177,32 @@ pub fn build_hyper_client_cert(opts: ClientOptions, state: &Arc<AppConfig>) -> H
             .unwrap_or(false);
 
     if !want_cert {
-        return build_hyper_client_normal(state);
+        return Ok(build_hyper_client_normal(state));
     }
 
     let cert_chain = match load_certs(opts.cert_path.as_ref().unwrap()) {
         Ok(c) if !c.is_empty() => c,
         _ => {
-            tracing::warn!("TLS: cert chain vide ou invalide, fallback sans client auth");
-            return build_hyper_client_normal(state);
+            let msg = "TLS: cert chain vide ou invalide";
+            if state.strict_mtls {
+                tracing::error!("{msg} — refusing the connection (strict_mtls is on)");
+                return Err(msg.to_string());
+            }
+            tracing::warn!("{msg}, fallback sans client auth");
+            return Ok(build_hyper_client_normal(state));
         }
     };
 
     let mut keys = match load_keys(opts.key_path.as_ref().unwrap()) {
         Ok(k) if !k.is_empty() => k,
         _ => {
-            tracing::warn!("TLS: clé vide ou invalide, fallback sans client auth");
-            return build_hyper_client_normal(state);
+            let msg = "TLS: clé vide ou invalide";
+            if state.strict_mtls {
+                tracing::error!("{msg} — refusing the connection (strict_mtls is on)");
+                return Err(msg.to_string());
+            }
+            tracing::warn!("{msg}, fallback sans client auth");
+            return Ok(build_hyper_client_normal(state));
         }
     };
 
@@ -204,12 +243,14 @@ pub fn build_hyper_client_cert(opts: ClientOptions, state: &Arc<AppConfig>) -> H
     {
         Ok(cfg) => cfg,
         Err(e) => {
-            tracing::warn!(
-                "TLS: paire cert/key invalide ({}), fallback sans client auth",
-                e
-            );
-
-            return build_hyper_client_normal(state);
+            if state.strict_mtls {
+                tracing::error!(
+                    "TLS: paire cert/key invalide ({e}) — refusing the connection (strict_mtls is on)"
+                );
+                return Err(format!("TLS: paire cert/key invalide ({e})"));
+            }
+            tracing::warn!("TLS: paire cert/key invalide ({e}), fallback sans client auth");
+            return Ok(build_hyper_client_normal(state));
         }
     };
 
@@ -219,10 +260,10 @@ pub fn build_hyper_client_cert(opts: ClientOptions, state: &Arc<AppConfig>) -> H
         .enable_http1()
         .wrap_connector(build_http_connector(keep));
 
-    Client::builder(TokioExecutor::new())
+    Ok(Client::builder(TokioExecutor::new())
         .pool_idle_timeout(keep)
         .pool_max_idle_per_host(state.max_idle_per_host.into())
-        .build::<_, BoxBody>(https)
+        .build::<_, BoxBody>(https))
 }
 
 pub fn build_hyper_client_proxy(opts: ClientOptions, state: &Arc<AppConfig>) -> ProxyClient {

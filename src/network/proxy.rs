@@ -1031,14 +1031,25 @@ async fn serve_static_file(
 /// trimmed down — no CSRF (irrelevant to serving a file) and no "/"
 /// login-redirect special case. `Ok(())` means the request may proceed;
 /// `Err(resp)` is the response to send back instead.
+/// Enforces `required_login` for a static route, the same way the
+/// proxied-route handlers do — and, on success, returns the resolved
+/// `(username, token_id)` so the caller can pass it to
+/// `LogContext::set_user`. Static routes used to authenticate correctly
+/// here but silently drop the resolved identity (`_token_id` was
+/// discarded, `username` never reached the log context at all) — the
+/// access log's `[username]`/`[tid]` fields showed `-` for every static
+/// route even with `required_login: true` correctly enforced. Empty
+/// strings are returned when `required_login` is `false`, matching the
+/// same "nothing to log" convention `proxy_with_proxy`/
+/// `proxy_without_proxy` already use.
 async fn check_static_auth(
     req: &HttpRequest,
     data: &web::Data<AppState>,
     rule: &RouteRule,
     ip: &str,
-) -> Result<(), HttpResponse> {
+) -> Result<(String, String), HttpResponse> {
     if !rule.required_login {
-        return Ok(());
+        return Ok((String::new(), String::new()));
     }
 
     let token_header = req
@@ -1072,8 +1083,8 @@ async fn check_static_auth(
             .body("401 Unauthorized"));
     };
 
-    let username = match validate_token(token_header, data, &data.config, ip).await {
-        Ok((username, _token_id, _expiry)) => username,
+    let (username, token_id) = match validate_token(token_header, data, &data.config, ip).await {
+        Ok((username, token_id, _expiry)) => (username, token_id),
         Err(_) => {
             return Err(HttpResponse::Unauthorized()
                 .append_header(("server", "ProxyAuth"))
@@ -1095,7 +1106,7 @@ async fn check_static_auth(
             .body("401 Unauthorized"));
     }
 
-    Ok(())
+    Ok((username, token_id))
 }
 
 pub async fn global_proxy(
@@ -1251,9 +1262,17 @@ pub async fn global_proxy(
             let ip_str = client_ip(&req, &data.config)
                 .map(|i| i.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            if let Err(resp) = check_static_auth(&req, &data, rule, &ip_str).await {
-                return Ok(resp);
-            }
+            let (username, token_id) = match check_static_auth(&req, &data, rule, &ip_str).await {
+                Ok(identity) => identity,
+                Err(resp) => return Ok(resp),
+            };
+            // Same as the proxied-route handlers: publishes the resolved
+            // identity for the access log's [username]/[tid] fields. Was
+            // previously missing entirely on this path — static routes
+            // correctly enforced `required_login`, but the resolved
+            // identity never reached the access log, so it always showed
+            // `-` regardless.
+            LogContext::set_user(&req, &username, &token_id);
             if method != "GET" && method != "HEAD" {
                 return Ok(HttpResponse::MethodNotAllowed()
                     .append_header(("server", "ProxyAuth"))
@@ -1663,7 +1682,14 @@ pub async fn proxy_with_proxy(
             })
             .collect();
 
-        forward_failover(hyper_req, &backends, Some(&rule.proxy_config))
+        // Uniquely identifies this route for the sticky-backend cache —
+        // see `forward_failover`'s doc comment. `vhost` alone isn't
+        // enough (a vhost can have many routes), `prefix` alone isn't
+        // enough either (two different vhosts can both have a route at
+        // the same prefix) — the pair together is exactly what
+        // `routes.yml` itself uses to distinguish routes.
+        let route_key = format!("{}|{}", rule.vhost.join(","), rule.prefix);
+        forward_failover(hyper_req, &backends, Some(&rule.proxy_config), &route_key)
             .await
             .map_err(|e| {
                 warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
@@ -2022,7 +2048,10 @@ pub async fn proxy_without_proxy(
         }
     };
 
-    let client = get_or_build_client(client_opts, &data.config);
+    let client = get_or_build_client(client_opts, &data.config).map_err(|e| {
+        tracing::error!("mTLS client build failed: {e}");
+        error::ErrorBadGateway("502 Bad Gateway")
+    })?;
 
     let uri = Uri::from_str(&full_url)
         .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
@@ -2264,7 +2293,8 @@ pub async fn proxy_without_proxy(
             })
             .collect();
 
-        match forward_failover(hyper_req, &backends, None).await {
+        let route_key = format!("{}|{}", rule.vhost.join(","), rule.prefix);
+        match forward_failover(hyper_req, &backends, None, &route_key).await {
             Ok(res) => res,
 
             Err(e) => {

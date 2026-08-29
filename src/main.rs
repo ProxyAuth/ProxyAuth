@@ -55,9 +55,6 @@ use futures_util::future::join_all;
 use logs::{ChannelLogWriter, get_logs, log_collector};
 use network::proxy::global_proxy;
 use network::ratelimit::{RateLimitLogger, UserToken};
-use network::shared_client::{
-    ClientOptions, build_hyper_client_cert, build_hyper_client_normal, build_hyper_client_proxy,
-};
 use socket2::{Domain, Protocol, Socket, Type};
 use start_actix::mode_actix_web;
 pub use stats::tokencount::CounterToken;
@@ -586,29 +583,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
 
-    let client_normal = build_hyper_client_normal(&config);
-    let client_with_cert = build_hyper_client_cert(
-        ClientOptions {
-            use_proxy: false,
-            proxy_addr: None,
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
-        },
-        &config,
-    );
-
-    let client_with_proxy = build_hyper_client_proxy(
-        ClientOptions {
-            use_proxy: true,
-            proxy_addr: Some("http://127.0.0.1:8888".to_string()),
-                                                     use_cert: false,
-                                                     cert_path: None,
-                                                     key_path: None,
-        },
-        &config,
-    );
-
     init_routes(&mut routes.routes);
     let routes = Arc::new(routes);
 
@@ -660,9 +634,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::clone(&config),
                                routes: Arc::clone(&routes),
                                counter: counter_token,
-                               client_normal,
-                               client_with_cert,
-                               client_with_proxy,
                                revoked_tokens,
                                stats,
                                ip_blocklist,

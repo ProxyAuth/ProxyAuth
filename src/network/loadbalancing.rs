@@ -7,7 +7,7 @@ use crate::network::config::{LB_TUNING, LbTuning};
 use crate::network::shared_client::BoxBody;
 use ahash::{AHashSet, RandomState};
 use dashmap::DashMap;
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Empty, Full, Limited};
 use hyper::body::Bytes;
 use hyper::{Method, Request, Response, Uri};
 use hyper_http_proxy::{Intercept, Proxy, ProxyConnector};
@@ -61,6 +61,13 @@ pub fn lb() -> &'static LbTuning {
         cooldown_base_secs: 2,
         cooldown_max_secs: 5,
         backend_reset_threshold_secs: 10,
+        // Same 10 MB default as `config::config::default_max_body_size`
+        // — this fallback only applies before `init_loadbalancer` has
+        // run (or if it's never called at all), so it can't actually
+        // read the configured value; matching the same default keeps
+        // this consistent with what a freshly-started instance would
+        // otherwise use anyway.
+        max_response_body_bytes: 10 * 1024 * 1024,
     })
 }
 
@@ -94,9 +101,23 @@ pub struct SwrrState {
     current: i32,
 }
 
-fn cache_key(method: &Method, uri: &Uri, _headers: &hyper::HeaderMap) -> String {
+/// Cache key for the sticky "last good backend" shortcut.
+///
+/// SECURITY/CORRECTNESS FIX: this used to be `format!("{}|{}", method,
+/// host)` — scoped only by HTTP method and the request's own Host
+/// header, never by which *route* (or which route's own `backends:`
+/// pool) actually matched. Two different routes on the same vhost using
+/// the same HTTP method collided on the exact same cache key, meaning
+/// one route's "last good backend" could get reused for a completely
+/// different route — including sending that route's traffic to a
+/// backend that was never even part of *its own* configured pool.
+/// `route_key` (built by the caller from the matched route's
+/// `vhost`+`prefix`, which together uniquely identify a route) closes
+/// that: two different routes now always get different cache entries,
+/// even if they share a vhost and method.
+fn cache_key(route_key: &str, method: &Method, uri: &Uri, _headers: &hyper::HeaderMap) -> String {
     let host = uri.authority().map(|a| a.as_str()).unwrap_or("default");
-    format!("{}|{}", method, host)
+    format!("{}|{}|{}", route_key, method, host)
 }
 
 pub static SWRR_STATE: Lazy<DashMap<String, SwrrState, RandomState>> = Lazy::new(Default::default);
@@ -226,10 +247,41 @@ pub async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> 
     arc_client
 }
 
+/// `is_idempotent_method` — GET/HEAD/PUT/DELETE/OPTIONS are safe to
+/// silently retry against a different backend on failure (repeating
+/// them has the same effect as doing it once). POST and PATCH are not:
+/// a POST that reached a backend, was fully processed, and only *then*
+/// produced a 5xx (e.g. a downstream dependency failing after the
+/// write already committed) would otherwise get retried against a
+/// second backend with the exact same body, risking a genuine
+/// duplicate write. See `forward_failover`'s own doc comment.
+fn is_idempotent_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS
+    )
+}
+
+/// Forwards a request to one of `backends`, with sticky-backend caching
+/// and automatic failover to the next backend on failure.
+///
+/// `route_key` must uniquely identify the *route* this call is being
+/// made on behalf of (the caller passes something derived from the
+/// matched route's `vhost`+`prefix`) — see `cache_key`'s doc comment
+/// for why this matters: without it, the sticky-backend cache and the
+/// backend pool it's scoped to can silently diverge across routes.
+///
+/// SECURITY/CORRECTNESS FIX: for a non-idempotent method (POST/PATCH),
+/// failover is now skipped entirely — a single failed attempt returns
+/// an error rather than retrying the same write against a second
+/// backend. Retrying was previously unconditional for every method,
+/// including on a 5xx a backend returned after fully processing the
+/// request.
 pub async fn forward_failover(
     req: Request<BoxBody>,
     backends: &[BackendConfig],
     proxy_addr: Option<&str>,
+    route_key: &str,
 ) -> Result<Response<BoxBody>, ForwardError> {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -246,10 +298,23 @@ pub async fn forward_failover(
     BACKEND_COOLDOWN
         .retain(|_, entry| now.duration_since(entry.last_failed) < backend_reset_threshold());
 
-    let ctx_key = cache_key(&method, &uri, &headers);
+    let ctx_key = cache_key(route_key, &method, &uri, &headers);
+    let retry_on_failure = is_idempotent_method(&method);
 
     if let Some((cached_url, when)) = LAST_GOOD_BACKEND.get(&ctx_key).map(|e| e.clone()) {
-        if when.elapsed() <= backend_valid_duration() && !is_in_cooldown(&cached_url) {
+        // SECURITY/CORRECTNESS FIX: previously used `cached_url`
+        // unconditionally, without checking it's actually a member of
+        // *this* route's own `backends` pool. Even with `route_key`
+        // now scoping the cache correctly, a stale entry from a route
+        // whose backend list changed (a config reload) could otherwise
+        // still point somewhere no longer valid for this route — this
+        // check makes that structurally impossible rather than merely
+        // unlikely.
+        let cached_is_valid_for_route = backends.iter().any(|b| b.url == cached_url);
+        if cached_is_valid_for_route
+            && when.elapsed() <= backend_valid_duration()
+            && !is_in_cooldown(&cached_url)
+        {
             match try_forward_to_backend(
                 &cached_url,
                 proxy_addr,
@@ -272,9 +337,36 @@ pub async fn forward_failover(
                             failures: 1,
                             last_failed: Instant::now(),
                         });
+                    if !retry_on_failure {
+                        return Err(ForwardError::AllBackendsFailed);
+                    }
                 }
             }
         }
+    }
+
+    if !retry_on_failure {
+        // Non-idempotent method and the sticky-backend shortcut above
+        // either wasn't applicable or already failed once — a single
+        // attempt against the first candidate backend, no failover.
+        let active: Vec<&BackendConfig> = backends.iter().filter(|b| b.weight != -1).collect();
+        let order_active = build_swrr_order(&active);
+        if let Some(backend) = order_active.first() {
+            return try_forward_to_backend(
+                &backend.url,
+                proxy_addr,
+                &body_bytes,
+                &method,
+                &uri,
+                &headers,
+            )
+            .await
+            .inspect(|_| {
+                LAST_GOOD_BACKEND.insert(ctx_key.clone(), (backend.url.clone(), Instant::now()));
+                BACKEND_COOLDOWN.remove(&backend.url);
+            });
+        }
+        return Err(ForwardError::AllBackendsFailed);
     }
 
     let active: Vec<&BackendConfig> = backends.iter().filter(|b| b.weight != -1).collect();
@@ -283,6 +375,7 @@ pub async fn forward_failover(
     let mut already_checked = AHashSet::default();
 
     if let Some(resp) = try_backends(
+        route_key,
         &order_active,
         &mut already_checked,
         &body_bytes,
@@ -296,6 +389,7 @@ pub async fn forward_failover(
         return Ok(resp);
     }
     if let Some(resp) = try_backends(
+        route_key,
         &disabled,
         &mut already_checked,
         &body_bytes,
@@ -313,6 +407,7 @@ pub async fn forward_failover(
 }
 
 async fn try_backends(
+    route_key: &str,
     backends: &[&BackendConfig],
     already_checked: &mut AHashSet<String>,
     body_bytes: &Bytes,
@@ -336,7 +431,7 @@ async fn try_backends(
         match try_forward_to_backend(url, proxy_addr, body_bytes, method, uri, headers).await {
             Ok(resp) => {
                 LAST_GOOD_BACKEND.insert(
-                    cache_key(method, uri, headers),
+                    cache_key(route_key, method, uri, headers),
                     (url.clone(), Instant::now()),
                 );
                 BACKEND_COOLDOWN.remove(url);
@@ -379,8 +474,19 @@ async fn try_forward_to_backend(
     let full_uri = Uri::from_parts(parts).map_err(|_| ForwardError::AllBackendsFailed)?;
     let mut builder = Request::builder().method(method.clone()).uri(full_uri);
 
+    // SECURITY/CORRECTNESS FIX: previously only excluded "Host" here —
+    // every other header, including hop-by-hop ones (Connection,
+    // Transfer-Encoding, TE, Trailer, Upgrade, Keep-Alive, Proxy-*),
+    // was relayed verbatim to the failover backend. `is_hop_by_hop_header`
+    // is the exact same check the main proxied-request path already
+    // uses (`network/proxy.rs`) — reused here rather than duplicated,
+    // so the two paths can't drift out of sync on what counts as
+    // hop-by-hop.
     for (key, value) in headers.iter() {
-        if key.as_str().to_ascii_lowercase() != "host" {
+        let key_str = key.as_str();
+        if key_str.to_ascii_lowercase() != "host"
+            && !crate::network::proxy::is_hop_by_hop_header(key_str)
+        {
             builder = builder.header(key, value);
         }
     }
@@ -434,10 +540,29 @@ async fn try_forward_to_backend(
                 Err(ForwardError::AllBackendsFailed)
             } else {
                 let (parts, body) = resp.into_parts();
-                let bytes = body
+                // SECURITY FIX: previously an unconditional
+                // `body.collect()` — a single backend returning an
+                // unbounded response body could grow ProxyAuth's own
+                // memory usage without limit, since the whole point of
+                // this failover path (deciding whether to retry a
+                // different backend) requires the full body before a
+                // decision can be made either way. `Limited` enforces
+                // `lb().max_response_body_bytes` (reusing the same
+                // budget already applied to request bodies) and fails
+                // cleanly, the same as any other backend failure —
+                // triggering the normal cooldown/retry path — instead
+                // of buffering without bound.
+                let bytes = Limited::new(body, lb().max_response_body_bytes)
                     .collect()
                     .await
-                    .map_err(|_| ForwardError::AllBackendsFailed)?
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "Failover: backend {} response body rejected: {}",
+                            backend,
+                            e
+                        );
+                        ForwardError::AllBackendsFailed
+                    })?
                     .to_bytes();
                 let boxed: BoxBody = Full::new(bytes).map_err(|e: Infallible| e).boxed();
                 Ok(Response::from_parts(parts, boxed))

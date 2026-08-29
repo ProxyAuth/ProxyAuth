@@ -1353,12 +1353,32 @@ fn load_recent_deletions(
 /// (`user_allow`/`user_roles`), by raw `user_id`. `table`/`column` are
 /// always one of the two hardcoded call sites below — never user input —
 /// so building the query string with them is safe.
+///
+/// SECURITY: the allow-list check below is defense-in-depth, not a fix
+/// for a currently-exploitable issue — both real call sites already
+/// pass only hardcoded literals. But `table`/`column` genuinely can't
+/// be bound as query parameters the way `user_id` is (most SQL engines
+/// don't support parameterizing identifiers at all), so this function
+/// has no choice but to build that part of the query with `format!`.
+/// Without an explicit check, nothing stops some future change from
+/// passing a request-derived value in here and silently turning this
+/// into a real SQL injection point, with no compiler warning to catch
+/// it. The check turns "safe because every current caller happens to
+/// be careful" into "safe because the function itself refuses anything
+/// outside a known-good set."
 fn load_values_for_user(
     conn: &mut DbConnection,
     table: &str,
     column: &str,
     user_id: i64,
 ) -> Result<Vec<String>, String> {
+    const ALLOWED: &[(&str, &str)] = &[("user_allow", "cidr"), ("user_roles", "role")];
+    if !ALLOWED.contains(&(table, column)) {
+        return Err(format!(
+            "load_values_for_user: refusing unrecognized table/column ({table:?}, {column:?}) — not in the allow-list"
+        ));
+    }
+
     let query = format!("SELECT {column} AS value FROM {table} WHERE user_id = ");
     match conn {
         DbConnection::Postgres(c) => sql_query(format!("{query}$1"))

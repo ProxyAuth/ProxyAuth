@@ -103,7 +103,16 @@ async fn clear_otpkey_anywhere(data: &web::Data<AppState>, username: &str) -> Re
 /// on success, and updates whichever in-memory overlay is relevant,
 /// same reasoning as `clear_otpkey_anywhere`.
 async fn add_otpkey_anywhere(data: &web::Data<AppState>, username: &str) -> Result<String, String> {
-    add_otpkey("/etc/proxyauth/config/config.json", username);
+    if let Err(e) = add_otpkey("/etc/proxyauth/config/config.json", username) {
+        // Not necessarily fatal here — "user not found in the file" is
+        // the expected, normal case for a database-backed account, and
+        // the file-re-read fallback below (then the database branch
+        // further down) already handles that correctly either way.
+        // Logged so a *genuine* failure (unreadable/malformed
+        // config.json) is still visible somewhere, now that it no
+        // longer panics loudly the way it used to.
+        tracing::debug!("add_otpkey (file): {e}");
+    }
 
     if let Ok(config_str) = std::fs::read_to_string("/etc/proxyauth/config/config.json") {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {

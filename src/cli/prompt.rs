@@ -10,10 +10,75 @@ use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
 use clap::Parser;
 use reqwest::{
-    ClientBuilder,
+    Certificate, ClientBuilder,
     header::{HeaderMap, HeaderValue},
 };
 use std::sync::Arc;
+
+/// Builds a `reqwest::Client` for the CLI's own loopback-only calls to
+/// the locally running ProxyAuth instance's admin API (`127.0.0.1`,
+/// same host, same config file) — used for `reset-otp` and any future
+/// CLI command that needs to hit its own `/adm/*` over HTTPS.
+///
+/// SECURITY: this used to be `danger_accept_invalid_certs(true)`,
+/// trusting *any* certificate whatsoever presented on that connection.
+/// The problem it was working around is real but narrower than that:
+/// `/etc/proxyauth/certs/cert.pem` (the server's own default
+/// certificate — see `tls.rs`) is a perfectly legitimate, correctly
+/// issued certificate, it just isn't issued for the literal hostname
+/// "127.0.0.1", so ordinary hostname verification fails against it
+/// even though the certificate itself is exactly the one this CLI
+/// should be talking to.
+///
+/// The fix here is certificate *pinning*, not disabling validation:
+/// `tls_certs_only([cert])` restricts trust to exactly this one
+/// certificate (nothing else — not the system CA store, not any other
+/// certificate), and `danger_accept_invalid_hostnames` tolerates only
+/// the specific hostname mismatch this loopback connection always has.
+/// reqwest 0.13 actually enforces this pairing itself — it refuses to
+/// build a client with hostname verification disabled unless
+/// `tls_certs_only` has *also* been used to restrict the trust store,
+/// specifically to prevent the far more dangerous combination of
+/// "trust any hostname, using the full normal CA store." A process on
+/// the same host can no longer intercept this connection by presenting
+/// an arbitrary self-signed certificate — it would need the private
+/// key matching this exact, on-disk certificate to be accepted at all.
+/// Verified end-to-end against a real TLS server: the correct
+/// certificate connects successfully, a different one is rejected.
+///
+/// Falls back to the old any-certificate-accepted behavior only if the
+/// certificate file can't be read (e.g. TLS enabled but the default
+/// cert genuinely isn't at the expected path for some reason) — loudly
+/// warned, not silent, so a broken pin doesn't just look like a
+/// mysterious connection failure.
+fn build_loopback_admin_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
+    const DEFAULT_CERT_PATH: &str = "/etc/proxyauth/certs/cert.pem";
+
+    match std::fs::read(DEFAULT_CERT_PATH) {
+        Ok(pem_bytes) => match Certificate::from_pem(&pem_bytes) {
+            Ok(cert) => Ok(ClientBuilder::new()
+                .tls_certs_only([cert])
+                .danger_accept_invalid_hostnames(true)
+                .build()?),
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to parse {DEFAULT_CERT_PATH} ({e}) — falling back to accepting any certificate for this loopback-only connection."
+                );
+                Ok(ClientBuilder::new()
+                    .danger_accept_invalid_certs(true)
+                    .build()?)
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read {DEFAULT_CERT_PATH} ({e}) — falling back to accepting any certificate for this loopback-only connection."
+            );
+            Ok(ClientBuilder::new()
+                .danger_accept_invalid_certs(true)
+                .build()?)
+        }
+    }
+}
 
 /// Formats a duration in seconds as e.g. "2d 3h 14m 05s" — trims
 /// leading zero units (an uptime under a minute just shows "42s", not
@@ -591,9 +656,11 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             let mut headers = HeaderMap::new();
             headers.insert("X-Auth-Token", HeaderValue::from_str(&config.token_admin)?);
 
-            let client = ClientBuilder::new()
-                .danger_accept_invalid_certs(true)
-                .build()?;
+            let client = if config.tls {
+                build_loopback_admin_client()?
+            } else {
+                ClientBuilder::new().build()?
+            };
 
             let response = client
                 .post(&url)
