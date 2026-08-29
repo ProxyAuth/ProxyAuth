@@ -227,9 +227,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aead"
-version = "0.6.0-rc.10"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b657e772794c6b04730ea897b66a058ccd866c16d1967da05eeeecec39043fe"
+checksum = "1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99"
 dependencies = [
  "crypto-common 0.2.1",
  "inout",
@@ -714,9 +714,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20poly1305"
-version = "0.11.0-rc.3"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c9ed179664f12fd6f155f6dd632edf5f3806d48c228c67ff78366f2a0eb6b5e"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
 dependencies = [
  "aead",
  "chacha20",
@@ -1658,11 +1658,11 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hkdf"
-version = "0.13.0-rc.5"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbb55385998ae66b8d2d5143c05c94b9025ab863966f0c94ce7a5fde30105092"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
 dependencies = [
- "hmac 0.13.0-rc.6",
+ "hmac 0.13.0",
 ]
 
 [[package]]
@@ -1676,9 +1676,9 @@ dependencies = [
 
 [[package]]
 name = "hmac"
-version = "0.13.0-rc.6"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60017b071c523c9e5a55dd1253582bff6150c5e96a7e8511e419de1ab5ee97f9"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.2",
 ]
@@ -2876,9 +2876,9 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "poly1305"
-version = "0.9.0-rc.6"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19feddcbdf17fad33f40041c7f9e768faf19455f32a6d52ba1b8b65ffc7b1cae"
+checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
 dependencies = [
  "cpufeatures 0.3.0",
  "universal-hash",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "proxyauth"
-version = "1.1.1-beta0"
+version = "1.1.1"
 dependencies = [
  "actix-governor",
  "actix-http",
@@ -3014,7 +3014,7 @@ dependencies = [
  "h2 0.4.16",
  "hex",
  "hkdf",
- "hmac 0.13.0-rc.6",
+ "hmac 0.13.0",
  "http 1.4.0",
  "http-body-util",
  "hyper 1.8.1",

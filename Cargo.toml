@@ -49,7 +49,7 @@ chrono-tz = "0.10.3"
 tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 hex = "0.4.3"
-chacha20poly1305 = "0.11.0-rc.3" # stable version 0.10.1
+chacha20poly1305 = "0.11" # stable version 0.10.1
 actix-governor = "0.10"
 quanta = "0.12.5"
 argon2 = "0.5"
@@ -92,7 +92,7 @@ flate2 = "1"
 subtle = "2"
 brotli = "3.3"
 lru = "0.16"
-hkdf = "0.13.0-rc.5"
+hkdf = "0.13"
 regex = "1"
 serial_test = "3" # it's for coverage code
 notify = "6"
@@ -100,7 +100,7 @@ arc-swap = "1.8.0"
 diesel = { version = "2.3", features = ["postgres", "mysql", "chrono"] }
 http = "1"
 hyper-tls = "0.5"
-hmac = "0.13.0-rc.2"
+hmac = "0.13"
 cookie = "0.18"
 lettre = { version = "0.11.22", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
 rpassword = "7.3"
