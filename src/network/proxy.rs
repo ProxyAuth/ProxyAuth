@@ -391,6 +391,20 @@ fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, ru
 /// file path, whose many internal early-returns make applying headers
 /// once at its single call site simpler than touching every one of
 /// them).
+/// Whether an authenticated visit to "/" has somewhere meaningful to
+/// redirect to — i.e., whether `login_redirect_url` resolves to
+/// anything other than "/" itself. See the two call sites' own
+/// comments for why this guard exists: `login_redirect_url` defaults
+/// to "/" when unconfigured, and without this check, that default
+/// turns a visit to "/" into a redirect to "/", forever
+/// (`NS_ERROR_REDIRECT_LOOP` in the browser) — discovered on an
+/// oidc-enabled vhost specifically, but the underlying bug applies to
+/// any vhost with `required_login: true` on "/" and no
+/// `login_redirect_url` configured, oidc or not.
+fn redirect_target_is_meaningful(config: &AppConfig) -> bool {
+    config.login_redirect_url.as_deref().unwrap_or("/") != "/"
+}
+
 fn apply_custom_headers(resp: &mut HttpResponse, rule: &RouteRule) {
     for (name, value) in &rule.headers {
         if let (Ok(header_name), Ok(header_value)) = (
@@ -668,7 +682,7 @@ pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -
     builder
 }
 
-fn is_secure_request(req: &HttpRequest, config: &AppConfig) -> bool {
+pub(crate) fn is_secure_request(req: &HttpRequest, config: &AppConfig) -> bool {
     if is_trusted_peer(req, config) {
         // Trusted proxy (e.g. local nginx) already terminated TLS and is
         // telling us the original scheme was https — trust it.
@@ -1048,7 +1062,14 @@ async fn check_static_auth(
     rule: &RouteRule,
     ip: &str,
 ) -> Result<(String, String), HttpResponse> {
-    if !rule.required_login {
+    // SECURITY/CORRECTNESS: same gap already found and fixed three
+    // times elsewhere in this file (the two `required_login` checks
+    // in `proxy_with_proxy`/`proxy_without_proxy`, and the early
+    // "already has a session" check for "/") — a static route on an
+    // oidc-enabled vhost was never meant to have ProxyAuth's own
+    // required_login enforcement apply at all; the backend makes its
+    // own auth decision via the OIDC token it receives instead.
+    if !rule.required_login || rule.oidc.is_some() {
         return Ok((String::new(), String::new()));
     }
 
@@ -1150,7 +1171,155 @@ pub async fn global_proxy(
         }
     }
 
+    // OIDC provider endpoints — same interception style as the ACME
+    // block above, checked ahead of normal routing. Only matches on a
+    // vhost that actually has `oidc:` configured on at least one of
+    // its routes; every other vhost's traffic falls through to
+    // normal routing unaffected, even if a request happens to hit
+    // these exact paths. Full flow: discovery/jwks (read-only) below,
+    // then `/oidc/authorize` (browser-facing) and `POST /oidc/token`
+    // (server-to-server) further down, `/oidc/userinfo` alongside
+    // discovery/jwks since it's also Bearer-token-only with no
+    // session/browser involvement.
+    if req.method() == actix_web::http::Method::GET {
+        let path = req.path();
+        if path == "/.well-known/openid-configuration" || path == "/oidc/jwks.json" {
+            if let Some(host) = request_host(&req) {
+                if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
+                    if rule.oidc.is_some() {
+                        let issuer = format!("https://{host}");
+                        let mut resp = if path == "/oidc/jwks.json" {
+                            crate::proto::oidc_provider::discovery::jwks_handler()
+                        } else {
+                            crate::proto::oidc_provider::discovery::discovery_handler(&issuer)
+                        };
+                        apply_custom_headers(&mut resp, rule);
+                        return Ok(resp);
+                    }
+                }
+            }
+        }
+
+        // `/oidc/userinfo` — Bearer-token-only, no browser/session
+        // involvement, so (unlike `/oidc/authorize`) it can be dispatched
+        // inline here the same way discovery/JWKS are, rather than
+        // needing its own block below.
+        if path == "/oidc/userinfo" {
+            if let Some(host) = request_host(&req) {
+                if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
+                    if rule.oidc.is_some() {
+                        let mut resp = crate::proto::oidc_provider::userinfo::userinfo_handler(
+                            req.clone(),
+                            data.clone(),
+                        )
+                        .await;
+                        apply_custom_headers(&mut resp, rule);
+                        return Ok(resp);
+                    }
+                }
+            }
+        }
+
+        // `/oidc/end-session` — RP-Initiated Logout, also Bearer/query-only,
+        // no request body needed, dispatched inline the same way.
+        if path == "/oidc/end-session" {
+            if let Some(host) = request_host(&req) {
+                if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
+                    if rule.oidc.is_some() {
+                        let mut resp = crate::proto::oidc_provider::logout::end_session_handler(
+                            req.clone(),
+                            data.clone(),
+                        )
+                        .await;
+                        apply_custom_headers(&mut resp, rule);
+                        return Ok(resp);
+                    }
+                }
+            }
+        }
+
+    }
+
+    // `/oidc/authorize` needs the full request (query params, request
+    // body, session cookie/Authorization header) rather than just the
+    // path, so it's handled by its own function instead of inline
+    // here — but the vhost-has-oidc-configured gate is checked first,
+    // the same way, so a vhost without `oidc:` is completely
+    // unaffected even if something on it happens to be named
+    // `/oidc/authorize`.
+    //
+    // Unlike discovery/JWKS/userinfo/end-session above, this checks
+    // *both* GET (the browser landing here from the relying party)
+    // and POST (the login form `/oidc/authorize` itself renders submitting
+    // back to this same URL — see `authorize::render_login_form`) —
+    // it can't live inside the GET-only block above for that reason.
+    if req.path() == "/oidc/authorize"
+        && (req.method() == actix_web::http::Method::GET
+            || req.method() == actix_web::http::Method::POST)
+    {
+        if let Some(host) = request_host(&req) {
+            if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
+                if rule.oidc.is_some() {
+                    let mut resp = crate::proto::oidc_provider::authorize::authorize_handler(
+                        req.clone(),
+                        body,
+                        data.clone(),
+                    )
+                    .await;
+                    apply_custom_headers(&mut resp, rule);
+                    return Ok(resp);
+                }
+            }
+        }
+    }
+
+    // `POST /token` — server-to-server, called by the relying party
+    // directly (never via the browser), so there's no return_to/login
+    // detour to consider here the way `/oidc/authorize` has. Same
+    // oidc-configured-vhost gate as every other interception in this
+    // block.
+    if req.method() == actix_web::http::Method::POST && req.path() == "/oidc/token" {
+        if let Some(host) = request_host(&req) {
+            if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
+                if rule.oidc.is_some() {
+                    let mut resp = crate::proto::oidc_provider::token::token_handler(
+                        req.clone(),
+                        body,
+                        data.clone(),
+                    )
+                    .await;
+                    apply_custom_headers(&mut resp, rule);
+                    return Ok(resp);
+                }
+            }
+        }
+    }
+
     if req.method() == actix_web::http::Method::OPTIONS {
+        // The OIDC provider's own discovery/JWKS documents are meant
+        // to be publicly, universally fetchable — see
+        // `proto::oidc_provider::discovery`'s own reasoning for why
+        // their actual GET responses always carry
+        // `Access-Control-Allow-Origin: *` unconditionally, regardless
+        // of this vhost's own `cors_origins` allow-list. This preflight
+        // handler didn't know about that special case at all: it
+        // checked every path against the same vhost-wide allow-list,
+        // rejecting a genuinely legitimate preflight from any caller
+        // whose origin wasn't explicitly listed — exactly the callers
+        // these two endpoints exist to serve.
+        if req.path() == "/.well-known/openid-configuration" || req.path() == "/oidc/jwks.json" {
+            if let Some(rule) = find_vhost_route(request_host(&req).as_deref(), &data.routes.routes) {
+                if rule.oidc.is_some() {
+                    return Ok(HttpResponse::Ok()
+                        .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+                        .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"))
+                        .insert_header((header::ACCESS_CONTROL_ALLOW_HEADERS, "Authorization, Content-Type, Accept"))
+                        .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
+                        .finish());
+                }
+            }
+        }
+
         let origin_header = req.headers().get(header::ORIGIN);
         let origin = origin_header.and_then(|v| v.to_str().ok());
         let preflight_vhost_route =
@@ -1211,9 +1380,24 @@ pub async fn global_proxy(
     // one, the same way the auth flow itself does.
     let early_vhost_route =
         find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
-    let early_session_cookie_enabled = early_vhost_route
-        .map(|r| r.session_cookie_enabled(&data.config))
-        .unwrap_or(data.config.session_cookie);
+    // SECURITY/CORRECTNESS: same gap as the two `required_login`
+    // checks in `proxy_with_proxy`/`proxy_without_proxy` — this "skip
+    // the logged-out landing page if there's already a session" check
+    // was never meant to run at all on an oidc-enabled vhost (its
+    // backend has its own, entirely separate session/landing-page
+    // logic), but never had a code-level bypass added either. Left
+    // unfixed: it ran for every "/" visit regardless, and its own
+    // `existing_session_response` call can end up at
+    // `render_error_page`, which requires the *global*
+    // `logout_redirect_url` (a different setting from this vhost's
+    // own `oidc.logout_redirect_uris`) to be configured — failing
+    // with "logout_redirect_url is not configured" on a vhost that
+    // was never meant to need it in the first place.
+    let early_oidc_enabled = early_vhost_route.map(|r| r.oidc.is_some()).unwrap_or(false);
+    let early_session_cookie_enabled = !early_oidc_enabled
+        && early_vhost_route
+            .map(|r| r.session_cookie_enabled(&data.config))
+            .unwrap_or(data.config.session_cookie);
     if early_session_cookie_enabled {
         let early_logout_redirect_url = early_vhost_route
             .and_then(|r| r.resolved_logout_redirect_url(&data.config))
@@ -1379,7 +1563,14 @@ pub async fn proxy_with_proxy(
     }
 
     // ── CSRF ────────────────────────────────────────────────────────────────
-    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() {
+    // `rule.oidc.is_none()`: on an oidc-enabled vhost, the backend's
+    // own frontend has no knowledge of ProxyAuth's CSRF mechanism at
+    // all — it was never issued a ProxyAuth CSRF token, and never
+    // will be. Without this gate, every state-changing request the
+    // backend's own app makes to itself (through ProxyAuth) would be
+    // rejected as an invalid CSRF request, breaking the backend
+    // entirely rather than just the parts ProxyAuth itself handles.
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() && rule.oidc.is_none() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
             LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>invalid csrf request</h1></body></html>"#;
@@ -1481,7 +1672,17 @@ pub async fn proxy_with_proxy(
         .map_err(|e| error::ErrorBadRequest(format!("Invalid proxy URI: {}", e)))?;
 
     // ── Auth ────────────────────────────────────────────────────
-    let (username, token_id) = if rule.required_login {
+    // SECURITY/CORRECTNESS: `oidc:` means this vhost's backend makes
+    // its own auth decision via the token it receives from the OIDC
+    // flow — ProxyAuth's own required_login/session enforcement was
+    // always meant to step aside entirely here (see `RouteRule::oidc`'s
+    // own doc comment), but this specific check never actually had a
+    // code-level bypass added for it, only the 5 dedicated OIDC
+    // endpoints did. Left unfixed, this was reachable even on an
+    // oidc-enabled vhost, and its own root-path redirect below could
+    // self-loop when `login_redirect_url` isn't configured (defaults
+    // to "/", redirecting "/" to "/" — exactly what it looks like).
+    let (username, token_id) = if rule.required_login && rule.oidc.is_none() {
         let token_header = req
             .headers()
             .get("Authorization")
@@ -1539,10 +1740,19 @@ pub async fn proxy_with_proxy(
         // this route" — see `AppConfig::route_access_decision`. Also
         // what `proxyauth routes-audit`/`check-access` call, so that
         // tool can never silently disagree with what's enforced here.
-        if !data
-            .config
-            .route_access_decision(rule, &username)
-            .is_allowed()
+        //
+        // `rule.oidc.is_none()`: on an oidc-enabled vhost,
+        // `required_login` was already bypassed above, leaving
+        // `username` empty — checking that empty username against
+        // `allow_users`/`allow_groups`/`allow_roles` here would reject
+        // every single request regardless of who the backend's own
+        // OIDC-based auth actually let through, since ProxyAuth itself
+        // never resolved a real username to check in the first place.
+        if rule.oidc.is_none()
+            && !data
+                .config
+                .route_access_decision(rule, &username)
+                .is_allowed()
         {
             warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
             let mut resp = HttpResponse::Unauthorized();
@@ -1551,7 +1761,15 @@ pub async fn proxy_with_proxy(
             return Ok(resp.body("403 Forbidden"));
         }
 
-        if req.uri() == "/" || req.uri() == "" {
+        // SECURITY/CORRECTNESS: `login_redirect_url` defaults to "/"
+        // when unconfigured — without this check, an authenticated
+        // visitor hitting "/" on a vhost that never set its own
+        // `login_redirect_url` gets redirected to "/", which redirects
+        // to "/", forever (`NS_ERROR_REDIRECT_LOOP` in the browser).
+        // Redirecting only when there's genuinely somewhere else to
+        // go turns "misconfigured" into "just proxies '/' through
+        // normally" instead of a hard failure.
+        if (req.uri() == "/" || req.uri() == "") && redirect_target_is_meaningful(&data.config) {
             let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
             return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
@@ -1605,9 +1823,14 @@ pub async fn proxy_with_proxy(
     for (key, value) in req.headers() {
         let key_str = key.as_str();
 
-        // Authorization is consumed by ProxyAuth only when
-        // the route itself requires ProxyAuth authentication.
-        if key_str == "authorization" && rule.required_login {
+        // Authorization is consumed by ProxyAuth only when the
+        // route itself requires ProxyAuth authentication — and on an
+        // oidc-enabled vhost, ProxyAuth never actually consumes it
+        // for that purpose at all (see the `required_login` gate
+        // above), regardless of what `required_login` is literally
+        // set to, so it should always reach the backend transparently
+        // there.
+        if key_str == "authorization" && rule.required_login && rule.oidc.is_none() {
             continue;
         }
 
@@ -1772,7 +1995,12 @@ pub async fn proxy_with_proxy(
         client_resp.insert_header(("Expires", "0"));
     }
 
-    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) {
+    // `rule.oidc.is_none()`: no point rewriting the backend's own
+    // response body looking for `{{ csrf_token }}` tags it was never
+    // going to contain — the backend doesn't speak ProxyAuth's own
+    // templating on an oidc-enabled vhost, same reasoning as the CSRF
+    // validation gate above.
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.oidc.is_none() {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {
@@ -1912,7 +2140,7 @@ pub async fn proxy_without_proxy(
     }
 
     // ── CSRF ─────────────────────────────────────────────────────────
-    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() {
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() && rule.oidc.is_none() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
             LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html>
@@ -2057,7 +2285,17 @@ pub async fn proxy_without_proxy(
         .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
 
     // ── Auth ─────────────────────────────────────────────────────────
-    let (username, token_id) = if rule.required_login {
+    // SECURITY/CORRECTNESS: `oidc:` means this vhost's backend makes
+    // its own auth decision via the token it receives from the OIDC
+    // flow — ProxyAuth's own required_login/session enforcement was
+    // always meant to step aside entirely here (see `RouteRule::oidc`'s
+    // own doc comment), but this specific check never actually had a
+    // code-level bypass added for it, only the 5 dedicated OIDC
+    // endpoints did. Left unfixed, this was reachable even on an
+    // oidc-enabled vhost, and its own root-path redirect below could
+    // self-loop when `login_redirect_url` isn't configured (defaults
+    // to "/", redirecting "/" to "/" — exactly what it looks like).
+    let (username, token_id) = if rule.required_login && rule.oidc.is_none() {
         let token_header = req
             .headers()
             .get("Authorization")
@@ -2124,10 +2362,16 @@ pub async fn proxy_without_proxy(
                 }
             };
 
-        if !data
-            .config
-            .route_access_decision(rule, &username)
-            .is_allowed()
+        // `rule.oidc.is_none()`: same reasoning as the twin check in
+        // `proxy_with_proxy` above — an oidc-enabled vhost already
+        // bypassed `required_login`, leaving `username` empty; without
+        // this gate, that empty username would fail
+        // `allow_users`/`allow_groups`/`allow_roles` unconditionally.
+        if rule.oidc.is_none()
+            && !data
+                .config
+                .route_access_decision(rule, &username)
+                .is_allowed()
         {
             let mut resp = HttpResponse::Unauthorized();
 
@@ -2143,7 +2387,11 @@ pub async fn proxy_without_proxy(
             return Ok(resp.body("401 Unauthorized"));
         }
 
-        if req.uri() == "/" || req.uri() == "" {
+        // SECURITY/CORRECTNESS: same guard as the twin check in
+        // `proxy_with_proxy` above — `login_redirect_url` defaulting
+        // to "/" when unconfigured otherwise makes an authenticated
+        // visit to "/" redirect to "/", forever.
+        if (req.uri() == "/" || req.uri() == "") && redirect_target_is_meaningful(&data.config) {
             let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
 
             return Ok(HttpResponse::SeeOther()
@@ -2192,9 +2440,14 @@ pub async fn proxy_without_proxy(
     for (key, value) in req.headers() {
         let key_str = key.as_str();
 
-        // Authorization is consumed by ProxyAuth only when
-        // the route itself requires ProxyAuth authentication.
-        if key_str == "authorization" && rule.required_login {
+        // Authorization is consumed by ProxyAuth only when the
+        // route itself requires ProxyAuth authentication — and on an
+        // oidc-enabled vhost, ProxyAuth never actually consumes it
+        // for that purpose at all (see the `required_login` gate
+        // above), regardless of what `required_login` is literally
+        // set to, so it should always reach the backend transparently
+        // there.
+        if key_str == "authorization" && rule.required_login && rule.oidc.is_none() {
             continue;
         }
 
@@ -2455,7 +2708,7 @@ pub async fn proxy_without_proxy(
     //
     // Never modify a HEAD response body.
     //
-    if !is_head && rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) {
+    if !is_head && rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.oidc.is_none() {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {

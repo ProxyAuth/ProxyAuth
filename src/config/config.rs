@@ -357,6 +357,39 @@ pub struct RouteRule {
     #[serde(default)]
     pub smtp: Option<crate::smtp::smtp::SmtpConfig>,
 
+    /// Turns this vhost into a genuine OIDC provider for the backend
+    /// sitting behind it — the backend (Grafana, Nextcloud, or
+    /// anything else that natively speaks OIDC as a relying party)
+    /// receives a real, independently-verifiable `id_token` via the
+    /// standard authorization code flow, instead of relying on
+    /// ProxyAuth's own header injection (`X-User`, `X-User-Roles`,
+    /// ...) or session cookie.
+    ///
+    /// **When this is set, ProxyAuth's own `required_login`/session
+    /// enforcement is bypassed for this vhost's proxied routes** — the
+    /// backend is responsible for its own auth decision via OIDC now,
+    /// the same way it would be if it sat behind any other OIDC
+    /// provider. What ProxyAuth *does* still do on this vhost: serve
+    /// `/.well-known/openid-configuration`, `/jwks.json`,
+    /// `/authorize`, `/token`, and `/userinfo` — intercepted ahead of
+    /// normal routing (see `global_proxy`) — using this vhost's own
+    /// `oidc.client_id`/`redirect_uris` to decide which requests are
+    /// legitimate. The rest of the vhost's traffic proxies straight
+    /// through, unauthenticated by ProxyAuth itself, exactly as if
+    /// `required_login` were never set.
+    ///
+    /// A user still authenticates against ProxyAuth's own account
+    /// store (file or database, same credential/TOTP verification as
+    /// everywhere else) — that happens *at* `/authorize`, packaged as
+    /// the OIDC login step, not via a separate mechanism. This field
+    /// changes how the *backend* receives proof of that login, not
+    /// how ProxyAuth itself verifies who's logging in.
+    ///
+    /// No global fallback, no per-route override — this is a
+    /// vhost-wide identity decision, set once on the `vhosts:` group.
+    #[serde(default)]
+    pub oidc: Option<crate::proto::oidc_provider::config::OidcProviderConfig>,
+
     /// Enables `{{ username }}`/`{{ csrf_token }}` tag substitution in
     /// this route's static files (and the shared error/logout page —
     /// see `network::error::render_error_page`). `None`/unset means
@@ -834,6 +867,13 @@ pub struct VhostGroup {
     pub smtp: Option<crate::smtp::smtp::SmtpConfig>,
 
     /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::oidc`. In practice this is where it belongs:
+    /// OIDC provider identity is a vhost-wide decision, not something
+    /// that makes sense to vary route-by-route within the same vhost.
+    #[serde(default)]
+    pub oidc: Option<crate::proto::oidc_provider::config::OidcProviderConfig>,
+
+    /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::tag_proxyauth`.
     #[serde(default)]
     pub tag_proxyauth: Option<bool>,
@@ -959,6 +999,9 @@ impl RouteConfig {
                 }
                 if route.smtp.is_none() {
                     route.smtp = group.smtp.clone();
+                }
+                if route.oidc.is_none() {
+                    route.oidc = group.oidc.clone();
                 }
                 if route.tag_proxyauth.is_none() {
                     route.tag_proxyauth = group.tag_proxyauth;

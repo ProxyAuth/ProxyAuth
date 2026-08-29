@@ -1,6 +1,6 @@
 use crate::AppConfig;
 use crate::AppState;
-use crate::config::config::{AuthRequest, User};
+use crate::config::config::{AuthRequest, RouteRule, User};
 use crate::network::error::render_error_page;
 use crate::network::proxy::client_ip;
 use crate::token::crypto::{calcul_cipher, derive_key_from_secret, encrypt};
@@ -167,6 +167,190 @@ pub fn verify_credentials_constant_time<'a>(
             None
         }
     }
+}
+
+/// Outcome of `check_login_credentials` — every caller (`/auth`, and
+/// the OIDC provider's own `POST /authorize` login step) needs to
+/// react differently to each case, so this stays a plain enum rather
+/// than folding straight into an `HttpResponse` here.
+pub enum LoginResult<'a> {
+    /// Credentials, IP allow-list, vhost login authorization, and TOTP
+    /// (if required) all checked out — safe to establish a session
+    /// for this user now.
+    Ok(&'a User),
+    /// Rejected at some check — `message` is a plain, non-specific
+    /// reason suitable for `render_error_page`. Deliberately not
+    /// detailed enough to distinguish "wrong password" from "TOTP
+    /// missing" from "IP denied" from the response alone, matching
+    /// `/auth`'s existing behavior of not giving an attacker a
+    /// finer-grained oracle than "the login didn't work."
+    Denied(&'static str),
+    /// Credentials (and TOTP, if required) checked out, but this
+    /// account is flagged `must_change_password` — the caller decides
+    /// what to do next (`/auth` redirects to `page_change_password`;
+    /// the OIDC provider currently just shows an error, since
+    /// completing a password change mid-authorization-code-flow isn't
+    /// wired up yet).
+    MustChangePassword(&'a User),
+}
+
+/// Runs every check `/auth` itself runs between "a username/password
+/// pair arrived" and "a session can be established" — credential
+/// verification (constant-time, see `verify_credentials_constant_time`
+/// above), IP allow-list, vhost-level login authorization, TOTP (if
+/// `login_via_otp` resolves to true for this vhost), and the
+/// must-change-password flag — in the same order, with the same
+/// security properties, so a second caller (the OIDC provider's own
+/// login step) never has to re-derive or risk drifting from this
+/// logic. Logging (`warn!`) happens here too, once, rather than in
+/// each caller.
+pub async fn check_login_credentials<'a>(
+    data: &web::Data<AppState>,
+    combined_users: &'a [User],
+    vhost_route: Option<&RouteRule>,
+    username: &str,
+    password: &str,
+    totp_code: Option<&str>,
+    ip: &str,
+) -> LoginResult<'a> {
+    let Some(matched_user) = verify_credentials_constant_time(combined_users, username, password)
+    else {
+        return LoginResult::Denied("Invalid credentials");
+    };
+
+    if !is_ip_allowed(ip, matched_user) {
+        warn!("[{}] Access ip denied for user {}", ip, matched_user.username);
+        return LoginResult::Denied("Access denied");
+    }
+
+    if let Some(vr) = vhost_route {
+        if !vr.login_authorized(&matched_user.username, &data.config) {
+            warn!(
+                "[{}] Login denied for user {} — not authorized for this vhost (allow_users/allow_groups/allow_roles/exclude_users)",
+                ip, matched_user.username
+            );
+            return LoginResult::Denied("Access denied");
+        }
+    }
+
+    let login_via_otp_enabled = vhost_route
+        .map(|r| r.resolved_login_via_otp(&data.config))
+        .unwrap_or(data.config.login_via_otp);
+
+    if login_via_otp_enabled {
+        let Some(totp_code) = totp_code.map(|c| c.trim()).filter(|c| !c.is_empty()) else {
+            warn!("[{}] Missing TOTP code for user {}", ip, matched_user.username);
+            return LoginResult::Denied("Missing TOTP code");
+        };
+
+        let resolved_otpkey = crate::config::config::resolve_otpkey(
+            data,
+            &matched_user.username,
+            matched_user.otpkey.as_deref(),
+        );
+
+        let Some(totp_key) = resolved_otpkey.as_deref() else {
+            warn!("[{}] Missing TOTP secret for user {}", ip, matched_user.username);
+            return LoginResult::Denied("Missing TOTP secret");
+        };
+
+        let Some(decoded_secret) =
+            base32::decode(base32::Alphabet::Rfc4648 { padding: false }, totp_key)
+        else {
+            warn!("Invalid base32 TOTP secret for user {}", matched_user.username);
+            return LoginResult::Denied("Internal TOTP error");
+        };
+
+        let totp = TOTP::new(Algorithm::SHA512, 6, 0, 30, decoded_secret)
+            .expect("TOTP creation failed");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let generated_code = totp.generate(now);
+
+        // SECURITY: constant-time comparison — see the identical
+        // comment at /auth's own original TOTP check for why a plain
+        // `!=` here would leak timing information.
+        if !bool::from(generated_code.as_bytes().ct_eq(totp_code.as_bytes())) {
+            warn!("Invalid TOTP code for user {}", matched_user.username);
+            return LoginResult::Denied("Invalid TOTP code");
+        }
+    }
+
+    let must_change = crate::config::config::resolve_must_change_password(
+        data,
+        &matched_user.username,
+        matched_user.must_change_password,
+    );
+    if must_change {
+        return LoginResult::MustChangePassword(matched_user);
+    }
+
+    LoginResult::Ok(matched_user)
+}
+
+/// Builds a signed, encrypted ProxyAuth session token and its
+/// corresponding `Set-Cookie` header value — the exact same
+/// construction `/auth`'s own success path uses (`generate_token` →
+/// fast-mode passthrough or `calcul_cipher` → `encrypt`), factored out
+/// so the OIDC provider's login step produces byte-for-byte the same
+/// kind of token `/auth` would, verifiable by the exact same
+/// `token::security::validate_token` everything else already uses.
+///
+/// Returns `(bearer_token, cookie_header_value)` — `bearer_token` is
+/// what a caller not using cookies (or issuing an OIDC session
+/// separately) would use in an `Authorization: Bearer` header;
+/// `cookie_header_value` is the complete `Set-Cookie` string.
+pub fn establish_session(
+    username: &str,
+    index_user: usize,
+    config: &Arc<AppConfig>,
+    max_age_session_cookie: i64,
+) -> (String, String) {
+    // `config: &Arc<AppConfig>` — `.clone()` here clones the `Arc`
+    // itself (a cheap refcount bump), not the underlying `AppConfig`,
+    // which doesn't implement `Clone` at all (only ever handled
+    // behind an `Arc` throughout this codebase, never copied).
+    let expiry = get_expiry_with_timezone(config.clone(), None);
+    let id_token = generate_random_string(48);
+    let expiry_ts = expiry.with_timezone(&Utc).timestamp().to_string();
+
+    let token = generate_token(username, config, &expiry_ts, &id_token);
+    let key = derive_key_from_secret(&config.secret);
+
+    let token_generate = if config.fast {
+        token.clone()
+    } else {
+        calcul_cipher(token.clone())
+    };
+
+    // SECURITY/CORRECTNESS: `index_user` here is genuinely read back
+    // by `token::security::validate_token` (`config.user_by_index(...)`)
+    // to resolve *which account* this token belongs to — it is not a
+    // cosmetic field. The caller must pass the matched user's real
+    // position in `AppConfig::combined_users()`, not a placeholder;
+    // getting this wrong doesn't fail loudly, it silently resolves a
+    // valid session to the *wrong* user.
+    let cipher_token = format!(
+        "{}|{}|{}|{}",
+        token_generate, expiry_ts, index_user, id_token
+    );
+    let token_encrypt = encrypt(&cipher_token, &key);
+
+    let session_max_age = max_age_session_cookie.min(config.token_expiry_seconds);
+    let seconds = expiry.signed_duration_since(Utc::now()).num_seconds().max(0) as u64;
+    let max_age = actix_web::cookie::time::Duration::seconds(seconds.min(session_max_age as u64) as i64);
+
+    let cookie = Cookie::build("session_token", token_encrypt.clone())
+        .path("/")
+        .max_age(max_age)
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Strict)
+        .finish();
+
+    (token_encrypt, cookie.to_string())
 }
 
 pub fn generate_random_string(len: usize) -> String {
@@ -391,6 +575,39 @@ pub async fn existing_session_response(
     }
 }
 
+/// Validates a `return_to` value as safe to redirect a browser to
+/// after a successful login — a same-origin relative path, nothing
+/// else. This is the classic open-redirect vulnerability class:
+/// without strict validation here, an attacker could craft a login
+/// link with `return_to=https://evil.example.com` (an absolute URL)
+/// or `return_to=//evil.example.com` (browsers treat a leading `//`
+/// as protocol-relative — same practical effect as a full absolute
+/// URL) and have a victim's browser sent off-site immediately after
+/// they type their real password into a genuine ProxyAuth login form.
+///
+/// Deliberately strict rather than trying to enumerate every possible
+/// bypass: only a value starting with exactly one `/` — not `//`, not
+/// `/\` (some environments normalize a leading backslash into a
+/// second forward slash, which browsers then also treat as
+/// protocol-relative) — and containing no `:` at all (blocks
+/// `javascript:`/`data:`/an embedded absolute URL, and does so without
+/// needing to maintain a scheme blocklist that could miss one) is
+/// accepted. Tested against a real, meaningful set of bypass payloads
+/// before this was wired in anywhere — see the OIDC provider's
+/// `/authorize` endpoint for the first real caller.
+fn validate_return_to(value: &str) -> Option<&str> {
+    if !value.starts_with('/') {
+        return None;
+    }
+    if value.starts_with("//") || value.starts_with("/\\") {
+        return None;
+    }
+    if value.contains(':') {
+        return None;
+    }
+    Some(value)
+}
+
 pub async fn auth(
     req: HttpRequest,
     data: web::Data<AppState>,
@@ -412,6 +629,33 @@ pub async fn auth(
     let login_redirect_target = vhost_route
         .and_then(|r| r.resolved_login_redirect_url(&data.config))
         .unwrap_or(data.config.login_redirect_url.as_deref().unwrap_or("/"));
+
+    // `return_to` lets a caller ask to land somewhere specific after a
+    // successful login instead of the vhost's own configured default
+    // — used by the OIDC provider's `/authorize` endpoint to send the
+    // browser back there once a session exists, completing the
+    // authorization-code flow, without needing its own separate login
+    // mechanism.
+    //
+    // SECURITY: this is user-supplied input (a query parameter),
+    // unlike `login_redirect_target` above (admin-configured, in
+    // config.json/routes.yml). Validated strictly as a same-origin
+    // relative path — see `validate_return_to`'s own doc comment for
+    // the open-redirect payloads this specifically guards against.
+    // Falls back to the normal `login_redirect_target` if absent or
+    // invalid; never silently ignored in a way that could look like
+    // it worked when it didn't — an invalid `return_to` just means
+    // "use the default," not an error, since a stale or tampered
+    // `return_to` shouldn't block an otherwise-legitimate login.
+    let login_redirect_target: String = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            let pairs: Vec<(String, String)> = serde_urlencoded::from_str(q).ok()?;
+            pairs.into_iter().find(|(k, _)| k == "return_to").map(|(_, v)| v)
+        })
+        .and_then(|v| validate_return_to(&v).map(|s| s.to_string()))
+        .unwrap_or_else(|| login_redirect_target.to_string());
     let login_via_otp_enabled = vhost_route
         .map(|r| r.resolved_login_via_otp(&data.config))
         .unwrap_or(data.config.login_via_otp);
@@ -455,7 +699,7 @@ pub async fn auth(
     }
 
     if session_cookie_enabled {
-        let redirect_target = login_redirect_target;
+        let redirect_target = login_redirect_target.clone();
         if req.cookie("session_token").is_none() && !redirect_target.starts_with('/') {
             return HttpResponse::BadRequest()
                 .append_header(("server", "ProxyAuth"))
@@ -762,4 +1006,81 @@ pub async fn auth(
 
         return render_error_page(&req, data.clone(), "Invalid credentials").await;
     }
+}
+
+/// The real dispatch target registered for `POST /auth` — decides
+/// whether this request is handled by ProxyAuth's own login logic
+/// (`auth`, below) or proxied straight through to the backend.
+///
+/// A vhost with `oidc:` configured proxies *everything* not
+/// explicitly part of the OIDC provider's own surface straight
+/// through to the backend — see `RouteRule::oidc`'s own doc comment.
+/// `/auth` and `/logout` are ordinarily registered as fixed,
+/// always-matching routes ahead of any proxying at all (see
+/// `main.rs`), which would otherwise make them the one exception to
+/// that rule on every vhost, oidc-enabled or not. This dispatcher
+/// closes that: on an oidc-enabled vhost, a request to `/auth` proxies
+/// through like everything else (a relying party like Grafana has its
+/// own native login/session handling; ProxyAuth's own `/auth` was
+/// never meant to be reachable there at all). The OIDC provider's own
+/// login step doesn't depend on this being reachable — it verifies
+/// credentials directly via `check_login_credentials`/
+/// `establish_session` from inside `POST /authorize` instead.
+///
+/// Manually replicates `EitherAuth`'s own `Content-Type`-based
+/// Json/Form dispatch from `body: web::Bytes` rather than letting
+/// actix extract it automatically, since the oidc-or-not decision has
+/// to happen *before* the body is consumed one way or the other, and
+/// `body: web::Bytes` (needed for the proxying path) and
+/// `payload: EitherAuth` can't both be extractor parameters on the
+/// same handler without one of them consuming what the other needs.
+pub async fn auth_dispatch(
+    req: HttpRequest,
+    body: web::Bytes,
+    data: web::Data<AppState>,
+) -> Result<HttpResponse, ActixError> {
+    let vhost_route = crate::network::proxy::find_vhost_route(
+        crate::network::proxy::request_host(&req).as_deref(),
+        &data.routes.routes,
+    );
+
+    if vhost_route.map(|r| r.oidc.is_some()).unwrap_or(false) {
+        return crate::network::proxy::global_proxy(req, body, data).await;
+    }
+
+    let content_type = req
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let payload = if content_type.contains("application/json") {
+        match serde_json::from_slice::<AuthRequest>(&body) {
+            Ok(v) => EitherAuth::Json(v),
+            Err(_) => {
+                return Ok(HttpResponse::BadRequest()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("Invalid JSON body"));
+            }
+        }
+    } else if content_type.contains("application/x-www-form-urlencoded") {
+        match serde_urlencoded::from_bytes::<AuthRequest>(&body) {
+            Ok(v) => EitherAuth::Form(v),
+            Err(_) => {
+                return Ok(HttpResponse::BadRequest()
+                    .append_header(("server", "ProxyAuth"))
+                    .body("Invalid form body"));
+            }
+        }
+    } else {
+        return Ok(HttpResponse::BadRequest()
+            .append_header(("server", "ProxyAuth"))
+            .body("Unsupported Content-Type"));
+    };
+
+    Ok(auth(req.clone(), data, payload)
+        .await
+        .respond_to(&req)
+        .map_into_boxed_body())
 }
