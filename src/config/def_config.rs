@@ -107,14 +107,6 @@ pub fn peek_run_user_group() -> (String, Option<String>) {
     (run_user, run_group)
 }
 
-/// Back-compat wrapper for the default user — every existing call site
-/// (`prompt.rs`'s `stats` subcommand, tests, ...) keeps working
-/// unchanged. `main.rs`'s own startup uses `ensure_running_as` with
-/// `AppConfig.run_user` instead, since that's configurable.
-pub fn ensure_running_as_proxyauth() {
-    ensure_running_as("proxyauth");
-}
-
 pub fn ensure_running_as_root() {
     let uid = Uid::effective();
 

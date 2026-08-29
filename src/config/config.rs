@@ -1,5 +1,4 @@
 use crate::adm::method_otp::generate_base32_secret;
-use crate::network::shared_client::BoxBody;
 use crate::network::stats::RequestStats;
 use crate::revoke::db::RevokedTokenMap;
 use crate::smtp::smtp::SmtpConfig;
@@ -9,10 +8,6 @@ use arc_swap::ArcSwap;
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
 use dashmap::DashMap;
-use hyper_http_proxy::ProxyConnector;
-use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
 use ipnet::IpNet;
 use regex::Regex;
 use serde::Deserializer;
@@ -1365,6 +1360,25 @@ pub struct AppConfig {
     #[serde(default = "default_tls")]
     pub tls: bool,
 
+    /// Whether a route configured with a client certificate (`cert:`
+    /// in `routes.yml`, for mTLS to a backend) must actually use it.
+    ///
+    /// `false` (default, unchanged from prior behavior): if the
+    /// configured cert/key can't be read or fails to pair, the backend
+    /// connection silently falls back to no client authentication at
+    /// all — logged (`tracing::warn!`) but otherwise invisible from
+    /// ProxyAuth's own external behavior. A backend that relies on
+    /// mTLS to authenticate ProxyAuth as a legitimate caller has no
+    /// way to tell "mTLS is working" from "mTLS silently isn't" in
+    /// that case.
+    ///
+    /// `true`: the same failures instead fail the request outright
+    /// (502 Bad Gateway) rather than connecting without client
+    /// authentication. A broken certificate path becomes a loud,
+    /// visible failure instead of a quiet downgrade.
+    #[serde(default)]
+    pub strict_mtls: bool,
+
     #[serde(default = "default_csrf_token")]
     pub csrf_token: bool,
 
@@ -1525,12 +1539,6 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub routes: Arc<RouteConfig>,
     pub counter: Arc<CounterToken>,
-    #[allow(dead_code)]
-    pub client_normal: Client<HttpsConnector<HttpConnector>, BoxBody>,
-    #[allow(dead_code)]
-    pub client_with_cert: Client<HttpsConnector<HttpConnector>, BoxBody>,
-    #[allow(dead_code)]
-    pub client_with_proxy: Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>,
     pub revoked_tokens: RevokedTokenMap,
     pub stats: Arc<RequestStats>,
 
@@ -2536,56 +2544,77 @@ pub fn clear_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
 }
 
 #[allow(dead_code)]
-pub fn add_otpkey(config_path: &str, username: &str) {
+/// Generates and stores a new OTP key for `username` in `config.json`,
+/// unless one is already set (returns `Ok(false)` in that case — not
+/// an error, this endpoint's caller decides what "already enrolled"
+/// means for its own flow).
+///
+/// Returns `Ok(true)` if a key was generated and written, `Ok(false)`
+/// if the user already had one (nothing changed), and `Err(_)` on
+/// I/O/parse failure or an unknown username — the same `Result`-based
+/// pattern `clear_otpkey` already uses, and for the same reason: this
+/// is reachable from a live HTTP route (`/adm/auth/totp/get`), and
+/// this used to `.expect()` on every file read/parse/write step,
+/// panicking the request on a transiently unreadable or malformed
+/// config file. Also no longer prints the generated secret to stdout —
+/// a raw TOTP secret ending up in a captured log (systemd/journald, a
+/// redirected stdout, ...) is exactly the kind of exposure enrollment
+/// is supposed to protect against in the first place; the caller
+/// already gets the secret back through the normal `Ok(true)` /
+/// re-read path, nothing needs it printed here too.
+pub fn add_otpkey(config_path: &str, username: &str) -> Result<bool, String> {
     if !Path::new(config_path).exists() {
-        eprintln!("Config file not found: {}", config_path);
-        return;
+        return Err(format!("Config file not found: {}", config_path));
     }
 
-    let config_str =
-        fs::read_to_string(config_path).expect("Failed to read the configuration file.");
-    let mut json: Value =
-        serde_json::from_str(&config_str).expect("Invalid JSON format in configuration file.");
+    let config_str = fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read the configuration file: {e}"))?;
+    let mut json: Value = serde_json::from_str(&config_str)
+        .map_err(|e| format!("Invalid JSON format in configuration file: {e}"))?;
 
     let users = json
         .get_mut("users")
         .and_then(|u| u.as_array_mut())
-        .expect("Missing 'users' field in configuration file.");
+        .ok_or_else(|| "Missing 'users' field in configuration file.".to_string())?;
 
+    let mut found = false;
     let mut updated = false;
 
     for user in users.iter_mut() {
         let name = user.get("username").and_then(|u| u.as_str());
         if name == Some(username) {
+            found = true;
             if user.get("otpkey").is_some() {
-                println!("User '{}' already has an OTP key.", username);
+                // Already enrolled — not this function's job to decide
+                // whether that's fine or not (see `allow_totp_reenroll`
+                // for the vhost-level policy on that); just report
+                // nothing changed.
             } else {
                 let otpkey = generate_base32_secret(32);
                 user.as_object_mut()
-                    .unwrap()
-                    .insert("otpkey".to_string(), Value::String(otpkey.clone()));
-                println!(
-                    "OTP key successfully generated for '{}': {}",
-                    username, otpkey
-                );
+                    .ok_or_else(|| format!("User '{}' is not a JSON object.", username))?
+                    .insert("otpkey".to_string(), Value::String(otpkey));
                 updated = true;
             }
             break;
         }
     }
 
+    if !found {
+        return Err(format!(
+            "User '{}' not found in the configuration file.",
+            username
+        ));
+    }
+
     if updated {
         let updated_str = serde_json::to_string_pretty(&json)
-            .expect("Failed to serialize the updated configuration.");
+            .map_err(|e| format!("Failed to serialize the updated configuration: {e}"))?;
         fs::write(config_path, updated_str)
-            .expect("Failed to write the updated configuration file.");
-        println!("Configuration file has been updated.");
-    } else if !users
-        .iter()
-        .any(|u| u.get("username").and_then(|n| n.as_str()) == Some(username))
-    {
-        eprintln!("User '{}' not found in the configuration file.", username);
+            .map_err(|e| format!("Failed to write the updated configuration file: {e}"))?;
     }
+
+    Ok(updated)
 }
 
 fn deserialize_log_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>

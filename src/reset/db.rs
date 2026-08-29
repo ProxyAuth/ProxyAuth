@@ -125,12 +125,45 @@ pub fn create_token(username: &str, kind: ResetKind, ttl_secs: i64) -> Result<St
     Ok(token)
 }
 
-/// Checks a token: valid (exists, not expired) returns the username it
-/// was issued for. Does **not** consume it — a failed password
-/// submission (e.g. mismatched confirmation) shouldn't burn the token,
-/// the user should be able to retry with the same link. Call
-/// `consume_token` once the password change actually succeeds.
-pub fn validate_token(token: &str) -> Result<String, String> {
+/// Validates *and* consumes a token in one atomic step — checks it
+/// exists and isn't expired, and deletes it, within a single LMDB
+/// read-write transaction.
+///
+/// SECURITY: this exists specifically to close a real race condition
+/// that `validate_token` (read-only) followed by a later, separate
+/// `consume_token` call left open. Between those two calls, the caller
+/// typically does real work — hashing the new password with Argon2 is
+/// deliberately slow, tens to hundreds of milliseconds — during which
+/// the token is still present and still valid. Two requests carrying
+/// the *same* token, arriving close enough together to both land in
+/// that window, would both pass the old `validate_token` check before
+/// either one reached `consume_token`: the single-use guarantee this
+/// token exists to provide would be defeated, and whichever password
+/// write happened to land second would silently win.
+///
+/// Using one read-write transaction for both the check and the delete
+/// closes that window entirely — under `RESET_MUTEX` (already the
+/// established pattern every other function in this file uses for its
+/// own transaction), a second concurrent call for the same token
+/// either sees it already gone (if it arrives after this one commits)
+/// or blocks until this one finishes (if it arrives during), and in
+/// neither case can it observe the token as simultaneously "still
+/// valid."
+///
+/// UX note: unlike the old `validate_token`, this call consumes the
+/// token on success even if the caller's *own* subsequent work (e.g.
+/// the actual database/file write for the new password) later fails —
+/// there is no way to "peek" at a single-use token without this same
+/// class of race reappearing. A failure after this call succeeds means
+/// the user needs a fresh reset link, not a retry with the same one.
+/// This trade-off is deliberate: the checks that *don't* need the
+/// token at all (password confirmation match, minimum length) already
+/// run earlier in `reset_password_route`, before this is ever called,
+/// so a mistyped password never burns a token in the first place —
+/// only a genuine backend failure after a syntactically valid
+/// submission does, which is rare enough not to be worth reopening the
+/// race for.
+pub fn validate_and_consume_token(token: &str) -> Result<String, String> {
     use lmdb::Transaction;
 
     let env = env()?;
@@ -138,44 +171,43 @@ pub fn validate_token(token: &str) -> Result<String, String> {
     let db = env
         .open_db(Some(DB_NAME))
         .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
-    let txn = env
-        .begin_ro_txn()
-        .map_err(|e| format!("Failed to begin password-reset read txn: {e}"))?;
-    let bytes = txn
-        .get(db, &token.as_bytes())
-        .map_err(|_| "Invalid or expired reset token".to_string())?;
 
-    let entry: ResetEntry = serde_json::from_slice(bytes)
-        .map_err(|e| format!("Failed to deserialize reset token entry: {e}"))?;
-
-    if entry.expires_at <= OffsetDateTime::now_utc().unix_timestamp() {
-        return Err("Invalid or expired reset token".to_string());
-    }
-
-    Ok(entry.username)
-}
-
-/// Permanently invalidates a token — called once its password change
-/// has actually been applied, so the same link can't be reused.
-pub fn consume_token(token: &str) -> Result<(), String> {
-    use lmdb::Transaction;
-
-    let env = env()?;
-    let _guard = RESET_MUTEX.lock().map_err(|e| e.to_string())?;
-    let db = env
-        .open_db(Some(DB_NAME))
-        .map_err(|e| format!("Failed to open password-reset LMDB db: {e}"))?;
+    // A single read-write transaction for the whole check-then-delete —
+    // this is what makes it atomic. A read-only txn here, or a
+    // separate begin_rw_txn() later, would reopen exactly the race
+    // this function exists to close.
     let mut txn = env
         .begin_rw_txn()
         .map_err(|e| format!("Failed to begin password-reset write txn: {e}"))?;
-    // A token that's already gone (double-submit, race) is fine to
-    // no-op on — the outcome ("this token can't be used again") is
-    // already true either way.
-    let _ = txn.del(db, &token.as_bytes(), None);
-    txn.commit()
-        .map_err(|e| format!("Failed to commit reset token deletion: {e}"))?;
 
-    Ok(())
+    let bytes = txn
+        .get(db, &token.as_bytes())
+        .map_err(|_| "Invalid or expired reset token".to_string())?
+        .to_vec();
+
+    let entry: ResetEntry = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Failed to deserialize reset token entry: {e}"))?;
+
+    if entry.expires_at <= OffsetDateTime::now_utc().unix_timestamp() {
+        // Expired tokens are simply rejected here, not actively
+        // deleted — `purge_expired()` already sweeps these separately,
+        // and there's no race to close for a token that was never
+        // going to validate for anyone.
+        return Err("Invalid or expired reset token".to_string());
+    }
+
+    // Delete within the SAME transaction as the read above, before
+    // committing — this is the atomic part. Any other call for this
+    // same token, from this point until this transaction commits, is
+    // serialized behind RESET_MUTEX and will correctly see the token
+    // as already gone once it does proceed.
+    txn.del(db, &token.as_bytes(), None)
+        .map_err(|e| format!("Failed to delete reset token during validation: {e}"))?;
+
+    txn.commit()
+        .map_err(|e| format!("Failed to commit reset token validate-and-consume: {e}"))?;
+
+    Ok(entry.username)
 }
 
 /// Sweeps every stored token and deletes the expired ones. Meant to be

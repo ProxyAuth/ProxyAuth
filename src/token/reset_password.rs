@@ -110,7 +110,12 @@ pub async fn reset_password_route(
             ));
     }
 
-    let username = match reset_db::validate_token(&body.token) {
+    // SECURITY: validate_and_consume_token checks and deletes the token
+    // atomically (single LMDB read-write transaction) — the previous
+    // validate-then-consume-later split left a real race window open
+    // for exactly as long as the Argon2 hashing below takes. See that
+    // function's own doc comment in reset/db.rs for the full reasoning.
+    let username = match reset_db::validate_and_consume_token(&body.token) {
         Ok(u) => u,
         Err(_) => {
             return HttpResponse::BadRequest()
@@ -196,7 +201,8 @@ pub async fn reset_password_route(
         }
     }
 
-    let _ = reset_db::consume_token(&body.token);
+    // Token was already consumed atomically inside validate_and_consume_token
+    // above, at the point of validation — nothing left to do here.
 
     HttpResponse::Ok()
         .append_header(("server", "ProxyAuth"))

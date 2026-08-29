@@ -1,5 +1,8 @@
 use actix_web::{App, HttpResponse, test, web};
 use dashmap::DashMap;
+use proxyauth::network::shared_client::{
+    ClientOptions, build_hyper_client_cert, build_hyper_client_normal, build_hyper_client_proxy,
+};
 use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 use proxyauth::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use proxyauth::{AppConfig, AppState, CounterToken, RouteConfig, auth as auth_handler};
@@ -43,6 +46,28 @@ macro_rules! build_app {
             )
             .expect("Failed to parse routes YAML");
 
+            let client_normal = build_hyper_client_normal(&config);
+            let client_with_cert = build_hyper_client_cert(
+                ClientOptions {
+                    use_proxy: false,
+                    proxy_addr: None,
+                    use_cert: false,
+                    cert_path: None,
+                    key_path: None,
+                },
+                &config,
+            );
+            let client_with_proxy = build_hyper_client_proxy(
+                ClientOptions {
+                    use_proxy: true,
+                    proxy_addr: Some("http://127.0.0.1:8888".to_string()),
+                    use_cert: false,
+                    cert_path: None,
+                    key_path: None,
+                },
+                &config,
+            );
+
             let counter_token = CounterToken::new();
             let revoked_tokens = match load_revoked_tokens() {
                 Ok(tokens) => tokens,
@@ -66,6 +91,9 @@ macro_rules! build_app {
                 config: Arc::clone(&config),
                 routes: Arc::new(routes),
                 counter: Arc::new(counter_token.into()),
+                client_normal,
+                client_with_cert,
+                client_with_proxy,
                 revoked_tokens,
                 stats,
                 otp_overrides: Arc::new(DashMap::new()),

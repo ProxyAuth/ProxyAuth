@@ -187,7 +187,15 @@ pub async fn render_error_page(
             key_path: None,
         }
     };
-    let client = get_or_build_client(client_opts, &data.config);
+    let client = match get_or_build_client(client_opts, &data.config) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("mTLS client build failed for error page backend: {e}");
+            return HttpResponse::BadGateway()
+                .append_header(("server", "ProxyAuth"))
+                .body("502 Bad Gateway");
+        }
+    };
 
     let backend_host = match full_url
         .split_once("://")
@@ -248,7 +256,8 @@ pub async fn render_error_page(
             })
             .collect();
 
-        match forward_failover(hyper_req, &backends, None).await {
+        let route_key = format!("{}|{}", rule.vhost.join(","), rule.prefix);
+        match forward_failover(hyper_req, &backends, None, &route_key).await {
             Ok(res) => res,
             Err(_e) => {
                 return HttpResponse::ServiceUnavailable()
