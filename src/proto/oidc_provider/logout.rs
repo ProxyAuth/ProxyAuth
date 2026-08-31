@@ -90,8 +90,19 @@ pub async fn end_session_handler(req: HttpRequest, data: web::Data<AppState>) ->
 
     let set_cookie_header = clear_session_cookie_header();
 
-    let Some(redirect_uri) = params.post_logout_redirect_uri.as_deref() else {
-        return logged_out_page(Some(set_cookie_header));
+    // No `post_logout_redirect_uri` given at all — falls back to the
+    // first entry in this vhost's own `logout_redirect_uris`, if any
+    // are configured, rather than a dead-end confirmation page. This
+    // is *not* the same exact-match check below: an operator-configured
+    // fallback is already a trusted value (it came from routes.yml,
+    // not this request), so there's nothing to validate it against —
+    // it effectively already *is* the validated list.
+    let redirect_uri = match params.post_logout_redirect_uri.as_deref() {
+        Some(uri) => uri,
+        None => match oidc.logout_redirect_uris.first() {
+            Some(default_uri) => default_uri.as_str(),
+            None => return logged_out_page(Some(set_cookie_header)),
+        },
     };
 
     // Exact match only — same discipline as `redirect_uris` at
@@ -99,6 +110,9 @@ pub async fn end_session_handler(req: HttpRequest, data: web::Data<AppState>) ->
     // post-logout redirect is exactly as capable of exfiltrating
     // something (here, whatever `state` carries) to an attacker-chosen
     // destination as an unvalidated authorization redirect_uri is.
+    // The fallback case above still passes this check trivially (it's
+    // drawn from this exact list), so there's no special-casing here
+    // — every path through this function validates the same way.
     if !oidc
         .logout_redirect_uris
         .iter()

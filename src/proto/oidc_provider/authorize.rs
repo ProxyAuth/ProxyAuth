@@ -366,7 +366,6 @@ h1 {{ font-size: 18px; margin: 0 0 20px; }}
 label {{ display: block; margin-bottom: 14px; font-size: 13px; color: #9da3b8; }}
 input {{ display: block; width: 100%; margin-top: 6px; padding: 9px 10px; background: #1a1d25; border: 1px solid #363d52; border-radius: 6px; color: #e8eaf0; font-size: 14px; box-sizing: border-box; }}
 button {{ width: 100%; padding: 10px; background: #e8ff47; color: #0a0a0a; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; margin-top: 6px; }}
-.login-container h2 {{ text-align: center; margin-bottom: 24px; font-size: 28px; font-weight: 600; font-color:white; }}
 </style></head>
 <body>
 {form}
@@ -434,7 +433,7 @@ fn render_login_form(
     // this vhost, or a failed-attempt error message; all of that is
     // already resolved by the time this string exists.
     let form = format!(
-        r#"<div class="login-container"> <h2>ProxyAuth OIDC Login</h2> <form method="POST" action="{action}">
+        r#"<form method="POST" action="{action}">
 <h1>Sign in to continue</h1>
 {error_banner}
 {csrf_field}
@@ -442,7 +441,7 @@ fn render_login_form(
 <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
 {form_totp}
 <button type="submit">Sign in</button>
-</form></div>"#,
+</form>"#,
         action = html_escape(&auth_action),
     );
 

@@ -402,6 +402,43 @@ pub struct RouteRule {
     #[serde(default)]
     pub tag_proxyauth: Option<bool>,
 
+    /// Adds `Host`, `X-Forwarded-Host`, `X-Forwarded-Proto`,
+    /// `X-Real-IP`, and `X-Forwarded-For` to every request this route
+    /// forwards to its backend — the standard reverse-proxy headers a
+    /// backend needs to know the original client's real host/scheme/IP,
+    /// the same information `proxy_set_header` directives provide in
+    /// an nginx config. `Host` is rewritten to the original vhost's
+    /// hostname (matching `proxy_set_header Host $host;`), not left as
+    /// whatever the backend's own address happens to be — real
+    /// end-to-end testing (a raw TCP listener on the receiving end, no
+    /// HTTP library involved to introduce ambiguity about what's
+    /// really on the wire) confirmed the underlying HTTP client
+    /// genuinely respects an explicitly-set `Host` header rather than
+    /// silently overriding it with the connection target.
+    ///
+    /// `X-Real-IP`/`X-Forwarded-For` are always built from ProxyAuth's
+    /// own already-resolved, trusted client IP (`network::proxy::client_ip`,
+    /// which itself respects `trust_proxy_forward_for`) — never a
+    /// blind copy of whatever a client sent, which would let any
+    /// visitor simply claim to be a different IP. More generally: a
+    /// client-supplied version of any of these five headers is always
+    /// excluded from the ordinary header copy-through, regardless of
+    /// this setting — see `network::proxy`'s own comment on exactly
+    /// why (`http::request::Builder::header` appends rather than
+    /// replaces, so leaving a client's own copy in place would have
+    /// sent the backend two values for the same header instead of
+    /// substituting ProxyAuth's trusted one).
+    ///
+    /// `None`/unset means `false` — off by default, the same
+    /// conservative reasoning as `tag_proxyauth`: a backend that
+    /// doesn't care about these headers shouldn't have them added
+    /// unconditionally, and a backend that already receives correct
+    /// values some other way (e.g. from a TLS-terminating load
+    /// balancer in front of ProxyAuth itself) shouldn't have this
+    /// silently override that.
+    #[serde(default)]
+    pub forward_proxy_headers: Option<bool>,
+
     /// Usernames allowed to *log in* via this vhost's `/auth` — a
     /// different, earlier gate than `RouteRule::username`/`groups`/
     /// `roles` above, which only govern access to *this specific
@@ -633,6 +670,13 @@ impl RouteRule {
     /// that's the deliberately conservative choice.
     pub fn tag_proxyauth_enabled(&self) -> bool {
         self.tag_proxyauth.unwrap_or(false)
+    }
+
+    /// Resolves `RouteRule.forward_proxy_headers` — same
+    /// no-global-fallback shape as `tag_proxyauth_enabled` just above,
+    /// for the same reason: unset means `false`, not inherited-then-on.
+    pub fn forward_proxy_headers_enabled(&self) -> bool {
+        self.forward_proxy_headers.unwrap_or(false)
     }
 
     /// Resolves whether `username` is allowed to log in via this
@@ -878,6 +922,11 @@ pub struct VhostGroup {
     #[serde(default)]
     pub tag_proxyauth: Option<bool>,
 
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::forward_proxy_headers`.
+    #[serde(default)]
+    pub forward_proxy_headers: Option<bool>,
+
     /// The vhost-wide login authorization lists — see
     /// `RouteRule::allow_users` for the full semantics (OR-combined
     /// with `allow_groups`/`allow_roles`, empty-means-denied default,
@@ -1005,6 +1054,9 @@ impl RouteConfig {
                 }
                 if route.tag_proxyauth.is_none() {
                     route.tag_proxyauth = group.tag_proxyauth;
+                }
+                if route.forward_proxy_headers.is_none() {
+                    route.forward_proxy_headers = group.forward_proxy_headers;
                 }
                 if route.allow_users.is_empty() {
                     route.allow_users = group.allow_users.clone();

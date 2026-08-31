@@ -1324,10 +1324,33 @@ pub async fn global_proxy(
         let origin = origin_header.and_then(|v| v.to_str().ok());
         let preflight_vhost_route =
             find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
+
+        // A same-origin request must never be blocked by CORS — CORS
+        // is fundamentally a *cross*-origin mechanism; enforcing it
+        // against the origin a request is already legitimately coming
+        // from was blocking a backend's own frontend from calling its
+        // own API (browsers send `Origin` even for a same-origin
+        // POST/PUT/DELETE, not just genuinely cross-origin ones), for
+        // no security benefit — nothing was ever being protected
+        // *from* the origin itself. Compares scheme too, not just
+        // host: `Origin` embeds both, and a request actually arriving
+        // over https shouldn't treat a same-host `http://` origin as
+        // equivalent — those are different origins per the Fetch
+        // spec's own definition, even though this vhost isn't
+        // expected to ever legitimately see one in practice.
+        let same_origin = origin.and_then(|o| request_host(&req).map(|h| (o, h))).is_some_and(
+            |(o, host)| {
+                let expected_scheme = if is_secure_request(&req, &data.config) { "https://" } else { "http://" };
+                o.strip_prefix(expected_scheme)
+                    .map(|rest| rest.trim_end_matches('/').eq_ignore_ascii_case(&host))
+                    .unwrap_or(false)
+            },
+        );
+
         let allowed = preflight_vhost_route
             .and_then(|r| r.resolved_cors_origins(&data.config))
             .or(data.config.cors_origins.as_ref());
-        let is_allowed = match (origin, allowed) {
+        let is_allowed = same_origin || match (origin, allowed) {
             (Some(o), Some(list)) => {
                 let origin_normalized = o.trim_end_matches('/');
                 list.iter()
@@ -1843,11 +1866,38 @@ pub async fn proxy_with_proxy(
         // re-serializes as fixed-length. Two HTTP implementations
         // disagreeing on framing metadata is precisely what enables
         // request smuggling.
+        // SECURITY: a client-supplied X-Forwarded-Host/X-Forwarded-Proto/
+        // X-Real-IP/X-Forwarded-For must never reach the backend
+        // unfiltered — `http::request::Builder::header()` appends
+        // rather than replaces, so when `forward_proxy_headers` is on,
+        // failing to exclude these here would have sent the backend
+        // *two* values for the same header (the client's own,
+        // potentially spoofed one, immediately followed by ProxyAuth's
+        // trusted one) rather than replacing it outright. Excluded
+        // unconditionally, not just when `forward_proxy_headers` is
+        // on: even with it off, a backend that naively trusts these
+        // headers shouldn't be able to be fed an attacker-chosen IP
+        // or host through ProxyAuth by simply asking.
         if !is_hop_by_hop_header(key_str)
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
+            && key_str != "x-forwarded-host"
+            && key_str != "x-forwarded-proto"
+            && key_str != "x-real-ip"
+            && key_str != "x-forwarded-for"
+            // `host` is excluded from the copy-through only when
+            // `forward_proxy_headers` is on — the existing, unchanged
+            // default behavior (copy the client's own Host through
+            // as-is) is preserved for every route that doesn't opt
+            // into this, so this doesn't silently change what backends
+            // already receive today. When it *is* on, `host` is set
+            // explicitly and deliberately further below instead — see
+            // that block's own comment for why it still needs
+            // excluding here (same append-not-replace reasoning as the
+            // four `X-Forwarded-*`/`X-Real-IP` headers above).
+            && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
             {
                 if let Ok(hv) =
@@ -1860,6 +1910,38 @@ pub async fn proxy_with_proxy(
 
     if strip_accept_encoding {
         request_builder = request_builder.header(hyper::header::ACCEPT_ENCODING, "identity");
+    }
+
+    // Standard reverse-proxy headers — see `RouteRule::forward_proxy_headers`'s
+    // own doc comment. `X-Real-IP`/`X-Forwarded-For` are built from
+    // `ip`, ProxyAuth's own already-resolved and trusted client IP
+    // (`client_ip`, which itself respects `trust_proxy_forward_for`),
+    // never copied from anything the client sent directly.
+    if rule.forward_proxy_headers_enabled() {
+        if let Some(original_host) = request_host(&req) {
+            // Explicit `Host` too, matching the nginx
+            // `proxy_set_header Host $host;` idiom this setting is
+            // meant to replace — real end-to-end testing (a raw TCP
+            // listener, no HTTP library on the receiving end to
+            // introduce any ambiguity) confirmed hyper genuinely
+            // respects an explicitly-set Host header rather than
+            // silently overriding it with the connection target, so
+            // this reaches the backend exactly as set here.
+            if let Ok(hv) = hyper::header::HeaderValue::from_str(&original_host) {
+                request_builder = request_builder.header("Host", hv);
+            }
+            if let Ok(hv) = hyper::header::HeaderValue::from_str(&original_host) {
+                request_builder = request_builder.header("X-Forwarded-Host", hv);
+            }
+        }
+        let proto = if is_secure_request(&req, &data.config) { "https" } else { "http" };
+        request_builder = request_builder.header("X-Forwarded-Proto", proto);
+        if let Ok(hv) = hyper::header::HeaderValue::from_str(&ip) {
+            request_builder = request_builder.header("X-Real-IP", hv);
+        }
+        if let Ok(hv) = hyper::header::HeaderValue::from_str(&ip) {
+            request_builder = request_builder.header("X-Forwarded-For", hv);
+        }
     }
 
     request_builder = request_builder
@@ -2460,11 +2542,38 @@ pub async fn proxy_without_proxy(
         // re-serializes as fixed-length. Two HTTP implementations
         // disagreeing on framing metadata is precisely what enables
         // request smuggling.
+        // SECURITY: a client-supplied X-Forwarded-Host/X-Forwarded-Proto/
+        // X-Real-IP/X-Forwarded-For must never reach the backend
+        // unfiltered — `http::request::Builder::header()` appends
+        // rather than replaces, so when `forward_proxy_headers` is on,
+        // failing to exclude these here would have sent the backend
+        // *two* values for the same header (the client's own,
+        // potentially spoofed one, immediately followed by ProxyAuth's
+        // trusted one) rather than replacing it outright. Excluded
+        // unconditionally, not just when `forward_proxy_headers` is
+        // on: even with it off, a backend that naively trusts these
+        // headers shouldn't be able to be fed an attacker-chosen IP
+        // or host through ProxyAuth by simply asking.
         if !is_hop_by_hop_header(key_str)
             && key_str != "user-agent"
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
+            && key_str != "x-forwarded-host"
+            && key_str != "x-forwarded-proto"
+            && key_str != "x-real-ip"
+            && key_str != "x-forwarded-for"
+            // `host` is excluded from the copy-through only when
+            // `forward_proxy_headers` is on — the existing, unchanged
+            // default behavior (copy the client's own Host through
+            // as-is) is preserved for every route that doesn't opt
+            // into this, so this doesn't silently change what backends
+            // already receive today. When it *is* on, `host` is set
+            // explicitly and deliberately further below instead — see
+            // that block's own comment for why it still needs
+            // excluding here (same append-not-replace reasoning as the
+            // four `X-Forwarded-*`/`X-Real-IP` headers above).
+            && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
             {
                 if let Ok(hv) =
@@ -2477,6 +2586,38 @@ pub async fn proxy_without_proxy(
 
     if strip_accept_encoding {
         request_builder = request_builder.header(hyper::header::ACCEPT_ENCODING, "identity");
+    }
+
+    // Standard reverse-proxy headers — see `RouteRule::forward_proxy_headers`'s
+    // own doc comment. `X-Real-IP`/`X-Forwarded-For` are built from
+    // `ip`, ProxyAuth's own already-resolved and trusted client IP
+    // (`client_ip`, which itself respects `trust_proxy_forward_for`),
+    // never copied from anything the client sent directly.
+    if rule.forward_proxy_headers_enabled() {
+        if let Some(original_host) = request_host(&req) {
+            // Explicit `Host` too, matching the nginx
+            // `proxy_set_header Host $host;` idiom this setting is
+            // meant to replace — real end-to-end testing (a raw TCP
+            // listener, no HTTP library on the receiving end to
+            // introduce any ambiguity) confirmed hyper genuinely
+            // respects an explicitly-set Host header rather than
+            // silently overriding it with the connection target, so
+            // this reaches the backend exactly as set here.
+            if let Ok(hv) = hyper::header::HeaderValue::from_str(&original_host) {
+                request_builder = request_builder.header("Host", hv);
+            }
+            if let Ok(hv) = hyper::header::HeaderValue::from_str(&original_host) {
+                request_builder = request_builder.header("X-Forwarded-Host", hv);
+            }
+        }
+        let proto = if is_secure_request(&req, &data.config) { "https" } else { "http" };
+        request_builder = request_builder.header("X-Forwarded-Proto", proto);
+        if let Ok(hv) = hyper::header::HeaderValue::from_str(&ip) {
+            request_builder = request_builder.header("X-Real-IP", hv);
+        }
+        if let Ok(hv) = hyper::header::HeaderValue::from_str(&ip) {
+            request_builder = request_builder.header("X-Forwarded-For", hv);
+        }
     }
 
     request_builder = request_builder.header(USER_AGENT, "ProxyAuth");
