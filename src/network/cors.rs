@@ -90,10 +90,30 @@ where
 
             res.headers_mut()
                 .insert(SERVER, HeaderValue::from_static("ProxyAuth"));
-            res.headers_mut().insert(
-                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                HeaderValue::from_static("true"),
-            );
+
+            // SECURITY/CORRECTNESS: `Access-Control-Allow-Origin: *` and
+            // `Access-Control-Allow-Credentials: true` together is an
+            // invalid combination per the Fetch/CORS spec — browsers
+            // reject it outright, treating the whole response as if
+            // CORS had failed. A handler that's already set `*` itself
+            // (the OIDC provider's own discovery/JWKS endpoints, meant
+            // to be publicly fetchable from any origin with no
+            // credentials involved at all — see
+            // `proto::oidc_provider::discovery`) means exactly that:
+            // no credentials, any origin. Adding `Allow-Credentials:
+            // true` unconditionally on top, as this used to, would
+            // silently break the one thing those endpoints exist for.
+            let already_wildcard = res
+                .headers()
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.as_bytes() == b"*")
+                .unwrap_or(false);
+            if !already_wildcard {
+                res.headers_mut().insert(
+                    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                    HeaderValue::from_static("true"),
+                );
+            }
             Ok(res)
         })
     }

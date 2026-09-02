@@ -88,13 +88,16 @@ mod tests {
             log: None,
             log_file: None,
             compression: None,
-            cache: true,
+            cache: Some(true),
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
             allow_methods: None,
             filters: Some(filters),
             filters_compiled: compiled,
+            forward_proxy_headers: None,
+            oidc: None,
+            redirect_protect: None,
         }
     }
 
@@ -548,13 +551,16 @@ mod more_unit_tests {
             log: None,
             log_file: None,
             compression: None,
-            cache: true,
+            cache: Some(true),
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
             allow_methods: None,
             filters: Some(filters),
             filters_compiled: compiled,
+            forward_proxy_headers: None,
+            oidc: None,
+            redirect_protect: None,
         }
     }
 

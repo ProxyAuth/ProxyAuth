@@ -44,6 +44,29 @@ pub async fn logout_options(
     }
 }
 
+/// The real dispatch target registered for `GET /logout` — decides
+/// whether this request is handled by ProxyAuth's own logout logic
+/// (`logout_session`, below) or proxied straight through to the
+/// backend. See `token::auth::auth_dispatch`'s own doc comment for the
+/// full reasoning — identical here, just simpler (no request body to
+/// worry about, since logout is a `GET`).
+pub async fn logout_dispatch(
+    req: HttpRequest,
+    body: web::Bytes,
+    data: web::Data<AppState>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let vhost_route = crate::network::proxy::find_vhost_route(
+        crate::network::proxy::request_host(&req).as_deref(),
+        &data.routes.routes,
+    );
+
+    if vhost_route.map(|r| r.oidc.is_some()).unwrap_or(false) {
+        return crate::network::proxy::global_proxy(req, body, data).await;
+    }
+
+    Ok(logout_session(req, data).await)
+}
+
 pub async fn logout_session(req: HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     // SECURITY: previously this handler only cleared the client-side
     // cookie — the token itself stayed fully valid server-side until its

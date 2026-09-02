@@ -44,13 +44,16 @@ fn default_route(prefix: &str, target: &str) -> RouteRule {
         log: None,
         log_file: None,
         compression: None,
-        cache: true,
+        cache: Some(true),
         cache_duration_secs: None,
         secure_path: false,
         preserve_prefix: false,
         allow_methods: None,
         filters: None,
         filters_compiled: None,
+        forward_proxy_headers: None,
+        oidc: None,
+        redirect_protect: None,
     }
 }
 
@@ -66,7 +69,7 @@ fn app_config_default_cache_duration_is_300() {
 #[test]
 fn route_cache_defaults_to_true() {
     let r = default_route("/api", "http://localhost:3000");
-    assert!(r.cache);
+    assert!(r.cache_enabled());
 }
 
 #[test]
@@ -160,8 +163,8 @@ fn expand_propagates_cache_flag() {
 
     let cached = cfg.routes.iter().find(|r| r.prefix == "/cached").unwrap();
     let nocache = cfg.routes.iter().find(|r| r.prefix == "/nocache").unwrap();
-    assert!(cached.cache);
-    assert!(!nocache.cache);
+    assert!(cached.cache_enabled());
+    assert!(!nocache.cache_enabled());
 }
 
 // ── expand_vhost_groups propagates compression ──────────────────

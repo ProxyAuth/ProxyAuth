@@ -61,8 +61,8 @@ pub use stats::tokencount::CounterToken;
 use std::net::TcpListener;
 use std::{fs, process, sync::Arc, time::Duration};
 use tls::bind_server;
-use token::auth::{auth, auth_options};
-use token::logout::{logout_options, logout_session};
+use token::auth::{auth_dispatch, auth_options};
+use token::logout::{logout_dispatch, logout_options};
 use token::reset_password::reset_password_route;
 use token::security::init_derived_key;
 use tokio::sync::mpsc::unbounded_channel;
@@ -306,7 +306,7 @@ macro_rules! build_app {
         })
         .service(
             web::resource("/auth")
-            .route(web::post().to(auth))
+            .route(web::post().to(auth_dispatch))
             .route(web::method(Method::OPTIONS).to(auth_options)),
         )
         .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
@@ -317,7 +317,7 @@ macro_rules! build_app {
         .service(web::resource("/adm/auth/totp/reset").route(web::post().to(reset_otp_route)))
         .service(
             web::resource("/logout")
-            .route(web::get().to(logout_session))
+            .route(web::get().to(logout_dispatch))
             .route(web::method(Method::OPTIONS).to(logout_options)),
         )
         .service(
@@ -787,6 +787,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // subscriber the access log writes through already exists.
     accesslog::init(&config);
 
+    // OIDC provider signing key — only generated/loaded if at least
+    // one vhost actually declares `oidc:`. Skipping this entirely for
+    // instances that don't use the feature avoids creating
+    // /etc/proxyauth/oidc and a signing key nothing will ever read.
+    if routes.routes.iter().any(|r| r.oidc.is_some()) {
+        proto::oidc_provider::jwt::init_signing_key()
+            .map_err(|e| format!("Failed to initialize OIDC provider signing key: {e}"))?;
+    }
+
     // load SMTP template if smtp use
     if let Some(smtp_cfg) = &config.smtp {
         ensure_reset_template_exists()?;
@@ -914,7 +923,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             web::resource("/auth")
                             .route(
                                 web::post()
-                                .to(auth)
+                                .to(auth_dispatch)
                                 .wrap(Governor::new(&governor_auth_conf)),
                             )
                             .route(web::method(Method::OPTIONS).to(auth_options)),
@@ -969,7 +978,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             web::resource("/auth")
                             .route(
                                 web::post()
-                                .to(auth)
+                                .to(auth_dispatch)
                                 .wrap(Governor::new(&governor_auth_conf)),
                             )
                             .route(web::method(Method::OPTIONS).to(auth_options)),
