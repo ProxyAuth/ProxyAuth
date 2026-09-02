@@ -45,6 +45,51 @@ pub enum RegexCond {
     BodyJson { key: String, re: Regex },
 }
 
+/// Maintenance-mode style gate: every visitor whose IP is *not* on
+/// `allow_ip` gets served the static file at `path` — whatever it is,
+/// HTML page, image, anything `guess_content_type` can identify —
+/// instead of this route's normal content, with a `503 Service
+/// Unavailable` status (the correct HTTP semantics for "temporarily
+/// unavailable," as opposed to `200`, which would tell caches/crawlers
+/// this *is* the real content). A visitor whose IP *is* on `allow_ip`
+/// is completely unaffected — normal routing, proxying, and auth all
+/// continue exactly as configured. Leaving `allow_ip` empty (the
+/// default) is genuine "maintenance mode for everyone," rather than
+/// needing to spell out a `"0.0.0.0/0"`-style catch-all.
+///
+/// Checked as early as possible in `network::proxy::global_proxy` —
+/// after IP blocklisting and ACME challenge handling (a certificate
+/// renewal must never be blocked by this), but before everything else,
+/// including OIDC discovery and normal routing — so nothing else this
+/// route would otherwise do (auth, CSRF, proxying) gets a chance to
+/// run for a visitor this gate turns away.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RedirectProtectConfig {
+    /// The only IPs/CIDR ranges allowed normal access to this route —
+    /// every visitor whose IP isn't in here gets `path` instead, with
+    /// a `503 Service Unavailable` status. Empty (the default) allows
+    /// nobody through, meaning every visitor is redirected — the
+    /// simplest way to write "maintenance mode for everyone" is just
+    /// leaving this empty, rather than having to spell out a
+    /// `"0.0.0.0/0"`-style catch-all. Same `IpNet`-based matching
+    /// `User::allow`/`is_ip_allowed` already uses elsewhere in this
+    /// codebase, not a separate implementation.
+    pub allow_ip: Vec<String>,
+
+    /// Absolute path to the static file to serve for a visitor not on
+    /// `allow_ip`. Read fresh on every matching request rather than
+    /// cached — a maintenance page is exactly the kind of content an
+    /// operator expects to be able to edit and see reflected
+    /// immediately, without restarting ProxyAuth.
+    pub path: String,
+
+    /// `allow_ip` parsed into `IpNet` once at startup — see
+    /// `compile_ip_lists_on_routes`'s own doc comment for why (a fatal
+    /// error on a bad entry, and no re-parsing on every request).
+    #[serde(skip)]
+    pub allow_ip_compiled: Vec<IpNet>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouteRule {
     /// Virtual hosts this route answers on, matched against the
@@ -550,8 +595,33 @@ pub struct RouteRule {
     #[serde(default)]
     pub compression: Option<CompressionConfig>,
 
-    #[serde(default = "default_cache")]
-    pub cache: bool,
+    /// Whether responses from this route may be cached at all
+    /// (`Cache-Control: public, max-age=<N>` is only ever added when
+    /// this resolves to `true` — see `cache_enabled`). `None`/unset
+    /// means `true` — deliberately the opposite default from
+    /// `tag_proxyauth`: caching being *on* unless a route explicitly
+    /// opts out matches what most proxied content actually wants,
+    /// where scanning for ProxyAuth's own tags does not.
+    ///
+    /// No global fallback (`AppConfig` has no equivalent toggle, only
+    /// `cache_duration_secs`) — this is a per-vhost-group/per-route
+    /// decision, same shape as `tag_proxyauth`. Previously a plain
+    /// `bool` rather than `Option<bool>`, which meant a `cache: false`
+    /// set on a `vhosts:` group had no field to propagate *from* on
+    /// `VhostGroup` at all (it didn't exist there) and silently had no
+    /// effect on any route in that group — every route just kept
+    /// deserializing its own default. `Option<bool>` here, matched by
+    /// `VhostGroup::cache` and the same `is_none()`-gated propagation
+    /// every other per-vhost setting already uses, fixes that.
+    #[serde(default)]
+    pub cache: Option<bool>,
+
+    /// Maintenance-mode gate for this route — see
+    /// `RedirectProtectConfig`'s own doc comment for the full
+    /// semantics. `None`/unset (the default) means no gate at all,
+    /// every visitor gets this route's normal content.
+    #[serde(default)]
+    pub redirect_protect: Option<RedirectProtectConfig>,
 
     /// Per-route cache duration override.  When `Some(N)`, the
     /// response will carry `Cache-Control: public, max-age=<N>` (if
@@ -670,6 +740,14 @@ impl RouteRule {
     /// that's the deliberately conservative choice.
     pub fn tag_proxyauth_enabled(&self) -> bool {
         self.tag_proxyauth.unwrap_or(false)
+    }
+
+    /// Resolves `RouteRule.cache` — no global fallback (same shape as
+    /// `tag_proxyauth_enabled`), but the opposite default: unset means
+    /// `true`, matching what this field always defaulted to back when
+    /// it was a plain, always-`true`-unless-set `bool`.
+    pub fn cache_enabled(&self) -> bool {
+        self.cache.unwrap_or(true)
     }
 
     /// Resolves `RouteRule.forward_proxy_headers` — same
@@ -923,6 +1001,23 @@ pub struct VhostGroup {
     pub tag_proxyauth: Option<bool>,
 
     /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::cache`. This is the field a group-level
+    /// `cache: false` actually needs to exist on to have any effect at
+    /// all — see `RouteRule::cache`'s own doc comment for the bug this
+    /// fixes.
+    #[serde(default)]
+    pub cache: Option<bool>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::redirect_protect`. Setting this directly on a
+    /// `vhosts:` group (rather than on each individual route) is the
+    /// normal way to use it: a maintenance-mode gate almost always
+    /// needs to cover an entire vhost, not one specific route prefix
+    /// within it.
+    #[serde(default)]
+    pub redirect_protect: Option<RedirectProtectConfig>,
+
+    /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::forward_proxy_headers`.
     #[serde(default)]
     pub forward_proxy_headers: Option<bool>,
@@ -1054,6 +1149,12 @@ impl RouteConfig {
                 }
                 if route.tag_proxyauth.is_none() {
                     route.tag_proxyauth = group.tag_proxyauth;
+                }
+                if route.cache.is_none() {
+                    route.cache = group.cache;
+                }
+                if route.redirect_protect.is_none() {
+                    route.redirect_protect = group.redirect_protect.clone();
                 }
                 if route.forward_proxy_headers.is_none() {
                     route.forward_proxy_headers = group.forward_proxy_headers;
@@ -1817,10 +1918,6 @@ fn default_timezone() -> String {
 
 fn default_port() -> u16 {
     8080
-}
-
-fn default_cache() -> bool {
-    true
 }
 
 fn default_cache_duration_secs() -> u64 {

@@ -141,6 +141,9 @@ pub fn compile_ip_lists_on_routes(routes: &mut [RouteRule]) {
     for r in routes.iter_mut() {
         r.allow_ips_compiled = parse_all(&r.prefix, "allow_ips", &r.allow_ips);
         r.deny_ips_compiled = parse_all(&r.prefix, "deny_ips", &r.deny_ips);
+        if let Some(rp) = r.redirect_protect.as_mut() {
+            rp.allow_ip_compiled = parse_all(&r.prefix, "redirect_protect.allow_ip", &rp.allow_ip);
+        }
     }
 }
 
@@ -781,6 +784,38 @@ async fn incoming_to_boxbody(
 /// browser sniffing it as HTML and executing it (stored XSS via file
 /// upload/download endpoints), which a wrong-but-inert binary MIME type
 /// avoids.
+/// Serves the maintenance-mode page for `RedirectProtectConfig` —
+/// reads `path` fresh on every call (see that field's own doc comment
+/// for why), guessing the content type the same way `serve_static_file`
+/// does. `503 Service Unavailable` regardless of what's being served —
+/// the correct HTTP semantics for "temporarily unavailable," so caches
+/// and crawlers don't treat this as the route's real content.
+///
+/// A read failure here (missing file, bad permissions) fails *closed*
+/// — a `500` rather than silently falling through to this route's
+/// normal content — since the entire point of this gate is to keep
+/// matched visitors away from that content; quietly letting them
+/// through because the maintenance page itself is misconfigured would
+/// defeat the feature at exactly the moment it's needed.
+async fn serve_redirect_protect_page(path: &str) -> HttpResponse {
+    let path_ref = Path::new(path);
+    match tokio::fs::read(path_ref).await {
+        Ok(bytes) => {
+            let content_type = guess_content_type(path_ref);
+            HttpResponse::ServiceUnavailable()
+                .append_header(("server", "ProxyAuth"))
+                .content_type(content_type)
+                .body(bytes)
+        }
+        Err(e) => {
+            warn!("redirect_protect: path {path:?} is not readable: {e}");
+            HttpResponse::InternalServerError()
+                .append_header(("server", "ProxyAuth"))
+                .body("500 Internal Server Error")
+        }
+    }
+}
+
 fn guess_content_type(path: &Path) -> &'static str {
     let ext = path
         .extension()
@@ -924,7 +959,7 @@ async fn serve_static_file(
                 let mut resp = HttpResponse::Ok();
                 resp.append_header(("server", "ProxyAuth"))
                     .content_type(content_type);
-                if rule.cache {
+                if rule.cache_enabled() {
                     resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
                 } else {
                     resp.append_header((
@@ -1023,7 +1058,7 @@ async fn serve_static_file(
             let mut resp = HttpResponse::Ok();
             resp.append_header(("server", "ProxyAuth"))
                 .content_type(content_type);
-            if rule.cache {
+            if rule.cache_enabled() {
                 resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
             } else {
                 resp.append_header((
@@ -1167,6 +1202,30 @@ pub async fn global_proxy(
                 return Ok(HttpResponse::Ok()
                     .content_type("application/octet-stream")
                     .body(key_authorization));
+            }
+        }
+    }
+
+    // `redirect_protect` — maintenance-mode gate, see
+    // `RedirectProtectConfig`'s own doc comment for the full
+    // semantics. Checked ahead of everything else below (OIDC
+    // discovery, normal routing, auth) so a matched visitor never
+    // reaches any of it — but after IP blocklisting and ACME above,
+    // since a certificate renewal must never be blocked by this, and
+    // a genuinely blocklisted IP should still just get a flat 403
+    // rather than seeing a maintenance page.
+    if let Some(rule) = find_vhost_route(request_host(&req).as_deref(), &data.routes.routes) {
+        if let Some(rp) = &rule.redirect_protect {
+            // Fails *closed*: a visitor whose IP couldn't be
+            // determined at all is treated the same as one that's
+            // simply not on `allow_ip` — redirected, not let through.
+            // The entire point of this gate is "only these IPs get
+            // normal access"; silently allowing an unidentifiable
+            // visitor through would contradict that.
+            let is_allowed = client_ip(&req, &data.config)
+                .is_some_and(|ip| rp.allow_ip_compiled.iter().any(|net| net.contains(&ip)));
+            if !is_allowed {
+                return Ok(serve_redirect_protect_page(&rp.path).await);
             }
         }
     }
@@ -2057,7 +2116,7 @@ pub async fn proxy_with_proxy(
         .to_bytes();
 
     // ── Cache policy ────────────────────────────────────────────────
-    if rule.cache {
+    if rule.cache_enabled() {
         let max_age = rule
             .cache_duration_secs
             .unwrap_or(data.config.cache_duration_secs);
@@ -2826,7 +2885,7 @@ pub async fn proxy_without_proxy(
     };
 
     // ── Cache policy ────────────────────────────────────────────────
-    if rule.cache {
+    if rule.cache_enabled() {
         let max_age = rule
             .cache_duration_secs
             .unwrap_or(data.config.cache_duration_secs);
