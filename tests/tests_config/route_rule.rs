@@ -46,13 +46,16 @@ mod tests {
             log: None,
             log_file: None,
             compression: None,
-            cache: true,
+            cache: Some(true),
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
             allow_methods: None,
             filters: None,
             filters_compiled: None,
+            forward_proxy_headers: None,
+            oidc: None,
+            redirect_protect: None,
         }
     }
 
@@ -83,7 +86,7 @@ mod tests {
     #[test]
     fn route_rule_cache_default_true() {
         let r = default_route("/api", "http://localhost:3000");
-        assert!(r.cache);
+        assert!(r.cache_enabled());
     }
 
     #[test]
@@ -529,7 +532,7 @@ mod tests {
         assert!(rule.vhost.is_empty());
         assert!(!rule.required_login);
         assert!(!rule.proxy);
-        assert!(rule.cache);
+        assert!(rule.cache_enabled());
     }
 
     #[test]
@@ -557,7 +560,7 @@ mod tests {
         assert_eq!(rule.username, vec!["alice"]);
         assert_eq!(rule.groups, vec!["ops"]);
         assert_eq!(rule.roles, vec!["admin"]);
-        assert!(!rule.cache);
+        assert!(!rule.cache_enabled());
         assert_eq!(rule.cache_duration_secs, Some(60));
         assert!(rule.secure_path);
         assert!(rule.preserve_prefix);

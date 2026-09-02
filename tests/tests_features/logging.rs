@@ -49,13 +49,16 @@ fn minimal_rule(prefix: &str) -> RouteRule {
         log: None,
         log_file: None,
         compression: None,
-        cache: true,
+        cache: Some(true),
         cache_duration_secs: None,
         secure_path: false,
         preserve_prefix: false,
         allow_methods: None,
         filters: None,
         filters_compiled: None,
+        forward_proxy_headers: None,
+        oidc: None,
+        redirect_protect: None,
     }
 }
 
