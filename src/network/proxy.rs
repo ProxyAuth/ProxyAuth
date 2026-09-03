@@ -1222,8 +1222,26 @@ pub async fn global_proxy(
             // The entire point of this gate is "only these IPs get
             // normal access"; silently allowing an unidentifiable
             // visitor through would contradict that.
-            let is_allowed = client_ip(&req, &data.config)
-                .is_some_and(|ip| rp.allow_ip_compiled.iter().any(|net| net.contains(&ip)));
+            let is_allowed = client_ip(&req, &data.config).is_some_and(|ip| {
+                // `redirect_protect_url_ips` only ever has an entry
+                // for a route that configured `allow_url_ips`/
+                // `deny_url_ips` at all — everything else here reduces
+                // to exactly the pre-existing `allow_ip`-only check.
+                let (url_allow, url_deny) = data
+                    .redirect_protect_url_ips
+                    .get(&rule.redirect_protect_route_key())
+                    .map(|entry| entry.value().clone())
+                    .unwrap_or_default();
+
+                // Deny wins, unconditionally — checked first, same
+                // discipline `is_ip_allowed`'s own deny-before-allow
+                // ordering already uses elsewhere in this codebase.
+                if url_deny.iter().any(|net| net.contains(&ip)) {
+                    return false;
+                }
+                rp.allow_ip_compiled.iter().any(|net| net.contains(&ip))
+                    || url_allow.iter().any(|net| net.contains(&ip))
+            });
             if !is_allowed {
                 return Ok(serve_redirect_protect_page(&rp.path).await);
             }

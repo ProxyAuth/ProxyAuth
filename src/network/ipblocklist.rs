@@ -253,3 +253,46 @@ pub async fn refresh_all(config: &AppConfig) -> Vec<IpNet> {
     merged.dedup();
     merged
 }
+
+/// Same idea as `refresh_all`, for `redirect_protect.allow_url_ips`/
+/// `deny_url_ips` — but per-route rather than one global merged list,
+/// since each route's maintenance-mode gate is independent. Updates
+/// `target` (`AppState.redirect_protect_url_ips`) directly, one entry
+/// per route that has either field set — routes with neither are
+/// skipped entirely, never getting an entry (so the request-time check
+/// can tell "not fetched yet" apart from "fetched, empty list" if that
+/// distinction ever matters).
+///
+/// Fetches every route's sources concurrently rather than one at a
+/// time — with enough oidc/redirect_protect-enabled vhosts, doing this
+/// sequentially would mean the last route's maintenance page waiting
+/// on every earlier route's fetch to finish first, for no reason: each
+/// route's sources are entirely independent of every other's.
+pub async fn refresh_redirect_protect_urls(
+    routes: &[crate::config::config::RouteRule],
+    target: &dashmap::DashMap<String, (Vec<IpNet>, Vec<IpNet>)>,
+) {
+    let fetches = routes.iter().filter_map(|route| {
+        let rp = route.redirect_protect.as_ref()?;
+        if rp.allow_url_ips.is_none() && rp.deny_url_ips.is_none() {
+            return None;
+        }
+        let key = route.redirect_protect_route_key();
+        Some(async move {
+            let allow = match &rp.allow_url_ips {
+                Some(src) => fetch_source(src).await,
+                None => Vec::new(),
+            };
+            let deny = match &rp.deny_url_ips {
+                Some(src) => fetch_source(src).await,
+                None => Vec::new(),
+            };
+            (key, allow, deny)
+        })
+    });
+
+    let results = futures_util::future::join_all(fetches).await;
+    for (key, allow, deny) in results {
+        target.insert(key, (allow, deny));
+    }
+}

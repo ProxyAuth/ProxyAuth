@@ -76,6 +76,28 @@ pub struct RedirectProtectConfig {
     /// codebase, not a separate implementation.
     pub allow_ip: Vec<String>,
 
+    /// A remote/local source — same shape as `AppConfig.ip_blocklists`'
+    /// own entries (plain text or CSV, gzip or not, auto-detected) —
+    /// fetched and merged into the effective allow-list alongside
+    /// `allow_ip`. Refetched on `redirect_protect_refresh_interval_secs`
+    /// (in `AppConfig`), the same "cache the last good fetch, degrade
+    /// rather than fail on a transient outage" behavior
+    /// `network::ipblocklist` already has for the abuse-blocklist
+    /// feature — reused here rather than reimplemented, since the
+    /// operational shape (a third-party feed an admin doesn't control)
+    /// is identical.
+    #[serde(default)]
+    pub allow_url_ips: Option<IpBlocklistSource>,
+
+    /// Same source shape as `allow_url_ips`, but the opposite
+    /// direction: an IP matching this list is redirected even if
+    /// `allow_ip`/`allow_url_ips` would otherwise have let it through
+    /// — checked first, deny always wins. Useful for "allow this whole
+    /// office CIDR range except the one machine that's separately
+    /// known-compromised," published as its own feed.
+    #[serde(default)]
+    pub deny_url_ips: Option<IpBlocklistSource>,
+
     /// Absolute path to the static file to serve for a visitor not on
     /// `allow_ip`. Read fresh on every matching request rather than
     /// cached — a maintenance page is exactly the kind of content an
@@ -748,6 +770,17 @@ impl RouteRule {
     /// it was a plain, always-`true`-unless-set `bool`.
     pub fn cache_enabled(&self) -> bool {
         self.cache.unwrap_or(true)
+    }
+
+    /// A stable-enough identifier for this route, used only as a
+    /// `redirect_protect_url_ips` DashMap key — not persisted, not
+    /// exposed anywhere a person would see it. `vhost` (joined) plus
+    /// `prefix` distinguishes routes the same way actual request
+    /// routing already does; two routes sharing both would already be
+    /// ambiguous to route to in the first place, so collisions here
+    /// aren't a new concern this introduces.
+    pub fn redirect_protect_route_key(&self) -> String {
+        format!("{}|{}", self.vhost.join(","), self.prefix)
     }
 
     /// Resolves `RouteRule.forward_proxy_headers` — same
@@ -1502,6 +1535,17 @@ pub struct AppConfig {
     #[serde(default = "default_ip_blocklist_refresh_interval")]
     pub ip_blocklist_refresh_interval_secs: u64,
 
+    /// How often every `redirect_protect.allow_url_ips`/`deny_url_ips`
+    /// source, across every route, is re-fetched — same shape and
+    /// same default as `ip_blocklist_refresh_interval_secs`, kept as
+    /// its own separate setting rather than reusing that one directly
+    /// since an operator may reasonably want a maintenance-mode allow
+    /// list refreshed on a different cadence than a general abuse
+    /// feed. `0` fetches once at startup and never refreshes again.
+    /// Ignored when no route has either field configured.
+    #[serde(default = "default_ip_blocklist_refresh_interval")]
+    pub redirect_protect_refresh_interval_secs: u64,
+
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
 
@@ -1745,6 +1789,17 @@ pub struct AppState {
     /// note) when `ip_blocklists` isn't configured, so the per-request
     /// check is just an empty-slice scan.
     pub ip_blocklist: Arc<ArcSwap<Vec<IpNet>>>,
+
+    /// Fetched `redirect_protect.allow_url_ips`/`deny_url_ips` results,
+    /// per route — `(allow_compiled, deny_compiled)`, hot-updated by a
+    /// background task on `redirect_protect_refresh_interval_secs`.
+    /// Keyed by `redirect_protect_route_key` rather than swapped as one
+    /// whole map (unlike `ip_blocklist`, which has exactly one global
+    /// list): a `DashMap`, matching `otp_overrides`/`password_overrides`'
+    /// own per-key-update shape, lets one route's refresh land without
+    /// waiting on or blocking every other route's. A route with neither
+    /// field configured simply never gets an entry here at all.
+    pub redirect_protect_url_ips: Arc<DashMap<String, (Vec<IpNet>, Vec<IpNet>)>>,
 
     /// Hot-reloadable overlay for per-user TOTP secrets. `AppState.config`
     /// is an immutable `Arc<AppConfig>` snapshot loaded once at startup —
