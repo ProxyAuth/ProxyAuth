@@ -108,14 +108,52 @@ pub struct RedirectProtectConfig {
     /// only needs the IP check, this one path also needs a genuine,
     /// currently-valid ProxyAuth login.
     #[serde(default)]
-    pub protected_paths: Vec<ProtectedPathRule>,
+    pub paths: Vec<ProtectedPathRule>,
+
+    /// A URL to send a visitor to with a real `303 See Other` — not a
+    /// proxied response, an actual `Location` header the browser
+    /// itself navigates to — when any `paths` rule's
+    /// session check fails. Shared across every rule in
+    /// `paths`; there's one place a blocked visitor gets
+    /// sent, not a different one per rule. Distinct from `target`
+    /// below, which is a genuinely different mechanism used for the
+    /// `allow_ip`/`allow_url_ips` check instead: that one forwards
+    /// the *entire* request through to another backend and returns
+    /// its response directly, this one just says "go here instead,"
+    /// the same as pointing someone at a login page. Optional — when
+    /// unset, a failed `paths` check falls through to
+    /// `target`/`path` below instead, exactly as before this field
+    /// existed.
+    #[serde(default)]
+    pub redirect_url: Option<String>,
 
     /// Absolute path to the static file to serve for a visitor not on
     /// `allow_ip`. Read fresh on every matching request rather than
     /// cached — a maintenance page is exactly the kind of content an
     /// operator expects to be able to edit and see reflected
-    /// immediately, without restarting ProxyAuth.
-    pub path: String,
+    /// immediately, without restarting ProxyAuth. Optional; the
+    /// fallback if `target` below is either unset or unreachable. If
+    /// neither `path` nor `target` resolves to anything usable — both
+    /// unset, `target` failing with no `path` configured to fall back
+    /// to, or `path` itself unreadable — the visitor gets a bare
+    /// `503` with no body, rather than this gate silently letting the
+    /// request through to the route's real content.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Backend URL to proxy a blocked request to instead of serving
+    /// `path` — the original method, headers, and body all forwarded,
+    /// same as a normal proxied route would. Optional; when set, this
+    /// is tried first, and only falls back to `path` (if that's also
+    /// set) if reaching `target` itself fails (connection error,
+    /// timeout, or an invalid URL). Useful for pointing a blocked
+    /// visitor at a real maintenance-page service or status page
+    /// hosted somewhere else entirely, rather than a file that has to
+    /// live on this exact machine. At least one of `path`/`target`
+    /// should normally be set — see `path`'s own doc comment for what
+    /// happens if neither is.
+    #[serde(default)]
+    pub target: Option<String>,
 
     /// `allow_ip` parsed into `IpNet` once at startup — see
     /// `compile_ip_lists_on_routes`'s own doc comment for why (a fatal
@@ -124,15 +162,14 @@ pub struct RedirectProtectConfig {
     pub allow_ip_compiled: Vec<IpNet>,
 }
 
-/// One path-scoped session gate under `RedirectProtectConfig.protected_paths`
-/// — a request whose path matches `regex` must carry a valid ProxyAuth
-/// session (the `session_token` cookie, verified through the exact same
-/// `validate_token` every other authenticated route already relies on)
-/// on top of the `allow_ip`/`allow_url_ips` check above, or it's
-/// redirected the same way an IP not on the allow-list would be. This
-/// is genuine authentication, not a hidden bypass value — a real
-/// ProxyAuth login is what's actually being required for these
-/// specific paths.
+/// One path-scoped session gate under `RedirectProtectConfig.paths`
+/// — a request whose path matches `regex` must prove its session is
+/// genuinely valid, on top of the `allow_ip`/`allow_url_ips` check
+/// above, or it's redirected the same way an IP not on the allow-list
+/// would be. Verified by asking the backend itself (see `check_path`
+/// below) rather than checking ProxyAuth's own `session_token` — this
+/// is genuine authentication, delegated to whatever the backend's own
+/// auth scheme actually is, not a hidden bypass value.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProtectedPathRule {
     /// Matched against the request path the same way `RouteRule.regex`
@@ -142,6 +179,132 @@ pub struct ProtectedPathRule {
 
     #[serde(skip)]
     pub regex_compiled: Option<Regex>,
+
+    /// A path on this route's own backend to probe, e.g. `"/api/user"`
+    /// — appended to `target` (the leading `/` is expected as part of
+    /// this value). ProxyAuth issues a real request there, forwarding
+    /// the original request's `Cookie` header unchanged, and checks
+    /// the response the way `type_return` says to. This is
+    /// deliberately not tied to `session_token` or any
+    /// ProxyAuth-specific mechanism: the backend decides what
+    /// "authenticated" means for its own session, the same as it
+    /// always does for every normal request that actually reaches it
+    /// — including on an `oidc:`-enabled vhost, where ProxyAuth's own
+    /// session cookie isn't the authority to begin with. A short
+    /// timeout applies (see where this is used in `network/proxy.rs`)
+    /// — a slow or unreachable backend fails the check rather than
+    /// holding the request open.
+    pub check_path: String,
+
+    /// How to decide whether `check_path`'s response means "session
+    /// valid" — `"status_code"` (the default) or `"json"`. Most
+    /// backends already answer this question in their status code
+    /// alone: a session-protected endpoint typically already returns
+    /// `401`, or redirects to a login page (`302`/`303`) — neither is
+    /// `2xx`, so status-code checking already gets the right answer
+    /// with nothing further to configure. Reach for `"json"` only
+    /// when a `2xx` alone isn't precise enough — e.g. `check_path`
+    /// might land on something that returns success for reasons
+    /// unrelated to this specific session being valid, and a known
+    /// field's value is what actually proves it.
+    #[serde(default)]
+    pub type_return: CheckReturnType,
+
+    /// Only used when `type_return` is `"status_code"`. The exact
+    /// status this response must have to count as "valid" — `None`
+    /// (the default) accepts any `2xx`. Set this when the success
+    /// case is a specific code (e.g. exactly `200`, not `204`), or
+    /// when being explicit is simply preferred over "any success
+    /// code" — either way, anything else, including a redirect to a
+    /// login page, fails the check.
+    #[serde(default)]
+    pub expected_status: Option<u16>,
+
+    /// Only used when `type_return` is `"json"`. A field to look up
+    /// in `check_path`'s response body, parsed as JSON — top-level
+    /// only, e.g. `"authenticated"` for a body like
+    /// `{"authenticated": true}`. Required in `"json"` mode; a rule
+    /// set to `"json"` with no `expected_field` never passes, since
+    /// there'd be nothing left to actually check.
+    #[serde(default)]
+    pub expected_field: Option<String>,
+
+    /// Only used when `type_return` is `"json"`, alongside
+    /// `expected_field`. The value that field must equal — compared
+    /// against the JSON value's natural string form (a JSON string
+    /// compares by its own content with no added quotes, a
+    /// bool/number by its usual display form, e.g. `"true"`/`"200"`).
+    /// Left unset, the field's mere presence with a scalar value is
+    /// enough on its own.
+    #[serde(default)]
+    pub expected_value: Option<String>,
+
+    /// Elements to conditionally strip from this section's own HTML
+    /// output — using the exact same check result as this `paths`
+    /// entry's own `check_path`/`type_return` above, not a separate
+    /// check per element. Setting `hidden_blocks` changes what that
+    /// check actually does, though: a `paths` entry with at least one
+    /// `hidden_blocks` rule no longer redirects or blocks the path at
+    /// all on a failed check — the request goes through normally, and
+    /// the check result is applied to the response HTML instead,
+    /// hiding or replacing the targeted element(s). A `paths` entry
+    /// with no `hidden_blocks` keeps its original job of gating the
+    /// whole path. Needs `tag_proxyauth: true` on the route serving
+    /// that page to actually run. Each rule targets one element by
+    /// pasting its exact opening tag verbatim — see
+    /// `HiddenBlockRule::html_tag` — and removes the whole element,
+    /// opening tag through its matching closing tag, nesting handled.
+    /// Empty by default: no content is ever removed, and the path
+    /// keeps gating normally, unless explicitly configured here.
+    #[serde(default)]
+    pub hidden_blocks: Vec<HiddenBlockRule>,
+
+}
+
+/// One conditional HTML block under `ProtectedPathRule.hidden_blocks`
+/// — see that field's own doc comment for how it's applied. Carries
+/// no check of its own on purpose: the session check already ran
+/// once for the enclosing `paths` entry (its own `check_path`/
+/// `type_return`/etc.), and that single result is reused for every
+/// `hidden_blocks` rule under it, rather than triggering a separate
+/// backend request per element.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct HiddenBlockRule {
+    /// The exact opening tag to search for, copied verbatim from the
+    /// page's own HTML — e.g. `<div id="toto" class="admin-only">`.
+    /// ProxyAuth searches for this literal text, works out the tag
+    /// name from it (`div` here, but any tag name works — `<section
+    /// id="panel">`, `<span class="warn">`, anything), and finds the
+    /// matching closing tag itself, nesting of the same tag name
+    /// handled correctly along the way. No need to separately specify
+    /// which attribute identifies the element — whatever's pasted
+    /// here, attributes and all, is searched for as-is. If this exact
+    /// text isn't found in the response, the rule is a silent no-op —
+    /// the page simply doesn't have anything for it to act on, not a
+    /// configuration error.
+    pub html_tag: String,
+
+    /// HTML to put in the element's place when the enclosing `paths`
+    /// entry's check fails, instead of removing it outright — e.g. a
+    /// "you don't have permission to view this" message. Left unset,
+    /// a failed check simply removes the whole element with nothing
+    /// left behind.
+    #[serde(default)]
+    pub fallback_html: Option<String>,
+}
+
+/// How `ProtectedPathRule.check_path`'s response is interpreted.
+/// `StatusCode` (the default) is the common case and needs nothing
+/// further configured; `Json` is the narrower, more precise
+/// alternative for the routes where a bare `2xx` genuinely isn't
+/// enough to trust. See `ProtectedPathRule::type_return`'s own doc
+/// comment for when to reach for which.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckReturnType {
+    #[default]
+    StatusCode,
+    Json,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

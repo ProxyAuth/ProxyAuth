@@ -1,5 +1,6 @@
 use crate::config::config::BackendConfig;
 use crate::config::config::BackendInput;
+use crate::config::config::CheckReturnType;
 use crate::config::config::RouteRule;
 use crate::network::accesslog::LogContext;
 use crate::network::canonical_url::canonicalize_path_for_match;
@@ -241,10 +242,10 @@ pub fn compile_regex_on_routes(routes: &mut [RouteRule]) {
         });
 
         if let Some(rp) = r.redirect_protect.as_mut() {
-            for pp in rp.protected_paths.iter_mut() {
+            for pp in rp.paths.iter_mut() {
                 pp.regex_compiled = Some(Regex::new(&pp.regex).unwrap_or_else(|e| {
                     panic!(
-                        "routes.yml: route \"{}\": invalid `redirect_protect.protected_paths` regex \"{}\": {e}",
+                        "routes.yml: route \"{}\": invalid `redirect_protect.paths` regex \"{}\": {e}",
                         r.prefix, pp.regex
                     )
                 }));
@@ -516,6 +517,118 @@ pub fn substitute_proxyauth_tags(content: &str, username: Option<&str>, csrf_tok
         .replace("{{ proxyauth_id }}", crate::ID)
         .replace("{{proxyauth_id}}", crate::ID);
     out
+}
+
+/// Pulls the tag name out of an opening tag string — `"div"` from
+/// `<div id="toto" class="admin-only">`, `"section"` from `<section
+/// id="panel">`, and so on for any tag name at all. Used so
+/// `find_matching_tag` can track nesting of whatever element the
+/// configured `html_tag` actually is, not just `<div>` specifically.
+fn extract_tag_name(html_tag: &str) -> Option<String> {
+    let trimmed = html_tag.trim();
+    let re = regex::Regex::new(r"^<\s*([a-zA-Z][a-zA-Z0-9-]*)").ok()?;
+    re.captures(trimmed).map(|c| c[1].to_string())
+}
+
+/// Finds `html_tag` — the exact opening tag text a `HiddenBlockRule`
+/// was configured with — searched for verbatim in `html`, and the
+/// byte range its element spans, opening tag through its matching
+/// closing tag. The tag name (`div`, `section`, whatever) is worked
+/// out from `html_tag` itself, so this works for any element, not
+/// just `<div>`. Nested elements of the *same* tag name in between are
+/// tracked by depth, so an element with its own nested same-name
+/// children isn't cut short at the first closing tag encountered.
+/// Returns `None` if `html_tag`'s literal text isn't found in `html`
+/// at all, or (rare, malformed HTML) no matching close tag exists.
+fn find_matching_tag(html: &str, html_tag: &str) -> Option<(usize, usize)> {
+    let html_tag = html_tag.trim();
+    let tag_name = extract_tag_name(html_tag)?;
+
+    let start = html.find(html_tag)?;
+    let scan_pos = start + html_tag.len();
+
+    let tag_pattern = regex::RegexBuilder::new(&format!(
+        r"<{0}\b[^>]*>|</{0}\s*>",
+        regex::escape(&tag_name)
+    ))
+    .case_insensitive(true)
+    .build()
+    .ok()?;
+
+    let close_prefix = format!("</{}", tag_name.to_lowercase());
+    let mut depth: i32 = 1;
+    for tm in tag_pattern.find_iter(&html[scan_pos..]) {
+        if tm.as_str().to_lowercase().starts_with(&close_prefix) {
+            depth -= 1;
+            if depth == 0 {
+                return Some((start, scan_pos + tm.end()));
+            }
+        } else {
+            depth += 1;
+        }
+    }
+    None
+}
+
+/// Applies every `hidden_blocks` rule from every `redirect_protect.paths`
+/// entry whose `regex` matches the current request path. One backend
+/// check per matching `paths` entry — that entry's own `check_path`/
+/// `type_return`/etc., the exact same check already deciding whether
+/// the path itself is reachable — reused for every `hidden_blocks`
+/// rule under it, rather than a separate request per element. Each
+/// rule's targeted element (found by its literal `html_tag` — see
+/// that field's own doc comment) gets replaced with `fallback_html`
+/// (or removed outright if unset) when that check fails, left
+/// untouched when it passes. A `paths` entry whose regex doesn't
+/// match this request, or that has no `hidden_blocks` at all,
+/// contributes nothing — no check is even made for it. A rule whose
+/// `html_tag` isn't found anywhere in `html` is a silent no-op, not
+/// an error.
+async fn apply_hidden_blocks(
+    mut html: String,
+    rule: &RouteRule,
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+) -> String {
+    let Some(rp) = rule.redirect_protect.as_ref() else {
+        return html;
+    };
+    let request_path = req.uri().path();
+
+    for pp in &rp.paths {
+        let matches = pp
+            .regex_compiled
+            .as_ref()
+            .is_some_and(|re| re.is_match(request_path));
+        if !matches || pp.hidden_blocks.is_empty() {
+            continue;
+        }
+        // One check per matching `paths` entry, reused for every
+        // `hidden_blocks` rule under it — not one backend request
+        // per element. Skipped entirely when there's nothing to
+        // apply it to.
+        let session_valid = check_backend_session(
+            &rule.target,
+            &pp.check_path,
+            pp.type_return,
+            pp.expected_status,
+            pp.expected_field.as_deref(),
+            pp.expected_value.as_deref(),
+            req,
+            data,
+        )
+        .await;
+        for hb in &pp.hidden_blocks {
+            let Some((start, end)) = find_matching_tag(&html, &hb.html_tag) else {
+                continue;
+            };
+            if !session_valid {
+                let replacement = hb.fallback_html.as_deref().unwrap_or("");
+                html.replace_range(start..end, replacement);
+            }
+        }
+    }
+    html
 }
 
 /// Resolves the token to pass as `substitute_proxyauth_tags`'s
@@ -827,6 +940,280 @@ async fn serve_redirect_protect_page(path: &str) -> HttpResponse {
     }
 }
 
+/// Proxies the original request — method, path/query, headers (minus
+/// hop-by-hop), and body — to `target`, for
+/// `RedirectProtectConfig.target`. Returns `None` on any failure
+/// (invalid resulting URI, unreachable backend, timeout), letting the
+/// caller fall back to serving `path` as a static file instead — see
+/// `RedirectProtectConfig.target`'s own doc comment.
+async fn proxy_to_redirect_protect_target(
+    target: &str,
+    req: &HttpRequest,
+    body: &web::Bytes,
+    data: &web::Data<AppState>,
+) -> Option<HttpResponse> {
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let uri_str = format!("{}{}", target.trim_end_matches('/'), path_and_query);
+    let uri = match Uri::from_str(&uri_str) {
+        Ok(uri) => uri,
+        Err(e) => {
+            warn!("redirect_protect: invalid target URI \"{uri_str}\": {e}");
+            return None;
+        }
+    };
+
+    let method = Method::from_bytes(req.method().as_str().as_bytes()).unwrap_or(Method::GET);
+    let mut request_builder = Request::builder().method(&method).uri(&uri);
+    for (name, value) in req.headers().iter() {
+        let name_str = name.as_str();
+        // Same exclusions the normal proxying path applies to a
+        // client's own copy-through — `x-user`/`x-user-roles`/
+        // `x-groups` are ProxyAuth-asserted values elsewhere, never
+        // meant to be trusted verbatim from whatever a client sent.
+        // This function doesn't set them itself, but a naive backend
+        // on the other end might still trust them if they arrived at
+        // all — excluding them here is the same discipline, not an
+        // oversight to skip just because this path is different.
+        if is_hop_by_hop_header(name_str)
+            || name_str == "x-user"
+            || name_str == "x-user-roles"
+            || name_str == "x-groups"
+        {
+            continue;
+        }
+        // `name`/`value` are actix_web's own header types, backed by
+        // a different major version of the `http` crate than hyper
+        // uses here — no direct conversion exists between the two,
+        // so this goes through raw bytes instead, the same way the
+        // normal proxied-request path already does elsewhere in this
+        // file.
+        if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
+            request_builder = request_builder.header(name_str, hv);
+        }
+    }
+
+    let hyper_req = request_builder
+        .body(Full::new(Bytes::from(body.to_vec())).boxed())
+        .ok()?;
+
+    let client_opts = ClientOptions {
+        use_proxy: false,
+        proxy_addr: None,
+        use_cert: false,
+        cert_path: None,
+        key_path: None,
+    };
+    let client = get_or_build_client(client_opts, &data.config).ok()?;
+
+    // Same shape as a normal proxied request's own timeout — this is
+    // meant to actually serve the response body a blocked visitor
+    // sees, not a quick internal check, so it gets the same budget a
+    // real backend request would.
+    let resp = match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
+        Ok(Ok(resp)) => resp,
+        _ => return None,
+    };
+
+    let status = resp.status();
+    let mut client_resp = HttpResponse::build(to_actix_status(status));
+    for (key, value) in resp.headers() {
+        let k = key.as_str();
+        if is_hop_by_hop_header(k) || k == "server" {
+            continue;
+        }
+        client_resp.append_header((k, value.as_bytes()));
+    }
+    client_resp.append_header(("server", "ProxyAuth"));
+
+    let body_bytes = resp.into_body().collect().await.ok()?.to_bytes();
+    Some(client_resp.body(body_bytes))
+}
+
+/// Resolves the actual response a blocked `redirect_protect` visitor
+/// gets — `rp.target` if it's set and reaching it succeeds, `rp.path`
+/// as a static file otherwise, or a bare `503` if neither is set (or
+/// usable). Centralizes the "try target, fall back to path, fall back
+/// to a plain response" logic in one place rather than duplicating it
+/// at both `redirect_protect` call sites (the IP check and the
+/// `paths` session check).
+async fn resolve_redirect_protect_response(
+    rp: &crate::config::config::RedirectProtectConfig,
+    req: &HttpRequest,
+    body: &web::Bytes,
+    data: &web::Data<AppState>,
+) -> HttpResponse {
+    if let Some(target) = &rp.target {
+        if let Some(resp) = proxy_to_redirect_protect_target(target, req, body, data).await {
+            return resp;
+        }
+        warn!("redirect_protect: target \"{target}\" unreachable, falling back");
+    }
+
+    match &rp.path {
+        Some(path) => serve_redirect_protect_page(path).await,
+        // Neither `target` (unset, or set but unreachable) nor `path`
+        // gives this gate anything to actually show — a generic `503`
+        // rather than serving the route's real content, which would
+        // defeat the entire point of the gate having matched at all.
+        None => HttpResponse::ServiceUnavailable()
+            .append_header(("server", "ProxyAuth"))
+            .body("503 Service Unavailable"),
+    }
+}
+
+/// Issues a real request to `target`'s own backend at `check_path`,
+/// forwarding the original request's `Cookie` header unchanged, and
+/// reports whether the session is genuinely valid — see
+/// `ProtectedPathRule::check_path`'s own doc comment for the full
+/// reasoning. Any failure at all — an invalid resulting URI, an
+/// unreachable backend, a timeout, a non-2xx status, a body that
+/// doesn't parse as JSON or doesn't carry the expected field/value
+/// when one was configured — is treated as "not authenticated." Fails
+/// *closed*, same discipline as the IP check right next to where this
+/// is called: a backend that can't be reached, or doesn't answer the
+/// way it's expected to, is not the same as one that confirmed the
+/// session is valid.
+async fn check_backend_session(
+    target: &str,
+    check_path: &str,
+    type_return: CheckReturnType,
+    expected_status: Option<u16>,
+    expected_field: Option<&str>,
+    expected_value: Option<&str>,
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+) -> bool {
+    let uri_str = format!("{}{}", target.trim_end_matches('/'), check_path);
+    let Ok(uri) = Uri::from_str(&uri_str) else {
+        warn!("redirect_protect: invalid check_path URI \"{uri_str}\"");
+        return false;
+    };
+
+    let mut request_builder = Request::builder().method(Method::GET).uri(&uri);
+    if let Some(cookie_header) = req.headers().get(header::COOKIE) {
+        // Same cross-crate `http` type mismatch as in
+        // `proxy_to_redirect_protect_target` — actix_web's
+        // `HeaderValue` doesn't convert directly into hyper's, so
+        // this goes through raw bytes. `hyper::header::COOKIE` is
+        // used directly for the name, sidestepping the same issue on
+        // that side entirely since it's a plain constant in both
+        // crates.
+        if let Ok(hv) = hyper::header::HeaderValue::from_bytes(cookie_header.as_bytes()) {
+            request_builder = request_builder.header(hyper::header::COOKIE, hv);
+        }
+    }
+
+    let Ok(hyper_req) = request_builder.body(Empty::<Bytes>::new().boxed()) else {
+        return false;
+    };
+
+    let client_opts = ClientOptions {
+        use_proxy: false,
+        proxy_addr: None,
+        use_cert: false,
+        cert_path: None,
+        key_path: None,
+    };
+    let Ok(client) = get_or_build_client(client_opts, &data.config) else {
+        return false;
+    };
+
+    // Deliberately short — this check runs ahead of every matching
+    // request, and a slow backend here shouldn't make every one of
+    // them wait as long as a normal proxied request would.
+    let resp = match timeout(Duration::from_millis(3000), client.request(hyper_req)).await {
+        Ok(Ok(resp)) => resp,
+        _ => return false,
+    };
+    let status = resp.status();
+
+    match type_return {
+        CheckReturnType::StatusCode => match expected_status {
+            // A specific code was asked for: exact match only —
+            // stricter than "any 2xx", so a route whose real success
+            // case is e.g. exactly 200 doesn't also quietly accept a
+            // 201 or 204 it never meant to.
+            Some(expected) => status.as_u16() == expected,
+            // No specific code: the common case — any 2xx counts, a
+            // redirect to a login page (302/303) or a 401 correctly
+            // doesn't.
+            None => status.is_success(),
+        },
+        CheckReturnType::Json => {
+            // A non-2xx response body isn't worth parsing at all —
+            // an error page's JSON (if any) was never going to carry
+            // a meaningful `expected_field` anyway.
+            if !status.is_success() {
+                return false;
+            }
+            // `Json` mode with nothing to actually check is treated
+            // as always-false rather than always-true — silently
+            // reducing to "any 2xx" would be a surprising, easy to
+            // miss downgrade from what the config visibly asked for.
+            let Some(field) = expected_field else {
+                warn!(
+                    "check_backend_session: type_return: json but no expected_field set — treating as never satisfied"
+                );
+                return false;
+            };
+
+            // A hard cap on how much of the body we'll ever read for
+            // this — meant to be a small status response
+            // (`{"authenticated": true}`, not a page of content), and
+            // an operator-configured backend behaving unexpectedly
+            // (or, worse, something else entirely answering at that
+            // address) shouldn't be able to hold an unbounded amount
+            // of memory open on ProxyAuth's side just because a
+            // maintenance-mode check happened to hit it.
+            const MAX_CHECK_BODY_BYTES: u64 = 65536;
+            let body_bytes = match timeout(
+                Duration::from_millis(2000),
+                http_body_util::Limited::new(resp.into_body(), MAX_CHECK_BODY_BYTES as usize)
+                    .collect(),
+            )
+            .await
+            {
+                Ok(Ok(collected)) => collected.to_bytes(),
+                _ => return false,
+            };
+
+            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) else {
+                return false;
+            };
+
+            let Some(actual) = json.get(field).and_then(json_value_as_flat_string) else {
+                return false;
+            };
+
+            match expected_value {
+                Some(expected) => actual == expected,
+                // A field named but no expected_value given:
+                // presence (with a scalar value at all) is enough on
+                // its own.
+                None => true,
+            }
+        }
+    }
+}
+
+/// Renders a JSON scalar the way an operator would naturally write it
+/// in `expected_value` — a string by its own content (no added
+/// quotes), a bool/number by their ordinary display form. Arrays,
+/// objects, and `null` have no sensible flat form, so they're not
+/// something `expected_value` can match against at all.
+fn json_value_as_flat_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 fn guess_content_type(path: &Path) -> &'static str {
     let ext = path
         .extension()
@@ -959,7 +1346,9 @@ async fn serve_static_file(
                             // token gets generated and spliced in, but
                             // /auth never actually checks it).
                             let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                            substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                            let tagged = substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                            apply_hidden_blocks(tagged, rule, req, data)
+                                .await
                                 .into_bytes()
                         }
                         Err(e) => e.into_bytes(),
@@ -1058,7 +1447,9 @@ async fn serve_static_file(
                     Ok(text) => {
                         let username = extract_username_for_tags(req, data, ip).await;
                         let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                        substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                        let tagged = substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                        apply_hidden_blocks(tagged, rule, req, data)
+                            .await
                             .into_bytes()
                     }
                     Err(e) => e.into_bytes(),
@@ -1254,37 +1645,58 @@ pub async fn global_proxy(
                     || url_allow.iter().any(|net| net.contains(&ip))
             });
             if !is_allowed {
-                return Ok(serve_redirect_protect_page(&rp.path).await);
+                return Ok(resolve_redirect_protect_response(rp, &req, &body, &data).await);
             }
 
             // Path-scoped session gates, layered on top of the IP
             // check above — a request already past `is_allowed` still
-            // has to carry a genuinely valid ProxyAuth session for
-            // every `protected_paths` rule whose regex matches this
-            // specific path. Same `validate_token` every other
-            // authenticated route already relies on — this isn't a
-            // separate, weaker check, it's the real login.
+            // has to prove its session is actually valid, for every
+            // `paths` rule whose regex matches this
+            // specific path. Delegated to the backend itself via
+            // `check_backend_session`, rather than checked against
+            // ProxyAuth's own `session_token` — this way it works
+            // regardless of what the backend's own auth scheme
+            // actually is, including on an `oidc:`-enabled vhost where
+            // ProxyAuth's own session cookie isn't the authority to
+            // begin with.
             let request_path = req.uri().path();
-            for pp in &rp.protected_paths {
+            for pp in &rp.paths {
                 let Some(re) = &pp.regex_compiled else {
                     continue;
                 };
                 if !re.is_match(request_path) {
                     continue;
                 }
-                let session_valid = match req.cookie("session_token") {
-                    Some(cookie) => {
-                        let ip_str = client_ip(&req, &data.config)
-                            .map(|ip| ip.to_string())
-                            .unwrap_or_default();
-                        validate_token(cookie.value(), &data, &data.config, &ip_str)
-                            .await
-                            .is_ok()
-                    }
-                    None => false,
-                };
+                // A `paths` entry with `hidden_blocks` configured
+                // doesn't gate the whole path — its check is deferred
+                // entirely to `apply_hidden_blocks`, run against the
+                // actual response once the request has already gone
+                // through. Redirecting/blocking here would mean the
+                // page never gets far enough to have anything for
+                // `hidden_blocks` to act on in the first place.
+                if !pp.hidden_blocks.is_empty() {
+                    continue;
+                }
+                let session_valid =
+                    check_backend_session(
+                        &rule.target,
+                        &pp.check_path,
+                        pp.type_return,
+                        pp.expected_status,
+                        pp.expected_field.as_deref(),
+                        pp.expected_value.as_deref(),
+                        &req,
+                        &data,
+                    )
+                    .await;
                 if !session_valid {
-                    return Ok(serve_redirect_protect_page(&rp.path).await);
+                    if let Some(location) = &rp.redirect_url {
+                        return Ok(HttpResponse::SeeOther()
+                            .append_header(("server", "ProxyAuth"))
+                            .append_header(("location", location.as_str()))
+                            .finish());
+                    }
+                    return Ok(resolve_redirect_protect_response(rp, &req, &body, &data).await);
                 }
             }
         }
@@ -2228,6 +2640,7 @@ pub async fn proxy_with_proxy(
                 let csrf_token = resolve_tag_csrf_token(rule, &data.config);
                 let substituted =
                     substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                let substituted = apply_hidden_blocks(substituted, rule, &req, &data).await;
                 let new_len = substituted.len();
                 body_bytes = Bytes::from(substituted.into_bytes());
                 client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
@@ -2994,6 +3407,7 @@ pub async fn proxy_without_proxy(
                 let csrf_token = resolve_tag_csrf_token(rule, &data.config);
                 let substituted =
                     substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                let substituted = apply_hidden_blocks(substituted, rule, &req, &data).await;
                 let new_len = substituted.len();
                 body_bytes = Bytes::from(substituted.into_bytes());
                 client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
