@@ -239,6 +239,17 @@ pub fn compile_regex_on_routes(routes: &mut [RouteRule]) {
                 )
             })
         });
+
+        if let Some(rp) = r.redirect_protect.as_mut() {
+            for pp in rp.protected_paths.iter_mut() {
+                pp.regex_compiled = Some(Regex::new(&pp.regex).unwrap_or_else(|e| {
+                    panic!(
+                        "routes.yml: route \"{}\": invalid `redirect_protect.protected_paths` regex \"{}\": {e}",
+                        r.prefix, pp.regex
+                    )
+                }));
+            }
+        }
     }
 }
 
@@ -1244,6 +1255,37 @@ pub async fn global_proxy(
             });
             if !is_allowed {
                 return Ok(serve_redirect_protect_page(&rp.path).await);
+            }
+
+            // Path-scoped session gates, layered on top of the IP
+            // check above — a request already past `is_allowed` still
+            // has to carry a genuinely valid ProxyAuth session for
+            // every `protected_paths` rule whose regex matches this
+            // specific path. Same `validate_token` every other
+            // authenticated route already relies on — this isn't a
+            // separate, weaker check, it's the real login.
+            let request_path = req.uri().path();
+            for pp in &rp.protected_paths {
+                let Some(re) = &pp.regex_compiled else {
+                    continue;
+                };
+                if !re.is_match(request_path) {
+                    continue;
+                }
+                let session_valid = match req.cookie("session_token") {
+                    Some(cookie) => {
+                        let ip_str = client_ip(&req, &data.config)
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_default();
+                        validate_token(cookie.value(), &data, &data.config, &ip_str)
+                            .await
+                            .is_ok()
+                    }
+                    None => false,
+                };
+                if !session_valid {
+                    return Ok(serve_redirect_protect_page(&rp.path).await);
+                }
             }
         }
     }

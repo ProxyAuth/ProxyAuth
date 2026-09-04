@@ -98,6 +98,18 @@ pub struct RedirectProtectConfig {
     #[serde(default)]
     pub deny_url_ips: Option<IpBlocklistSource>,
 
+    /// Extra, path-scoped gates layered on top of the `allow_ip`/
+    /// `allow_url_ips` check above — not a replacement for it. A
+    /// visitor already on the allow-list still has to satisfy every
+    /// `ProtectedPathRule` whose `regex` matches the request path, on
+    /// top of being IP-allowed in the first place. Meant for a
+    /// sensitive sub-path (an admin panel, an internal dashboard)
+    /// living under an otherwise-normal route: the rest of the route
+    /// only needs the IP check, this one path also needs a genuine,
+    /// currently-valid ProxyAuth login.
+    #[serde(default)]
+    pub protected_paths: Vec<ProtectedPathRule>,
+
     /// Absolute path to the static file to serve for a visitor not on
     /// `allow_ip`. Read fresh on every matching request rather than
     /// cached — a maintenance page is exactly the kind of content an
@@ -110,6 +122,26 @@ pub struct RedirectProtectConfig {
     /// error on a bad entry, and no re-parsing on every request).
     #[serde(skip)]
     pub allow_ip_compiled: Vec<IpNet>,
+}
+
+/// One path-scoped session gate under `RedirectProtectConfig.protected_paths`
+/// — a request whose path matches `regex` must carry a valid ProxyAuth
+/// session (the `session_token` cookie, verified through the exact same
+/// `validate_token` every other authenticated route already relies on)
+/// on top of the `allow_ip`/`allow_url_ips` check above, or it's
+/// redirected the same way an IP not on the allow-list would be. This
+/// is genuine authentication, not a hidden bypass value — a real
+/// ProxyAuth login is what's actually being required for these
+/// specific paths.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ProtectedPathRule {
+    /// Matched against the request path the same way `RouteRule.regex`
+    /// is — searched anywhere in the path by default; add `^`/`$`
+    /// yourself for an exact match.
+    pub regex: String,
+
+    #[serde(skip)]
+    pub regex_compiled: Option<Regex>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
