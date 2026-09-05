@@ -630,6 +630,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let redirect_protect_url_ips: Arc<DashMap<String, (Vec<ipnet::IpNet>, Vec<ipnet::IpNet>)>> =
+        Arc::new(DashMap::new());
+    let any_redirect_protect_urls = routes.routes.iter().any(|r| {
+        r.redirect_protect
+            .as_ref()
+            .is_some_and(|rp| rp.allow_url_ips.is_some() || rp.deny_url_ips.is_some())
+    });
+    if any_redirect_protect_urls {
+        let rp_config = Arc::clone(&config);
+        let rp_routes = Arc::clone(&routes);
+        let rp_store = Arc::clone(&redirect_protect_url_ips);
+        tokio::spawn(async move {
+            network::ipblocklist::refresh_redirect_protect_urls(&rp_routes.routes, &rp_store)
+                .await;
+            println!(
+                "[redirect_protect] loaded url-fetched allow/deny lists for {} route(s)",
+                rp_store.len()
+            );
+
+            if rp_config.redirect_protect_refresh_interval_secs == 0 {
+                return;
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                rp_config.redirect_protect_refresh_interval_secs,
+            ));
+            ticker.tick().await; // initial load above already covered the first fetch
+            loop {
+                ticker.tick().await;
+                network::ipblocklist::refresh_redirect_protect_urls(&rp_routes.routes, &rp_store)
+                    .await;
+                println!(
+                    "[redirect_protect] refreshed url-fetched allow/deny lists for {} route(s)",
+                    rp_store.len()
+                );
+            }
+        });
+    }
+
     let state = web::Data::new(AppState {
         config: Arc::clone(&config),
                                routes: Arc::clone(&routes),
@@ -637,6 +675,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                revoked_tokens,
                                stats,
                                ip_blocklist,
+                               redirect_protect_url_ips,
                                otp_overrides: Arc::new(DashMap::new()),
                                password_overrides: Arc::new(DashMap::new()),
                                must_change_overrides: Arc::new(DashMap::new()),

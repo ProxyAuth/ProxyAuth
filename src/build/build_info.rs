@@ -60,6 +60,22 @@ pub fn update_build_info(input: &str) -> Result<(), String> {
         shuffled_order: parts[7].to_string(),
     };
 
+    // Checked after the field parsing so that a malformed build_time
+    // still reports build_time rather than being masked by this guard.
+    //
+    // The build secret is key material: it is the HKDF salt in
+    // derive_key_from_secret and a field in generate_token. A keystore
+    // produced before the 256-bit change carries a 26-character value,
+    // and importing it would silently drop the deployment back to ~70
+    // bits. Fail loudly instead.
+    if build_info.build_hk.len() < 64 {
+        return Err(
+            "build_hk too short: this keystore predates the 256-bit build secret. \
+             Re-run the export on an upgraded instance."
+                .into(),
+        );
+    }
+
     update(build_info);
     Ok(())
 }
