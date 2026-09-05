@@ -249,9 +249,13 @@ pub struct ProtectedPathRule {
     /// the check result is applied to the response HTML instead,
     /// hiding or replacing the targeted element(s). A `paths` entry
     /// with no `hidden_blocks` keeps its original job of gating the
-    /// whole path. Needs `tag_proxyauth: true` on the route serving
-    /// that page to actually run. Each rule targets one element by
-    /// pasting its exact opening tag verbatim — see
+    /// whole path. Runs independently of `tag_proxyauth` — this and
+    /// `{{ }}` tag substitution happen to share the same
+    /// response-scanning pass for efficiency, but a route with
+    /// `hidden_blocks` configured gets that pass regardless of
+    /// whether `tag_proxyauth` is set at all (see
+    /// `RouteRule::has_hidden_blocks`). Each rule targets one element
+    /// by pasting its exact opening tag verbatim — see
     /// `HiddenBlockRule::html_tag` — and removes the whole element,
     /// opening tag through its matching closing tag, nesting handled.
     /// Empty by default: no content is ever removed, and the path
@@ -957,6 +961,20 @@ impl RouteRule {
     /// that's the deliberately conservative choice.
     pub fn tag_proxyauth_enabled(&self) -> bool {
         self.tag_proxyauth.unwrap_or(false)
+    }
+
+    /// Whether this route has at least one `redirect_protect.paths`
+    /// entry with a non-empty `hidden_blocks` list — independent of
+    /// `tag_proxyauth_enabled`, on purpose. The two features happen
+    /// to share the same "scan this HTML response" pass for
+    /// efficiency, but they're unrelated otherwise: a route can want
+    /// `hidden_blocks` without wanting `{{ }}` tag substitution at
+    /// all, so this is checked on its own rather than folded into
+    /// `tag_proxyauth`'s own flag.
+    pub fn has_hidden_blocks(&self) -> bool {
+        self.redirect_protect
+            .as_ref()
+            .is_some_and(|rp| rp.paths.iter().any(|pp| !pp.hidden_blocks.is_empty()))
     }
 
     /// Resolves `RouteRule.cache` — no global fallback (same shape as

@@ -2,6 +2,9 @@
 mod tests {
     use proxyauth::build::build_info::{get, update_build_info, update, BuildInfo};
 
+    /// A 64-character build secret, matching what build.rs now emits.
+    const TEST_HK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn save_build_info() -> BuildInfo {
         get()
     }
@@ -61,7 +64,8 @@ mod tests {
     #[test]
     fn update_build_info_valid_input() {
         let saved = save_build_info();
-        let input = "test-version|1234|5678|9012|3456|7890|test-hk|a,b,c";
+        let input = format!("test-version|1234|5678|9012|3456|7890|{}|a,b,c", TEST_HK);
+        let input = input.as_str();
         let result = update_build_info(input);
         assert!(result.is_ok());
 
@@ -72,10 +76,19 @@ mod tests {
         assert_eq!(info.build_seed, 9012);
         assert_eq!(info.build_seed2, 3456);
         assert_eq!(info.build_epoch, 7890);
-        assert_eq!(info.build_hk, "test-hk");
+        assert_eq!(info.build_hk, TEST_HK);
         assert_eq!(info.shuffled_order, "a,b,c");
 
         restore_build_info(&saved);
+    }
+
+    #[test]
+    fn update_build_info_rejects_short_build_hk() {
+        // A keystore exported before the 256-bit build secret must not
+        // silently downgrade the running instance back to ~70 bits.
+        let result = update_build_info("v|0|0|0|0|0|AA:BB:CC:DD:EE:FF:00:11:22|order");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("build_hk"));
     }
 
     #[test]
@@ -130,14 +143,15 @@ mod tests {
     #[test]
     fn update_build_info_preserves_through_to_string() {
         let saved = save_build_info();
-        let input = "v2|100|200|300|400|500|hk-val|x,y,z";
+        let input = format!("v2|100|200|300|400|500|{}|x,y,z", TEST_HK);
+        let input = input.as_str();
         let _ = update_build_info(input);
         let info = get();
         let serialized = info.to_string();
         assert!(serialized.contains("v2"));
         assert!(serialized.contains("100"));
         assert!(serialized.contains("200"));
-        assert!(serialized.contains("hk-val"));
+        assert!(serialized.contains(TEST_HK));
         assert!(serialized.contains("x,y,z"));
         restore_build_info(&saved);
     }

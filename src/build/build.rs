@@ -1,5 +1,7 @@
 use blake3;
 use rand::seq::SliceRandom;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::env;
@@ -33,6 +35,22 @@ pub fn identity(seed: u64) -> String {
         .join(":")
 }
 
+/// Generates the build-time secret used as the HKDF salt in
+/// `derive_key_from_secret` and mixed into `generate_token`.
+///
+/// Unlike `identity()`, this draws `len` bytes directly from the OS
+/// CSPRNG. That distinction matters: hashing a low-entropy seed to a
+/// longer output does not create entropy, it only hides how little
+/// there is. The entropy of the result here is the full `len * 8` bits.
+///
+/// This value is key material. It must not be truncated, nor shaped to
+/// resemble a MAC address or any other identifier format.
+pub fn build_secret_hex(len: usize) -> String {
+    let mut buf = vec![0u8; len];
+    OsRng.fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 fn main() {
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION not set");
 
@@ -45,7 +63,8 @@ fn main() {
 
     let mut rng = rand::thread_rng();
     let build_rand = rng.gen_range(1..999_999_999);
-    let build_seed = rng.gen_range(1..999);
+    let mut rngr = rand::thread_rng();
+    let build_seed = rngr.next_u64();
     let build_seed2 = rng.gen_range(10..99);
 
     let build_time = SystemTime::now()
@@ -56,7 +75,7 @@ fn main() {
 
     let random_epoch: i64 = rng.gen_range(0..999_999_999_999);
     let identity_str = identity(rng.gen_range(1..999_999_999_999));
-    let hk = identity(rng.gen_range(1..999_999_999_999));
+    let hk = build_secret_hex(32);
 
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);
     println!("cargo:rustc-env=BUILD_RAND={}", build_rand);

@@ -1331,7 +1331,9 @@ async fn serve_static_file(
         return match tokio::fs::read(&root).await {
             Ok(bytes) => {
                 let content_type = guess_content_type(&root);
-                let bytes = if rule.tag_proxyauth_enabled() && content_type.starts_with("text/html") {
+                let bytes = if (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
+                    && content_type.starts_with("text/html")
+                {
                     match String::from_utf8(bytes) {
                         Ok(text) => {
                             let username = extract_username_for_tags(req, data, ip).await;
@@ -1346,7 +1348,11 @@ async fn serve_static_file(
                             // token gets generated and spliced in, but
                             // /auth never actually checks it).
                             let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                            let tagged = substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                            let tagged = if rule.tag_proxyauth_enabled() {
+                                substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                            } else {
+                                text
+                            };
                             apply_hidden_blocks(tagged, rule, req, data)
                                 .await
                                 .into_bytes()
@@ -1442,12 +1448,18 @@ async fn serve_static_file(
     match tokio::fs::read(&resolved).await {
         Ok(bytes) => {
             let content_type = guess_content_type(&resolved);
-            let bytes = if rule.tag_proxyauth_enabled() && content_type.starts_with("text/html") {
+            let bytes = if (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
+                && content_type.starts_with("text/html")
+            {
                 match String::from_utf8(bytes) {
                     Ok(text) => {
                         let username = extract_username_for_tags(req, data, ip).await;
                         let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                        let tagged = substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                        let tagged = if rule.tag_proxyauth_enabled() {
+                            substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                        } else {
+                            text
+                        };
                         apply_hidden_blocks(tagged, rule, req, data)
                             .await
                             .into_bytes()
@@ -2629,7 +2641,7 @@ pub async fn proxy_with_proxy(
     // also available in whatever HTML the backend itself returns, so
     // a target's own page can use them too, not just ProxyAuth's own
     // static content.
-    if rule.tag_proxyauth_enabled() {
+    if rule.tag_proxyauth_enabled() || rule.has_hidden_blocks() {
         let ct = headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
@@ -2638,8 +2650,11 @@ pub async fn proxy_with_proxy(
             if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
                 let username = extract_username_for_tags(&req, &data, &ip).await;
                 let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                let substituted =
-                    substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                let substituted = if rule.tag_proxyauth_enabled() {
+                    substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                } else {
+                    text
+                };
                 let substituted = apply_hidden_blocks(substituted, rule, &req, &data).await;
                 let new_len = substituted.len();
                 body_bytes = Bytes::from(substituted.into_bytes());
@@ -3396,7 +3411,7 @@ pub async fn proxy_without_proxy(
     // static files and the other proxied-response path, so a target's
     // own HTML can use these tags too, not just ProxyAuth's own static
     // content.
-    if !is_head && rule.tag_proxyauth_enabled() {
+    if !is_head && (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks()) {
         let ct = headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
@@ -3405,8 +3420,11 @@ pub async fn proxy_without_proxy(
             if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
                 let username = extract_username_for_tags(&req, &data, &ip).await;
                 let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                let substituted =
-                    substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref());
+                let substituted = if rule.tag_proxyauth_enabled() {
+                    substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                } else {
+                    text
+                };
                 let substituted = apply_hidden_blocks(substituted, rule, &req, &data).await;
                 let new_len = substituted.len();
                 body_bytes = Bytes::from(substituted.into_bytes());
