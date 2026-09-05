@@ -2579,6 +2579,28 @@ pub async fn proxy_with_proxy(
 
     for (key, value) in response_result.headers() as &hyper::HeaderMap {
         let k = key.as_str();
+        // Hop-by-hop headers are per-connection and must not be
+        // forwarded to the client (RFC 9110 §7.6.1). Letting the
+        // upstream's `connection`, `transfer-encoding`,
+        // `content-length` or `keep-alive` through means the backend
+        // dictates the framing of a connection it is not part of,
+        // which is the classic source of response desynchronisation
+        // and request smuggling. The request-building paths in this
+        // file already filter these through `is_hop_by_hop_header`;
+        // the response paths did not, which was an asymmetry rather
+        // than a decision. actix recomputes the framing headers it
+        // needs from the body it is actually sending.
+        //
+        // `content-length` is the same deliberate exception as in
+        // `proxy_without_proxy`: on HEAD the body is empty, so actix
+        // would emit 0, but the client is entitled to the length the
+        // matching GET would have returned. Kept identical here so the
+        // two proxy paths do not answer HEAD differently.
+        let keep_head_content_length =
+            method_str.eq_ignore_ascii_case("HEAD") && k.eq_ignore_ascii_case("content-length");
+        if is_hop_by_hop_header(k) && !keep_head_content_length {
+            continue;
+        }
         if k != "user-agent" && k != "authorization" && k != "server" {
             client_resp.append_header((k, value.as_bytes()));
         }
@@ -3339,6 +3361,23 @@ pub async fn proxy_without_proxy(
     // response would have had.
     for (key, value) in &headers {
         let k = key.as_str();
+
+        // Hop-by-hop headers are per-connection and must not reach the
+        // client (RFC 9110 §7.6.1) — forwarding the upstream's
+        // `connection`, `transfer-encoding` or `keep-alive` lets the
+        // backend dictate the framing of a connection it is not part
+        // of, which is how response desynchronisation happens. The
+        // request-building path above already filters these through
+        // `is_hop_by_hop_header`; this response path did not.
+        //
+        // `content-length` is the deliberate exception noted above:
+        // on HEAD the body is empty, so actix would emit 0, but the
+        // client is entitled to the length the matching GET would
+        // have returned.
+        let keep_head_content_length = is_head && k.eq_ignore_ascii_case("content-length");
+        if is_hop_by_hop_header(k) && !keep_head_content_length {
+            continue;
+        }
 
         if k != "user-agent" && k != "authorization" && k != "server" {
             client_resp.append_header((k, value.as_bytes()));
