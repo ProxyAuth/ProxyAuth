@@ -25,6 +25,38 @@ jobs:
       - run: cargo install cargo-audit
       - run: cargo audit
 
+      - name: No duplicated cryptographic crates
+        # ProxyAuth and zerocrypt must agree on their crypto stack. If they
+        # drift — one on chacha20poly1305 0.11, the other on 0.10 — cargo
+        # compiles both, and the binary carries two implementations of the
+        # same primitive: dead weight and a doubled audit surface.
+        #
+        # `cargo tree --duplicates` is the right tool. Asking
+        # `--package <name>` instead fails with "ambiguous specification"
+        # in exactly the case being detected, so the check would pass
+        # silently on a duplicate.
+        run: |
+          set -eu
+          WATCH="chacha20poly1305 sha2 hkdf blake3 subtle base64 rand"
+
+          dups=$(cargo tree --duplicates --prefix none 2>/dev/null \
+                 | grep -oP '^[a-z0-9_-]+(?= v[0-9])' | sort -u || true)
+
+          FAILED=0
+          for crate in $WATCH; do
+            if printf '%s\n' "$dups" | grep -qx "$crate"; then
+              echo "::error::$crate is compiled more than once"
+              cargo tree --duplicates | grep -A3 "^$crate v" || true
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Align the versions in Cargo.toml, or in zerocrypt, so each resolves once."
+            exit 1
+          fi
+          echo "Every watched cryptographic crate resolves to a single version."
+
   coverage:
     runs-on: ubuntu-latest
 
@@ -62,7 +94,7 @@ jobs:
           override: true
 
       - name: Install dependancy
-        run: apt update && apt install -y nettle-dev sudo pkg-config libssl-dev libpq-dev default-libmysqlclient-dev
+        run: apt update && apt install -y nettle-dev sudo pkg-config libssl-dev libpq-dev default-libmysqlclient-dev jq
 
       - name: install nextest
         run: cargo install --locked cargo-nextest
@@ -91,17 +123,133 @@ jobs:
             sudo rm -rf /opt/proxyauth/db/*
             sudo chmod 700 -R /opt/proxyauth
 
+      - name: Start a dummy backend on 8500
+        # routes.yml points /app at http://127.0.0.1:8500. Without
+        # something listening there, a proxied request returns 502 whether
+        # or not the token was accepted — which would make the test below
+        # pass for the wrong reason, or fail without telling us why.
+        run: |
+          mkdir -p /tmp/backend
+          echo "BACKEND-OK" > /tmp/backend/index.html
+          (cd /tmp/backend && python3 -m http.server 8500 >/tmp/backend.log 2>&1) &
+          echo $! > backend.pid
+          for _ in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8500/ >/dev/null && break
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:8500/ | grep -q BACKEND-OK
+
       - name: Start ProxyAuth in background
         run: |
           sudo -u proxyauth ./target/release/proxyauth &
           echo $! > proxyauth.pid
           sleep 2  # wait start server
+
       - name: Test HTTP response
         run: curl -k -I https://localhost:8080 || (cat proxyauth.pid | xargs kill && exit 1)
 
+      - name: A protected route refuses an anonymous request
+        # Checked before the happy path: if /app answered 200 to everyone,
+        # the token test below would pass without proving anything.
+        run: |
+          set -eu
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app)
+          echo "anonymous GET /app -> $code"
+          case "$code" in
+            2*) echo "::error::/app served content without a token"; exit 1 ;;
+          esac
+
+      - name: Log in and use the token
+        # End-to-end cover for the whole token path: issue through the
+        # zerocrypt vault, seal, return, then decrypt and verify on the
+        # next request. Unit tests exercise the pieces; this is the only
+        # place the real binary proves they fit together.
+        run: |
+          set -eu
+
+          response=$(curl -k -s -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}')
+
+          echo "$response" | jq . || { echo "::error::/auth did not return JSON: $response"; exit 1; }
+
+          token=$(echo "$response" | jq -r '.token // empty')
+          if [ -z "$token" ]; then
+            echo "::error::no token in the /auth response: $response"
+            exit 1
+          fi
+          echo "token issued, ${#token} chars"
+
+          body=$(curl -k -s -w '\n%{http_code}' https://localhost:8080/app \
+                 -H "Authorization: Bearer $token")
+          code=$(echo "$body" | tail -n1)
+          content=$(echo "$body" | sed '$d')
+
+          echo "authenticated GET /app -> $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::a freshly issued token was refused by /app"
+            exit 1
+          fi
+
+          # The status alone is not enough: it must be the backend's own
+          # content, not a ProxyAuth error page that happens to be a 200.
+          echo "$content" | grep -q BACKEND-OK || {
+            echo "::error::/app answered 200 but did not proxy the backend"
+            exit 1
+          }
+
+          # The same token twice: the second request is served from the
+          # verification cache, and must give the same answer.
+          code2=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app \
+                  -H "Authorization: Bearer $token")
+          echo "same token again (cache hit) -> $code2"
+          [ "$code2" = "200" ] || { echo "::error::the cached path refused a valid token"; exit 1; }
+
+      - name: A tampered token is refused
+        # The token is authenticated, so flipping one character must break
+        # it. If this ever returns 200, the signature is not being checked.
+        run: |
+          set -eu
+          token=$(curl -k -s -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+          # Swap the last character for a different one. `tr` would be
+          # shorter but leaves '-' and '_' untouched, and base64url uses
+          # both — a token ending in either would come out unchanged and
+          # the test would fail for the wrong reason.
+          last="${token: -1}"
+          if [ "$last" = "A" ]; then repl="B"; else repl="A"; fi
+          tampered="${token%?}$repl"
+
+          if [ "$tampered" = "$token" ]; then
+            echo "::error::failed to alter the token; the test would be meaningless"
+            exit 1
+          fi
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app \
+                 -H "Authorization: Bearer $tampered")
+          echo "tampered token -> $code"
+          case "$code" in
+            2*) echo "::error::a tampered token was accepted"; exit 1 ;;
+          esac
+
+      - name: Wrong credentials are refused
+        run: |
+          set -eu
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"not-the-password"}')
+          echo "bad password -> $code"
+          case "$code" in
+            2*) echo "::error::/auth accepted a wrong password"; exit 1 ;;
+          esac
+
       - name: Stop the server
+        if: always()
         run: |
           cat proxyauth.pid | xargs kill || true
+          cat backend.pid | xargs kill || true
 
   notify:
     needs: [audit, coverage, ci]
