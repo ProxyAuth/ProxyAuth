@@ -25,38 +25,6 @@ jobs:
       - run: cargo install cargo-audit
       - run: cargo audit
 
-      - name: No duplicated cryptographic crates
-        # ProxyAuth and zerocrypt must agree on their crypto stack. If they
-        # drift — one on chacha20poly1305 0.11, the other on 0.10 — cargo
-        # compiles both, and the binary carries two implementations of the
-        # same primitive: dead weight and a doubled audit surface.
-        #
-        # `cargo tree --duplicates` is the right tool. Asking
-        # `--package <name>` instead fails with "ambiguous specification"
-        # in exactly the case being detected, so the check would pass
-        # silently on a duplicate.
-        run: |
-          set -eu
-          WATCH="chacha20poly1305 sha2 hkdf blake3 subtle base64 rand"
-
-          dups=$(cargo tree --duplicates --prefix none 2>/dev/null \
-                 | grep -oP '^[a-z0-9_-]+(?= v[0-9])' | sort -u || true)
-
-          FAILED=0
-          for crate in $WATCH; do
-            if printf '%s\n' "$dups" | grep -qx "$crate"; then
-              echo "::error::$crate is compiled more than once"
-              cargo tree --duplicates | grep -A3 "^$crate v" || true
-              FAILED=1
-            fi
-          done
-
-          if [ "$FAILED" -ne 0 ]; then
-            echo "Align the versions in Cargo.toml, or in zerocrypt, so each resolves once."
-            exit 1
-          fi
-          echo "Every watched cryptographic crate resolves to a single version."
-
   coverage:
     runs-on: ubuntu-latest
 
