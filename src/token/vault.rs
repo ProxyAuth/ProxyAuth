@@ -21,6 +21,29 @@ use crate::token::security::{
 
 static VAULT: OnceLock<Vault> = OnceLock::new();
 
+/// How many verified tokens the vault keeps.
+///
+/// Bounded on purpose. The cache key is a live token, and an unbounded
+/// map keyed by attacker-supplied strings is a memory-exhaustion
+/// primitive. At roughly 300 bytes an entry this is a few megabytes; a
+/// deployment with more than 50 000 distinct live sessions sees a lower
+/// hit rate rather than unbounded growth.
+///
+/// What the cache does and does not cover is documented on
+/// `zerocrypt::VaultBuilder::cache`. The part that matters here: it
+/// caches only successful verifications and re-checks expiry on every
+/// hit, and it knows nothing about revocation, user lookup or the expiry
+/// policy. `token::security::validate_token` performs all three after
+/// every call, so revoking a token, editing a user or lowering
+/// `token_expiry_seconds` all take effect immediately rather than when
+/// an entry ages out. See the note on that function before moving any
+/// check around it.
+///
+/// Note this is per process. With `num_instances: 4` the memory cost is
+/// four times the figure above, and a user's hit rate depends on which
+/// instance takes the request.
+const CACHE_CAPACITY: usize = 50_000;
+
 /// Domain string for the build key derivation.
 ///
 /// Separates ProxyAuth's keys from those of anything else using the same
@@ -76,7 +99,8 @@ fn build_key() -> Result<BuildKey, String> {
 pub fn init(config: &AppConfig) -> Result<(), String> {
     let mut builder = Vault::builder(&config.secret)
         .key(build_key()?)
-        .ttl(config.token_expiry_seconds.max(0) as u64);
+        .ttl(config.token_expiry_seconds.max(0) as u64)
+        .cache(CACHE_CAPACITY);
 
     // `fast: true` skips the obfuscation pass; `fast: false` (the
     // default) applies it, keyed by BUILD_SEED2. Same meaning the flag

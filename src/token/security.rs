@@ -152,6 +152,24 @@ pub fn issue_token(
 /// cryptography is delegated; everything below it — the expiry policy,
 /// the user lookup, revocation, stats and logging — is application
 /// behaviour and stays here.
+///
+/// # The order of the checks below is load-bearing
+///
+/// `vault().verify()` is **cached** (see `token::vault`), because for a
+/// given key the answer to "is this token authentic" cannot change.
+/// Everything after it reads live state and runs on every request:
+/// the user lookup, the name/index agreement, the expiry policy against
+/// the current config, and revocation.
+///
+/// That ordering is what makes the cache safe. Revoking a token, editing
+/// or removing a user, or lowering `token_expiry_seconds` all take effect
+/// immediately, because none of those answers is remembered.
+///
+/// Moving any of those checks above the `verify` call, or caching their
+/// results, would break that guarantee — a revoked token would keep
+/// working until its cache entry aged out, which is exactly the failure
+/// this arrangement avoids. If you need to add a check that reads
+/// mutable state, add it below, not above.
 pub async fn validate_token(
     token: &str,
     data_app: &web::Data<AppState>,
@@ -173,6 +191,8 @@ pub async fn validate_token(
         }
     };
 
+    // ── everything from here down reads live state, every request ──
+    // Nothing below this line is cached. See the note on this function.
     let index_user = session
         .data()
         .parse::<usize>()
