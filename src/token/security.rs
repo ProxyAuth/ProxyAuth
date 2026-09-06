@@ -5,20 +5,23 @@ use crate::config::config::RegexCond;
 use crate::config::config::RouteRule;
 use crate::network::canonical_url::canonicalize_path_for_match;
 use crate::revoke::load::is_token_revoked;
-use crate::token::crypto::{calcul_factorhash, decrypt, derive_key_from_secret};
+use crate::token::vault::vault;
 use actix_web::HttpRequest;
 use actix_web::http::StatusCode;
 use actix_web::http::header::HeaderMap;
 use actix_web::web;
-use blake3;
-use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
+
+// Build metadata accessors. All of them are folded into the vault's key
+// at startup by `token::vault::build_key`, so a difference in any build
+// constant yields a different key — see that function for why that
+// binding is worth keeping now that the old shuffle no longer provides
+// it.
 
 pub fn get_build_time() -> u64 {
     let get_build = get();
@@ -44,6 +47,11 @@ pub fn get_build_epochdate() -> i64 {
     data
 }
 
+/// Convenience wrapper over [`get_build_epochdate`].
+///
+/// The vault folds the raw epoch in, not this; only the integration
+/// tests call this one, and a library build cannot see those call sites.
+#[allow(dead_code)]
 pub fn get_build_datetime() -> chrono::DateTime<chrono::Utc> {
     let seconds = get_build_epochdate();
     let naive = Utc.timestamp_opt(seconds, 0).unwrap();
@@ -55,8 +63,6 @@ pub fn get_build_hk() -> String {
     let data = get_build.build_hk;
     data
 }
-
-static DERIVED_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 #[allow(dead_code)]
 pub fn format_long_date(seconds: u128) -> String {
@@ -73,11 +79,6 @@ pub fn format_long_date(seconds: u128) -> String {
         "+{:0>8}-01-01T{:02}:{:02}:{:02}Z",
         year, hours, minutes, seconds
     )
-}
-
-pub fn init_derived_key(secret: &str) {
-    let key = derive_key_from_secret(secret);
-    DERIVED_KEY.set(key).expect("Key already initialized");
 }
 
 pub fn check_date_token(
@@ -115,119 +116,93 @@ pub fn check_date_token(
     diff.try_into().map_err(|_| ())
 }
 
-pub fn generate_secret(secret: &str, token_expiry_seconds: &i64) -> String {
-    let base = get_build_datetime();
-
-    let next_reset_time = match *token_expiry_seconds {
-        0..=86_400 => base + Duration::seconds(*token_expiry_seconds),
-
-        86_401..=2_419_200 => {
-            let weeks = (*token_expiry_seconds as f64 / (7.0 * 86400.0)).ceil() as i64;
-            base + Duration::days(weeks * 7)
-        }
-
-        2_419_201..=31_104_000 => {
-            let months = (*token_expiry_seconds as f64 / (30.0 * 86400.0)).ceil() as u32;
-
-            let mut year = 0;
-            let mut month = 1 + months;
-
-            while month > 12 {
-                month -= 12;
-                year += 1;
-            }
-
-            let (next_year, next_month) = if month == 12 {
-                (year + 1, 1)
-            } else {
-                (year, month + 1)
-            };
-
-            let first_of_next_month = Utc
-                .with_ymd_and_hms(next_year as i32, next_month, 1, 0, 0, 0)
-                .unwrap();
-
-            let last_day = first_of_next_month - Duration::days(1);
-            last_day
-                .with_hour(23)
-                .unwrap()
-                .with_minute(59)
-                .unwrap()
-                .with_second(59)
-                .unwrap()
-        }
-
-        31_104_001..=157_680_000 => {
-            let years = (*token_expiry_seconds as f64 / (365.0 * 86400.0)).ceil() as i32;
-            Utc.with_ymd_and_hms(0 + years, 12, 31, 23, 59, 59).unwrap()
-        }
-
-        _ => base + Duration::seconds(86_400),
-    };
-
-    let now = Utc::now();
-    let _remaining_seconds = (next_reset_time - now).num_seconds();
-
-    format!("{}:{}", secret, next_reset_time.timestamp())
-}
-
-pub fn generate_token(
+/// Mints a sealed session token.
+///
+/// The digest, the sealing and the optional obfuscation pass are all in
+/// `zerocrypt` now; what remains here is ProxyAuth's own vocabulary —
+/// the user's index, the expiry string, the token id.
+///
+/// `index_user` is genuinely read back by [`validate_token`] to resolve
+/// which account a token belongs to. Passing the wrong one does not fail
+/// loudly, it resolves a valid session to the wrong user.
+pub fn issue_token(
     username: &str,
-    config: &AppConfig,
-    time_expire: &str,
+    index_user: usize,
+    expiry_ts: &str,
     token_id: &str,
-) -> String {
-    let values_map = HashMap::from([
-        ("username", username.to_string()),
-        (
-            "secret_with_timestamp",
-            generate_secret(&config.secret, &config.token_expiry_seconds),
-        ),
-        ("build_time", get_build_time().to_string()),
-        ("time_expire", time_expire.to_string()),
-        ("build_rand", get_build_rand().to_string()),
-        ("token_id", token_id.to_string()),
-        ("hk", get_build_hk()),
-    ]);
+) -> Result<String, String> {
+    let expires_at = expiry_ts
+        .parse::<u64>()
+        .map_err(|_| "invalid expiry timestamp".to_string())?;
 
-    let shuffled: Vec<String> = get()
-        .shuffled_order_list()
-        .iter()
-        .map(|k| values_map[k.as_str()].clone())
-        .collect();
-
-    let shuffle_data = shuffled.join(":");
-    blake3::hash(shuffle_data.as_bytes()).to_hex().to_string()
+    vault()
+        .token(username)
+        .expires_at(expires_at)
+        .id(token_id)
+        // The user index rides in the token's data field: the library
+        // has no concept of an index, and does not need one.
+        .data(&index_user.to_string())
+        .issue()
+        .map_err(|e| format!("token issue failed: {e}"))
 }
 
+/// Verifies a token and returns `(username, token_id, seconds_remaining)`.
+///
+/// Signature unchanged, so every existing call site keeps working. The
+/// cryptography is delegated; everything below it — the expiry policy,
+/// the user lookup, revocation, stats and logging — is application
+/// behaviour and stays here.
 pub async fn validate_token(
     token: &str,
     data_app: &web::Data<AppState>,
     config: &AppConfig,
     ip: &str,
 ) -> Result<(String, String, u64), String> {
-    let key = derive_key_from_secret(&config.secret);
+    // One call covers what used to be decrypt + split + digest recompute
+    // + constant-time compare. `Expired` is separated from `Invalid`
+    // because the two deserve different log lines: one is routine, the
+    // other is worth noticing.
+    let session = match vault().verify(token) {
+        Ok(session) => session,
+        Err(zerocrypt::Error::Expired) => {
+            return Err("Your token is expired".to_string());
+        }
+        Err(_) => {
+            warn!("[{}] Invalid token", ip);
+            return Err("no valid token".to_string());
+        }
+    };
 
-    let decrypt_token = decrypt(token, &key).map_err(|_| "Invalid token format")?;
-
-    let data: [&str; 4] = decrypt_token
-        .splitn(4, '|')
-        .collect::<Vec<&str>>()
-        .try_into()
-        .map_err(|_| "Invalid token format")?;
-
-    let token_hash_decrypt = data[0];
-
-    let index_user = data[2].parse::<usize>().map_err(|_| "Index invalide")?;
+    let index_user = session
+        .data()
+        .parse::<usize>()
+        .map_err(|_| "Index invalide")?;
     let user = config.user_by_index(index_user).ok_or("User not found")?;
 
-    let time_expire = check_date_token(data[1], &user.username, ip, &config.timezone)
-        .map_err(|_| "Your token is expired")?;
+    // The token carries the name it was issued to; the index must still
+    // resolve to that same account. They can only disagree if the user
+    // list changed under a live token, and silently serving the wrong
+    // account is exactly the failure mode worth refusing.
+    if user.username != session.user() {
+        warn!(
+            "[{}] token for {} resolved to index {} which is now {}",
+            ip,
+            session.user(),
+            index_user,
+            user.username
+        );
+        return Err("no valid token".to_string());
+    }
 
-    if (time_expire > (config.token_expiry_seconds as i64).try_into().unwrap())
-        .try_into()
-        .unwrap()
-    {
+    let time_expire = check_date_token(
+        &session.expires_at().to_string(),
+        &user.username,
+        ip,
+        &config.timezone,
+    )
+    .map_err(|_| "Your token is expired")?;
+
+    if time_expire > config.token_expiry_seconds.max(0) as u64 {
         error!(
             "[{}] username {} try to access token limit config {} value request {}",
             ip, user.username, config.token_expiry_seconds, time_expire
@@ -235,50 +210,22 @@ pub async fn validate_token(
         return Err("Bad time token".to_string());
     }
 
-    let token_generated = generate_token(&user.username, &config, data[1], data[3]);
-
-    // mode fast token is more speed but less secure
-    // and fast is false token is more secure but it's slower
-    let token_hash = if config.fast {
-        token_generated.clone()
-    } else {
-        calcul_factorhash(token_generated.clone())
-    };
-
-    // SECURITY: constant-time comparison for both branches — this token
-    // hash is a secret being verified, and a plain `!=` on strings leaks
-    // timing information about how many leading bytes matched.
-    if config.fast {
-        if !bool::from(
-            token_generated
-                .clone()
-                .as_bytes()
-                .ct_eq(token_hash_decrypt.as_bytes()),
-        ) {
-            warn!("[{}] Invalid token", ip);
-            return Err("no valid token".to_string());
-        }
-    } else {
-        let computed = blake3::hash(token_hash.as_bytes()).to_hex().to_string();
-        if !bool::from(computed.as_bytes().ct_eq(token_hash_decrypt.as_bytes())) {
-            warn!("[{}] Invalid token", ip);
-            return Err("no valid token".to_string());
-        }
-    }
-
-    if is_token_revoked(data[3], &data_app.revoked_tokens) {
+    if is_token_revoked(session.id(), &data_app.revoked_tokens) {
         warn!(
             "[{}] token_id {} is revoked from user {}",
-            ip, data[3], user.username
+            ip,
+            session.id(),
+            user.username
         );
         return Err("revoked token".to_string());
     }
 
     if config.stats {
-        let count =
-            data_app
-                .counter
-                .record_and_get(&user.username, data[3], &time_expire.to_string());
+        let count = data_app.counter.record_and_get(
+            &user.username,
+            session.id(),
+            &time_expire.to_string(),
+        );
 
         info!(
             "[{}] user {} is logged token expire in {} seconds [token used: {}]",
@@ -291,28 +238,33 @@ pub async fn validate_token(
         );
     }
 
-    Ok((user.username.to_string(), data[3].to_string(), time_expire))
+    Ok((
+        user.username.to_string(),
+        session.id().to_string(),
+        time_expire,
+    ))
 }
 
+/// Resolves the username a token belongs to, without the full policy
+/// checks [`validate_token`] applies.
+///
+/// Still authenticated: an unsealed or tampered token is rejected here
+/// too. It is the revocation, expiry-policy and stats work that is
+/// skipped, not the cryptography.
 pub fn extract_token_user(token: &str, config: &AppConfig, ip: String) -> Result<String, String> {
-    let key = derive_key_from_secret(&config.secret);
-
-    let decrypt_token = match decrypt(token, &key) {
-        Ok(val) => val,
+    let session = match vault().verify(token) {
+        Ok(session) => session,
+        Err(zerocrypt::Error::Expired) => {
+            warn!("[{}] Token is expired", ip);
+            return Err("Your token is expired".into());
+        }
         Err(_) => {
-            warn!("[{}] Failed to decrypt token (invalid format)", ip);
+            warn!("[{}] Failed to open token (invalid format)", ip);
             return Err("Invalid token format".into());
         }
     };
 
-    let data: Vec<&str> = decrypt_token.split('|').collect();
-
-    if data.len() < 3 {
-        warn!("[{}] Token structure is invalid (not enough segments)", ip);
-        return Err("Invalid token content".into());
-    }
-
-    let index_user: usize = match data[2].parse() {
+    let index_user: usize = match session.data().parse() {
         Ok(i) => i,
         Err(_) => {
             warn!("[{}] Failed to parse user index from token", ip);
@@ -320,11 +272,22 @@ pub fn extract_token_user(token: &str, config: &AppConfig, ip: String) -> Result
         }
     };
 
-    if let Some(user) = config.user_by_index(index_user) {
-        Ok(user.username.clone())
-    } else {
-        warn!("[{}] User index out of bounds: {}", ip, index_user);
-        Err("User not found".into())
+    match config.user_by_index(index_user) {
+        Some(user) if user.username == session.user() => Ok(user.username.clone()),
+        Some(user) => {
+            warn!(
+                "[{}] token for {} resolved to index {} which is now {}",
+                ip,
+                session.user(),
+                index_user,
+                user.username
+            );
+            Err("User not found".into())
+        }
+        None => {
+            warn!("[{}] User index out of bounds: {}", ip, index_user);
+            Err("User not found".into())
+        }
     }
 }
 

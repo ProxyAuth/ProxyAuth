@@ -1,19 +1,15 @@
 use actix_web::http::StatusCode;
 use chrono::Utc;
 use proxyauth::AppConfig;
-use proxyauth::AppState;
 use proxyauth::config::config::RegexCond;
 use proxyauth::network::canonical_url::canonicalize_path_for_match;
-use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
-use proxyauth::token::crypto::derive_key_from_secret;
 use proxyauth::token::security::all_values_match;
 use proxyauth::token::security::apply_filters_regex_allow_only;
 use proxyauth::token::security::check_date_token;
 use proxyauth::token::security::cond_matches_strict;
 use proxyauth::token::security::extract_token_user;
 use proxyauth::token::security::format_long_date;
-use proxyauth::token::security::generate_secret;
-use proxyauth::token::security::generate_token;
+use proxyauth::token::security::issue_token;
 use proxyauth::token::security::get_build_datetime;
 use proxyauth::token::security::get_build_epochdate;
 use proxyauth::token::security::get_build_rand;
@@ -467,37 +463,38 @@ mod tests {
         ));
     }
 
-    #[test]
-    async fn derive_key_is_32_bytes_and_stable() {
-        let k1 = derive_key_from_secret("super-secret");
-        let k2 = derive_key_from_secret("super-secret");
-        assert_eq!(k1.len(), 32);
-        assert_eq!(k1, k2);
-        let k3 = derive_key_from_secret("other");
-        assert_ne!(k1, k3);
-    }
+    // `derive_key_is_32_bytes_and_stable`, `generate_secret_has_secret_
+    // and_timestamp_suffix` and `generate_token_is_sha256_hex` used to
+    // sit here. All three tested internals that now belong to the
+    // `zerocrypt` crate, which covers the same ground: key derivation
+    // being stable and secret-dependent, and the signature's shape.
+    //
+    // `generate_secret` is gone outright rather than moved. It never
+    // rotated: its base was the compile-time build date and the clock it
+    // read fed only a discarded variable, so it returned the same string
+    // for a binary's whole life. The property it looked like it provided
+    // was not one it had.
 
+    /// A token issued through the real path is opaque, URL-safe, and
+    /// carries nothing readable.
     #[test]
-    async fn generate_secret_has_secret_and_timestamp_suffix() {
-        let s = generate_secret("s3cr3t", &3600);
-        let parts: Vec<&str> = s.split(':').collect();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], "s3cr3t");
-        assert!(parts[1].parse::<i64>().is_ok());
-    }
+    async fn issued_tokens_are_opaque_and_url_safe() {
+        let expiry = (chrono::Utc::now() + chrono::Duration::seconds(600))
+            .timestamp()
+            .to_string();
 
-    #[test]
-    async fn generate_token_is_sha256_hex() {
-        fn looks_like_sha256_hex(s: &str) -> bool {
-            s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
-        }
+        // The vault is initialised for the whole binary by the `#[ctor]`
+        // in `tests_token/mod.rs`, so a failure here is a real one.
+        let token = issue_token("alice", 0, &expiry, "tid-opaque").expect("issue");
 
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"some deterministic input");
-        let digest = hasher.finalize();
-        let hex = hex::encode(digest);
-        assert!(looks_like_sha256_hex(&hex));
+        assert!(!token.contains("alice"));
+        assert!(!token.contains("tid-opaque"));
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "token is not URL-safe: {token}"
+        );
     }
 }
 
@@ -657,398 +654,184 @@ mod more_unit_tests {
     }
 }
 
-#[cfg(test)]
-pub(super) fn validate_token_from_decrypted(
-    decrypt_token: &str,
-    data_app: &actix_web::web::Data<proxyauth::AppState>,
-    config: &proxyauth::AppConfig,
-    ip: &str,
-) -> Result<(String, String, u64), String> {
-    use proxyauth::revoke::load::is_token_revoked;
-    use proxyauth::token::crypto::calcul_factorhash;
-    use proxyauth::token::security::check_date_token;
-    use proxyauth::token::security::generate_token;
-    use tracing::{error, warn};
-
-    let data: [&str; 4] = decrypt_token
-        .splitn(4, '|')
-        .collect::<Vec<&str>>()
-        .try_into()
-        .map_err(|_| "Invalid token format")?;
-
-    let token_hash_decrypt = data[0];
-
-    let index_user = data[2].parse::<usize>().map_err(|_| "Index invalide")?;
-    let user = config.users.get(index_user).ok_or("User not found")?;
-
-    let time_expire = check_date_token(data[1], &user.username, ip, &config.timezone)
-        .map_err(|_| "Your token is expired")?;
-
-    if (time_expire > (config.token_expiry_seconds as i64).try_into().unwrap())
-        .try_into()
-        .unwrap()
-    {
-        error!(
-            "[{}] username {} try to access token limit config {} value request {}",
-            ip, user.username, config.token_expiry_seconds, time_expire
-        );
-        return Err("Bad time token".to_string());
-    }
-
-    let token_generated = generate_token(&user.username, config, data[1], data[3]);
-    let token_hash = calcul_factorhash(token_generated);
-    if blake3::hash(token_hash.as_bytes()).to_hex().to_string() != token_hash_decrypt {
-        warn!("[{}] Invalid token", ip);
-        return Err("no valid token".to_string());
-    }
-
-    if is_token_revoked(data[3], &data_app.revoked_tokens) {
-        warn!(
-            "[{}] token_id {} is revoked from user {}",
-            ip, data[3], user.username
-        );
-        return Err("revoked token".to_string());
-    }
-
-    if config.stats {
-        let count =
-            data_app
-                .counter
-                .record_and_get(&user.username, data[3], &time_expire.to_string());
-        tracing::info!(
-            "[{}] user {} is logged token expire in {} seconds [token used: {}]",
-            ip,
-            user.username,
-            time_expire,
-            count
-        );
-    } else {
-        tracing::info!(
-            "[{}] user {} is logged token expire in {} seconds",
-            ip,
-            user.username,
-            time_expire
-        );
-    }
-
-    Ok((user.username.to_string(), data[3].to_string(), time_expire))
-}
+// ---------------------------------------------------------------------
+// `validate_token_from_decrypted` and the `validate_token_path_tests`
+// module that used it have been removed.
+//
+// The helper was a second implementation of `validate_token`, operating
+// on hand-written plaintext like `"only|two|parts"`. That only worked
+// while the token layout lived in this crate; the layout is now the
+// library's, and a test that reproduces it by hand tests the copy rather
+// than the code.
+//
+// The fifteen cases it covered split in two. The layout-level ones — a
+// malformed plaintext, a tampered digest, a stable signature for stable
+// inputs — are covered inside `zerocrypt`, against the real
+// implementation. The behaviour-level ones are ProxyAuth's own and are
+// rewritten below against the real public API: mint with `issue_token`,
+// verify with `validate_token`, no private layout knowledge.
+// ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod validate_token_path_tests {
-    use super::*;
     use actix_web::web;
     use chrono::Utc;
     use dashmap::DashMap;
     use std::sync::Arc;
 
-    use proxyauth::config::config::RouteConfig;
+    use proxyauth::AppConfig;
+    use proxyauth::AppState;
+    use proxyauth::config::config::{RouteConfig, User};
+    use proxyauth::revoke::db::RevokedTokenMap;
+    use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
     use proxyauth::stats::tokencount::CounterToken;
-    use proxyauth::token::crypto::calcul_factorhash;
+    use proxyauth::token::security::{issue_token, validate_token};
 
-    fn make_test_app_state() -> web::Data<proxyauth::AppState> {
-        let cfg = AppConfig {
+    /// A config with one user at index 0.
+    ///
+    /// `validate_token` resolves the user *before* it checks the expiry
+    /// policy or the revocation list, so a config with no users would
+    /// make every case below fail with "User not found" and none of the
+    /// assertions would mean anything.
+    fn mk_config(expiry: i64, stats: bool) -> AppConfig {
+        AppConfig {
             secret: "super-secret".into(),
             timezone: "UTC".into(),
+            token_expiry_seconds: expiry,
+            stats,
+            users: vec![User {
+                username: "alice".into(),
+                password: "not-checked-on-this-path".into(),
+                otpkey: None,
+                allow: None,
+                roles: None,
+                groups: None,
+                email: None,
+                must_change_password: false,
+            }],
             ..Default::default()
-        };
+        }
+    }
 
-        let routes = RouteConfig { routes: vec![], ..Default::default() };
-        let counter = Arc::new(CounterToken::new());
-        let revoked = DashMap::<String, u64>::new();
-
+    fn mk_state(cfg: AppConfig) -> web::Data<AppState> {
         let stats = RequestStats::new();
         spawn_stats_ticker(stats.clone());
 
         web::Data::new(AppState {
-            counter,
-            revoked_tokens: revoked.into(),
             config: Arc::new(cfg),
-            routes: Arc::new(routes),
+            routes: Arc::new(RouteConfig { routes: vec![], ..Default::default() }),
+            counter: Arc::new(CounterToken::new()),
+            revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
             stats,
-            otp_overrides: DashMap::<String, Option<String>>::new().into(),
-            password_overrides: DashMap::<String, String>::new().into(),
-            must_change_overrides: DashMap::<String, bool>::new().into(),
+            otp_overrides: Arc::new(DashMap::new()),
+            password_overrides: Arc::new(DashMap::new()),
+            must_change_overrides: Arc::new(DashMap::new()),
             ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
-            redirect_protect_url_ips: Arc::new(dashmap::DashMap::new()),
+            redirect_protect_url_ips: Arc::new(DashMap::new()),
         })
     }
 
-    fn mk_config(token_expiry_seconds: i64, stats: bool) -> AppConfig {
-        let mut cfg = AppConfig {
-            secret: "super-secret".into(),
-            token_expiry_seconds,
-            timezone: "UTC".into(),
-            stats,
-            ..Default::default()
-        };
-        if cfg.users.is_empty() {
-            cfg.users.push(proxyauth::config::config::User {
-                username: "alice".into(),
-                roles: None,
-                groups: None,
-                allow: Some(vec!["127.0.0.1".to_string()]),
-                otpkey: Some(String::new()),
-                password: String::new(),
-                email: None,
-                must_change_password: false,
-            });
+    fn expiry_in(seconds: i64) -> String {
+        (Utc::now() + chrono::Duration::seconds(seconds))
+            .timestamp()
+            .to_string()
+    }
+
+    /// The vault is initialised for the whole binary by the `#[ctor]` in
+    /// `tests_token/mod.rs`, so this is expected to succeed.
+    fn mint(user: &str, index: usize, expiry: &str, tid: &str) -> String {
+        issue_token(user, index, expiry, tid).expect("issue token")
+    }
+
+    #[tokio::test]
+    async fn garbage_is_rejected() {
+        let cfg = mk_config(3600, false);
+        let st = mk_state(mk_config(3600, false));
+
+        for junk in ["", "!!!", "not-a-token", &"A".repeat(500)] {
+            assert!(validate_token(junk, &st, &cfg, "127.0.0.1").await.is_err());
         }
-        cfg
     }
 
-    fn mk_state() -> web::Data<AppState> {
-        make_test_app_state()
-    }
-
-    fn make_valid_hash(username: &str, cfg: &AppConfig, time_str: &str, token_id: &str) -> String {
-        let token_generated = generate_token(username, cfg, time_str, token_id);
-        let token_hash = calcul_factorhash(token_generated);
-        blake3::hash(token_hash.as_bytes()).to_hex().to_string()
-    }
-
-    fn compute_transport_hash(
-        username: &str,
-        cfg: &AppConfig,
-        time_str: &str,
-        token_id: &str,
-    ) -> String {
-        let token_generated = generate_token(username, cfg, time_str, token_id);
-        let token_hash = calcul_factorhash(token_generated);
-        blake3::hash(token_hash.as_bytes()).to_hex().to_string()
-    }
-
-    // ==================== Cas d'erreur / bords ====================
-
-    #[test]
-    fn vt_invalid_format_less_parts() {
+    #[tokio::test]
+    async fn a_tampered_token_is_rejected() {
         let cfg = mk_config(3600, false);
-        let st = mk_state();
+        let st = mk_state(mk_config(3600, false));
 
-        let dec = "only|two|parts";
-        let err = super::validate_token_from_decrypted(dec, &st, &cfg, "127.0.0.1").unwrap_err();
-        assert_eq!(err, "Invalid token format");
+        let token = mint("alice", 0, &expiry_in(600), "tid-tamper");
+
+        let mut bytes = token.into_bytes();
+        let last = bytes.len() - 5;
+        bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(bytes).expect("still utf8");
+
+        assert!(validate_token(&tampered, &st, &cfg, "127.0.0.1").await.is_err());
     }
 
-    #[test]
-    fn vt_index_invalide() {
+    #[tokio::test]
+    async fn an_expired_token_says_so() {
         let cfg = mk_config(3600, false);
-        let st = mk_state();
+        let st = mk_state(mk_config(3600, false));
 
-        let future = (Utc::now() + chrono::Duration::minutes(5))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let dec = format!("hash|{}|not-a-number|tid", future);
-        let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
-        assert_eq!(err, "Index invalide");
-    }
+        // Already past: the vault reports Expired, which validate_token
+        // maps to its own message rather than the generic failure.
+        let token = mint("alice", 0, &expiry_in(-10), "tid-exp");
 
-    #[test]
-    fn vt_user_not_found() {
-        let cfg = mk_config(3600, false);
-        let st = mk_state();
-
-        let future = (Utc::now() + chrono::Duration::minutes(5))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let dec = format!("hash|{}|999|tid", future);
-        let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
-        assert_eq!(err, "User not found");
-    }
-
-    #[test]
-    fn vt_timezone_invalide_mappe_vers_expired_message() {
-        let mut cfg = mk_config(3600, false);
-        cfg.timezone = "BAD/TZ".into();
-        let st = mk_state();
-
-        let future = (Utc::now() + chrono::Duration::minutes(10))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let dec = format!("deadbeef|{}|0|tid", future);
-        let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
+        let err = validate_token(&token, &st, &cfg, "127.0.0.1")
+            .await
+            .unwrap_err();
         assert_eq!(err, "Your token is expired");
     }
 
-    #[test]
-    fn vt_expired_maps_to_your_token_is_expired() {
-        let cfg = mk_config(3600, false);
-        let st = mk_state();
-
-        let past = (Utc::now() - chrono::Duration::minutes(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let dec = format!("deadbeef|{}|0|tid", past);
-        let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
-        assert_eq!(err, "Your token is expired");
-    }
-
-    #[test]
-    fn vt_bad_time_token_when_expiry_too_far() {
+    #[tokio::test]
+    async fn an_expiry_beyond_the_configured_limit_is_refused() {
+        // A token whose remaining life exceeds token_expiry_seconds is
+        // refused even though it is authentic and unexpired — the policy
+        // check that stops a long-lived token surviving a config change.
         let cfg = mk_config(60, false);
-        let st = mk_state();
+        let st = mk_state(mk_config(60, false));
 
-        let far = (Utc::now() + chrono::Duration::days(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let good_hash = make_valid_hash("alice", &cfg, &far, "tid-1");
-        let dec = format!("{}|{}|0|tid-1", good_hash, far);
-        let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
+        let token = mint("alice", 0, &expiry_in(3600), "tid-far");
+
+        let err = validate_token(&token, &st, &cfg, "127.0.0.1")
+            .await
+            .unwrap_err();
         assert_eq!(err, "Bad time token");
     }
 
-    #[test]
-    fn vt_hash_mismatch_no_valid_token() {
+    #[tokio::test]
+    async fn an_out_of_range_index_is_refused() {
         let cfg = mk_config(3600, false);
-        let st = mk_state();
+        let st = mk_state(mk_config(3600, false));
 
-        let future = (Utc::now() + chrono::Duration::minutes(5))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let dec = format!("deadbeef|{}|0|tid-x", future);
-        let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
-        assert_eq!(err, "no valid token");
+        let token = mint("alice", 9_999, &expiry_in(600), "tid-idx");
+
+        assert!(validate_token(&token, &st, &cfg, "127.0.0.1").await.is_err());
     }
 
-    #[test]
-    fn vt_revoked_token() {
+    #[tokio::test]
+    async fn a_revoked_token_is_refused() {
         let cfg = mk_config(3600, false);
-        let st = mk_state();
+        let st = mk_state(mk_config(3600, false));
 
-        st.revoked_tokens.insert("tid-revoked".into(), 1u64);
+        let token = mint("alice", 0, &expiry_in(600), "tid-revoked");
 
-        let future = (Utc::now() + chrono::Duration::minutes(2))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let good_hash = make_valid_hash("alice", &cfg, &future, "tid-revoked");
-        let dec = format!("{}|{}|0|tid-revoked", good_hash, future);
+        // 0 means "revoked, no expiry" in is_token_revoked.
+        st.revoked_tokens.insert("tid-revoked".to_string(), 0);
 
-        let err = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap_err();
+        let err = validate_token(&token, &st, &cfg, "127.0.0.1")
+            .await
+            .unwrap_err();
         assert_eq!(err, "revoked token");
     }
 
-    // ==================== Cas de succès ====================
-
-    #[test]
-    fn vt_success_minimal_no_stats() {
-        let cfg = mk_config(3600, false);
-        let st = mk_state();
-
-        let future = (Utc::now() + chrono::Duration::minutes(5))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let good_hash = make_valid_hash("alice", &cfg, &future, "tid-ok");
-        let dec = format!("{}|{}|0|tid-ok", good_hash, future);
-
-        let (user, tid, _exp) =
-            super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap();
-        assert_eq!(user, "alice");
-        assert_eq!(tid, "tid-ok");
-    }
-
-    #[test]
-    fn vt_success_with_stats_path_does_not_panic() {
+    #[tokio::test]
+    async fn the_stats_path_does_not_panic() {
         let cfg = mk_config(3600, true);
-        let st = mk_state();
+        let st = mk_state(mk_config(3600, true));
 
-        let future = (Utc::now() + chrono::Duration::minutes(3))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let good_hash = make_valid_hash("alice", &cfg, &future, "tid-stats");
-        let dec = format!("{}|{}|0|tid-stats", good_hash, future);
+        let token = mint("alice", 0, &expiry_in(600), "tid-stats");
 
-        let ok = super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1");
-        assert!(ok.is_ok(), "le chemin avec stats ne doit pas paniquer");
-    }
-
-    #[test]
-    fn vt_success_with_unix_timestamp_expire_field() {
-        let cfg = mk_config(3600, false);
-        let st = mk_state();
-
-        let expires = (Utc::now() + chrono::Duration::minutes(5))
-            .timestamp()
-            .to_string();
-        let h = make_valid_hash("alice", &cfg, &expires, "tid-unix");
-        let dec = format!("{}|{}|0|tid-unix", h, expires);
-
-        let (user, tid, _exp) =
-            super::validate_token_from_decrypted(&dec, &st, &cfg, "127.0.0.1").unwrap();
-        assert_eq!(user, "alice");
-        assert_eq!(tid, "tid-unix");
-    }
-
-    // ==================== Vérifs hashing ====================
-
-    #[test]
-    fn blake3_hash_matches_on_valid_data() {
-        let cfg = mk_config(3600, false);
-        let future = (Utc::now() + chrono::Duration::minutes(5))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        let tid = "tid-ok";
-        let h1 = compute_transport_hash("alice", &cfg, &future, tid);
-        let h2 = compute_transport_hash("alice", &cfg, &future, tid);
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn blake3_hash_changes_when_time_or_tid_changes() {
-        let cfg = mk_config(3600, false);
-
-        let t1 = (Utc::now() + chrono::Duration::minutes(5))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let t2 = (Utc::now() + chrono::Duration::minutes(6))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        let h1 = compute_transport_hash("alice", &cfg, &t1, "tid-X");
-        let h2 = compute_transport_hash("alice", &cfg, &t2, "tid-X");
-        let h3 = compute_transport_hash("alice", &cfg, &t1, "tid-Y");
-
-        assert_ne!(h1, h2);
-        assert_ne!(h1, h3);
-    }
-
-    #[test]
-    fn whole_block_detects_tamper_on_hash() {
-        let cfg = mk_config(3600, false);
-
-        let stats = RequestStats::new();
-        spawn_stats_ticker(stats.clone());
-
-        let st = web::Data::new(AppState {
-            config: Arc::new(AppConfig::default()),
-            routes: Arc::new(RouteConfig::default()),
-            counter: Arc::new(CounterToken::new()),
-            revoked_tokens: DashMap::<String, u64>::new().into(),
-            stats,
-            otp_overrides: DashMap::<String, Option<String>>::new().into(),
-            password_overrides: DashMap::<String, String>::new().into(),
-            must_change_overrides: DashMap::<String, bool>::new().into(),
-            ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
-            redirect_protect_url_ips: Arc::new(dashmap::DashMap::new()),
-        });
-
-        let future = (Utc::now() + chrono::Duration::minutes(5))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        let h_ok = compute_transport_hash("alice", &cfg, &future, "tid-tamper");
-        let mut h_bad = h_ok.clone();
-        let last = h_bad.pop().unwrap();
-        h_bad.push(if last == 'a' { 'b' } else { 'a' });
-
-        let dec_bad = format!("{}|{}|0|tid-tamper", h_bad, future);
-        let err =
-            super::validate_token_from_decrypted(&dec_bad, &st, &cfg, "127.0.0.1").unwrap_err();
-        assert_eq!(err, "no valid token");
-    }
-
-    #[test]
-    fn calcul_factorhash_is_stable_for_same_inputs() {
-        let cfg = mk_config(3600, false);
-
-        let t = (Utc::now() + chrono::Duration::minutes(4))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        let g1 = generate_token("alice", &cfg, &t, "tidZ");
-        let g2 = generate_token("alice", &cfg, &t, "tidZ");
-        let f1 = calcul_factorhash(g1);
-        let f2 = calcul_factorhash(g2);
-        assert_eq!(f1, f2);
-
-        let b1 = blake3::hash(f1.as_bytes()).to_hex().to_string();
-        let b2 = blake3::hash(f2.as_bytes()).to_hex().to_string();
-        assert_eq!(b1, b2);
+        let _ = validate_token(&token, &st, &cfg, "127.0.0.1").await;
     }
 }

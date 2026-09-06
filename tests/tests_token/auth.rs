@@ -6,10 +6,7 @@ use proxyauth::AppState;
 use proxyauth::CounterToken;
 use proxyauth::config::config::AuthRequest;
 use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
-use proxyauth::token::crypto::calcul_cipher;
-use proxyauth::token::crypto::derive_key_from_secret;
-use proxyauth::token::crypto::encrypt;
-use proxyauth::token::security::generate_token;
+use proxyauth::token::security::issue_token;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use totp_rs::Algorithm;
@@ -534,11 +531,12 @@ mod tests {
             .timestamp()
             .to_string();
 
-        let token_plain = generate_token(&user.username, &data.config, &expiry_ts, token_id);
-        let cipher_part = calcul_cipher(token_plain);
-        let clear = format!("{cipher_part}|{expiry_ts}|{index_user}|{token_id}");
-        let key = derive_key_from_secret(&data.config.secret);
-        encrypt(&clear, &key)
+        // One call now: the digest, the obfuscation pass and the sealing
+        // all happen inside the vault. The test no longer has to
+        // reproduce the token layout by hand, which is what used to make
+        // it break every time that layout changed.
+        issue_token(&user.username, index_user, &expiry_ts, token_id)
+            .expect("issue token for test")
     }
 
     // ---------- EitherAuth::Form end-to-end ----------------------------------
