@@ -113,7 +113,7 @@ tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpk
 instant-acme = "0.8"
 rcgen = "0.13"
 x509-parser = "0.16"
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 pem = "3"
 
 # Security-advisory floors, not exact pins — deliberately left as
