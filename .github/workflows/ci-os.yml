@@ -37,27 +37,93 @@ jobs:
 
     container:
       image: ${{ matrix.image }}
-      options: --user root
+      options: --user root --cap-add=SYS_PTRACE
 
     steps:
+
       # ----------------------------------------------------------------------
-      # OS bootstrap
+      # NODE.JS BOOTSTRAP
       # ----------------------------------------------------------------------
-      - name: Install OS dependencies
-        # `sh` et non `bash` : cette étape est celle qui installe bash, et
-        # l'image Alpine n'a que le `ash` de busybox avant qu'elle ne tourne.
-        # Déclarer `shell: bash` ici désactive le repli automatique de
-        # GitHub vers `sh` et échoue avec « bash: executable file not found ».
-        # Le script est du shell POSIX, il tourne à l'identique partout.
+
+      - name: Bootstrap Node.js
         shell: sh
         run: |
           set -eux
 
           case "${{ matrix.os }}" in
             Alpine)
+              echo "Node.js already provided by node:26-alpine"
+              node --version
+              npm --version
+              ;;
+
+            "Arch Linux")
+              pacman -Sy --noconfirm archlinux-keyring
+              pacman -Sy --noconfirm nodejs npm
+              node --version
+              npm --version
+              ;;
+
+            "CentOS Stream 9")
+              dnf install -y nodejs npm
+              node --version
+              npm --version
+              ;;
+
+            Debian)
+              echo "Node.js already provided by node:24-bookworm"
+              node --version
+              npm --version
+              ;;
+
+            Fedora)
+              echo "Node.js already provided by quay.io/fedora/nodejs-24"
+              node --version
+              npm --version
+              ;;
+
+            Ubuntu)
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm
+              node --version
+              npm --version
+              ;;
+          esac
+
+      # ----------------------------------------------------------------------
+      # CACHE - OS PACKAGES
+      # ----------------------------------------------------------------------
+
+      - name: Restore OS package cache
+        id: os-cache
+        uses: actions/cache/restore@v4
+        with:
+            path: |
+                /var/cache/apk
+                /var/cache/pacman/pkg
+                /var/cache/dnf
+                /var/cache/apt
+                /var/lib/apt/lists
+            key: proxyauth-os-${{ matrix.os }}-${{ github.sha }}
+            restore-keys: |
+                    proxyauth-os-${{ matrix.os }}-
+
+      # ----------------------------------------------------------------------
+      # OS BOOTSTRAP
+      # ----------------------------------------------------------------------
+
+      - name: Install OS dependencies
+        shell: sh
+        run: |
+          set -eux
+
+          case "${{ matrix.os }}" in
+
+            Alpine)
               export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
               echo "RUSTFLAGS=$RUSTFLAGS" >> "$GITHUB_ENV"
-              apk add --no-cache \
+              apk update
+              apk add \
                 bash \
                 build-base \
                 clang \
@@ -183,34 +249,93 @@ jobs:
                 python3 \
                 sudo
               ;;
+
+            *)
+              echo "Unsupported OS: ${{ matrix.os }}"
+              exit 1
+              ;;
           esac
+
+      # ----------------------------------------------------------------------
+      # VERIFY SYSTEM LIBRARIES
+      # ----------------------------------------------------------------------
+
+      - name: Verify MySQL client development library
+        shell: sh
+        run: |
+          set -eux
+
+          if command -v mysql_config >/dev/null 2>&1; then
+            mysql_config --version
+          elif pkg-config --exists mysqlclient 2>/dev/null; then
+            pkg-config --modversion mysqlclient
+          elif pkg-config --exists mariadb 2>/dev/null; then
+            pkg-config --modversion mariadb
+          else
+            echo "::error::MySQL/MariaDB client development library was not found"
+            exit 1
+          fi
+
+      # ----------------------------------------------------------------------
+      # CHECKOUT
+      # ----------------------------------------------------------------------
 
       - name: Checkout repository
         uses: actions/checkout@v6
+
+      # ----------------------------------------------------------------------
+      # RUST
+      # ----------------------------------------------------------------------
 
       - name: Set up Rust
         shell: bash
         run: |
           set -eux
+
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal
 
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
           . "$HOME/.cargo/env"
 
           rustup toolchain install stable
           rustup default stable
+
           rustc --version
           cargo --version
 
+      # ----------------------------------------------------------------------
+      # PARALLELISM
+      # ----------------------------------------------------------------------
+
       - name: Report available parallelism
         run: |
-          echo "cœurs disponibles : $(nproc)"
+          echo "cores cpu : $(nproc)"
           echo "NPROC=$(nproc)" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------------
+      # CACHE - CARGO
+      #
+      # registry + git = téléchargements des crates et dépendances Git.
+      # ----------------------------------------------------------------------
+
+      - name: Restore Cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+            path: |
+                ~/.cargo/registry
+                ~/.cargo/git
+            key: proxyauth-cargo-${{ matrix.os }}-${{ github.sha }}
+            restore-keys: |
+                proxyauth-cargo-${{ matrix.os }}-
+                proxyauth-cargo-
 
       # ----------------------------------------------------------------------
       # AUDIT
       # ----------------------------------------------------------------------
+
       - name: Install cargo-audit
         run: |
           . "$HOME/.cargo/env"
@@ -235,11 +360,8 @@ jobs:
 
       # ----------------------------------------------------------------------
       # COVERAGE
-      #
-      # This is deliberately in the same OS job. Tarpaulin may compile the
-      # test profile internally, but ProxyAuth's release binary is NOT built
-      # a second time for coverage.
       # ----------------------------------------------------------------------
+
       - name: Install cargo-tarpaulin
         run: |
           . "$HOME/.cargo/env"
@@ -248,27 +370,21 @@ jobs:
       - name: Coverage
         continue-on-error: true
         env:
-          # Tarpaulin délègue la compilation à cargo : cette variable est
-          # lue par le cargo qu'il lance en interne, sans dépendre d'une
-          # option que tarpaulin exposerait ou non.
-          #
-          # Elle ne touche que la compilation. `--test-threads=1` après le
-          # `--` reste la seule chose qui gouverne l'exécution des tests,
-          # et il ne bouge pas.
           CARGO_BUILD_JOBS: ${{ env.NPROC }}
         run: |
           . "$HOME/.cargo/env"
+
           cargo tarpaulin \
             --all-features \
             --out Html \
             --timeout 300 \
             --engine llvm \
-            -- \
-            --test-threads=1
+            -- --test-threads=1
 
       # ----------------------------------------------------------------------
       # CI / RELEASE BUILD
       # ----------------------------------------------------------------------
+
       - name: Install cargo-nextest
         run: |
           . "$HOME/.cargo/env"
@@ -280,11 +396,23 @@ jobs:
           CARGO_PROFILE_RELEASE_LTO: "false"
         run: |
           . "$HOME/.cargo/env"
-          cargo build --release --jobs "$(nproc)"
+
+          cargo build \
+            --release \
+            --locked \
+            --jobs "$(nproc)"
+
+      # ----------------------------------------------------------------------
+      # PREPARE PROXYAUTH
+      # ----------------------------------------------------------------------
 
       - name: Prepare user for ProxyAuth
         run: |
           sudo ./target/release/proxyauth prepare --insecure
+
+      # ----------------------------------------------------------------------
+      # TLS
+      # ----------------------------------------------------------------------
 
       - name: Generate self-signed cert for ProxyAuth
         run: |
@@ -302,14 +430,22 @@ jobs:
 
           sudo chown -R proxyauth:proxyauth /etc/proxyauth/certs
 
+      # ----------------------------------------------------------------------
+      # UNIT / INTEGRATION TESTS
+      # ----------------------------------------------------------------------
+
       - name: Run unit tests
         run: |
           . "$HOME/.cargo/env"
-          cargo nextest run --verbose --no-fail-fast --test-threads=1
+          cargo nextest run \
+            --verbose \
+            --no-fail-fast \
+            --test-threads=1
 
       # ----------------------------------------------------------------------
       # END-TO-END PROXYAUTH TEST
       # ----------------------------------------------------------------------
+
       - name: Install routes.yml with the route under test
         run: |
           sudo mkdir -p /etc/proxyauth/config
@@ -331,6 +467,10 @@ jobs:
         run: |
           sudo rm -rf /opt/proxyauth/db/*
           sudo chmod 700 -R /opt/proxyauth
+
+      # ----------------------------------------------------------------------
+      # DUMMY BACKEND
+      # ----------------------------------------------------------------------
 
       - name: Start dummy backend on port 8500
         run: |
@@ -361,11 +501,20 @@ jobs:
 
           curl -sf http://127.0.0.1:8500/app | grep -q BACKEND-OK
 
+      # ----------------------------------------------------------------------
+      # START PROXYAUTH
+      # ----------------------------------------------------------------------
+
       - name: Start ProxyAuth in background
         run: |
           sudo -u proxyauth ./target/release/proxyauth &
           echo $! > proxyauth.pid
+
           sleep 2
+
+      # ----------------------------------------------------------------------
+      # HTTPS
+      # ----------------------------------------------------------------------
 
       - name: Test HTTPS response
         run: |
@@ -373,6 +522,10 @@ jobs:
             cat proxyauth.pid | xargs kill || true
             exit 1
           }
+
+      # ----------------------------------------------------------------------
+      # ANONYMOUS ACCESS
+      # ----------------------------------------------------------------------
 
       - name: Protected route refuses anonymous request
         run: |
@@ -389,6 +542,10 @@ jobs:
               exit 1
               ;;
           esac
+
+      # ----------------------------------------------------------------------
+      # AUTHENTICATION / TOKEN
+      # ----------------------------------------------------------------------
 
       - name: Log in and use the token
         run: |
@@ -456,6 +613,10 @@ jobs:
             exit 1
           }
 
+      # ----------------------------------------------------------------------
+      # TAMPERED TOKEN
+      # ----------------------------------------------------------------------
+
       - name: Tampered token is refused
         run: |
           set -eu
@@ -496,6 +657,10 @@ jobs:
               ;;
           esac
 
+      # ----------------------------------------------------------------------
+      # WRONG PASSWORD
+      # ----------------------------------------------------------------------
+
       - name: Wrong credentials are refused
         run: |
           set -eu
@@ -516,6 +681,10 @@ jobs:
               ;;
           esac
 
+      # ----------------------------------------------------------------------
+      # CLEANUP
+      # ----------------------------------------------------------------------
+
       - name: Stop test servers
         if: always()
         run: |
@@ -526,3 +695,28 @@ jobs:
           if [ -f backend.pid ]; then
             cat backend.pid | xargs kill || true
           fi
+
+      # ----------------------------------------------------------------------
+      # SAVE CACHES
+      # ----------------------------------------------------------------------
+
+      - name: Save OS package cache
+        if: always() && steps.os-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /var/cache/apk
+            /var/cache/pacman/pkg
+            /var/cache/dnf
+            /var/cache/apt
+            /var/lib/apt/lists
+          key: proxyauth-os-${{ matrix.os }}-${{ github.sha }}
+
+      - name: Save Cargo cache
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: proxyauth-cargo-${{ matrix.os }}-${{ github.sha }}
