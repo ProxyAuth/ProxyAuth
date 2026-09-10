@@ -1,0 +1,368 @@
+```yaml
+name: CI/CD ProxyAuth - CentOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+
+  audit:
+    runs-on: ubuntu-latest
+
+    container:
+      image: quay.io/centos/centos:stream9
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        run: |
+          dnf install -y curl
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependancy
+        run: |
+          dnf install -y \
+            nettle-devel \
+            pkg-config \
+            openssl-devel \
+            libpq-devel \
+            mariadb-connector-c-devel \
+            python3
+
+      - name: install cargo-audit
+        run: |
+          source "$HOME/.cargo/env"
+          cargo install cargo-audit
+
+      - run: |
+          source "$HOME/.cargo/env"
+          cargo audit
+
+      - name: ProxyAuth and zerocrypt agree on their crypto crates
+        run: |
+          python3 ci/check-crypto-alignment.py proxyauth zerocrypt
+
+      - name: Report the wider picture, without failing on it
+        continue-on-error: true
+        run: |
+          source "$HOME/.cargo/env"
+          cargo tree --duplicates || true
+
+
+  coverage:
+    runs-on: ubuntu-latest
+
+    container:
+      image: quay.io/centos/centos:stream9
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: theoparis/rust-toolchain@stable
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install dependancy
+        run: |
+          dnf install -y \
+            nettle-devel \
+            pkg-config \
+            openssl-devel \
+            libpq-devel \
+            mariadb-connector-c-devel
+
+      - name: install tarpaulin for coverage
+        run: cargo install --locked cargo-tarpaulin
+
+      - name: Coverage
+        run: cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm -- --test-threads=1
+        continue-on-error: true
+
+
+  ci:
+    runs-on: ubuntu-latest
+
+    container:
+      image: quay.io/centos/centos:stream9
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: theoparis/rust-toolchain@stable
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install dependancy
+        run: |
+          dnf install -y \
+            nettle-devel \
+            sudo \
+            pkg-config \
+            openssl-devel \
+            libpq-devel \
+            mariadb-connector-c-devel \
+            jq \
+            python3 \
+            curl
+
+      - name: install nextest
+        run: cargo install --locked cargo-nextest
+
+      - name: Build the binary
+        run: cargo build --release
+
+      - name: Prepare User for run proxyauth
+        run: |
+          groupadd --system proxyauth || true
+          useradd \
+            --system \
+            --gid proxyauth \
+            --home-dir /opt/proxyauth \
+            --shell /sbin/nologin \
+            proxyauth || true
+
+          mkdir -p \
+            /etc/proxyauth \
+            /opt/proxyauth/db \
+            /var/log/proxyauth
+
+          chown -R proxyauth:proxyauth \
+            /etc/proxyauth \
+            /opt/proxyauth \
+            /var/log/proxyauth
+
+      - name: Generate self-signed cert for ProxyAuth
+        run: |
+          mkdir -p /etc/proxyauth/certs
+
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 1 \
+            -nodes \
+            -keyout /etc/proxyauth/certs/key.pem \
+            -out /etc/proxyauth/certs/cert.pem \
+            -subj "/CN=localhost"
+
+          chown -R proxyauth:proxyauth /etc/proxyauth/certs
+
+      - name: Test ProxyAuth (unittest)
+        run: cargo nextest run --verbose --no-fail-fast --test-threads=1
+
+      - name: Install a routes.yml with the route under test
+        run: |
+          mkdir -p /etc/proxyauth/config
+
+          cat > /etc/proxyauth/config/routes.yml <<'YML'
+          routes:
+            - prefix: "/app"
+              target: "http://127.0.0.1:8500"
+              required_login: true
+              username: ["admin"]
+          YML
+
+          chown -R proxyauth:proxyauth /etc/proxyauth/config
+
+          echo "--- routes.yml in use ---"
+          cat /etc/proxyauth/config/routes.yml
+
+      - name: Cleanup test database files & Fix permissions
+        run: |
+          rm -rf /opt/proxyauth/db/*
+          chmod 700 -R /opt/proxyauth
+
+      - name: Start a dummy backend on 8500
+        run: |
+          cat > /tmp/backend.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          class H(BaseHTTPRequestHandler):
+              def _reply(self):
+                  body = f"BACKEND-OK {self.path}".encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/plain")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              do_GET = do_POST = do_HEAD = _reply
+
+          HTTPServer(("127.0.0.1", 8500), H).serve_forever()
+          PY
+
+          python3 /tmp/backend.py >/tmp/backend.log 2>&1 &
+          echo $! > backend.pid
+
+          for _ in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8500/app >/dev/null && break
+            sleep 0.5
+          done
+
+          curl -sf http://127.0.0.1:8500/app | grep -q BACKEND-OK
+
+      - name: Start ProxyAuth in background
+        run: |
+          chown -R proxyauth:proxyauth \
+            /etc/proxyauth \
+            /opt/proxyauth \
+            /var/log/proxyauth
+
+          sudo -u proxyauth ./target/release/proxyauth &
+          echo $! > proxyauth.pid
+
+          sleep 2
+
+      - name: Test HTTP response
+        run: curl -k -I https://localhost:8080 || (cat proxyauth.pid | xargs kill && exit 1)
+
+      - name: A protected route refuses an anonymous request
+        run: |
+          set -eu
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app)
+
+          echo "anonymous GET /app -> $code"
+
+          case "$code" in
+            2*)
+              echo "::error::/app served content without a token"
+              exit 1
+              ;;
+          esac
+
+      - name: Log in and use the token
+        run: |
+          set -eu
+
+          response=$(curl -k -s -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}')
+
+          echo "$response" | jq . || {
+            echo "::error::/auth did not return JSON: $response"
+            exit 1
+          }
+
+          token=$(echo "$response" | jq -r '.token // empty')
+
+          if [ -z "$token" ]; then
+            echo "::error::no token in the /auth response: $response"
+            exit 1
+          fi
+
+          echo "token issued, ${#token} chars"
+
+          body=$(curl -k -s -w '\n%{http_code}' https://localhost:8080/app \
+            -H "Authorization: Bearer $token")
+
+          code=$(echo "$body" | tail -n1)
+          content=$(echo "$body" | sed '$d')
+
+          echo "authenticated GET /app -> $code"
+
+          case "$code" in
+            200)
+              ;;
+            401|403)
+              echo "::error::a freshly issued token was refused by /app"
+              exit 1
+              ;;
+            *)
+              echo "::error::/app answered $code — the token was accepted, so this is routing or the backend, not auth"
+              echo "backend log:"
+              cat /tmp/backend.log || true
+              exit 1
+              ;;
+          esac
+
+          echo "$content" | grep -q BACKEND-OK || {
+            echo "::error::/app answered 200 but did not proxy the backend"
+            exit 1
+          }
+
+          code2=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app \
+            -H "Authorization: Bearer $token")
+
+          echo "same token again (cache hit) -> $code2"
+
+          [ "$code2" = "200" ] || {
+            echo "::error::the cached path refused a valid token"
+            exit 1
+          }
+
+      - name: A tampered token is refused
+        run: |
+          set -eu
+
+          token=$(curl -k -s -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}' \
+            | jq -r '.token')
+
+          last="${token: -1}"
+
+          if [ "$last" = "A" ]; then
+            repl="B"
+          else
+            repl="A"
+          fi
+
+          tampered="${token%?}$repl"
+
+          if [ "$tampered" = "$token" ]; then
+            echo "::error::failed to alter the token"
+            exit 1
+          fi
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app \
+            -H "Authorization: Bearer $tampered")
+
+          echo "tampered token -> $code"
+
+          case "$code" in
+            2*)
+              echo "::error::a tampered token was accepted"
+              exit 1
+              ;;
+          esac
+
+      - name: Wrong credentials are refused
+        run: |
+          set -eu
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"not-the-password"}')
+
+          echo "bad password -> $code"
+
+          case "$code" in
+            2*)
+              echo "::error::/auth accepted a wrong password"
+              exit 1
+              ;;
+          esac
+
+      - name: Stop the server
+        if: always()
+        run: |
+          if [ -f proxyauth.pid ]; then
+            cat proxyauth.pid | xargs kill || true
+          fi
+
+          if [ -f backend.pid ]; then
+            cat backend.pid | xargs kill || true
+          fi
+```
