@@ -1,21 +1,21 @@
 name: CI/CD ProxyAuth - Fedora
-
-on:
+'on':
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
-  workflow_dispatch:
-  workflow_call:
-
+    branches:
+      - main
+  workflow_dispatch: null
+  workflow_call: null
 jobs:
-
   audit:
     runs-on: ubuntu-latest
     container:
-      image: fedora:latest
-
+      image: quay.io/fedora/nodejs-24
+      options: --user root
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -35,34 +35,32 @@ jobs:
 
       - name: Set up Rust
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          . "$HOME/.cargo/env"
-          rustup toolchain install stable
-          rustup default stable
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+            source "$HOME/.cargo/env"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            cargo --version
 
       - name: Install cargo-audit
         run: |
           . "$HOME/.cargo/env"
           cargo install cargo-audit
-
       - name: Audit dependencies
         run: |
           . "$HOME/.cargo/env"
           cargo audit
-
       - name: ProxyAuth and zerocrypt agree on their crypto crates
         run: python3 ci/check-crypto-alignment.py proxyauth zerocrypt
-
-      - name: Report the wider picture, without failing on it
+      - name: 'Report the wider picture, without failing on it'
         continue-on-error: true
         run: |
           . "$HOME/.cargo/env"
           cargo tree --duplicates || true
-
   coverage:
     runs-on: ubuntu-latest
     container:
-      image: fedora:latest
+      image: quay.io/fedora/nodejs-24
+      options: --user root
 
     steps:
       - name: Checkout repository
@@ -83,29 +81,32 @@ jobs:
             llvm \
             clang \
             python3
-
       - name: Set up Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          . "$HOME/.cargo/env"
-          rustup toolchain install stable
-          rustup default stable
+        run: >
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s --
+          -y
 
+          . "$HOME/.cargo/env"
+
+          rustup toolchain install stable
+
+          rustup default stable
       - name: Install tarpaulin for coverage
         run: |
           . "$HOME/.cargo/env"
           cargo install --locked cargo-tarpaulin
-
       - name: Coverage
-        run: |
+        run: >
           . "$HOME/.cargo/env"
-          cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm -- --test-threads=1
-        continue-on-error: true
 
+          cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm
+          -- --test-threads=1
+        continue-on-error: true
   ci:
     runs-on: ubuntu-latest
     container:
-      image: fedora:latest
+      image: quay.io/fedora/nodejs-24
+      options: --user root
 
     steps:
       - name: Checkout repository
@@ -130,26 +131,26 @@ jobs:
             python3
 
       - name: Set up Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          . "$HOME/.cargo/env"
-          rustup toolchain install stable
-          rustup default stable
+        run: >
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s --
+          -y
 
+          . "$HOME/.cargo/env"
+
+          rustup toolchain install stable
+
+          rustup default stable
       - name: Install nextest
         run: |
           . "$HOME/.cargo/env"
           cargo install --locked cargo-nextest
-
       - name: Build the binary
         run: |
           . "$HOME/.cargo/env"
           cargo build --release
-
       - name: Prepare User for run proxyauth
         run: |
           sudo ./target/release/proxyauth prepare --insecure
-
       - name: Generate self-signed cert for ProxyAuth
         run: |
           sudo mkdir -p /etc/proxyauth/certs
@@ -159,12 +160,10 @@ jobs:
             -out /etc/proxyauth/certs/cert.pem \
             -subj "/CN=localhost"
           sudo chown -R proxyauth:proxyauth /etc/proxyauth/certs
-
       - name: Test ProxyAuth (unittest)
         run: |
           . "$HOME/.cargo/env"
           cargo nextest run --verbose --no-fail-fast --test-threads=1
-
       - name: Install a routes.yml with the route under test
         run: |
           sudo mkdir -p /etc/proxyauth/config
@@ -178,12 +177,10 @@ jobs:
           sudo chown -R proxyauth:proxyauth /etc/proxyauth/config
           echo "--- routes.yml in use ---"
           sudo cat /etc/proxyauth/config/routes.yml
-
       - name: Cleanup test database files & Fix permissions
         run: |
           sudo rm -rf /opt/proxyauth/db/*
           sudo chmod 700 -R /opt/proxyauth
-
       - name: Start a dummy backend on 8500
         run: |
           cat > /tmp/backend.py <<'PY'
@@ -212,23 +209,24 @@ jobs:
           done
 
           curl -sf http://127.0.0.1:8500/app | grep -q BACKEND-OK
-
       - name: Start ProxyAuth in background
         run: |
           sudo -u proxyauth ./target/release/proxyauth &
           echo $! > proxyauth.pid
           sleep 2
-
       - name: Test HTTP response
         run: |
           curl -k -I https://localhost:8080 || \
             (cat proxyauth.pid | xargs kill && exit 1)
-
       - name: A protected route refuses an anonymous request
-        run: |
+        run: >
           set -eu
-          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app)
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}'
+          https://localhost:8080/app)
+
           echo "anonymous GET /app -> $code"
+
 
           case "$code" in
             2*)
@@ -236,7 +234,6 @@ jobs:
               exit 1
               ;;
           esac
-
       - name: Log in and use the token
         run: |
           set -eu
@@ -297,7 +294,6 @@ jobs:
             echo "::error::the cached path refused a valid token"
             exit 1
           }
-
       - name: A tampered token is refused
         run: |
           set -eu
@@ -333,7 +329,6 @@ jobs:
               exit 1
               ;;
           esac
-
       - name: Wrong credentials are refused
         run: |
           set -eu
@@ -351,7 +346,6 @@ jobs:
               exit 1
               ;;
           esac
-
       - name: Stop the server
         if: always()
         run: |

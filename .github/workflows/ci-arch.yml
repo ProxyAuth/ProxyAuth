@@ -1,26 +1,25 @@
-```yaml
 name: CI/CD ProxyAuth - Arch Linux
-
-on:
+'on':
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
-  workflow_dispatch:
-  workflow_call:
+    branches:
+      - main
+  workflow_dispatch: null
+  workflow_call: null
 
 jobs:
-
   audit:
     runs-on: ubuntu-latest
-
     container:
-      image: archlinux:latest
-
+      image: 'archlinux:latest'
     steps:
+      - name: Install dependencies for checkout
+        run: pacman -Syu --noconfirm nodejs npm git
+
       - name: Checkout repository
         uses: actions/checkout@v6
-
       - name: Set up Rust
         run: |
           pacman -Sy --noconfirm curl
@@ -36,45 +35,41 @@ jobs:
             openssl \
             postgresql-libs \
             mariadb \
-            python
+            python \
+            base-devel
 
       - name: install cargo-audit
         run: |
           source "$HOME/.cargo/env"
           cargo install cargo-audit
-
       - run: |
           source "$HOME/.cargo/env"
           cargo audit
-
       - name: ProxyAuth and zerocrypt agree on their crypto crates
         run: |
           python3 ci/check-crypto-alignment.py proxyauth zerocrypt
-
-      - name: Report the wider picture, without failing on it
+      - name: 'Report the wider picture, without failing on it'
         continue-on-error: true
         run: |
           source "$HOME/.cargo/env"
           cargo tree --duplicates || true
 
-
   coverage:
     runs-on: ubuntu-latest
-
     container:
-      image: archlinux:latest
-
+      image: 'archlinux:latest'
     steps:
+      - name: Install dependencies for checkout
+        run: pacman -Syu --noconfirm nodejs npm git
+
       - name: Checkout repository
         uses: actions/checkout@v6
-
       - name: Set up Rust
         run: |
           pacman -Sy --noconfirm curl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
       - name: Install dependancy
         run: |
           pacman -Sy --noconfirm \
@@ -84,37 +79,37 @@ jobs:
             postgresql-libs \
             mariadb \
             llvm \
-            clang
-
+            clang \
+            base-devel
       - name: install tarpaulin for coverage
         run: |
           source "$HOME/.cargo/env"
           cargo install --locked cargo-tarpaulin
-
       - name: Coverage
-        run: |
+        run: >
           source "$HOME/.cargo/env"
-          cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm -- --test-threads=1
+
+          cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm
+          -- --test-threads=1
         continue-on-error: true
 
 
   ci:
     runs-on: ubuntu-latest
-
     container:
-      image: archlinux:latest
-
+      image: 'archlinux:latest'
     steps:
+      - name: Install dependencies for checkout
+        run: pacman -Syu --noconfirm nodejs npm git
+
       - name: Checkout repository
         uses: actions/checkout@v6
-
       - name: Set up Rust
         run: |
           pacman -Sy --noconfirm curl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
       - name: Install dependancy
         run: |
           pacman -Sy --noconfirm \
@@ -126,18 +121,16 @@ jobs:
             mariadb \
             jq \
             python \
-            curl
-
+            curl \
+            base-devel
       - name: install nextest
         run: |
           source "$HOME/.cargo/env"
           cargo install --locked cargo-nextest
-
       - name: Build the binary
         run: |
           source "$HOME/.cargo/env"
           cargo build --release
-
       - name: Prepare User for run proxyauth
         run: |
           groupadd --system proxyauth || true
@@ -157,7 +150,6 @@ jobs:
             /etc/proxyauth \
             /opt/proxyauth \
             /var/log/proxyauth
-
       - name: Generate self-signed cert for ProxyAuth
         run: |
           mkdir -p /etc/proxyauth/certs
@@ -169,12 +161,10 @@ jobs:
             -subj "/CN=localhost"
 
           chown -R proxyauth:proxyauth /etc/proxyauth/certs
-
       - name: Test ProxyAuth (unittest)
         run: |
           source "$HOME/.cargo/env"
           cargo nextest run --verbose --no-fail-fast --test-threads=1
-
       - name: Install a routes.yml with the route under test
         run: |
           mkdir -p /etc/proxyauth/config
@@ -191,12 +181,10 @@ jobs:
 
           echo "--- routes.yml in use ---"
           cat /etc/proxyauth/config/routes.yml
-
       - name: Cleanup test database files & Fix permissions
         run: |
           rm -rf /opt/proxyauth/db/*
           chmod 700 -R /opt/proxyauth
-
       - name: Start a dummy backend on 8500
         run: |
           cat > /tmp/backend.py <<'PY'
@@ -225,7 +213,6 @@ jobs:
           done
 
           curl -sf http://127.0.0.1:8500/app | grep -q BACKEND-OK
-
       - name: Start ProxyAuth in background
         run: |
           chown -R proxyauth:proxyauth \
@@ -237,12 +224,10 @@ jobs:
           echo $! > proxyauth.pid
 
           sleep 2
-
       - name: Test HTTP response
         run: |
           curl -k -I https://localhost:8080 || \
             (cat proxyauth.pid | xargs kill && exit 1)
-
       - name: A protected route refuses an anonymous request
         run: |
           set -eu
@@ -258,7 +243,6 @@ jobs:
               exit 1
               ;;
           esac
-
       - name: Log in and use the token
         run: |
           set -eu
@@ -320,7 +304,6 @@ jobs:
             echo "::error::the cached path refused a valid token"
             exit 1
           }
-
       - name: A tampered token is refused
         run: |
           set -eu
@@ -357,7 +340,6 @@ jobs:
               exit 1
               ;;
           esac
-
       - name: Wrong credentials are refused
         run: |
           set -eu
@@ -375,7 +357,6 @@ jobs:
               exit 1
               ;;
           esac
-
       - name: Stop the server
         if: always()
         run: |
@@ -386,4 +367,3 @@ jobs:
           if [ -f backend.pid ]; then
             cat backend.pid | xargs kill || true
           fi
-```

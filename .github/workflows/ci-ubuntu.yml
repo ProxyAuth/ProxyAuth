@@ -1,4 +1,4 @@
-name: CI/CD ProxyAuth
+name: CI/CD ProxyAuth - Ubuntu
 
 on:
   push:

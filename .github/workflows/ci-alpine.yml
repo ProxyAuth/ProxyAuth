@@ -1,4 +1,3 @@
-```yaml
 name: CI/CD ProxyAuth - Alpine
 
 on:
@@ -15,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     container:
-      image: alpine:latest
+      image: node:26-alpine
 
     steps:
       - name: Checkout repository
@@ -28,15 +27,20 @@ jobs:
             | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependancy
+      - name: Install dependencies
         run: |
-          apk add --no-cache \
+            apk add --no-cache \
+            bash \
+            build-base \
+            curl \
+            jq \
             nettle-dev \
-            pkgconf \
             openssl-dev \
+            pkgconf \
             postgresql-dev \
             mariadb-connector-c-dev \
-            python3
+            python3 \
+            sudo
 
       - name: install cargo-audit
         run: |
@@ -62,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
 
     container:
-      image: alpine:latest
+      image:  node:26-alpine
 
     steps:
       - name: Checkout repository
@@ -75,16 +79,41 @@ jobs:
             | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependancy
+      - name: Install dependencies
         run: |
-          apk add --no-cache \
-            nettle-dev \
-            pkgconf \
+            apk add --no-cache \
+            openssl \
+            openssl-libs-static \
             openssl-dev \
+            zlib-static \
+            zlib-dev \
+            musl-dev \
+            build-base \
+            pkgconf \
+            alpine-sdk \
+            sudo \
+            curl \
+            tar \
+            coreutils \
+            python3 \
+            jq \
+            nettle-dev \
             postgresql-dev \
             mariadb-connector-c-dev \
-            llvm \
-            clang
+            mariadb-static
+
+      - name: Configure Rust linker
+        run: |
+          export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
+          echo "RUSTFLAGS=$RUSTFLAGS" >> "$GITHUB_ENV"
+
+      - name: Configure static native dependencies
+        run: |
+          export PKG_CONFIG_ALL_STATIC=1
+          echo "PostgreSQL:"
+          pkg-config --static --libs libpq
+          echo "MariaDB:"
+          pkg-config --static --libs libmariadb
 
       - name: install tarpaulin for coverage
         run: |
@@ -97,12 +126,11 @@ jobs:
           cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm -- --test-threads=1
         continue-on-error: true
 
-
   ci:
     runs-on: ubuntu-latest
 
     container:
-      image: alpine:latest
+      image: node:26-alpine
 
     steps:
       - name: Checkout repository
@@ -115,19 +143,41 @@ jobs:
             | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependancy
+      - name: Install dependencies
         run: |
-          apk add --no-cache \
-            nettle-dev \
-            sudo \
-            pkgconf \
+            apk add --no-cache \
+            openssl \
+            openssl-libs-static \
             openssl-dev \
+            zlib-static \
+            zlib-dev \
+            musl-dev \
+            build-base \
+            pkgconf \
+            alpine-sdk \
+            sudo \
+            curl \
+            tar \
+            coreutils \
+            python3 \
+            jq \
+            nettle-dev \
             postgresql-dev \
             mariadb-connector-c-dev \
-            jq \
-            python3 \
-            curl \
-            openssh-client
+            mariadb-static
+
+      - name: Configure Rust linker
+        run: |
+          export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
+          echo "RUSTFLAGS=$RUSTFLAGS" >> "$GITHUB_ENV"
+
+      - name: Configure static native dependencies
+        run: |
+          export PKG_CONFIG_ALL_STATIC=1
+          echo "PostgreSQL:"
+          pkg-config --static --libs libpq
+          echo "MariaDB:"
+          pkg-config --static --libs libmariadb
 
       - name: install nextest
         run: |
@@ -386,4 +436,3 @@ jobs:
           if [ -f backend.pid ]; then
             cat backend.pid | xargs kill || true
           fi
-```

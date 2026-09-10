@@ -358,6 +358,7 @@ fn can_write_log_dir() -> bool {
 fn vhost_log_writer_empty_path_is_noop() {
     let writer = proxyauth::network::accesslog::VhostLogWriter::new();
     writer.write("", "should not panic");
+    writer.flush_all();
 }
 
 #[test]
@@ -373,6 +374,7 @@ fn vhost_log_writer_creates_file() {
 
     writer.write(fname, "line 1");
     writer.write(fname, "line 2");
+    writer.flush_all();
 
     let content = std::fs::read_to_string(format!("{}/{}", LOG_DIR, fname)).unwrap();
     assert!(content.contains("line 1"));
@@ -395,7 +397,7 @@ fn vhost_log_writer_shared_across_writes() {
     for i in 0..50 {
         writer.write(fname, &format!("entry {i}"));
     }
-
+    writer.flush_all();
     let content = std::fs::read_to_string(format!("{}/{}", LOG_DIR, fname)).unwrap();
     let line_count = content.lines().count();
     assert_eq!(line_count, 50);

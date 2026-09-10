@@ -1,29 +1,29 @@
-```yaml
 name: CI/CD ProxyAuth - CentOS
-
-on:
+'on':
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
-  workflow_dispatch:
-  workflow_call:
-
+    branches:
+      - main
+  workflow_dispatch: null
+  workflow_call: null
 jobs:
-
   audit:
     runs-on: ubuntu-latest
-
     container:
-      image: quay.io/centos/centos:stream9
-
+      image: 'quay.io/centos/centos:stream9'
     steps:
+
+      - name: Install Node.js
+        run: |
+          dnf install -y nodejs npm
+
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Set up Rust
         run: |
-          dnf install -y curl
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -36,7 +36,9 @@ jobs:
             openssl-devel \
             libpq-devel \
             mariadb-connector-c-devel \
-            python3
+            python3 \
+            gcc \
+            gcc-c++ \
 
       - name: install cargo-audit
         run: |
@@ -51,20 +53,20 @@ jobs:
         run: |
           python3 ci/check-crypto-alignment.py proxyauth zerocrypt
 
-      - name: Report the wider picture, without failing on it
+      - name: 'Report the wider picture, without failing on it'
         continue-on-error: true
         run: |
           source "$HOME/.cargo/env"
           cargo tree --duplicates || true
 
-
   coverage:
     runs-on: ubuntu-latest
-
     container:
-      image: quay.io/centos/centos:stream9
-
+      image: 'quay.io/centos/centos:stream9'
     steps:
+      - name: Install Node.js
+        run: |
+          dnf install -y nodejs npm
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -81,23 +83,28 @@ jobs:
             pkg-config \
             openssl-devel \
             libpq-devel \
-            mariadb-connector-c-devel
+            mariadb-connector-c-devel \
+            gcc \
+            gcc-c++
 
       - name: install tarpaulin for coverage
         run: cargo install --locked cargo-tarpaulin
 
       - name: Coverage
-        run: cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm -- --test-threads=1
+        run: >-
+          cargo tarpaulin --all-features --out Html --timeout 300 --engine llvm
+          -- --test-threads=1
         continue-on-error: true
-
 
   ci:
     runs-on: ubuntu-latest
-
     container:
-      image: quay.io/centos/centos:stream9
-
+      image: 'quay.io/centos/centos:stream9'
     steps:
+      - name: Install Node.js
+        run: |
+          dnf install -y nodejs npm
+
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -118,7 +125,8 @@ jobs:
             mariadb-connector-c-devel \
             jq \
             python3 \
-            curl
+            gcc \
+            gcc-c++ \
 
       - name: install nextest
         run: cargo install --locked cargo-nextest
@@ -157,7 +165,6 @@ jobs:
             -subj "/CN=localhost"
 
           chown -R proxyauth:proxyauth /etc/proxyauth/certs
-
       - name: Test ProxyAuth (unittest)
         run: cargo nextest run --verbose --no-fail-fast --test-threads=1
 
@@ -225,15 +232,21 @@ jobs:
           sleep 2
 
       - name: Test HTTP response
-        run: curl -k -I https://localhost:8080 || (cat proxyauth.pid | xargs kill && exit 1)
+        run: >-
+          curl -k -I https://localhost:8080 || (cat proxyauth.pid | xargs kill
+          && exit 1)
 
       - name: A protected route refuses an anonymous request
-        run: |
+        run: >
           set -eu
 
-          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app)
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}'
+          https://localhost:8080/app)
+
 
           echo "anonymous GET /app -> $code"
+
 
           case "$code" in
             2*)
@@ -243,8 +256,9 @@ jobs:
           esac
 
       - name: Log in and use the token
-        run: |
+        run: >
           set -eu
+
 
           response=$(curl -k -s -X POST https://localhost:8080/auth \
             -H 'Content-Type: application/json' \
@@ -255,22 +269,29 @@ jobs:
             exit 1
           }
 
+
           token=$(echo "$response" | jq -r '.token // empty')
+
 
           if [ -z "$token" ]; then
             echo "::error::no token in the /auth response: $response"
             exit 1
           fi
 
+
           echo "token issued, ${#token} chars"
+
 
           body=$(curl -k -s -w '\n%{http_code}' https://localhost:8080/app \
             -H "Authorization: Bearer $token")
 
           code=$(echo "$body" | tail -n1)
+
           content=$(echo "$body" | sed '$d')
 
+
           echo "authenticated GET /app -> $code"
+
 
           case "$code" in
             200)
@@ -287,15 +308,19 @@ jobs:
               ;;
           esac
 
+
           echo "$content" | grep -q BACKEND-OK || {
             echo "::error::/app answered 200 but did not proxy the backend"
             exit 1
           }
 
-          code2=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app \
+
+          code2=$(curl -k -s -o /dev/null -w '%{http_code}'
+          https://localhost:8080/app \
             -H "Authorization: Bearer $token")
 
           echo "same token again (cache hit) -> $code2"
+
 
           [ "$code2" = "200" ] || {
             echo "::error::the cached path refused a valid token"
@@ -303,8 +328,9 @@ jobs:
           }
 
       - name: A tampered token is refused
-        run: |
+        run: >
           set -eu
+
 
           token=$(curl -k -s -X POST https://localhost:8080/auth \
             -H 'Content-Type: application/json' \
@@ -313,23 +339,29 @@ jobs:
 
           last="${token: -1}"
 
+
           if [ "$last" = "A" ]; then
             repl="B"
           else
             repl="A"
           fi
 
+
           tampered="${token%?}$repl"
+
 
           if [ "$tampered" = "$token" ]; then
             echo "::error::failed to alter the token"
             exit 1
           fi
 
-          code=$(curl -k -s -o /dev/null -w '%{http_code}' https://localhost:8080/app \
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}'
+          https://localhost:8080/app \
             -H "Authorization: Bearer $tampered")
 
           echo "tampered token -> $code"
+
 
           case "$code" in
             2*)
@@ -339,14 +371,17 @@ jobs:
           esac
 
       - name: Wrong credentials are refused
-        run: |
+        run: >
           set -eu
 
-          code=$(curl -k -s -o /dev/null -w '%{http_code}' -X POST https://localhost:8080/auth \
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' -X POST
+          https://localhost:8080/auth \
             -H 'Content-Type: application/json' \
             -d '{"username":"admin","password":"not-the-password"}')
 
           echo "bad password -> $code"
+
 
           case "$code" in
             2*)
@@ -365,4 +400,3 @@ jobs:
           if [ -f backend.pid ]; then
             cat backend.pid | xargs kill || true
           fi
-```
