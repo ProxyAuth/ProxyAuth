@@ -1,0 +1,180 @@
+name: Build AUR package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  workflow_dispatch:
+
+jobs:
+  build-arch:
+    runs-on: ubuntu-latest
+
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          pacman -Sy --noconfirm
+          pacman -S --noconfirm \
+            base-devel \
+            rust \
+            cargo \
+            openssl \
+            ca-certificates \
+            postgresql-libs \
+            mariadb-libs \
+            git
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+
+          if [ -z "$VERSION" ]; then
+            echo "Unable to determine version from Cargo.toml"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building ProxyAuth $VERSION"
+
+      - name: Build ProxyAuth
+        run: |
+          cargo build --release --locked
+
+          test -x target/release/proxyauth
+
+      - name: Create Arch package
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          mkdir -p arch-package
+
+          cp target/release/proxyauth arch-package/proxyauth-${VERSION}
+
+          cat > arch-package/PKGBUILD <<EOF
+          # Maintainer: Vladimir Souchet <staff@proxyauth.app>
+
+          pkgname=proxyauth
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Authentication gateway and reverse proxy written in Rust"
+          arch=('x86_64')
+          url="https://proxyauth.app"
+          license=('Apache-2.0')
+
+          depends=(
+              'openssl'
+              'ca-certificates'
+              'systemd'
+          )
+
+          source=(
+              "proxyauth-\${pkgver}"
+          )
+
+          sha256sums=(
+              'SKIP'
+          )
+
+          package() {
+              install -Dm755 "\$srcdir/proxyauth-\${pkgver}" \
+                  "\$pkgdir/usr/bin/proxyauth"
+
+              install -Dm644 /dev/stdin \
+                  "\$pkgdir/usr/lib/systemd/system/proxyauth.service" <<'SERVICE'
+          [Unit]
+          Description=ProxyAuth Authentication Gateway
+          After=network.target
+
+          [Service]
+          Type=simple
+
+          User=proxyauth
+          Group=proxyauth
+
+          ExecStart=/usr/bin/proxyauth
+
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+          Restart=on-failure
+          RestartSec=5
+
+          Environment=RUST_LOG=info
+
+          WorkingDirectory=/opt/proxyauth
+
+          StandardOutput=append:/var/log/proxyauth/proxyauth.log
+          StandardError=append:/var/log/proxyauth/proxyauth.err
+
+          NoNewPrivileges=true
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+              install -Dm644 /dev/stdin \
+                  "\$pkgdir/usr/lib/sysusers.d/proxyauth.conf" <<'SYSUSERS'
+          u proxyauth - "ProxyAuth service user"
+          SYSUSERS
+
+              install -Dm644 /dev/stdin \
+                  "\$pkgdir/usr/lib/tmpfiles.d/proxyauth.conf" <<'TMPFILES'
+          d /etc/proxyauth 0750 proxyauth proxyauth -
+          d /etc/proxyauth/certs 0750 proxyauth proxyauth -
+          d /etc/proxyauth/certs/routes 0750 proxyauth proxyauth -
+          d /opt/proxyauth 0750 proxyauth proxyauth -
+          d /opt/proxyauth/db 0750 proxyauth proxyauth -
+          d /var/log/proxyauth 0750 proxyauth proxyauth -
+          TMPFILES
+          }
+          EOF
+
+      - name: Build package
+        run: |
+          cd arch-package
+
+          useradd -m builder
+          chown -R builder:builder .
+
+          su builder -c \
+            'makepkg --cleanbuild --clean --syncdeps --noconfirm'
+
+      - name: Validate package
+        run: |
+          PACKAGE=$(find arch-package -name 'proxyauth-*.pkg.tar.*' -type f | head -n1)
+
+          if [ -z "$PACKAGE" ]; then
+            echo "Arch package was not generated"
+            exit 1
+          fi
+
+          echo "Generated package:"
+          ls -lh "$PACKAGE"
+
+          pacman -Qp "$PACKAGE"
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+
+          cp arch-package/proxyauth-*.pkg.tar.* dist/
+
+          cd dist
+
+          sha256sum proxyauth-*.pkg.tar.* \
+            > proxyauth-arch.sha256
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxyauth-arch
+          path: dist/
