@@ -8,6 +8,7 @@ name: CI/CD ProxyAuth - Fedora
       - main
   workflow_dispatch: null
   workflow_call: null
+
 jobs:
   audit:
     runs-on: ubuntu-latest
@@ -56,6 +57,7 @@ jobs:
         run: |
           . "$HOME/.cargo/env"
           cargo tree --duplicates || true
+
   coverage:
     runs-on: ubuntu-latest
     container:
@@ -81,6 +83,7 @@ jobs:
             llvm \
             clang \
             python3
+
       - name: Set up Rust
         run: >
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s --
@@ -128,7 +131,8 @@ jobs:
             clang \
             sudo \
             jq \
-            python3
+            python3 \
+            openssl
 
       - name: Set up Rust
         run: >
