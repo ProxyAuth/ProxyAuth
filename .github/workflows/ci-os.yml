@@ -28,9 +28,10 @@ jobs:
 
           - os: Debian
             image: node:24-bookworm
-          - os: Fedora
 
+          - os: Fedora
             image: quay.io/fedora/nodejs-24
+
           - os: Ubuntu
             image: ubuntu:24.04
 
@@ -43,12 +44,19 @@ jobs:
       # OS bootstrap
       # ----------------------------------------------------------------------
       - name: Install OS dependencies
-        shell: bash
+        # `sh` et non `bash` : cette étape est celle qui installe bash, et
+        # l'image Alpine n'a que le `ash` de busybox avant qu'elle ne tourne.
+        # Déclarer `shell: bash` ici désactive le repli automatique de
+        # GitHub vers `sh` et échoue avec « bash: executable file not found ».
+        # Le script est du shell POSIX, il tourne à l'identique partout.
+        shell: sh
         run: |
           set -eux
 
           case "${{ matrix.os }}" in
             Alpine)
+              export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
+              echo "RUSTFLAGS=$RUSTFLAGS" >> "$GITHUB_ENV"
               apk add --no-cache \
                 bash \
                 build-base \
@@ -195,6 +203,11 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Report available parallelism
+        run: |
+          echo "cœurs disponibles : $(nproc)"
+          echo "NPROC=$(nproc)" >> "$GITHUB_ENV"
+
       # ----------------------------------------------------------------------
       # AUDIT
       # ----------------------------------------------------------------------
@@ -234,6 +247,15 @@ jobs:
 
       - name: Coverage
         continue-on-error: true
+        env:
+          # Tarpaulin délègue la compilation à cargo : cette variable est
+          # lue par le cargo qu'il lance en interne, sans dépendre d'une
+          # option que tarpaulin exposerait ou non.
+          #
+          # Elle ne touche que la compilation. `--test-threads=1` après le
+          # `--` reste la seule chose qui gouverne l'exécution des tests,
+          # et il ne bouge pas.
+          CARGO_BUILD_JOBS: ${{ env.NPROC }}
         run: |
           . "$HOME/.cargo/env"
           cargo tarpaulin \
@@ -253,9 +275,12 @@ jobs:
           cargo install --locked cargo-nextest
 
       - name: Build ProxyAuth
+        env:
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+          CARGO_PROFILE_RELEASE_LTO: "false"
         run: |
           . "$HOME/.cargo/env"
-          cargo build --release
+          cargo build --release --jobs "$(nproc)"
 
       - name: Prepare user for ProxyAuth
         run: |
