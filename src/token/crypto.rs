@@ -6,8 +6,6 @@ use chacha20poly1305::{
 };
 
 use hkdf::Hkdf;
-use rand::RngCore;
-use rand::rngs::OsRng;
 use sha2::Sha256;
 
 /// Key length for the password-based helpers below.
@@ -31,7 +29,7 @@ const HKDF_INFO_PW: &[u8] = b"encrypt_base64.password.v1";
 #[allow(dead_code)]
 pub fn encrypt_base64(message: &str, password: &str) -> String {
     let mut salt = [0u8; 16];
-    OsRng.fill_bytes(&mut salt);
+    getrandom::fill(&mut salt).expect("OS CSPRNG unavailable");
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), password.as_bytes());
     let mut key_bytes = [0u8; KEY_LEN];
@@ -42,7 +40,7 @@ pub fn encrypt_base64(message: &str, password: &str) -> String {
     let cipher = XChaCha20Poly1305::new(&key);
 
     let mut nonce_bytes = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    getrandom::fill(&mut nonce_bytes).expect("OS CSPRNG unavailable");
     let nonce = XNonce::try_from(&nonce_bytes[..]).unwrap();
 
     let ct = cipher.encrypt(&nonce, message.as_bytes()).expect("encrypt");

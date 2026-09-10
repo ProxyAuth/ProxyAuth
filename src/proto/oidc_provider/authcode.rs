@@ -104,13 +104,12 @@ pub fn create_code(entry: AuthCodeEntry) -> Result<String, String> {
         .open_db(Some(DB_NAME))
         .map_err(|e| format!("Failed to open OIDC authcode LMDB db: {e}"))?;
 
-    // 256 bits from OsRng, hex-encoded — plenty of entropy for a
+    // 256 bits straight from the OS CSPRNG, hex-encoded — plenty of entropy for a
     // 120-second-lived, single-use secret; no need for the heavier
     // shift+BLAKE3 construction `token::auth::generate_random_string`
     // uses for ProxyAuth's own longer-lived tokens.
-    use rand::RngCore;
     let mut raw = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut raw);
+    getrandom::fill(&mut raw).expect("OS CSPRNG unavailable");
     let code = hex::encode(raw);
 
     let serialized =

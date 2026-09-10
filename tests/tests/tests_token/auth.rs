@@ -24,7 +24,6 @@ mod tests {
     use proxyauth::config::config::{AppConfig, RouteConfig, RouteRule, User};
     use proxyauth::revoke::db::RevokedTokenMap;
     use proxyauth::token::csrf::make_csrf_token;
-    use rand_chacha::rand_core;
 
     // hyper 1.x
     use http_body_util::Full;
@@ -79,7 +78,7 @@ mod tests {
     }
 
     fn hash_pwd(plain: &str) -> String {
-        let salt = SaltString::generate(&mut rand_core::OsRng);
+        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
         Argon2::default()
             .hash_password(plain.as_bytes(), &salt)
             .unwrap()

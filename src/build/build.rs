@@ -1,9 +1,11 @@
 use blake3;
+// rand 0.10 : `RngCore` s'appelle `Rng`, et l'ancien `Rng` (les méthodes
+// de commodité) s'appelle `RngExt`. `ChaCha8Rng` vient de `rand` via la
+// feature `chacha`, ce qui évite de retirer un second `rand_core` dans
+// le graphe de dépendances.
+use rand::rngs::ChaCha8Rng;
 use rand::seq::SliceRandom;
-use rand::rngs::OsRng;
-use rand::RngCore;
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
+use rand::{Rng, RngExt, SeedableRng};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -48,7 +50,7 @@ pub fn identity(seed: u64) -> String {
 /// resemble a MAC address or any other identifier format.
 pub fn build_secret_hex(len: usize) -> String {
     let mut buf = vec![0u8; len];
-    OsRng.fill_bytes(&mut buf);
+    getrandom::fill(&mut buf).expect("OS CSPRNG unavailable");
     buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
@@ -62,11 +64,13 @@ fn main() {
         println!("cargo:warning=Version {} is allowed to build", version);
     }
 
-    let mut rng = rand::thread_rng();
-    let build_rand = rng.gen_range(1..999_999_999);
-    let mut rngr = rand::thread_rng();
+    // `thread_rng()` est renommé `rng()`. `gen_range` est renommé
+    // `random_range` et vit sur `RngExt` ; `next_u64` vit sur `Rng`.
+    let mut rng = rand::rng();
+    let build_rand = rng.random_range(1..999_999_999);
+    let mut rngr = rand::rng();
     let build_seed = rngr.next_u64();
-    let build_seed2 = rng.gen_range(10..99);
+    let build_seed2 = rng.random_range(10..99);
 
     let build_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -74,8 +78,8 @@ fn main() {
         .as_secs()
         .to_string();
 
-    let random_epoch: i64 = rng.gen_range(0..999_999_999_999);
-    let identity_str = identity(rng.gen_range(1..999_999_999_999));
+    let random_epoch: i64 = rng.random_range(0..999_999_999_999);
+    let identity_str = identity(rng.random_range(1..999_999_999_999));
     let hk = build_secret_hex(32);
 
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);

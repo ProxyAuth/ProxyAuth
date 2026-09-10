@@ -14,7 +14,6 @@ use hyper::header::{CONTENT_ENCODING, CONTENT_TYPE as HYPER_CONTENT_TYPE};
 use actix_web::http::StatusCode;
 use actix_web::http::header::CONTENT_TYPE as CONTENT_TYPE_ACTIX;
 use proxyauth::token::csrf::fix_mime_actix;
-use rand::RngCore;
 use std::io::Read;
 
 #[cfg(test)]
@@ -90,7 +89,7 @@ mod tests {
 
         let secret = "s3cr3t";
         let mut nonce = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        getrandom::fill(&mut nonce).expect("OS CSPRNG unavailable");
         let exp = (OffsetDateTime::now_utc() - Duration::seconds(10)).unix_timestamp();
         let exp_b = exp.to_be_bytes();
 
