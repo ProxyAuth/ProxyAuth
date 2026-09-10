@@ -1,0 +1,243 @@
+name: Build Alpine package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    container:
+      image: alpine:latest
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apk update
+
+          apk add --no-cache \
+            alpine-sdk \
+            build-base \
+            cargo \
+            rust \
+            pkgconf \
+            openssl-dev \
+            postgresql-dev \
+            mariadb-dev \
+            ca-certificates \
+            curl \
+            file \
+            openssl \
+            git \
+            sudo
+
+      - name: Create build user
+        run: |
+          adduser -D builder
+          addgroup builder abuild
+          addgroup builder wheel
+
+      - name: Configure abuild
+        run: |
+          mkdir -p /home/builder/.abuild
+
+          chown -R builder:builder /home/builder
+
+          su builder -c '
+            abuild-keygen -a -n
+          '
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Read version
+        id: version
+        shell: sh
+        run: |
+          VERSION=$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml \
+            | grep '^version' \
+            | head -n1 \
+            | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')
+
+          if [ -z "$VERSION" ]; then
+            echo "Unable to determine package version"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build ProxyAuth
+        run: |
+          cargo build --release --locked
+
+      - name: Verify binary
+        run: |
+          test -x target/release/proxyauth
+
+          ./target/release/proxyauth --version || true
+
+          file target/release/proxyauth
+
+          echo "Dynamic dependencies:"
+          ldd target/release/proxyauth || true
+
+      - name: Prepare Alpine package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+
+          mkdir -p /home/builder/packages/proxyauth
+          mkdir -p /home/builder/dist
+
+          PACKAGE_DIR="/home/builder/packages/proxyauth"
+
+          #
+          # APKBUILD
+          #
+          cat > "$PACKAGE_DIR/APKBUILD" <<EOF
+          # Contributor: Vladimir Souchet <staff@proxyauth.app>
+          # Maintainer: Vladimir Souchet <staff@proxyauth.app>
+
+          pkgname=proxyauth
+          pkgver=${VERSION}
+          pkgrel=0
+
+          pkgdesc="ProxyAuth authentication gateway"
+          url="https://proxyauth.app"
+          arch="x86_64"
+
+          license="Apache-2.0"
+
+          depends="
+              openssl
+              ca-certificates
+              openrc
+          "
+
+          makedepends=""
+
+          source=""
+
+          options="!check"
+
+          build() {
+              :
+          }
+
+          package() {
+              install -Dm755 \
+                  "\$srcdir/proxyauth" \
+                  "\$pkgdir/usr/bin/proxyauth"
+
+              install -Dm755 \
+                  "\$srcdir/proxyauth.initd" \
+                  "\$pkgdir/etc/init.d/proxyauth"
+          }
+
+          EOF
+
+          #
+          # Binary source for APKBUILD
+          #
+          cp \
+            target/release/proxyauth \
+            "$PACKAGE_DIR/proxyauth"
+
+          #
+          # OpenRC service
+          #
+          cat > "$PACKAGE_DIR/proxyauth.initd" <<'EOF'
+          #!/sbin/openrc-run
+
+          name="ProxyAuth"
+          description="ProxyAuth Authentication Proxy"
+
+          command="/usr/bin/proxyauth"
+          command_user="proxyauth:proxyauth"
+
+          directory="/opt/proxyauth"
+
+          output_log="/var/log/proxyauth/proxyauth.log"
+          error_log="/var/log/proxyauth/proxyauth.err"
+
+          pidfile="/run/${RC_SVCNAME}.pid"
+
+          depend() {
+              need net
+              after firewall
+          }
+          EOF
+
+          chmod 0755 "$PACKAGE_DIR/proxyauth.initd"
+
+          #
+          # Install files required by APKBUILD
+          #
+          chown -R builder:builder "$PACKAGE_DIR"
+
+          #
+          # Build APK
+          #
+          su builder -c "
+            cd '$PACKAGE_DIR'
+            abuild checksum
+            abuild -r
+          "
+
+          #
+          # Find generated APK
+          #
+          find /home/builder/packages \
+            -type f \
+            -name 'proxyauth-*.apk' \
+            -exec cp {} /home/builder/dist/ \;
+
+          ls -lh /home/builder/dist
+
+      - name: Generate SHA256
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+
+          cd /home/builder/dist
+
+          APK=$(find . -maxdepth 1 -type f -name 'proxyauth-*.apk' | head -n1)
+
+          if [ -z "$APK" ]; then
+            echo "APK package not found"
+            exit 1
+          fi
+
+          sha256sum "$APK" > "proxyauth_${VERSION}_apk.sha256"
+
+          cat "proxyauth_${VERSION}_apk.sha256"
+
+      - name: Validate APK
+        run: |
+          set -e
+
+          APK=$(find /home/builder/dist \
+            -maxdepth 1 \
+            -type f \
+            -name 'proxyauth-*.apk' \
+            | head -n1)
+
+          apk info --description --root "$APK" || true
+
+          echo "APK:"
+          ls -lh "$APK"
+
+      - name: Upload Alpine package
+        uses: actions/upload-artifact@v3
+        with:
+          name: proxyauth deposite alpine-apk
+          path: |
+            /home/builder/dist/*.apk
+            /home/builder/dist/*.sha256

@@ -3,9 +3,8 @@ use crate::AppState;
 use crate::config::config::{AuthRequest, RouteRule, User};
 use crate::network::error::render_error_page;
 use crate::network::proxy::client_ip;
-use crate::token::crypto::{calcul_cipher, derive_key_from_secret, encrypt};
 use crate::token::csrf::verify_csrf_token;
-use crate::token::security::{generate_token, validate_token};
+use crate::token::security::{issue_token, validate_token};
 use actix_web::cookie::{Cookie, SameSite};
 use actix_web::{
     Error as ActixError, FromRequest, HttpRequest, HttpResponse, Responder,
@@ -292,8 +291,8 @@ pub async fn check_login_credentials<'a>(
 
 /// Builds a signed, encrypted ProxyAuth session token and its
 /// corresponding `Set-Cookie` header value — the exact same
-/// construction `/auth`'s own success path uses (`generate_token` →
-/// fast-mode passthrough or `calcul_cipher` → `encrypt`), factored out
+/// construction `/auth`'s own success path uses (`issue_token`, which
+/// seals through the shared `zerocrypt` vault), factored out
 /// so the OIDC provider's login step produces byte-for-byte the same
 /// kind of token `/auth` would, verifiable by the exact same
 /// `token::security::validate_token` everything else already uses.
@@ -316,14 +315,9 @@ pub fn establish_session(
     let id_token = generate_random_string(48);
     let expiry_ts = expiry.with_timezone(&Utc).timestamp().to_string();
 
-    let token = generate_token(username, config, &expiry_ts, &id_token);
-    let key = derive_key_from_secret(&config.secret);
-
-    let token_generate = if config.fast {
-        token.clone()
-    } else {
-        calcul_cipher(token.clone())
-    };
+    // Digest, obfuscation pass and sealing are all inside `issue_token`
+    // now; `config.fast` still selects whether the pass runs, it is just
+    // read once when the vault is built rather than here.
 
     // SECURITY/CORRECTNESS: `index_user` here is genuinely read back
     // by `token::security::validate_token` (`config.user_by_index(...)`)
@@ -331,12 +325,16 @@ pub fn establish_session(
     // cosmetic field. The caller must pass the matched user's real
     // position in `AppConfig::combined_users()`, not a placeholder;
     // getting this wrong doesn't fail loudly, it silently resolves a
-    // valid session to the *wrong* user.
-    let cipher_token = format!(
-        "{}|{}|{}|{}",
-        token_generate, expiry_ts, index_user, id_token
-    );
-    let token_encrypt = encrypt(&cipher_token, &key);
+    // valid session to the *wrong* user. Validation now also checks the
+    // index and the name in the token agree, so a mismatch is refused
+    // rather than served.
+    let token_encrypt = match issue_token(username, index_user, &expiry_ts, &id_token) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("failed to issue session token for {username}: {e}");
+            String::new()
+        }
+    };
 
     let session_max_age = max_age_session_cookie.min(config.token_expiry_seconds);
     let seconds = expiry.signed_duration_since(Utc::now()).num_seconds().max(0) as u64;
@@ -881,23 +879,17 @@ pub async fn auth(
         let expiry_ts = expiry.with_timezone(&Utc).timestamp().to_string();
         let expires_at_str = get_expiry_with_timezone_format(data.config.clone(), None);
 
-        let token = generate_token(&auth.username, &data.config, &expiry_ts, &id_token);
-        let key = derive_key_from_secret(&data.config.secret);
-
-        // mode fast token is more speed but less secure
-        // and fast is false token is more secure but it's slower
-        let token_generate = if data.config.fast {
-            token.clone()
-        } else {
-            calcul_cipher(token.clone())
+        // `config.fast` still selects whether the obfuscation pass runs;
+        // it is read once when the vault is built rather than on every
+        // login. Everything else — digest, sealing, encoding — is inside
+        // `issue_token`.
+        let token_encrypt = match issue_token(&auth.username, index_user, &expiry_ts, &id_token) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("[{}] failed to issue token for {}: {}", ip, auth.username, e);
+                return HttpResponse::InternalServerError().finish();
+            }
         };
-
-        let cipher_token = format!(
-            "{}|{}|{}|{}",
-            token_generate, expiry_ts, index_user, id_token
-        );
-
-        let token_encrypt = encrypt(&cipher_token, &key);
 
         info!(
             "[{}] new token generated for user {} expirated at {}",

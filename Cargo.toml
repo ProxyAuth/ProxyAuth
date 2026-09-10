@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -39,7 +39,7 @@ reqwest = { version = "0.13", features = ["rustls", "json", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.33"
 serde_json = { version = "1.0.140", features = ["preserve_order"] }
-base64 = "0.21"
+base64 = "0.22.1"
 sha2 = "0.11.0-rc.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
@@ -74,6 +74,15 @@ futures-util = "0.3"
 bytes = "1.11.1"
 socket2 = "0.5"
 blake3 = ">=1.8.7"
+
+# Token construction: key derivation, sealing, signature and the
+# optional obfuscation pass. Extracted from this crate so the logic can
+# be tested and reviewed on its own.
+zerocrypt = {
+    git = "https://git.proxyauth.app/ProxyAuth/zerocrypt.git",
+    tag = "v0.1.6",
+    features = ["cache"]
+}
 anyhow = "1.0"
 base32 = "0.5.1"
 sequoia-openpgp = { version = "2.1", default-features = false, features = ["crypto-openssl"] }
@@ -108,7 +117,7 @@ tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpk
 instant-acme = "0.8"
 rcgen = "0.13"
 x509-parser = "0.16"
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 pem = "3"
 
 # Security-advisory floors, not exact pins — deliberately left as

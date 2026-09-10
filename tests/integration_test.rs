@@ -38,6 +38,13 @@ macro_rules! build_app {
             spawn_stats_ticker(stats.clone());
 
             let config: Arc<AppConfig> = Arc::new(load_config("config/config.json"));
+
+            // The token vault is a process-wide OnceLock that `main.rs`
+            // fills at startup. A test binary has no startup, so it has
+            // to do it here — otherwise the first handler that mints or
+            // checks a token panics. `init` is idempotent, so calling it
+            // from several tests in the same binary is fine.
+            proxyauth::token::vault::init(&config).expect("initialise the token vault");
             let routes: RouteConfig = serde_yaml::from_str(
                 &fs::read_to_string("config/routes.yml").expect("Failed to read routes.yml"),
             )

@@ -36,7 +36,8 @@ pub fn identity(seed: u64) -> String {
 }
 
 /// Generates the build-time secret used as the HKDF salt in
-/// `derive_key_from_secret` and mixed into `generate_token`.
+/// key derivation and the token signature, via the `zerocrypt` vault
+/// built in `token::vault::init`.
 ///
 /// Unlike `identity()`, this draws `len` bytes directly from the OS
 /// CSPRNG. That distinction matters: hashing a low-entropy seed to a

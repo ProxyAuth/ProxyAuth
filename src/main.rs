@@ -64,7 +64,7 @@ use tls::bind_server;
 use token::auth::{auth_dispatch, auth_options};
 use token::logout::{logout_dispatch, logout_options};
 use token::reset_password::reset_password_route;
-use token::security::init_derived_key;
+use token::vault as token_vault;
 use tokio::sync::mpsc::unbounded_channel;
 use tracing::{error, warn};
 use tracing_loki::url::Url;
@@ -709,7 +709,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    init_derived_key(&config.secret);
+    // Builds the process-wide token vault from the operator secret and
+    // the build constants. Must happen before any request is served: a
+    // missing vault is a startup-ordering bug, and failing here beats
+    // discovering it on the first login.
+    if let Err(e) = token_vault::init(&config) {
+        eprintln!("fatal: cannot initialise the token vault: {e}");
+        std::process::exit(1);
+    }
 
     // logs
     fn init_logging(config: &AppConfig) {

@@ -18,3 +18,4 @@ pub mod csrf;
 pub mod logout;
 pub mod reset_password;
 pub mod security;
+pub mod vault;

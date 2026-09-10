@@ -64,7 +64,7 @@ pub fn update_build_info(input: &str) -> Result<(), String> {
     // still reports build_time rather than being masked by this guard.
     //
     // The build secret is key material: it is the HKDF salt in
-    // derive_key_from_secret and a field in generate_token. A keystore
+    // the zerocrypt vault's key derivation and signature. A keystore
     // produced before the 256-bit change carries a 26-character value,
     // and importing it would silently drop the deployment back to ~70
     // bits. Fail loudly instead.
@@ -95,6 +95,11 @@ impl BuildInfo {
         )
     }
 
+    /// The build's field ordering, as a list.
+    ///
+    /// The token signature no longer uses it — the vault has its own
+    /// construction — but it is folded into the vault's key at startup,
+    /// so it still binds a deployment to its own build constants.
     pub fn shuffled_order_list(&self) -> Vec<String> {
         self.shuffled_order
             .split(',')

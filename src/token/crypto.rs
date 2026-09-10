@@ -1,205 +1,32 @@
-use crate::token::security::get_build_seed2;
-
 use base64::{Engine as _, engine::general_purpose};
-use blake3;
 
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
 
-use crate::build::build_info;
 use hkdf::Hkdf;
-use lru::LruCache;
-use once_cell::sync::Lazy;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::Sha256;
-use std::fmt::Write;
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
 
+/// Key length for the password-based helpers below.
 const KEY_LEN: usize = 32;
-const TAG_V1: u8 = 1;
+
+/// Format tag for `encrypt_base64` output. Distinct from any token tag:
+/// these two formats must never be mistaken for one another.
 pub const TAG_V1_PW: u8 = 0xE1;
-const HKDF_INFO_DERIVE: &[u8] = b"derive_key_from_secret.v1";
+
+/// HKDF context string for the password-based helpers. Domain-separated
+/// from anything else so the same password can never yield the same key
+/// in two different places.
 const HKDF_INFO_PW: &[u8] = b"encrypt_base64.password.v1";
 
-static DERIVED_KEYS: Lazy<Mutex<LruCache<[u8; 32], [u8; 32]>>> = Lazy::new(|| {
-    let cap = NonZeroUsize::new(1024).expect("nonzero");
-    Mutex::new(LruCache::new(cap))
-});
-
-pub fn derive_key_from_secret(secret: &str) -> [u8; 32] {
-    let id_hash = blake3::hash(secret.as_bytes());
-    let mut id = [0u8; 32];
-    id.copy_from_slice(id_hash.as_bytes());
-
-    if let Some(k) = DERIVED_KEYS.lock().unwrap().get(&id).cloned() {
-        return k;
-    }
-
-    let salt = build_info::get().build_hk;
-    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), secret.as_bytes());
-    let mut okm = [0u8; KEY_LEN];
-    hk.expand(HKDF_INFO_DERIVE, &mut okm).expect("HKDF expand");
-
-    DERIVED_KEYS.lock().unwrap().put(id, okm);
-
-    okm
-}
-
-pub fn encrypt(message: &str, key_bytes: &[u8]) -> String {
-    assert_eq!(key_bytes.len(), KEY_LEN);
-
-    let key = Key::try_from(key_bytes).expect("invalid key length");
-    let cipher = XChaCha20Poly1305::new(&key);
-
-    let mut nonce_bytes = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::try_from(&nonce_bytes[..]).expect("invalid nonce length");
-
-    let ct = cipher
-        .encrypt(&nonce, message.as_bytes())
-        .expect("encryption failure");
-
-    let mut out = Vec::with_capacity(1 + 24 + ct.len());
-    out.push(TAG_V1);
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ct);
-
-    general_purpose::STANDARD.encode(out)
-}
-
-pub fn decrypt(obsf: &str, key_bytes: &[u8]) -> Result<String, ()> {
-    if key_bytes.len() != KEY_LEN {
-        return Err(());
-    }
-
-    let data = general_purpose::STANDARD.decode(obsf).map_err(|_| ())?;
-    if data.len() < 1 + 24 || data[0] != TAG_V1 {
-        return Err(());
-    }
-
-    let nonce = XNonce::try_from(&data[1..25]).expect("invalid nonce length");
-    let ct = &data[25..];
-
-    let key = Key::try_from(key_bytes).expect("invalid key length");
-    let cipher = XChaCha20Poly1305::new(&key);
-
-    let pt = cipher.decrypt(&nonce, ct).map_err(|_| ())?;
-    String::from_utf8(pt).map_err(|_| ())
-}
-
-pub fn split_hash(s: String, n: usize) -> Vec<String> {
-    if n == 0 {
-        return vec![s];
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity((bytes.len() + n - 1) / n);
-    for chunk in bytes.chunks(n) {
-        out.push(std::str::from_utf8(chunk).unwrap().to_string());
-    }
-    out
-}
-
-pub struct Blake3Keystream {
-    rdr: blake3::OutputReader,
-}
-
-impl Blake3Keystream {
-    pub fn new(factor: u64) -> Self {
-        let mut h = blake3::Hasher::new();
-        h.update(b"proxyauth.process_string.keystream.v1");
-        h.update(&factor.to_le_bytes());
-        let rdr = h.finalize_xof();
-        Self { rdr }
-    }
-    #[inline]
-    pub fn next_u8(&mut self) -> u8 {
-        let mut b = [0u8; 1];
-        self.rdr.fill(&mut b);
-        b[0]
-    }
-}
-
-pub fn process_string(s: &str, factor: u64) -> String {
-    let mut ks = Blake3Keystream::new(factor);
-
-    let mut result = Vec::with_capacity(s.len() * 2);
-    let mut number_acc = 0u64;
-    let mut in_digit = false;
-    let mut buf = itoa::Buffer::new();
-
-    for &c in s.as_bytes() {
-        match c {
-            b'0'..=b'9' => {
-                in_digit = true;
-                number_acc = number_acc * 10 + (c - b'0') as u64;
-            }
-            b'a'..=b'z' | b'A'..=b'Z' => {
-                if in_digit {
-                    let computed = buf.format(number_acc ^ factor);
-                    result.extend_from_slice(computed.as_bytes());
-                    number_acc = 0;
-                    in_digit = false;
-                }
-                let k = ks.next_u8();
-                let rot = ((c ^ k) % 26) as u8;
-                let mapped = match c {
-                    b'a'..=b'z' => b'a' + ((c - b'a' + rot) % 26),
-                    b'A'..=b'Z' => b'A' + ((c - b'A' + rot) % 26),
-                    _ => c,
-                };
-                result.push(mapped);
-            }
-            _ => {
-                if in_digit {
-                    let computed = buf.format(number_acc ^ factor);
-                    result.extend_from_slice(computed.as_bytes());
-                    number_acc = 0;
-                    in_digit = false;
-                }
-                result.push(c);
-            }
-        }
-    }
-
-    if in_digit {
-        let computed = buf.format(number_acc ^ factor);
-        result.extend_from_slice(computed.as_bytes());
-    }
-
-    String::from_utf8(result).expect("ASCII-only output")
-}
-
-pub fn calcul_cipher(hashdata: String) -> String {
-    let factor = get_build_seed2();
-    let transformed = transform_hash_parts(&hashdata, factor);
-    blake3::hash(transformed.as_bytes()).to_hex().to_string()
-}
-
-pub fn calcul_factorhash(hashdata: String) -> String {
-    let factor = get_build_seed2();
-    transform_hash_parts(&hashdata, factor)
-}
-
-fn transform_hash_parts(input: &str, factor: u64) -> String {
-    let parts = split_hash(input.to_string(), 10);
-    let mut out = String::with_capacity(input.len() + input.len() / 10);
-    let mut first = true;
-
-    for part in parts {
-        let encoded = process_string(&part, factor);
-        if first {
-            write!(out, "{}", encoded).unwrap();
-            first = false;
-        } else {
-            write!(out, "-{}", encoded).unwrap();
-        }
-    }
-    out
-}
+// Token key derivation, sealing, the BLAKE3 signature and the optional
+// obfuscation pass all moved to the `zerocrypt` crate — see
+// `crate::token::vault`. What is left here is the standalone
+// password-based helper pair below, which is unrelated to session
+// tokens and has no equivalent in the library.
 
 #[allow(dead_code)]
 pub fn encrypt_base64(message: &str, password: &str) -> String {
