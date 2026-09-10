@@ -78,12 +78,7 @@ blake3 = ">=1.8.7"
 # Token construction: key derivation, sealing, signature and the
 # optional obfuscation pass. Extracted from this crate so the logic can
 # be tested and reviewed on its own.
-zerocrypt = {
-    version = "0.1.7",
-    git = "https://git.proxyauth.app/ProxyAuth/zerocrypt.git",
-    tag = "v0.1.7",
-    features = ["cache"]
-}
+zerocrypt = ">=0.1.7"
 anyhow = "1.0"
 base32 = "0.5.1"
 sequoia-openpgp = { version = "2.1", default-features = false, features = ["crypto-openssl"] }
