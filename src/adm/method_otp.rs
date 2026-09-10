@@ -1,5 +1,4 @@
 use data_encoding::BASE32_NOPAD;
-use rand::{RngCore, rngs::OsRng};
 use totp_rs::{Algorithm, TOTP};
 use urlencoding::encode;
 
@@ -8,7 +7,7 @@ use urlencoding::encode;
 #[allow(dead_code)]
 pub fn generate_base32_secret(length: usize) -> String {
     let mut bytes = vec![0u8; length];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
     BASE32_NOPAD.encode(&bytes)
 }
 

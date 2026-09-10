@@ -22,8 +22,7 @@ use futures_util::FutureExt;
 use futures_util::future::{LocalBoxFuture, ready};
 use hex;
 use ipnet::IpNet;
-use rand::rngs::OsRng;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -354,7 +353,7 @@ pub fn establish_session(
 pub fn generate_random_string(len: usize) -> String {
     let charset: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^*()+-=";
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
 
     let base: Vec<u8> = (0..len)
         .map(|_| *charset.choose(&mut rng).unwrap())

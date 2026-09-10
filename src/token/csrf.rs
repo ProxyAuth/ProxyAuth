@@ -12,7 +12,6 @@ use dashmap::mapref::entry::Entry;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use memchr::memmem;
 use once_cell::sync::Lazy;
-use rand::RngCore;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -261,7 +260,7 @@ fn extract_json_csrf_token(json_str: &str) -> Option<String> {
 
 pub fn make_csrf_token(secret: &str) -> String {
     let mut nonce = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    getrandom::fill(&mut nonce).expect("OS CSPRNG unavailable");
 
     let exp = (OffsetDateTime::now_utc() + Duration::minutes(10)).unix_timestamp();
     let exp_b = exp.to_be_bytes();

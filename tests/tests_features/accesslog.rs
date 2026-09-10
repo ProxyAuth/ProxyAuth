@@ -225,6 +225,7 @@ fn can_write_log_dir() -> bool {
 fn writer_empty_path_noop() {
     let w = VhostLogWriter::new();
     w.write("", "this should not appear");
+    w.flush_all();
 }
 
 #[test]
@@ -240,6 +241,7 @@ fn writer_creates_file_and_writes() {
 
     w.write(fname, "first line");
     w.write(fname, "second line");
+    w.flush_all();
 
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(content.contains("first line"));
@@ -264,6 +266,7 @@ fn writer_multiple_files_independent() {
 
     w.write(f1, "file A");
     w.write(f2, "file B");
+    w.flush_all();
 
     assert!(std::fs::read_to_string(&p1).unwrap().contains("file A"));
     assert!(std::fs::read_to_string(&p2).unwrap().contains("file B"));
@@ -287,7 +290,7 @@ fn writer_high_volume() {
     for i in 0..200 {
         w.write(fname, &format!("entry {i:04}"));
     }
-
+    w.flush_all();
     let content = std::fs::read_to_string(&path).unwrap();
     assert_eq!(content.lines().count(), 200);
     assert!(content.contains("entry 0000"));
@@ -490,6 +493,8 @@ fn writer_works_even_with_logging_disabled() {
     let _ = std::fs::remove_file(&path);
 
     w.write(fname, "logged even when access log is off");
+    w.flush_all();
+
     assert!(std::fs::read_to_string(&path).unwrap().contains("logged even when access log is off"));
 
     let _ = std::fs::remove_file(&path);

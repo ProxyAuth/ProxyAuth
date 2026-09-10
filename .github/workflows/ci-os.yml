@@ -1,0 +1,725 @@
+name: ProxyAuth OS CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  os:
+    name: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Alpine
+            image: node:26-alpine
+
+          - os: Arch Linux
+            image: archlinux:latest
+
+          - os: CentOS Stream 9
+            image: quay.io/centos/centos:stream9
+
+          - os: Debian
+            image: node:24-bookworm
+
+          - os: Fedora
+            image: quay.io/fedora/nodejs-24
+
+          - os: Ubuntu
+            image: ubuntu:24.04
+
+    container:
+      image: ${{ matrix.image }}
+      options: --user root --cap-add=SYS_PTRACE
+
+    steps:
+
+      # ----------------------------------------------------------------------
+      # NODE.JS BOOTSTRAP
+      # ----------------------------------------------------------------------
+
+      - name: Bootstrap Node.js
+        shell: sh
+        run: |
+          set -eux
+
+          case "${{ matrix.os }}" in
+            Alpine)
+              echo "Node.js already provided by node:26-alpine"
+              node --version
+              npm --version
+              ;;
+
+            "Arch Linux")
+              pacman -Sy --noconfirm archlinux-keyring
+              pacman -Sy --noconfirm nodejs npm
+              node --version
+              npm --version
+              ;;
+
+            "CentOS Stream 9")
+              dnf install -y nodejs npm
+              node --version
+              npm --version
+              ;;
+
+            Debian)
+              echo "Node.js already provided by node:24-bookworm"
+              node --version
+              npm --version
+              ;;
+
+            Fedora)
+              echo "Node.js already provided by quay.io/fedora/nodejs-24"
+              node --version
+              npm --version
+              ;;
+
+            Ubuntu)
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm
+              node --version
+              npm --version
+              ;;
+          esac
+
+      # ----------------------------------------------------------------------
+      # CACHE - OS PACKAGES
+      # ----------------------------------------------------------------------
+
+      - name: Restore OS package cache
+        id: os-cache
+        uses: actions/cache/restore@v4
+        with:
+            path: |
+                /var/cache/apk
+                /var/cache/pacman/pkg
+                /var/cache/dnf
+                /var/cache/apt
+                /var/lib/apt/lists
+            key: proxyauth-os-${{ matrix.os }}-${{ github.sha }}
+            restore-keys: |
+                    proxyauth-os-${{ matrix.os }}-
+
+      # ----------------------------------------------------------------------
+      # OS BOOTSTRAP
+      # ----------------------------------------------------------------------
+
+      - name: Install OS dependencies
+        shell: sh
+        run: |
+          set -eux
+
+          case "${{ matrix.os }}" in
+
+            Alpine)
+              export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
+              echo "RUSTFLAGS=$RUSTFLAGS" >> "$GITHUB_ENV"
+              apk update
+              apk add \
+                bash \
+                build-base \
+                clang \
+                curl \
+                git \
+                jq \
+                llvm \
+                mariadb-connector-c-dev \
+                nettle-dev \
+                nodejs \
+                npm \
+                openssl \
+                openssl-dev \
+                openssl-libs-static \
+                pkgconf \
+                postgresql-dev \
+                python3 \
+                sudo \
+                zlib-dev \
+                zlib-static \
+                tar
+              ;;
+
+            "Arch Linux")
+              pacman -Syu --noconfirm \
+                base-devel \
+                clang \
+                curl \
+                git \
+                jq \
+                llvm \
+                mariadb \
+                nettle \
+                nodejs \
+                npm \
+                openssl \
+                pkgconf \
+                postgresql-libs \
+                python \
+                sudo \
+                tar
+              ;;
+
+            "CentOS Stream 9")
+              dnf install -y \
+                clang \
+                gcc \
+                gcc-c++ \
+                git \
+                jq \
+                llvm \
+                make \
+                mariadb-connector-c-devel \
+                nettle-devel \
+                nodejs \
+                npm \
+                openssl \
+                openssl-devel \
+                pkg-config \
+                libpq-devel \
+                python3 \
+                sudo \
+                tar
+              ;;
+
+            Debian)
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                clang \
+                curl \
+                gcc \
+                git \
+                jq \
+                llvm \
+                make \
+                nettle-dev \
+                nodejs \
+                npm \
+                openssl \
+                pkg-config \
+                libssl-dev \
+                libpq-dev \
+                default-libmysqlclient-dev \
+                python3 \
+                sudo \
+                tar
+              ;;
+
+            Fedora)
+              dnf install -y \
+                clang \
+                curl \
+                gcc \
+                gcc-c++ \
+                git \
+                jq \
+                llvm \
+                make \
+                mariadb-connector-c-devel \
+                nettle-devel \
+                nodejs \
+                npm \
+                openssl \
+                openssl-devel \
+                pkg-config \
+                libpq-devel \
+                python3 \
+                sudo \
+                tar
+              ;;
+
+            Ubuntu)
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                clang \
+                curl \
+                gcc \
+                git \
+                jq \
+                llvm \
+                make \
+                nettle-dev \
+                openssl \
+                pkg-config \
+                libssl-dev \
+                libpq-dev \
+                default-libmysqlclient-dev \
+                python3 \
+                sudo \
+                tar
+              ;;
+
+            *)
+              echo "Unsupported OS: ${{ matrix.os }}"
+              exit 1
+              ;;
+          esac
+
+      # ----------------------------------------------------------------------
+      # VERIFY SYSTEM LIBRARIES
+      # ----------------------------------------------------------------------
+
+      - name: Verify MySQL client development library
+        shell: sh
+        run: |
+          set -eux
+
+          if command -v mysql_config >/dev/null 2>&1; then
+            mysql_config --version
+          elif pkg-config --exists mysqlclient 2>/dev/null; then
+            pkg-config --modversion mysqlclient
+          elif pkg-config --exists mariadb 2>/dev/null; then
+            pkg-config --modversion mariadb
+          else
+            echo "::error::MySQL/MariaDB client development library was not found"
+            exit 1
+          fi
+
+      # ----------------------------------------------------------------------
+      # CHECKOUT
+      # ----------------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # ----------------------------------------------------------------------
+      # RUST
+      # ----------------------------------------------------------------------
+
+      - name: Set up Rust
+        shell: bash
+        run: |
+          set -eux
+
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          . "$HOME/.cargo/env"
+
+          rustup toolchain install stable
+          rustup default stable
+
+          rustc --version
+          cargo --version
+
+      # ----------------------------------------------------------------------
+      # PARALLELISM
+      # ----------------------------------------------------------------------
+
+      - name: Report available parallelism
+        run: |
+          echo "cores cpu : $(nproc)"
+          echo "NPROC=$(nproc)" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------------
+      # CACHE - CARGO
+      #
+      # registry + git = téléchargements des crates et dépendances Git.
+      # ----------------------------------------------------------------------
+
+      - name: Restore Cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+            path: |
+                ~/.cargo/registry
+                ~/.cargo/git
+            key: proxyauth-cargo-${{ matrix.os }}-${{ github.sha }}
+
+      # ----------------------------------------------------------------------
+      # AUDIT
+      # ----------------------------------------------------------------------
+
+      - name: Install cargo-audit
+        run: |
+          . "$HOME/.cargo/env"
+          cargo install --locked cargo-audit
+
+      - name: Audit dependencies
+        run: |
+          . "$HOME/.cargo/env"
+          cargo audit
+
+      - name: ProxyAuth and zerocrypt agree on their crypto crates
+        continue-on-error: true
+        run: |
+          . "$HOME/.cargo/env"
+          python3 ci/check-crypto-alignment.py proxyauth zerocrypt
+
+      - name: Report dependency duplicates
+        continue-on-error: true
+        run: |
+          . "$HOME/.cargo/env"
+          cargo tree --duplicates || true
+
+      # ----------------------------------------------------------------------
+      # COVERAGE
+      # ----------------------------------------------------------------------
+
+      - name: Install cargo-tarpaulin
+        run: |
+          . "$HOME/.cargo/env"
+          cargo install --locked cargo-tarpaulin
+
+      - name: Coverage
+        continue-on-error: true
+        env:
+          CARGO_BUILD_JOBS: ${{ env.NPROC }}
+        run: |
+          . "$HOME/.cargo/env"
+
+          cargo tarpaulin \
+            --all-features \
+            --out Html \
+            --timeout 300 \
+            --engine llvm \
+            -- --test-threads=1
+
+      # ----------------------------------------------------------------------
+      # CI / RELEASE BUILD
+      # ----------------------------------------------------------------------
+
+      - name: Install cargo-nextest
+        run: |
+          . "$HOME/.cargo/env"
+          cargo install --locked cargo-nextest
+
+      - name: Build ProxyAuth
+        env:
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+          CARGO_PROFILE_RELEASE_LTO: "false"
+        run: |
+          . "$HOME/.cargo/env"
+
+          cargo build \
+            --release \
+            --locked \
+            --jobs "$(nproc)"
+
+      # ----------------------------------------------------------------------
+      # PREPARE PROXYAUTH
+      # ----------------------------------------------------------------------
+
+      - name: Prepare user for ProxyAuth
+        run: |
+          sudo ./target/release/proxyauth prepare --insecure
+
+      # ----------------------------------------------------------------------
+      # TLS
+      # ----------------------------------------------------------------------
+
+      - name: Generate self-signed cert for ProxyAuth
+        run: |
+          sudo mkdir -p /etc/proxyauth/certs
+
+          sudo openssl req \
+            -x509 \
+            -newkey rsa:2048 \
+            -sha256 \
+            -days 1 \
+            -nodes \
+            -keyout /etc/proxyauth/certs/key.pem \
+            -out /etc/proxyauth/certs/cert.pem \
+            -subj "/CN=localhost"
+
+          sudo chown -R proxyauth:proxyauth /etc/proxyauth/certs
+
+      # ----------------------------------------------------------------------
+      # UNIT / INTEGRATION TESTS
+      # ----------------------------------------------------------------------
+
+      - name: Run unit tests
+        run: |
+          . "$HOME/.cargo/env"
+          cargo nextest run \
+            --verbose \
+            --no-fail-fast \
+            --test-threads=1
+
+      # ----------------------------------------------------------------------
+      # END-TO-END PROXYAUTH TEST
+      # ----------------------------------------------------------------------
+
+      - name: Install routes.yml with the route under test
+        run: |
+          sudo mkdir -p /etc/proxyauth/config
+
+          sudo tee /etc/proxyauth/config/routes.yml >/dev/null <<'YML'
+          routes:
+            - prefix: "/app"
+              target: "http://127.0.0.1:8500"
+              required_login: true
+              username: ["admin"]
+          YML
+
+          sudo chown -R proxyauth:proxyauth /etc/proxyauth/config
+
+          echo "--- routes.yml in use ---"
+          sudo cat /etc/proxyauth/config/routes.yml
+
+      - name: Cleanup test database files and fix permissions
+        run: |
+          sudo rm -rf /opt/proxyauth/db/*
+          sudo chmod 700 -R /opt/proxyauth
+
+      # ----------------------------------------------------------------------
+      # DUMMY BACKEND
+      # ----------------------------------------------------------------------
+
+      - name: Start dummy backend on port 8500
+        run: |
+          cat > /tmp/backend.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          class H(BaseHTTPRequestHandler):
+              def _reply(self):
+                  body = f"BACKEND-OK {self.path}".encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/plain")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              do_GET = do_POST = do_HEAD = _reply
+
+          HTTPServer(("127.0.0.1", 8500), H).serve_forever()
+          PY
+
+          python3 /tmp/backend.py >/tmp/backend.log 2>&1 &
+          echo $! > backend.pid
+
+          for _ in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8500/app >/dev/null && break
+            sleep 0.5
+          done
+
+          curl -sf http://127.0.0.1:8500/app | grep -q BACKEND-OK
+
+      # ----------------------------------------------------------------------
+      # START PROXYAUTH
+      # ----------------------------------------------------------------------
+
+      - name: Start ProxyAuth in background
+        run: |
+          sudo -u proxyauth ./target/release/proxyauth &
+          echo $! > proxyauth.pid
+
+          sleep 2
+
+      # ----------------------------------------------------------------------
+      # HTTPS
+      # ----------------------------------------------------------------------
+
+      - name: Test HTTPS response
+        run: |
+          curl -k -I https://localhost:8080 || {
+            cat proxyauth.pid | xargs kill || true
+            exit 1
+          }
+
+      # ----------------------------------------------------------------------
+      # ANONYMOUS ACCESS
+      # ----------------------------------------------------------------------
+
+      - name: Protected route refuses anonymous request
+        run: |
+          set -eu
+
+          code=$(curl -k -s -o /dev/null -w '%{http_code}' \
+            https://localhost:8080/app)
+
+          echo "anonymous GET /app -> $code"
+
+          case "$code" in
+            2*)
+              echo "::error::/app served content without a token"
+              exit 1
+              ;;
+          esac
+
+      # ----------------------------------------------------------------------
+      # AUTHENTICATION / TOKEN
+      # ----------------------------------------------------------------------
+
+      - name: Log in and use the token
+        run: |
+          set -eu
+
+          response=$(curl -k -s \
+            -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}')
+
+          echo "$response" | jq . || {
+            echo "::error::/auth did not return JSON: $response"
+            exit 1
+          }
+
+          token=$(echo "$response" | jq -r '.token // empty')
+
+          if [ -z "$token" ]; then
+            echo "::error::no token in the /auth response: $response"
+            exit 1
+          fi
+
+          echo "token issued, ${#token} chars"
+
+          body=$(curl -k -s \
+            -w '\n%{http_code}' \
+            https://localhost:8080/app \
+            -H "Authorization: Bearer $token")
+
+          code=$(echo "$body" | tail -n1)
+          content=$(echo "$body" | sed '$d')
+
+          echo "authenticated GET /app -> $code"
+
+          case "$code" in
+            200)
+              ;;
+            401|403)
+              echo "::error::a freshly issued token was refused by /app"
+              exit 1
+              ;;
+            *)
+              echo "::error::/app answered $code — routing or backend problem"
+              echo "backend log:"
+              cat /tmp/backend.log || true
+              exit 1
+              ;;
+          esac
+
+          echo "$content" | grep -q BACKEND-OK || {
+            echo "::error::/app answered 200 but did not proxy the backend"
+            exit 1
+          }
+
+          code2=$(curl -k -s \
+            -o /dev/null \
+            -w '%{http_code}' \
+            https://localhost:8080/app \
+            -H "Authorization: Bearer $token")
+
+          echo "same token again (cache hit) -> $code2"
+
+          [ "$code2" = "200" ] || {
+            echo "::error::the cached path refused a valid token"
+            exit 1
+          }
+
+      # ----------------------------------------------------------------------
+      # TAMPERED TOKEN
+      # ----------------------------------------------------------------------
+
+      - name: Tampered token is refused
+        run: |
+          set -eu
+
+          token=$(curl -k -s \
+            -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"admin123"}' |
+            jq -r '.token')
+
+          last="${token: -1}"
+
+          if [ "$last" = "A" ]; then
+            repl="B"
+          else
+            repl="A"
+          fi
+
+          tampered="${token%?}$repl"
+
+          if [ "$tampered" = "$token" ]; then
+            echo "::error::failed to alter the token"
+            exit 1
+          fi
+
+          code=$(curl -k -s \
+            -o /dev/null \
+            -w '%{http_code}' \
+            https://localhost:8080/app \
+            -H "Authorization: Bearer $tampered")
+
+          echo "tampered token -> $code"
+
+          case "$code" in
+            2*)
+              echo "::error::a tampered token was accepted"
+              exit 1
+              ;;
+          esac
+
+      # ----------------------------------------------------------------------
+      # WRONG PASSWORD
+      # ----------------------------------------------------------------------
+
+      - name: Wrong credentials are refused
+        run: |
+          set -eu
+
+          code=$(curl -k -s \
+            -o /dev/null \
+            -w '%{http_code}' \
+            -X POST https://localhost:8080/auth \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"not-the-password"}')
+
+          echo "bad password -> $code"
+
+          case "$code" in
+            2*)
+              echo "::error::/auth accepted a wrong password"
+              exit 1
+              ;;
+          esac
+
+      # ----------------------------------------------------------------------
+      # CLEANUP
+      # ----------------------------------------------------------------------
+
+      - name: Stop test servers
+        if: always()
+        run: |
+          if [ -f proxyauth.pid ]; then
+            cat proxyauth.pid | xargs kill || true
+          fi
+
+          if [ -f backend.pid ]; then
+            cat backend.pid | xargs kill || true
+          fi
+
+      # ----------------------------------------------------------------------
+      # SAVE CACHES
+      # ----------------------------------------------------------------------
+
+      - name: Save OS package cache
+        if: always() && steps.os-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /var/cache/apk
+            /var/cache/pacman/pkg
+            /var/cache/dnf
+            /var/cache/apt
+            /var/lib/apt/lists
+          key: proxyauth-os-${{ matrix.os }}-${{ github.sha }}
+
+      - name: Save Cargo cache
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+            path: |
+                ~/.cargo/registry
+                ~/.cargo/git
+            key: proxyauth-cargo-${{ matrix.os }}-${{ github.sha }}

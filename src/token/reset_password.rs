@@ -22,7 +22,7 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, SaltString};
 use futures_util::FutureExt;
 use futures_util::future::{LocalBoxFuture, ready};
-use rand::rngs::OsRng;
+use argon2::password_hash::rand_core::OsRng;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
