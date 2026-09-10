@@ -5332,7 +5332,8 @@ dependencies = [
 [[package]]
 name = "zerocrypt"
 version = "0.1.7"
-source = "git+https://git.proxyauth.app/ProxyAuth/zerocrypt.git?tag=v0.1.7#e56e354074ff7f6451c02addf4d70cddc502d6b9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf30ed5676b340ba46f1a8fda951b1c7931359aafaf780d5a0ef78b98af4f696"
 dependencies = [
  "base64",
  "blake3",
