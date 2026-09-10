@@ -1614,6 +1614,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
 name = "headers"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2993,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "proxyauth"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "actix-governor",
  "actix-http",
@@ -3101,13 +3107,13 @@ dependencies = [
 
 [[package]]
 name = "quick_cache"
-version = "0.6.24"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9c6658afe513a3b484e3abfdaa0d03ef3c0bbf017542c178dd55f94eb3051f9"
+checksum = "403c1a912fec895cafb223201e368234842acb9220aaf08ab042ae89ba5f135c"
 dependencies = [
- "ahash",
  "equivalent",
- "hashbrown 0.16.1",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
  "parking_lot",
 ]
 
@@ -5325,16 +5331,16 @@ dependencies = [
 
 [[package]]
 name = "zerocrypt"
-version = "0.1.6"
-source = "git+https://git.proxyauth.app/ProxyAuth/zerocrypt.git?tag=v0.1.6#6f76d7be2b3378fa60ba33f63194578ac4032d25"
+version = "0.1.7"
+source = "git+https://git.proxyauth.app/ProxyAuth/zerocrypt.git?tag=v0.1.7#e56e354074ff7f6451c02addf4d70cddc502d6b9"
 dependencies = [
  "base64",
  "blake3",
  "chacha20poly1305",
+ "getrandom 0.4.2",
  "hkdf",
  "itoa",
  "quick_cache",
- "rand 0.8.5",
  "sha2 0.11.0",
  "subtle",
 ]

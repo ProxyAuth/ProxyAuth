@@ -1,15 +1,5 @@
 name: Packages — build & deploy
 
-# Déclenchement manuel uniquement. Rien ne part sur un push ou sur un tag :
-# la chaîne de publication ne démarre que lorsque quelqu'un décide qu'une
-# version est prête, et nomme explicitement le tag à empaqueter.
-#
-# Le job `validate` sert de garde : il refuse de continuer si le tag n'est
-# pas de la forme `vX.Y.Z`, ou s'il ne correspond pas à la version déclarée
-# dans Cargo.toml au commit de ce tag. Cinq paquets étiquetés 1.2.2 mais
-# construits depuis un tag qui en dit 1.2.3 est le genre d'erreur qu'on ne
-# découvre qu'une fois les fichiers publiés.
-
 on:
   workflow_dispatch:
     inputs:
@@ -43,8 +33,6 @@ on:
         type: boolean
         default: true
 
-# Une seule exécution de publication à la fois. Deux lancements concurrents
-# sur des tags différents produiraient des artefacts entremêlés.
 concurrency:
   group: packages-deploy
   cancel-in-progress: false
@@ -56,10 +44,6 @@ jobs:
 
   # ────────────────────────────────────────────────────────────────────
   # Garde de version
-  #
-  # Tourne avant tout le reste et publie la version en sortie, pour que
-  # les cinq jobs empaquettent le même numéro sans le relire chacun de
-  # son côté depuis Cargo.toml.
   # ────────────────────────────────────────────────────────────────────
   validate:
     name: Validate ${{ inputs.tag }}
@@ -498,6 +482,8 @@ jobs:
           ref: ${{ inputs.tag }}
 
       - name: Build ProxyAuth
+        env:
+          RUSTFLAGS: -C target-feature=-crt-static
         run: |
           cargo build --release --locked
 
@@ -689,8 +675,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pacman -Sy --noconfirm
-          pacman -S --noconfirm \
+          # `-Syu` en une passe : un `-Sy` suivi d'un `-S` séparé installe
+          # depuis une base rafraîchie sur un système non mis à jour, ce
+          # qui casse dès qu'une dépendance a bougé entre les deux.
+          pacman -Syu --noconfirm \
             base-devel \
             rust \
             cargo \
@@ -1038,6 +1026,9 @@ jobs:
 
           %files
           %attr(0755, root, root) /usr/bin/proxyauth
+          %attr(0750, proxyauth, proxyauth) %dir /opt/proxyauth
+          %attr(0750, proxyauth, proxyauth) %dir /opt/proxyauth/db
+          %attr(0750, proxyauth, proxyauth) %dir /var/log/proxyauth
           %{_unitdir}/proxyauth.service
 
           %config(noreplace) /etc/proxyauth/*
@@ -1397,10 +1388,7 @@ jobs:
             dist/*.sha256
 
   # ────────────────────────────────────────────────────────────────────
-  # Récapitulatif
-  #
-  # `always()` pour que le tableau s'affiche même quand un paquet échoue :
-  # savoir lesquels sont passés vaut mieux qu'un job annulé sans trace.
+  # Summary
   # ────────────────────────────────────────────────────────────────────
   summary:
     name: Summary
