@@ -1759,6 +1759,15 @@ pub struct AppConfig {
     #[serde(default = "default_ip_blocklist_refresh_interval")]
     pub redirect_protect_refresh_interval_secs: u64,
 
+    /// Largest request body accepted from a client, in bytes (default
+    /// 10 MB). Anything larger is refused with `413 Payload Too Large`
+    /// before it reaches the backend — over HTTP/2 a client sees that
+    /// as a reset stream rather than a clean 413. Request bodies are
+    /// buffered in memory before being forwarded, so each in-flight
+    /// upload can hold up to this many bytes. Raise it for routes that
+    /// receive large uploads (package registries, file shares, git
+    /// pushes over HTTP). Also caps how much of a failover backend's
+    /// response the load balancer will buffer.
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
 
@@ -1782,6 +1791,18 @@ pub struct AppConfig {
 
     #[serde(default = "default_client_timeout")]
     pub client_timeout: u64,
+
+    /// How long, in milliseconds, to wait for a backend to answer a
+    /// proxied request (default 10000). The clock covers sending the
+    /// request body to the backend and the backend's processing time,
+    /// up to the moment its response headers arrive — so it has to be
+    /// long enough for the largest upload the backend receives to be
+    /// transferred and handled (a package registry indexing a 100 MB
+    /// upload, for instance). Streaming the response body back to the
+    /// client is not counted. When exceeded, the client gets a `503`.
+    /// Must be greater than 0.
+    #[serde(default = "default_backend_timeout")]
+    pub backend_timeout: u64,
 
     #[serde(default = "default_keep_alive")]
     pub keep_alive: u64,
@@ -2221,6 +2242,10 @@ fn default_client_timeout() -> u64 {
     5000
 }
 
+fn default_backend_timeout() -> u64 {
+    10000
+}
+
 fn default_pending_connections_limit() -> u32 {
     65535
 }
@@ -2412,6 +2437,18 @@ impl RouteAccessDecision {
 }
 
 impl AppConfig {
+    /// `backend_timeout` as a `Duration`, falling back to the default
+    /// when it's set to `0` — a zero timeout would make every proxied
+    /// request fail instantly with a 503.
+    pub fn backend_timeout_duration(&self) -> std::time::Duration {
+        let ms = if self.backend_timeout == 0 {
+            default_backend_timeout()
+        } else {
+            self.backend_timeout
+        };
+        std::time::Duration::from_millis(ms)
+    }
+
     /// The address(es) to bind to — `address` (a list) if it's set and
     /// non-empty, otherwise the single `host` for backward
     /// compatibility. Always returns at least one entry.

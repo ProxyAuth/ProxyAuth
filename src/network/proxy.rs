@@ -12,6 +12,7 @@ use crate::token::csrf::{fix_mime_actix, inject_csrf_token, validate_csrf_token}
 use crate::token::security::apply_filters_regex_allow_only;
 use crate::token::security::validate_token;
 use crate::{AppConfig, AppState};
+use actix_web::body::{BodySize, MessageBody};
 use actix_web::{
     Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
     web,
@@ -27,8 +28,10 @@ use regex::Regex;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::RwLock;
+use std::task::{Context, Poll};
 use tokio::time::{Duration, timeout};
 use tracing::warn;
 
@@ -901,6 +904,106 @@ async fn incoming_to_boxbody(
     Ok(hyper::Response::from_parts(parts, boxed))
 }
 
+/// Where a proxied response's body comes from: already read fully
+/// into memory (`Buffered` — the failover path, which has to buffer
+/// so it can still retry another backend, and every response
+/// ProxyAuth may rewrite), or still arriving from the backend
+/// (`Streaming` — relayed to the client as it arrives, see
+/// `can_stream_response`).
+enum UpstreamBody {
+    Buffered(BoxBody),
+    Streaming(Incoming),
+}
+
+/// Whether a backend response can be relayed to the client as it
+/// arrives instead of being read fully into memory first.
+///
+/// Only HTML is ever rewritten on its way back — `inject_csrf_token`,
+/// `substitute_proxyauth_tags` and `apply_hidden_blocks` all check
+/// for an HTML content type before touching the body — so every other
+/// response (package files, archives, images, video, JSON…) can be
+/// streamed. A large download then costs a few network buffers of
+/// memory instead of its full size, and the client starts receiving
+/// bytes before the backend has finished sending them.
+///
+/// HEAD responses, bodiless statuses (1xx, 204, 304) and server errors
+/// (which get replaced by ProxyAuth's own 500 anyway) keep the
+/// buffered path, exactly as before.
+fn can_stream_response(headers: &hyper::HeaderMap, status: hyper::StatusCode, is_head: bool) -> bool {
+    if is_head
+        || status.is_informational()
+        || status == hyper::StatusCode::NO_CONTENT
+        || status == hyper::StatusCode::NOT_MODIFIED
+        || status.is_server_error()
+    {
+        return false;
+    }
+
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let main_type = content_type.split(';').next().unwrap_or("").trim();
+
+    !(main_type.starts_with("text/html") || main_type.ends_with("+html"))
+}
+
+/// The backend's `Content-Length`, when it sent a valid one.
+fn upstream_content_length(headers: &hyper::HeaderMap) -> Option<u64> {
+    headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Relays a backend's response body to the client chunk by chunk, as
+/// it arrives. `size` is the backend's `Content-Length` when it sent
+/// one, so the client still receives a length rather than a chunked
+/// response (and download progress bars keep working). If the backend
+/// connection fails midway, actix aborts the client connection — the
+/// client sees a truncated transfer, never a silently incomplete one.
+struct StreamedUpstreamBody {
+    inner: Pin<Box<Incoming>>,
+    size: Option<u64>,
+}
+
+impl MessageBody for StreamedUpstreamBody {
+    type Error = hyper::Error;
+
+    fn size(&self) -> BodySize {
+        match self.size {
+            Some(n) => BodySize::Sized(n),
+            None => BodySize::Stream,
+        }
+    }
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, Self::Error>>> {
+        let this = self.get_mut();
+
+        loop {
+            match hyper::body::Body::poll_frame(this.inner.as_mut(), cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(frame))) => {
+                    // Trailer frames and empty data frames carry nothing
+                    // actix can relay through a body — skip to the next
+                    // frame.
+                    if let Ok(data) = frame.into_data() {
+                        if !data.is_empty() {
+                            return Poll::Ready(Some(Ok(data)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Very small extension → MIME map, good enough for the kind of static
 /// assets `static` is meant for (docs sites, SPA builds, downloads).
 /// Anything unrecognized falls back to `application/octet-stream`
@@ -997,7 +1100,7 @@ async fn proxy_to_redirect_protect_target(
     }
 
     let hyper_req = request_builder
-        .body(Full::new(Bytes::from(body.to_vec())).boxed())
+        .body(Full::new(body.clone()).boxed())
         .ok()?;
 
     let client_opts = ClientOptions {
@@ -1013,7 +1116,7 @@ async fn proxy_to_redirect_protect_target(
     // meant to actually serve the response body a blocked visitor
     // sees, not a quick internal check, so it gets the same budget a
     // real backend request would.
-    let resp = match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
+    let resp = match timeout(data.config.backend_timeout_duration(), client.request(hyper_req)).await {
         Ok(Ok(resp)) => resp,
         _ => return None,
     };
@@ -2504,7 +2607,7 @@ pub async fn proxy_with_proxy(
             }
         }
     } else {
-        match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
+        match request_builder.body(Full::new(body.clone()).boxed()) {
             Ok(req) => req,
             Err(e) => {
                 warn!(client_ip = %ip, target = %full_url, "Request build failed: {}", e);
@@ -2517,7 +2620,7 @@ pub async fn proxy_with_proxy(
     };
 
     // ── send upstream ───────────────────────────────────────────────
-    let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
+    let response_result: hyper::Response<UpstreamBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
             .backends
             .iter()
@@ -2543,12 +2646,25 @@ pub async fn proxy_with_proxy(
                 warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
                 error::ErrorServiceUnavailable("503 Service Unavailable")
             })?
+            .map(UpstreamBody::Buffered)
     } else {
-        match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
-            Ok(Ok(res)) => incoming_to_boxbody(res).await.map_err(|e| {
-                warn!(client_ip = %ip, target = %full_url, "Body collect error: {}", e);
-                error::ErrorServiceUnavailable("503 Service Unavailable")
-            })?,
+        match timeout(data.config.backend_timeout_duration(), client.request(hyper_req)).await {
+            Ok(Ok(res))
+                if can_stream_response(
+                    res.headers(),
+                    res.status(),
+                    method_str.eq_ignore_ascii_case("HEAD"),
+                ) =>
+            {
+                res.map(UpstreamBody::Streaming)
+            }
+            Ok(Ok(res)) => incoming_to_boxbody(res)
+                .await
+                .map_err(|e| {
+                    warn!(client_ip = %ip, target = %full_url, "Body collect error: {}", e);
+                    error::ErrorServiceUnavailable("503 Service Unavailable")
+                })?
+                .map(UpstreamBody::Buffered),
             Ok(Err(e)) => {
                 warn!(client_ip = %ip, target = %full_url, "Upstream error: {}", e);
                 let mut resp = HttpResponse::ServiceUnavailable();
@@ -2608,18 +2724,23 @@ pub async fn proxy_with_proxy(
 
     let headers = response_result.headers().clone();
 
-    let mut body_bytes: Bytes = response_result
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| {
-            warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
-            let mut resp = HttpResponse::InternalServerError();
-            resp.append_header(("server", "ProxyAuth"));
-            add_cors_headers(&mut resp, &req);
-            error::InternalError::from_response("500 Internal Server Error", resp.finish())
-        })?
-        .to_bytes();
+    let (streaming, mut body_bytes): (Option<Incoming>, Bytes) = match response_result.into_body() {
+        UpstreamBody::Streaming(incoming) => (Some(incoming), Bytes::new()),
+        UpstreamBody::Buffered(body) => {
+            let bytes = body
+                .collect()
+                .await
+                .map_err(|e| {
+                    warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
+                    let mut resp = HttpResponse::InternalServerError();
+                    resp.append_header(("server", "ProxyAuth"));
+                    add_cors_headers(&mut resp, &req);
+                    error::InternalError::from_response("500 Internal Server Error", resp.finish())
+                })?
+                .to_bytes();
+            (None, bytes)
+        }
+    };
 
     // ── Cache policy ────────────────────────────────────────────────
     if rule.cache_enabled() {
@@ -2647,7 +2768,11 @@ pub async fn proxy_with_proxy(
     // going to contain — the backend doesn't speak ProxyAuth's own
     // templating on an oidc-enabled vhost, same reasoning as the CSRF
     // validation gate above.
-    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.oidc.is_none() {
+    if streaming.is_none()
+        && rule.session_cookie_enabled(&data.config)
+        && rule.csrf_enabled(&data.config)
+        && rule.oidc.is_none()
+    {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {
@@ -2663,7 +2788,7 @@ pub async fn proxy_with_proxy(
     // also available in whatever HTML the backend itself returns, so
     // a target's own page can use them too, not just ProxyAuth's own
     // static content.
-    if rule.tag_proxyauth_enabled() || rule.has_hidden_blocks() {
+    if streaming.is_none() && (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks()) {
         let ct = headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
@@ -2688,9 +2813,16 @@ pub async fn proxy_with_proxy(
     add_cors_headers(&mut client_resp, &req);
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
     apply_custom_headers_builder(&mut client_resp, rule);
-    Ok(client_resp
-        .append_header(("server", "ProxyAuth"))
-        .body(body_bytes))
+    client_resp.append_header(("server", "ProxyAuth"));
+
+    if let Some(incoming) = streaming {
+        return Ok(client_resp.body(StreamedUpstreamBody {
+            inner: Box::pin(incoming),
+            size: upstream_content_length(&headers),
+        }));
+    }
+
+    Ok(client_resp.body(body_bytes))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3220,7 +3352,7 @@ pub async fn proxy_without_proxy(
             }
         }
     } else {
-        match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
+        match request_builder.body(Full::new(body.clone()).boxed()) {
             Ok(req) => req,
 
             Err(e) => {
@@ -3243,7 +3375,7 @@ pub async fn proxy_without_proxy(
     };
 
     // ── Send upstream ────────────────────────────────────────────────
-    let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
+    let response_result: hyper::Response<UpstreamBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
             .backends
             .iter()
@@ -3259,7 +3391,7 @@ pub async fn proxy_without_proxy(
 
         let route_key = format!("{}|{}", rule.vhost.join(","), rule.prefix);
         match forward_failover(hyper_req, &backends, None, &route_key).await {
-            Ok(res) => res,
+            Ok(res) => res.map(UpstreamBody::Buffered),
 
             Err(e) => {
                 warn!(
@@ -3279,17 +3411,24 @@ pub async fn proxy_without_proxy(
             }
         }
     } else {
-        match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
-            Ok(Ok(res)) => incoming_to_boxbody(res).await.map_err(|e| {
-                warn!(
-                    client_ip = %ip,
-                    target = %full_url,
-                    "Body collect error: {}",
-                    e
-                );
+        match timeout(data.config.backend_timeout_duration(), client.request(hyper_req)).await {
+            Ok(Ok(res)) if can_stream_response(res.headers(), res.status(), is_head) => {
+                res.map(UpstreamBody::Streaming)
+            }
 
-                error::ErrorServiceUnavailable("503 Service Unavailable")
-            })?,
+            Ok(Ok(res)) => incoming_to_boxbody(res)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        client_ip = %ip,
+                        target = %full_url,
+                        "Body collect error: {}",
+                        e
+                    );
+
+                    error::ErrorServiceUnavailable("503 Service Unavailable")
+                })?
+                .map(UpstreamBody::Buffered),
 
             Ok(Err(e)) => {
                 warn!(
@@ -3390,26 +3529,33 @@ pub async fn proxy_without_proxy(
     // HEAD:
     //   Do NOT collect/download the upstream body.
     //
+    // Streaming (see `can_stream_response`):
+    //   Leave the body with the backend connection — it is relayed to
+    //   the client as it arrives, at the very end.
+    //
     // GET/other:
     //   Collect normally.
     //
-    let mut body_bytes: Bytes = if is_head {
-        Bytes::new()
-    } else {
-        resp_body
-            .collect()
-            .await
-            .map_err(|e| {
-                warn!(
-                    client_ip = %ip,
-                    target = %full_url,
-                    "Body read error: {}",
-                    e
-                );
+    let (streaming, mut body_bytes): (Option<Incoming>, Bytes) = match resp_body {
+        _ if is_head => (None, Bytes::new()),
+        UpstreamBody::Streaming(incoming) => (Some(incoming), Bytes::new()),
+        UpstreamBody::Buffered(body) => {
+            let bytes = body
+                .collect()
+                .await
+                .map_err(|e| {
+                    warn!(
+                        client_ip = %ip,
+                        target = %full_url,
+                        "Body read error: {}",
+                        e
+                    );
 
-                error::ErrorInternalServerError("500 Internal Server Error")
-            })?
-            .to_bytes()
+                    error::ErrorInternalServerError("500 Internal Server Error")
+                })?
+                .to_bytes();
+            (None, bytes)
+        }
     };
 
     // ── Cache policy ────────────────────────────────────────────────
@@ -3436,7 +3582,12 @@ pub async fn proxy_without_proxy(
     //
     // Never modify a HEAD response body.
     //
-    if !is_head && rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.oidc.is_none() {
+    if !is_head
+        && streaming.is_none()
+        && rule.session_cookie_enabled(&data.config)
+        && rule.csrf_enabled(&data.config)
+        && rule.oidc.is_none()
+    {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {
@@ -3451,7 +3602,7 @@ pub async fn proxy_without_proxy(
     // static files and the other proxied-response path, so a target's
     // own HTML can use these tags too, not just ProxyAuth's own static
     // content.
-    if !is_head && (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks()) {
+    if !is_head && streaming.is_none() && (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks()) {
         let ct = headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
@@ -3484,7 +3635,14 @@ pub async fn proxy_without_proxy(
     // remain intact.
     //
     apply_custom_headers_builder(&mut client_resp, rule);
-    Ok(client_resp
-        .append_header(("server", "ProxyAuth"))
-        .body(body_bytes))
+    client_resp.append_header(("server", "ProxyAuth"));
+
+    if let Some(incoming) = streaming {
+        return Ok(client_resp.body(StreamedUpstreamBody {
+            inner: Box::pin(incoming),
+            size: upstream_content_length(&headers),
+        }));
+    }
+
+    Ok(client_resp.body(body_bytes))
 }
