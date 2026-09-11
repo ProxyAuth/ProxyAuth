@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag à empaqueter (ex. v1.2.2)"
+        description: "Tag to package (e.g. v1.2.2)"
         required: true
         type: string
 
@@ -33,19 +33,19 @@ on:
         type: boolean
         default: true
 
+      publish:
+        description: "Publish to the Forgejo package registry"
+        type: boolean
+        default: true
+
 concurrency:
   group: packages-deploy
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
+enable-openid-connect: true
 
 jobs:
 
-  # ────────────────────────────────────────────────────────────────────
-  # Garde de version
-  # ────────────────────────────────────────────────────────────────────
   validate:
     name: Validate ${{ inputs.tag }}
     runs-on: ubuntu-latest
@@ -70,7 +70,7 @@ jobs:
           case "$TAG" in
             v[0-9]*) ;;
             *)
-              echo "::error::Le tag doit être de la forme vX.Y.Z — reçu « $TAG »"
+              echo "::error::The tag must look like vX.Y.Z — got '$TAG'"
               exit 1
               ;;
           esac
@@ -83,25 +83,25 @@ jobs:
             | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')
 
           if [ -z "$CARGO" ]; then
-            echo "::error::Version introuvable dans Cargo.toml"
+            echo "::error::No version found in Cargo.toml"
             exit 1
           fi
 
           if [ "$VERSION" != "$CARGO" ]; then
-            echo "::error::Le tag $TAG annonce $VERSION, Cargo.toml déclare $CARGO"
+            echo "::error::Tag $TAG announces $VERSION, but Cargo.toml declares $CARGO"
             exit 1
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           {
-            echo "### Publication de ProxyAuth $VERSION"
+            echo "### ProxyAuth $VERSION release"
             echo
             echo "| | |"
             echo "|---|---|"
             echo "| Tag | \`$TAG\` |"
             echo "| Commit | \`$(git rev-parse --short HEAD)\` |"
-            echo "| Version Cargo.toml | \`$CARGO\` |"
+            echo "| Cargo.toml version | \`$CARGO\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install Rust
@@ -119,44 +119,37 @@ jobs:
           set -uo pipefail
 
           if [ ! -f Cargo.lock ]; then
-            echo "::error::Cargo.lock absent du tag $TAG — il doit être commité pour builder avec --locked"
+            echo "::error::Cargo.lock is missing from tag $TAG — it must be committed to build with --locked"
             exit 1
           fi
 
           if cargo metadata --locked --format-version 1 >/dev/null; then
-            echo "Cargo.lock est à jour."
+            echo "Cargo.lock is up to date."
             exit 0
           fi
 
-          echo "::error::Cargo.lock n'est pas synchronisé avec Cargo.toml au tag $TAG — lance « cargo check » en local et commite Cargo.lock"
+          echo "::error::Cargo.lock is out of sync with Cargo.toml at tag $TAG — run 'cargo check' locally and commit Cargo.lock"
 
           echo
-          echo "Modifications que cargo voudrait apporter à Cargo.lock :"
+          echo "Changes cargo would make to Cargo.lock:"
           cargo metadata --format-version 1 >/dev/null || true
           git --no-pager diff -- Cargo.lock
 
           exit 1
 
-  # ────────────────────────────────────────────────────────────────────
-  # Debian / Ubuntu
-  # ────────────────────────────────────────────────────────────────────
-  debian:
-    name: Debian / Ubuntu (.deb)
+  sources:
+    name: Sources bundle
     needs: validate
-    if: ${{ inputs.debian }}
-
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout the tag
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag }}
 
       - name: Install build dependencies
         run: |
-          # Selon l'image derrière « ubuntu-latest », on est soit root
-          # sans sudo (node:*-bookworm), soit un utilisateur avec sudo.
           SUDO=""
           if [ "$(id -u)" -ne 0 ]; then
             SUDO="sudo"
@@ -170,12 +163,9 @@ jobs:
             libssl-dev \
             libpq-dev \
             default-libmysqlclient-dev \
-            dpkg-dev \
-            fakeroot \
             ca-certificates \
             curl \
-            file \
-            openssl
+            git
 
       - name: Install Rust
         run: |
@@ -184,198 +174,402 @@ jobs:
 
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Build ProxyAuth
+      - name: Vendor dependencies
+        shell: bash
         run: |
-          cargo build --release --locked
+          set -euo pipefail
 
-      - name: Verify binary
+          cargo vendor --locked --versioned-dirs vendor > /tmp/vendor-config.toml
+
+          mkdir -p .cargo
+          cat /tmp/vendor-config.toml >> .cargo/config.toml
+
+          cat .cargo/config.toml
+
+      - name: Test offline build
         run: |
-          test -x target/release/proxyauth
+          cargo build --release --locked --offline
 
-          ./target/release/proxyauth --version || true
-
-          file target/release/proxyauth
-
-          echo "Dynamic dependencies:"
-          ldd target/release/proxyauth || true
-
-      - name: Prepare Debian package
+      - name: Assemble bundle
+        shell: bash
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
+          set -euo pipefail
+
+          BUNDLE="$PWD/bundle"
+          STAGE=$(mktemp -d)
+          SRC="proxyauth-${VERSION}"
+
+          mkdir -p "$BUNDLE" "$STAGE/$SRC"
+
+          git archive --format=tar HEAD | tar -x -C "$STAGE/$SRC"
+          cp -a vendor .cargo "$STAGE/$SRC/"
+
+          tar -C "$STAGE" -czf "$BUNDLE/proxyauth-src.tar.gz" "$SRC"
+
+          rustc --version | awk '{ print $2 }' > "$BUNDLE/toolchain"
+
+          cat > "$BUNDLE/proxyauth-build" <<'EOF'
+          #!/bin/sh
           set -eu
 
-          PACKAGE="proxyauth_${VERSION}_amd64"
-          ROOT="dist/${PACKAGE}"
+          LIB_DIR=/usr/lib/proxyauth
+          SRC_TARBALL=/usr/share/proxyauth/proxyauth-src.tar.gz
+          STATE_DIR=/var/lib/proxyauth
+          BUILD_DIR=$STATE_DIR/build
+          RUST_DIR=$STATE_DIR/rust
+          LOG_DIR=/var/log/proxyauth
+          LOG_FILE=$LOG_DIR/build.log
 
-          mkdir -p "$ROOT/DEBIAN"
-          mkdir -p "$ROOT/usr/bin"
-          mkdir -p "$ROOT/etc/proxyauth/certs/routes"
-          mkdir -p "$ROOT/opt/proxyauth/db"
-          mkdir -p "$ROOT/var/log/proxyauth"
-          mkdir -p "$ROOT/lib/systemd/system"
+          if [ "$(id -u)" -ne 0 ]; then
+              echo "proxyauth-build must be run as root" >&2
+              exit 1
+          fi
 
-          #
-          # Binary
-          #
-          install -m 0755 \
-            target/release/proxyauth \
-            "$ROOT/usr/bin/proxyauth"
+          group_exists() {
+              getent group "$1" >/dev/null 2>&1 || grep -q "^$1:" /etc/group 2>/dev/null
+          }
 
-          #
-          # systemd service
-          #
-          cat > "$ROOT/lib/systemd/system/proxyauth.service" <<'EOF'
+          setup_user() {
+              nologin=$(command -v nologin 2>/dev/null || echo /sbin/nologin)
+
+              if ! group_exists proxyauth; then
+                  if command -v groupadd >/dev/null 2>&1; then
+                      groupadd --system proxyauth
+                  else
+                      addgroup -S proxyauth
+                  fi
+              fi
+
+              if ! id proxyauth >/dev/null 2>&1; then
+                  if command -v useradd >/dev/null 2>&1; then
+                      useradd --system --gid proxyauth --no-create-home \
+                          --home-dir /opt/proxyauth --shell "$nologin" proxyauth
+                  else
+                      adduser -S -D -H -h /opt/proxyauth -s "$nologin" -G proxyauth proxyauth
+                  fi
+              fi
+
+              if group_exists www-data; then
+                  if command -v usermod >/dev/null 2>&1; then
+                      usermod -aG www-data proxyauth 2>/dev/null || true
+                  else
+                      addgroup proxyauth www-data 2>/dev/null || true
+                  fi
+              fi
+          }
+
+          setup_dirs() {
+              mkdir -p /etc/proxyauth/certs/routes /opt/proxyauth/db "$LOG_DIR"
+              touch "$LOG_DIR/proxyauth.log" "$LOG_DIR/proxyauth.err"
+
+              if [ ! -f /etc/proxyauth/certs/cert.pem ] || [ ! -f /etc/proxyauth/certs/key.pem ]; then
+                  echo "==> Generating a self-signed certificate"
+                  openssl req -x509 -newkey rsa:2048 -sha256 -days 7300 -nodes \
+                      -keyout /etc/proxyauth/certs/key.pem \
+                      -out /etc/proxyauth/certs/cert.pem \
+                      -subj "/CN=localhost" >/dev/null 2>&1
+                  chmod 644 /etc/proxyauth/certs/cert.pem
+                  chmod 640 /etc/proxyauth/certs/key.pem
+              fi
+          }
+
+          run_build() {
+              set -e
+
+              TOOLCHAIN=$(cat "$LIB_DIR/toolchain")
+
+              RUSTUP_HOME=$RUST_DIR/rustup
+              CARGO_HOME=$RUST_DIR/cargo
+              CARGO_TARGET_DIR=$BUILD_DIR/target
+              HOME=$BUILD_DIR
+              PATH=$CARGO_HOME/bin:$PATH
+              export RUSTUP_HOME CARGO_HOME CARGO_TARGET_DIR HOME PATH
+
+              mem_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0)
+              if [ -z "${CARGO_BUILD_JOBS:-}" ] && [ "${mem_kb:-0}" -gt 0 ] && [ "$mem_kb" -lt 2000000 ]; then
+                  echo "==> Less than 2 GB of RAM: building with a single job"
+                  CARGO_BUILD_JOBS=1
+                  export CARGO_BUILD_JOBS
+              fi
+
+              if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+                  echo "==> Installing Rust $TOOLCHAIN into $RUST_DIR"
+                  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$BUILD_DIR/rustup-init.sh"
+                  sh "$BUILD_DIR/rustup-init.sh" -y --profile minimal \
+                      --default-toolchain "$TOOLCHAIN" --no-modify-path
+                  rm -f "$BUILD_DIR/rustup-init.sh"
+              else
+                  echo "==> Checking Rust $TOOLCHAIN"
+                  rustup toolchain install "$TOOLCHAIN" --profile minimal
+              fi
+
+              rustup toolchain list | awk '{ print $1 }' | while read -r installed; do
+                  case "$installed" in
+                      "$TOOLCHAIN"-*) ;;
+                      *) rustup toolchain uninstall "$installed" ;;
+                  esac
+              done
+
+              RUSTUP_TOOLCHAIN=$TOOLCHAIN
+              export RUSTUP_TOOLCHAIN
+
+              if rustc -vV | grep -q '^host:.*musl'; then
+                  RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=-crt-static"
+                  export RUSTFLAGS
+              fi
+
+              echo "==> Extracting sources"
+              rm -rf "$BUILD_DIR/src"
+              mkdir -p "$BUILD_DIR/src"
+              tar -xzf "$SRC_TARBALL" -C "$BUILD_DIR/src" --strip-components=1
+
+              echo "==> Building ProxyAuth (this can take several minutes)"
+              cd "$BUILD_DIR/src"
+              cargo build --release --locked --offline
+
+              install -m 0755 "$CARGO_TARGET_DIR/release/proxyauth" "$LIB_DIR/proxyauth.new"
+              mv -f "$LIB_DIR/proxyauth.new" "$LIB_DIR/proxyauth"
+
+              cd /
+              rm -rf "$BUILD_DIR/src"
+          }
+
+          compile() {
+              mkdir -p "$BUILD_DIR" "$RUST_DIR"
+              chmod 0700 "$STATE_DIR"
+              rm -f "$BUILD_DIR/.status"
+
+              { ( run_build ); echo "$?" > "$BUILD_DIR/.status"; } 2>&1 | tee "$LOG_FILE"
+
+              return "$(cat "$BUILD_DIR/.status" 2>/dev/null || echo 1)"
+          }
+
+          fix_permissions() {
+              chown -R proxyauth:proxyauth /etc/proxyauth /opt/proxyauth "$LOG_DIR"
+              chmod 750 /etc/proxyauth /etc/proxyauth/certs /etc/proxyauth/certs/routes \
+                  /opt/proxyauth /opt/proxyauth/db "$LOG_DIR"
+              chmod 640 "$LOG_DIR/proxyauth.log" "$LOG_DIR/proxyauth.err"
+          }
+
+          setup_user
+          setup_dirs
+
+          status=0
+
+          if [ "${PROXYAUTH_SKIP_BUILD:-0}" != "1" ]; then
+              set +e
+              compile
+              status=$?
+              set -e
+
+              if [ "$status" -eq 0 ]; then
+                  timeout 60 "$LIB_DIR/proxyauth" prepare >/dev/null 2>&1 || true
+                  echo "==> ProxyAuth built: $LIB_DIR/proxyauth"
+              else
+                  echo "==> ERROR: ProxyAuth build failed (log: $LOG_FILE)" >&2
+                  echo "==> Fix the problem, then run 'proxyauth-build' again as root" >&2
+              fi
+          fi
+
+          fix_permissions
+
+          exit "$status"
+          EOF
+
+          cat > "$BUNDLE/proxyauth-wrapper" <<'EOF'
+          #!/bin/sh
+          if [ ! -x /usr/lib/proxyauth/proxyauth ]; then
+              echo "ProxyAuth is not built yet: run 'proxyauth-build' as root." >&2
+              exit 1
+          fi
+          exec /usr/lib/proxyauth/proxyauth "$@"
+          EOF
+
+          cat > "$BUNDLE/proxyauth.service" <<'EOF'
           [Unit]
           Description=ProxyAuth Authentication Proxy
           After=network.target
 
           [Service]
           Type=simple
-
           User=proxyauth
           Group=proxyauth
-
           ExecStart=/usr/bin/proxyauth
-
           AmbientCapabilities=CAP_NET_BIND_SERVICE
           CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
           Restart=on-failure
           RestartSec=5
-
           Environment=RUST_LOG=info
-
           WorkingDirectory=/opt/proxyauth
-
           StandardOutput=append:/var/log/proxyauth/proxyauth.log
           StandardError=append:/var/log/proxyauth/proxyauth.err
-
           NoNewPrivileges=true
 
           [Install]
           WantedBy=multi-user.target
           EOF
 
-          #
-          # Runtime dependencies
-          #
-          SHLIBS_WORK=$(mktemp -d)
-          mkdir -p "$SHLIBS_WORK/debian"
+          cat > "$BUNDLE/proxyauth.initd" <<'EOF'
+          #!/sbin/openrc-run
 
-          cat > "$SHLIBS_WORK/debian/control" <<'EOF'
-          Source: proxyauth
+          name="ProxyAuth"
+          description="ProxyAuth Authentication Proxy"
 
-          Package: proxyauth
-          Architecture: amd64
+          command="/usr/bin/proxyauth"
+          command_user="proxyauth:proxyauth"
+          command_background="yes"
+          directory="/opt/proxyauth"
+          pidfile="/run/${RC_SVCNAME}.pid"
+
+          output_log="/var/log/proxyauth/proxyauth.log"
+          error_log="/var/log/proxyauth/proxyauth.err"
+
+          export RUST_LOG="${RUST_LOG:-info}"
+
+          depend() {
+              need net
+              after firewall
+          }
+
+          start_pre() {
+              checkpath -d -o proxyauth:proxyauth -m 0750 /var/log/proxyauth
+          }
           EOF
 
-          BIN_PATH="$PWD/$ROOT/usr/bin/proxyauth"
+          cat > "$BUNDLE/proxyauth.spec" <<EOF
+          %global debug_package %{nil}
 
-          SHLIBS=$(cd "$SHLIBS_WORK" && dpkg-shlibdeps -O "$BIN_PATH")
-          DEPS=$(printf '%s\n' "$SHLIBS" | sed -n 's/^shlibs:Depends=//p')
+          Name:           proxyauth
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        ProxyAuth authentication gateway
+          License:        Apache-2.0
+          URL:            https://proxyauth.app
+          Packager:       Vladimir Souchet <staff@proxyauth.app>
+          BuildArch:      noarch
 
-          if [ -z "$DEPS" ]; then
-            echo "::error::dpkg-shlibdeps n'a produit aucune dépendance"
-            exit 1
+          Source0:        proxyauth-src.tar.gz
+          Source1:        proxyauth-build
+          Source2:        proxyauth-wrapper
+          Source3:        toolchain
+          Source4:        proxyauth.service
+
+          Requires:       gcc
+          Requires:       make
+          Requires:       pkgconf-pkg-config
+          Requires:       openssl-devel
+          Requires:       libpq-devel
+          Requires:       mariadb-connector-c-devel
+          Requires:       /usr/bin/curl
+          Requires:       ca-certificates
+          Requires:       openssl
+          Requires:       tar
+          Requires:       gzip
+          Requires:       systemd
+          Requires:       shadow-utils
+
+          %description
+          Secure authentication gateway and reverse proxy written in Rust.
+          ProxyAuth is compiled from the bundled sources during installation.
+
+          %prep
+
+          %build
+
+          %install
+          install -Dm0755 %{SOURCE2} %{buildroot}/usr/bin/proxyauth
+          install -Dm0755 %{SOURCE1} %{buildroot}/usr/lib/proxyauth/proxyauth-build
+          install -Dm0644 %{SOURCE3} %{buildroot}/usr/lib/proxyauth/toolchain
+          install -Dm0644 %{SOURCE0} %{buildroot}/usr/share/proxyauth/proxyauth-src.tar.gz
+          install -Dm0644 %{SOURCE4} %{buildroot}/usr/lib/systemd/system/proxyauth.service
+          ln -s ../lib/proxyauth/proxyauth-build %{buildroot}/usr/bin/proxyauth-build
+
+          %post
+          /usr/lib/proxyauth/proxyauth-build || exit 1
+          systemctl daemon-reload >/dev/null 2>&1 || true
+          systemctl enable proxyauth.service >/dev/null 2>&1 || true
+          systemctl restart proxyauth.service >/dev/null 2>&1 || true
+
+          %preun
+          if [ "\$1" -eq 0 ]; then
+              systemctl disable --now proxyauth.service >/dev/null 2>&1 || true
+              rm -f /usr/lib/proxyauth/proxyauth /usr/lib/proxyauth/proxyauth.new
+              rm -rf /var/lib/proxyauth
           fi
 
-          echo "Runtime dependencies: $DEPS"
+          %postun
+          systemctl daemon-reload >/dev/null 2>&1 || true
 
-          #
-          # Package metadata
-          #
+          %files
+          /usr/bin/proxyauth
+          /usr/bin/proxyauth-build
+          /usr/lib/proxyauth/
+          /usr/share/proxyauth/
+          /usr/lib/systemd/system/proxyauth.service
+          EOF
+
+          ls -lh "$BUNDLE"
+
+      - name: Upload bundle
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-bundle
+          path: bundle/
+
+  debian:
+    name: Debian / Ubuntu (.deb)
+    needs: [validate, sources]
+    if: ${{ inputs.debian }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download bundle
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-bundle
+          path: bundle
+
+      - name: Build Debian package
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -eu
+
+          PACKAGE="proxyauth_${VERSION}_all"
+          ROOT="dist/${PACKAGE}"
+
+          mkdir -p "$ROOT/DEBIAN"
+
+          install -Dm0755 bundle/proxyauth-wrapper "$ROOT/usr/bin/proxyauth"
+          install -Dm0755 bundle/proxyauth-build "$ROOT/usr/lib/proxyauth/proxyauth-build"
+          install -Dm0644 bundle/toolchain "$ROOT/usr/lib/proxyauth/toolchain"
+          install -Dm0644 bundle/proxyauth-src.tar.gz "$ROOT/usr/share/proxyauth/proxyauth-src.tar.gz"
+          install -Dm0644 bundle/proxyauth.service "$ROOT/usr/lib/systemd/system/proxyauth.service"
+          ln -s ../lib/proxyauth/proxyauth-build "$ROOT/usr/bin/proxyauth-build"
+
           cat > "$ROOT/DEBIAN/control" <<EOF
           Package: proxyauth
           Version: ${VERSION}
           Section: net
           Priority: optional
-          Architecture: amd64
+          Architecture: all
           Maintainer: Vladimir Souchet <staff@proxyauth.app>
-          Depends: ${DEPS}, openssl, ca-certificates
+          Depends: build-essential, pkg-config, libssl-dev, libpq-dev, default-libmysqlclient-dev, curl, ca-certificates, openssl, tar, gzip
           Description: ProxyAuth authentication gateway
            Secure authentication gateway and reverse proxy written in Rust.
+           ProxyAuth is compiled from the bundled sources during installation.
           EOF
 
-          #
-          # postinst
-          #
           cat > "$ROOT/DEBIAN/postinst" <<'EOF'
           #!/bin/sh
           set -e
 
-          # Rien à faire pour abort-upgrade, abort-remove, etc.
           [ "$1" = "configure" ] || exit 0
 
-          #
-          # System group and user
-          #
-          if ! getent group proxyauth >/dev/null 2>&1; then
-              groupadd --system proxyauth
-          fi
-
-          if ! id proxyauth >/dev/null 2>&1; then
-              useradd \
-                  --system \
-                  --gid proxyauth \
-                  --no-create-home \
-                  --shell /usr/sbin/nologin \
-                  proxyauth
-          fi
-
-          if getent group www-data >/dev/null 2>&1; then
-              usermod -aG www-data proxyauth || true
-          fi
-
-          #
-          # Directories and log files
-          #
-          mkdir -p /etc/proxyauth/certs/routes
-          mkdir -p /opt/proxyauth/db
-          mkdir -p /var/log/proxyauth
-
-          touch /var/log/proxyauth/proxyauth.log
-          touch /var/log/proxyauth/proxyauth.err
-
-          #
-          # Self-signed certificate, only if none exists
-          #
-          if [ ! -f /etc/proxyauth/certs/cert.pem ] || \
-             [ ! -f /etc/proxyauth/certs/key.pem ]; then
-
-              openssl req \
-                  -x509 \
-                  -newkey rsa:2048 \
-                  -sha256 \
-                  -days 7300 \
-                  -nodes \
-                  -keyout /etc/proxyauth/certs/key.pem \
-                  -out /etc/proxyauth/certs/cert.pem \
-                  -subj "/CN=localhost" \
-                  >/dev/null 2>&1
-
-              chmod 644 /etc/proxyauth/certs/cert.pem
-              chmod 640 /etc/proxyauth/certs/key.pem
-          fi
-
-          timeout 60 /usr/bin/proxyauth prepare >/dev/null 2>&1 || true
-
-          #
-          # Ownership and permissions (après prepare, qui tourne en root)
-          #
-          chown -R proxyauth:proxyauth /etc/proxyauth
-          chown -R proxyauth:proxyauth /opt/proxyauth
-          chown -R proxyauth:proxyauth /var/log/proxyauth
-
-          chmod 750 /etc/proxyauth
-          chmod 750 /etc/proxyauth/certs
-          chmod 750 /etc/proxyauth/certs/routes
-          chmod 750 /opt/proxyauth/db
-          chmod 750 /var/log/proxyauth
-
-          chmod 640 \
-              /var/log/proxyauth/proxyauth.log \
-              /var/log/proxyauth/proxyauth.err
+          /usr/lib/proxyauth/proxyauth-build
 
           if [ -d /run/systemd/system ]; then
               systemctl daemon-reload
@@ -392,42 +586,30 @@ jobs:
           exit 0
           EOF
 
-          chmod 0755 "$ROOT/DEBIAN/postinst"
-
-          #
-          # prerm
-          #
           cat > "$ROOT/DEBIAN/prerm" <<'EOF'
           #!/bin/sh
           set -e
 
-          if [ -d /run/systemd/system ]; then
-              systemctl stop proxyauth.service 2>/dev/null || true
-          fi
+          if [ "$1" = "remove" ]; then
+              if [ -d /run/systemd/system ]; then
+                  systemctl stop proxyauth.service 2>/dev/null || true
+              fi
 
-          # On ne désactive le service qu'en cas de suppression,
-          # pas lors d'une mise à jour.
-          if [ "$1" = "remove" ] && command -v systemctl >/dev/null 2>&1; then
-              systemctl disable proxyauth.service 2>/dev/null || true
+              if command -v systemctl >/dev/null 2>&1; then
+                  systemctl disable proxyauth.service 2>/dev/null || true
+              fi
+
+              rm -f /usr/lib/proxyauth/proxyauth /usr/lib/proxyauth/proxyauth.new
+              rm -rf /var/lib/proxyauth
           fi
 
           exit 0
           EOF
 
-          chmod 0755 "$ROOT/DEBIAN/prerm"
+          chmod 0755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/prerm"
 
-          #
-          # Build package
-          #
-          dpkg-deb \
-            --build \
-            --root-owner-group \
-            "$ROOT" \
-            "dist/${PACKAGE}.deb"
+          dpkg-deb --build --root-owner-group "$ROOT" "dist/${PACKAGE}.deb"
 
-          #
-          # Validate package
-          #
           dpkg-deb --info "dist/${PACKAGE}.deb"
           dpkg-deb --contents "dist/${PACKAGE}.deb"
 
@@ -437,11 +619,9 @@ jobs:
         run: |
           cd dist
 
-          sha256sum \
-            "proxyauth_${VERSION}_amd64.deb" \
-            > "proxyauth_${VERSION}_amd64.deb.sha256"
+          sha256sum "proxyauth_${VERSION}_all.deb" > "proxyauth_${VERSION}_all.deb.sha256"
 
-          cat "proxyauth_${VERSION}_amd64.deb.sha256"
+          cat "proxyauth_${VERSION}_all.deb.sha256"
 
       - name: Upload Debian package
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
@@ -451,13 +631,13 @@ jobs:
             dist/*.deb
             dist/*.deb.sha256
 
-  # ────────────────────────────────────────────────────────────────────
-  # Alpine
-  # ────────────────────────────────────────────────────────────────────
   alpine:
     name: Alpine (.apk)
-    needs: validate
+    needs: [validate, sources]
     if: ${{ inputs.alpine }}
+
+    outputs:
+      branch: ${{ steps.build.outputs.branch }}
 
     runs-on: ubuntu-latest
 
@@ -465,64 +645,44 @@ jobs:
       image: alpine:latest
 
     steps:
-      - name: Install build dependencies
+      - name: Install packaging tools
         run: |
-          # nodejs + git : requis par actions/checkout et upload-artifact,
-          # qui s'exécutent dans ce conteneur.
-          apk add --no-cache \
-            nodejs \
-            git \
-            alpine-sdk \
-            build-base \
-            cargo \
-            rust \
-            pkgconf \
-            openssl-dev \
-            openssl-libs-static \
-            postgresql-dev \
-            mariadb-connector-c-dev \
-            zlib-dev \
-            zlib-static \
-            ca-certificates \
-            curl \
-            file \
-            openssl
+          apk add --no-cache nodejs alpine-sdk tar
 
-      - name: Create build user
+      - name: Set up build user and signing key
+        env:
+          APK_PRIVATE_KEY: ${{ secrets.APK_PRIVATE_KEY }}
         run: |
+          set -eu
+
           adduser -D builder
           addgroup builder abuild
 
-      - name: Configure abuild
-        run: |
-          mkdir -p /home/builder/.abuild
-          chown -R builder:builder /home/builder
+          KEYS=/home/builder/.abuild
+          mkdir -p "$KEYS"
 
-          su builder -c 'abuild-keygen -a -n'
+          if [ -n "${APK_PRIVATE_KEY:-}" ]; then
+            printf '%s\n' "$APK_PRIVATE_KEY" > "$KEYS/proxyauth.rsa"
+            chmod 600 "$KEYS/proxyauth.rsa"
+            openssl rsa -in "$KEYS/proxyauth.rsa" -pubout -out "$KEYS/proxyauth.rsa.pub"
+            echo "PACKAGER_PRIVKEY=\"$KEYS/proxyauth.rsa\"" > "$KEYS/abuild.conf"
+            chown -R builder:builder /home/builder
+          else
+            echo "::warning::No APK_PRIVATE_KEY secret: signing with a throwaway key, clients will need --allow-untrusted"
+            chown -R builder:builder /home/builder
+            su builder -c 'abuild-keygen -a -n'
+          fi
 
-      - name: Checkout
-        uses: actions/checkout@v6
+          cp "$KEYS"/*.rsa.pub /etc/apk/keys/
+
+      - name: Download bundle
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
-          ref: ${{ inputs.tag }}
+          name: proxyauth-${{ needs.validate.outputs.version }}-bundle
+          path: bundle
 
-      - name: Build ProxyAuth
-        env:
-          RUSTFLAGS: -C target-feature=-crt-static
-        run: |
-          cargo build --release --locked
-
-      - name: Verify binary
-        run: |
-          test -x target/release/proxyauth
-
-          ./target/release/proxyauth --version || true
-
-          file target/release/proxyauth
-
-          echo "Dynamic dependencies:"
-          ldd target/release/proxyauth || true
-
-      - name: Prepare Alpine package
+      - name: Build Alpine package
+        id: build
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
@@ -533,9 +693,13 @@ jobs:
 
           mkdir -p "$APORT" "$REPODEST" /home/builder/dist
 
-          #
-          # APKBUILD
-          #
+          cp bundle/proxyauth-src.tar.gz \
+             bundle/proxyauth-build \
+             bundle/proxyauth-wrapper \
+             bundle/toolchain \
+             bundle/proxyauth.initd \
+             "$APORT/"
+
           cat > "$APORT/APKBUILD" <<EOF
           # Contributor: Vladimir Souchet <staff@proxyauth.app>
           # Maintainer: Vladimir Souchet <staff@proxyauth.app>
@@ -544,170 +708,96 @@ jobs:
           pkgver=${VERSION}
           pkgrel=0
 
-          pkgdesc="ProxyAuth authentication gateway"
+          pkgdesc="ProxyAuth authentication gateway (built from source at install time)"
           url="https://proxyauth.app"
-          arch="x86_64"
+          arch="noarch"
 
           license="Apache-2.0"
 
           depends="
-              openssl
+              build-base
+              pkgconf
+              openssl-dev
+              postgresql-dev
+              mariadb-connector-c-dev
+              zlib-dev
+              curl
               ca-certificates
+              openssl
               openrc
+              tar
           "
 
           makedepends=""
 
           install="
-              \$pkgname.pre-install
               \$pkgname.post-install
               \$pkgname.post-upgrade
+              \$pkgname.pre-deinstall
           "
 
           source="
-              proxyauth
+              proxyauth-src.tar.gz
+              proxyauth-build
+              proxyauth-wrapper
+              toolchain
               proxyauth.initd
           "
 
           options="!check"
+
+          unpack() {
+              :
+          }
 
           build() {
               :
           }
 
           package() {
-              install -Dm755 \
-                  "\$srcdir/proxyauth" \
-                  "\$pkgdir/usr/bin/proxyauth"
-
-              install -Dm755 \
-                  "\$srcdir/proxyauth.initd" \
-                  "\$pkgdir/etc/init.d/proxyauth"
+              install -Dm755 "\$startdir/proxyauth-wrapper" "\$pkgdir/usr/bin/proxyauth"
+              install -Dm755 "\$startdir/proxyauth-build" "\$pkgdir/usr/lib/proxyauth/proxyauth-build"
+              install -Dm644 "\$startdir/toolchain" "\$pkgdir/usr/lib/proxyauth/toolchain"
+              install -Dm644 "\$startdir/proxyauth-src.tar.gz" "\$pkgdir/usr/share/proxyauth/proxyauth-src.tar.gz"
+              install -Dm755 "\$startdir/proxyauth.initd" "\$pkgdir/etc/init.d/proxyauth"
+              ln -s ../lib/proxyauth/proxyauth-build "\$pkgdir/usr/bin/proxyauth-build"
           }
           EOF
 
-          #
-          # Binary source
-          #
-          cp target/release/proxyauth "$APORT/proxyauth"
-
-          #
-          # OpenRC service
-          #
-          cat > "$APORT/proxyauth.initd" <<'EOF'
-          #!/sbin/openrc-run
-
-          name="ProxyAuth"
-          description="ProxyAuth Authentication Proxy"
-
-          command="/usr/bin/proxyauth"
-          command_user="proxyauth:proxyauth"
-          command_background="yes"
-
-          directory="/opt/proxyauth"
-
-          output_log="/var/log/proxyauth/proxyauth.log"
-          error_log="/var/log/proxyauth/proxyauth.err"
-
-          pidfile="/run/${RC_SVCNAME}.pid"
-
-          export RUST_LOG="${RUST_LOG:-info}"
-
-          depend() {
-              need net
-              after firewall
-          }
-
-          start_pre() {
-              checkpath -d -o proxyauth:proxyauth -m 0750 /var/log/proxyauth
-          }
-          EOF
-
-          chmod 0755 "$APORT/proxyauth.initd"
-
-          #
-          # pre-install : création de l'utilisateur système
-          #
-          cat > "$APORT/proxyauth.pre-install" <<'EOF'
-          #!/bin/sh
-
-          addgroup -S proxyauth 2>/dev/null
-          adduser -S -D -H \
-              -h /opt/proxyauth \
-              -s /sbin/nologin \
-              -G proxyauth \
-              -g "ProxyAuth service user" \
-              proxyauth 2>/dev/null
-
-          exit 0
-          EOF
-
-          #
-          # post-install : répertoires, certificats, prepare, droits
-          #
           cat > "$APORT/proxyauth.post-install" <<'EOF'
           #!/bin/sh
-
-          mkdir -p /etc/proxyauth/certs/routes
-          mkdir -p /opt/proxyauth/db
-          mkdir -p /var/log/proxyauth
-
-          touch /var/log/proxyauth/proxyauth.log
-          touch /var/log/proxyauth/proxyauth.err
-
-          if [ ! -f /etc/proxyauth/certs/cert.pem ] || \
-             [ ! -f /etc/proxyauth/certs/key.pem ]; then
-
-              openssl req \
-                  -x509 \
-                  -newkey rsa:2048 \
-                  -sha256 \
-                  -days 7300 \
-                  -nodes \
-                  -keyout /etc/proxyauth/certs/key.pem \
-                  -out /etc/proxyauth/certs/cert.pem \
-                  -subj "/CN=localhost" \
-                  >/dev/null 2>&1
-
-              chmod 644 /etc/proxyauth/certs/cert.pem
-              chmod 640 /etc/proxyauth/certs/key.pem
-          fi
-
-          timeout 60 /usr/bin/proxyauth prepare >/dev/null 2>&1 || true
-
-          chown -R proxyauth:proxyauth /etc/proxyauth
-          chown -R proxyauth:proxyauth /opt/proxyauth
-          chown -R proxyauth:proxyauth /var/log/proxyauth
-
-          chmod 750 /etc/proxyauth
-          chmod 750 /etc/proxyauth/certs
-          chmod 750 /etc/proxyauth/certs/routes
-          chmod 750 /opt/proxyauth/db
-          chmod 750 /var/log/proxyauth
-
-          chmod 640 \
-              /var/log/proxyauth/proxyauth.log \
-              /var/log/proxyauth/proxyauth.err
-
+          /usr/lib/proxyauth/proxyauth-build || exit 1
+          rc-update add proxyauth default >/dev/null 2>&1 || true
           exit 0
           EOF
 
-          cp "$APORT/proxyauth.post-install" "$APORT/proxyauth.post-upgrade"
+          cat > "$APORT/proxyauth.post-upgrade" <<'EOF'
+          #!/bin/sh
+          /usr/lib/proxyauth/proxyauth-build || exit 1
+          rc-service proxyauth --ifstarted restart >/dev/null 2>&1 || true
+          exit 0
+          EOF
+
+          cat > "$APORT/proxyauth.pre-deinstall" <<'EOF'
+          #!/bin/sh
+          rc-service proxyauth stop >/dev/null 2>&1 || true
+          rc-update del proxyauth default >/dev/null 2>&1 || true
+          rm -f /usr/lib/proxyauth/proxyauth /usr/lib/proxyauth/proxyauth.new
+          rm -rf /var/lib/proxyauth
+          exit 0
+          EOF
 
           chmod 0755 \
-            "$APORT/proxyauth.pre-install" \
             "$APORT/proxyauth.post-install" \
-            "$APORT/proxyauth.post-upgrade"
+            "$APORT/proxyauth.post-upgrade" \
+            "$APORT/proxyauth.pre-deinstall"
 
           chown -R builder:builder /home/builder
 
-          #
-          # Build APK
-          #
           su builder -c "
             cd '$APORT' &&
             abuild checksum &&
-            REPODEST='$REPODEST' abuild -r
+            REPODEST='$REPODEST' abuild -d
           "
 
           find "$REPODEST" \
@@ -715,7 +805,25 @@ jobs:
             -name 'proxyauth-*.apk' \
             -exec cp {} /home/builder/dist/ \;
 
+          cp /home/builder/.abuild/*.rsa.pub /home/builder/dist/
+
           ls -lh /home/builder/dist
+
+          echo "branch=v$(cut -d. -f1,2 /etc/alpine-release)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate APK
+        run: |
+          set -e
+
+          APK=$(find /home/builder/dist -maxdepth 1 -type f -name 'proxyauth-*.apk' | head -n1)
+
+          if [ -z "$APK" ]; then
+            echo "APK package not found"
+            exit 1
+          fi
+
+          ls -lh "$APK"
+          tar -tzvf "$APK"
 
       - name: Generate SHA256
         env:
@@ -727,33 +835,9 @@ jobs:
 
           APK=$(find . -maxdepth 1 -type f -name 'proxyauth-*.apk' | head -n1)
 
-          if [ -z "$APK" ]; then
-            echo "APK package not found"
-            exit 1
-          fi
-
           sha256sum "$APK" > "proxyauth_${VERSION}_apk.sha256"
 
           cat "proxyauth_${VERSION}_apk.sha256"
-
-      - name: Validate APK
-        run: |
-          set -e
-
-          APK=$(find /home/builder/dist \
-            -maxdepth 1 \
-            -type f \
-            -name 'proxyauth-*.apk' \
-            | head -n1)
-
-          ls -lh "$APK"
-
-          apk add --no-cache --allow-untrusted "$APK"
-
-          apk info -L proxyauth
-
-          test -x /usr/bin/proxyauth
-          id proxyauth
 
       - name: Upload Alpine package
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
@@ -762,13 +846,11 @@ jobs:
           path: |
             /home/builder/dist/*.apk
             /home/builder/dist/*.sha256
+            /home/builder/dist/*.rsa.pub
 
-  # ────────────────────────────────────────────────────────────────────
-  # Arch Linux
-  # ────────────────────────────────────────────────────────────────────
   arch:
     name: Arch Linux (.pkg.tar.zst)
-    needs: validate
+    needs: [validate, sources]
     if: ${{ inputs.arch }}
 
     runs-on: ubuntu-latest
@@ -777,32 +859,15 @@ jobs:
       image: archlinux:latest
 
     steps:
-      - name: Install dependencies
+      - name: Install packaging tools
         run: |
-          # `-Syu` en une passe : un `-Sy` suivi d'un `-S` séparé installe
-          # depuis une base rafraîchie sur un système non mis à jour, ce
-          # qui casse dès qu'une dépendance a bougé entre les deux.
-          pacman -Syu --noconfirm --needed \
-            nodejs \
-            git \
-            base-devel \
-            rust \
-            openssl \
-            pkgconf \
-            ca-certificates \
-            postgresql-libs \
-            mariadb-libs
+          pacman -Syu --noconfirm --needed nodejs base-devel
 
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Download bundle
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
-          ref: ${{ inputs.tag }}
-
-      - name: Build ProxyAuth
-        run: |
-          cargo build --release --locked
-
-          test -x target/release/proxyauth
+          name: proxyauth-${{ needs.validate.outputs.version }}-bundle
+          path: bundle
 
       - name: Create Arch package
         env:
@@ -812,135 +877,79 @@ jobs:
 
           mkdir -p arch-package
 
-          cp target/release/proxyauth "arch-package/proxyauth-${VERSION}"
+          cp bundle/proxyauth-src.tar.gz \
+             bundle/proxyauth-build \
+             bundle/proxyauth-wrapper \
+             bundle/toolchain \
+             bundle/proxyauth.service \
+             arch-package/
 
-          #
-          # PKGBUILD
-          #
           cat > arch-package/PKGBUILD <<EOF
           # Maintainer: Vladimir Souchet <staff@proxyauth.app>
 
           pkgname=proxyauth
           pkgver=${VERSION}
           pkgrel=1
-          pkgdesc="Authentication gateway and reverse proxy written in Rust"
-          arch=('x86_64')
+          pkgdesc="Authentication gateway and reverse proxy written in Rust (built from source at install time)"
+          arch=('any')
           url="https://proxyauth.app"
           license=('Apache-2.0')
 
           depends=(
+              'gcc'
+              'make'
+              'pkgconf'
               'openssl'
+              'postgresql-libs'
+              'mariadb-libs'
+              'curl'
               'ca-certificates'
+              'tar'
+              'gzip'
               'systemd'
           )
 
-          options=('!debug')
+          options=('!debug' '!strip')
 
           install=proxyauth.install
 
           source=(
-              "proxyauth-\${pkgver}"
+              'proxyauth-src.tar.gz'
+              'proxyauth-build'
+              'proxyauth-wrapper'
+              'toolchain'
+              'proxyauth.service'
           )
 
-          sha256sums=(
-              'SKIP'
-          )
+          noextract=('proxyauth-src.tar.gz')
+
+          sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
           package() {
-              install -Dm755 "\$srcdir/proxyauth-\${pkgver}" \
-                  "\$pkgdir/usr/bin/proxyauth"
-
-              install -Dm644 /dev/stdin \
-                  "\$pkgdir/usr/lib/systemd/system/proxyauth.service" <<'SERVICE'
-          [Unit]
-          Description=ProxyAuth Authentication Gateway
-          After=network.target
-
-          [Service]
-          Type=simple
-
-          User=proxyauth
-          Group=proxyauth
-
-          ExecStart=/usr/bin/proxyauth
-
-          AmbientCapabilities=CAP_NET_BIND_SERVICE
-          CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-          Restart=on-failure
-          RestartSec=5
-
-          Environment=RUST_LOG=info
-
-          WorkingDirectory=/opt/proxyauth
-
-          StandardOutput=append:/var/log/proxyauth/proxyauth.log
-          StandardError=append:/var/log/proxyauth/proxyauth.err
-
-          NoNewPrivileges=true
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-
-              install -Dm644 /dev/stdin \
-                  "\$pkgdir/usr/lib/sysusers.d/proxyauth.conf" <<'SYSUSERS'
-          u proxyauth - "ProxyAuth service user" /opt/proxyauth
-          SYSUSERS
-
-              install -Dm644 /dev/stdin \
-                  "\$pkgdir/usr/lib/tmpfiles.d/proxyauth.conf" <<'TMPFILES'
-          d /etc/proxyauth 0750 proxyauth proxyauth -
-          d /etc/proxyauth/certs 0750 proxyauth proxyauth -
-          d /etc/proxyauth/certs/routes 0750 proxyauth proxyauth -
-          d /opt/proxyauth 0750 proxyauth proxyauth -
-          d /opt/proxyauth/db 0750 proxyauth proxyauth -
-          d /var/log/proxyauth 0750 proxyauth proxyauth -
-          TMPFILES
+              install -Dm755 "\$srcdir/proxyauth-wrapper" "\$pkgdir/usr/bin/proxyauth"
+              install -Dm755 "\$srcdir/proxyauth-build" "\$pkgdir/usr/lib/proxyauth/proxyauth-build"
+              install -Dm644 "\$srcdir/toolchain" "\$pkgdir/usr/lib/proxyauth/toolchain"
+              install -Dm644 "\$srcdir/proxyauth-src.tar.gz" "\$pkgdir/usr/share/proxyauth/proxyauth-src.tar.gz"
+              install -Dm644 "\$srcdir/proxyauth.service" "\$pkgdir/usr/lib/systemd/system/proxyauth.service"
+              ln -s ../lib/proxyauth/proxyauth-build "\$pkgdir/usr/bin/proxyauth-build"
           }
           EOF
 
           cat > arch-package/proxyauth.install <<'EOF'
           post_install() {
-              systemd-sysusers proxyauth.conf
-              systemd-tmpfiles --create proxyauth.conf
-
-              touch /var/log/proxyauth/proxyauth.log
-              touch /var/log/proxyauth/proxyauth.err
-              chmod 640 \
-                  /var/log/proxyauth/proxyauth.log \
-                  /var/log/proxyauth/proxyauth.err
-
-              if [ ! -f /etc/proxyauth/certs/cert.pem ] || \
-                 [ ! -f /etc/proxyauth/certs/key.pem ]; then
-
-                  openssl req \
-                      -x509 \
-                      -newkey rsa:2048 \
-                      -sha256 \
-                      -days 7300 \
-                      -nodes \
-                      -keyout /etc/proxyauth/certs/key.pem \
-                      -out /etc/proxyauth/certs/cert.pem \
-                      -subj "/CN=localhost" \
-                      >/dev/null 2>&1
-
-                  chmod 644 /etc/proxyauth/certs/cert.pem
-                  chmod 640 /etc/proxyauth/certs/key.pem
-              fi
-
-              timeout 60 /usr/bin/proxyauth prepare >/dev/null 2>&1 || true
-
-              chown -R proxyauth:proxyauth \
-                  /etc/proxyauth \
-                  /opt/proxyauth \
-                  /var/log/proxyauth
-
+              /usr/lib/proxyauth/proxyauth-build || return 1
               echo "==> Enable the service with: systemctl enable --now proxyauth.service"
           }
 
           post_upgrade() {
-              post_install
+              /usr/lib/proxyauth/proxyauth-build || return 1
+              systemctl try-restart proxyauth.service 2>/dev/null || true
+          }
+
+          pre_remove() {
+              systemctl disable --now proxyauth.service 2>/dev/null || true
+              rm -f /usr/lib/proxyauth/proxyauth /usr/lib/proxyauth/proxyauth.new
+              rm -rf /var/lib/proxyauth
           }
           EOF
 
@@ -949,8 +958,7 @@ jobs:
           useradd -m builder
           chown -R builder:builder arch-package
 
-          su builder -c \
-            'cd arch-package && makepkg --cleanbuild --clean --noconfirm'
+          su builder -c 'cd arch-package && makepkg --cleanbuild --clean --nodeps --noconfirm'
 
       - name: Validate package
         run: |
@@ -961,10 +969,9 @@ jobs:
             exit 1
           fi
 
-          echo "Generated package:"
           ls -lh "$PACKAGE"
 
-          pacman -Qp "$PACKAGE"
+          pacman -Qip "$PACKAGE"
           pacman -Qlp "$PACKAGE"
 
       - name: Prepare artifact
@@ -975,8 +982,7 @@ jobs:
 
           cd dist
 
-          sha256sum proxyauth-*.pkg.tar.* \
-            > proxyauth-arch.sha256
+          sha256sum proxyauth-*.pkg.tar.* > proxyauth-arch.sha256
 
       - name: Upload Arch package
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
@@ -984,12 +990,9 @@ jobs:
           name: proxyauth-${{ needs.validate.outputs.version }}-arch
           path: dist/
 
-  # ────────────────────────────────────────────────────────────────────
-  # Fedora
-  # ────────────────────────────────────────────────────────────────────
   fedora:
     name: Fedora (.rpm)
-    needs: validate
+    needs: [validate, sources]
     if: ${{ inputs.fedora }}
 
     runs-on: ubuntu-latest
@@ -998,235 +1001,43 @@ jobs:
       image: fedora:latest
 
     steps:
-      - name: Install build dependencies
+      - name: Install packaging tools
         run: |
-          dnf -y update
+          dnf -y install nodejs rpm-build
 
-          # nodejs + git : requis par checkout / upload-artifact.
-          # postgresql-devel retiré : libpq-devel suffit, et le nom
-          # n'existe plus sur les Fedora récentes.
-          # --allowerasing : l'image embarque curl-minimal, qui entre en
-          # conflit avec le paquet curl complet.
-          dnf -y install --allowerasing \
-            nodejs \
-            git \
-            gcc \
-            gcc-c++ \
-            make \
-            pkg-config \
-            openssl-devel \
-            libpq-devel \
-            mariadb-connector-c-devel \
-            rpm-build \
-            ca-certificates \
-            curl \
-            file \
-            openssl
-
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Download bundle
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
-          ref: ${{ inputs.tag }}
+          name: proxyauth-${{ needs.validate.outputs.version }}-bundle
+          path: bundle
 
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
-
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Build ProxyAuth
-        shell: bash
-        run: |
-          cargo build --release --locked
-
-      - name: Verify binary
-        shell: bash
-        run: |
-          test -x target/release/proxyauth
-
-          ./target/release/proxyauth --version || true
-
-          file target/release/proxyauth
-
-          echo "Dynamic dependencies:"
-          ldd target/release/proxyauth || true
-
-      - name: Prepare RPM
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
+      - name: Build RPM
         shell: bash
         run: |
           set -euo pipefail
 
           RPMROOT="$PWD/rpmbuild"
 
-          mkdir -p "$RPMROOT"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          mkdir -p "$RPMROOT"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS} dist
 
-          install -m 0755 target/release/proxyauth "$RPMROOT/SOURCES/proxyauth"
+          cp bundle/proxyauth-src.tar.gz \
+             bundle/proxyauth-build \
+             bundle/proxyauth-wrapper \
+             bundle/toolchain \
+             bundle/proxyauth.service \
+             "$RPMROOT/SOURCES/"
 
-          cat > "$RPMROOT/SOURCES/proxyauth.service" <<'EOF'
-          [Unit]
-          Description=ProxyAuth Authentication Proxy
-          After=network.target
+          cp bundle/proxyauth.spec "$RPMROOT/SPECS/"
 
-          [Service]
-          Type=simple
+          rpmbuild --define "_topdir $RPMROOT" -bb "$RPMROOT/SPECS/proxyauth.spec"
 
-          User=proxyauth
-          Group=proxyauth
-
-          ExecStart=/usr/bin/proxyauth
-
-          AmbientCapabilities=CAP_NET_BIND_SERVICE
-          CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-          Restart=on-failure
-          RestartSec=5
-
-          Environment=RUST_LOG=info
-
-          WorkingDirectory=/opt/proxyauth
-
-          StandardOutput=append:/var/log/proxyauth/proxyauth.log
-          StandardError=append:/var/log/proxyauth/proxyauth.err
-
-          NoNewPrivileges=true
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          cat > "$RPMROOT/SOURCES/proxyauth.sysusers" <<'EOF'
-          u proxyauth - "ProxyAuth service user" /opt/proxyauth /usr/sbin/nologin
-          EOF
-
-          #
-          # Spec
-          #
-          cat > "$RPMROOT/SPECS/proxyauth.spec" <<EOF
-          %global debug_package %{nil}
-
-          Name:           proxyauth
-          Version:        ${VERSION}
-          Release:        1%{?dist}
-          Summary:        ProxyAuth authentication gateway
-          License:        Apache-2.0
-          URL:            https://proxyauth.app
-          Packager:       Vladimir Souchet <staff@proxyauth.app>
-
-          Source0:        proxyauth
-          Source1:        proxyauth.service
-          Source2:        proxyauth.sysusers
-
-          Requires:       openssl
-          Requires:       ca-certificates
-          Requires:       systemd
-          Requires(pre):  shadow-utils
-          Requires(post): openssl
-
-          %description
-          Secure authentication gateway and reverse proxy written in Rust.
-
-          %prep
-
-          %build
-
-          %install
-          install -Dm0755 %{SOURCE0} %{buildroot}/usr/bin/proxyauth
-          install -Dm0644 %{SOURCE1} %{buildroot}/usr/lib/systemd/system/proxyauth.service
-          install -Dm0644 %{SOURCE2} %{buildroot}/usr/lib/sysusers.d/proxyauth.conf
-
-          install -dm0750 %{buildroot}/etc/proxyauth/certs/routes
-          install -dm0750 %{buildroot}/opt/proxyauth/db
-          install -dm0750 %{buildroot}/var/log/proxyauth
-
-          %pre
-          getent group proxyauth >/dev/null || \
-              groupadd --system proxyauth
-
-          getent passwd proxyauth >/dev/null || \
-              useradd \
-                --system \
-                --gid proxyauth \
-                --no-create-home \
-                --shell /usr/sbin/nologin \
-                proxyauth
-
-          exit 0
-
-          %post
-          touch /var/log/proxyauth/proxyauth.log
-          touch /var/log/proxyauth/proxyauth.err
-
-          if [ ! -f /etc/proxyauth/certs/cert.pem ] || \
-             [ ! -f /etc/proxyauth/certs/key.pem ]; then
-
-              openssl req \
-                -x509 \
-                -newkey rsa:2048 \
-                -sha256 \
-                -days 7300 \
-                -nodes \
-                -keyout /etc/proxyauth/certs/key.pem \
-                -out /etc/proxyauth/certs/cert.pem \
-                -subj "/CN=localhost" \
-                >/dev/null 2>&1
-
-              chmod 644 /etc/proxyauth/certs/cert.pem
-              chmod 640 /etc/proxyauth/certs/key.pem
-          fi
-
-          timeout 60 /usr/bin/proxyauth prepare >/dev/null 2>&1 || true
-
-          chown -R proxyauth:proxyauth /etc/proxyauth
-          chown -R proxyauth:proxyauth /opt/proxyauth
-          chown -R proxyauth:proxyauth /var/log/proxyauth
-
-          chmod 640 \
-            /var/log/proxyauth/proxyauth.log \
-            /var/log/proxyauth/proxyauth.err
-
-          systemctl daemon-reload >/dev/null 2>&1 || true
-          systemctl enable proxyauth.service >/dev/null 2>&1 || true
-          systemctl restart proxyauth.service >/dev/null 2>&1 || true
-
-          %preun
-          if [ "\$1" -eq 0 ]; then
-              systemctl stop proxyauth.service 2>/dev/null || true
-              systemctl disable proxyauth.service 2>/dev/null || true
-          fi
-
-          %postun
-          systemctl daemon-reload >/dev/null 2>&1 || true
-
-          %files
-          %attr(0755, root, root) /usr/bin/proxyauth
-          /usr/lib/systemd/system/proxyauth.service
-          /usr/lib/sysusers.d/proxyauth.conf
-          %dir %attr(0750, proxyauth, proxyauth) /etc/proxyauth
-          %dir %attr(0750, proxyauth, proxyauth) /etc/proxyauth/certs
-          %dir %attr(0750, proxyauth, proxyauth) /etc/proxyauth/certs/routes
-          %dir %attr(0750, proxyauth, proxyauth) /opt/proxyauth
-          %dir %attr(0750, proxyauth, proxyauth) /opt/proxyauth/db
-          %dir %attr(0750, proxyauth, proxyauth) /var/log/proxyauth
-          EOF
-
-          rpmbuild \
-            --define "_topdir $RPMROOT" \
-            -bb "$RPMROOT/SPECS/proxyauth.spec"
-
-          mkdir -p dist
-
-          find "$RPMROOT/RPMS" \
-            -type f \
-            -name '*.rpm' \
-            -exec cp {} dist/ \;
+          find "$RPMROOT/RPMS" -type f -name '*.rpm' -exec cp {} dist/ \;
 
           ls -lh dist/
 
           rpm -qip dist/*.rpm
           rpm -qlp dist/*.rpm
+          rpm -qp --scripts dist/*.rpm
 
       - name: Generate SHA256
         env:
@@ -1234,9 +1045,7 @@ jobs:
         run: |
           cd dist
 
-          sha256sum \
-            *.rpm \
-            > proxyauth_${VERSION}_fedora_rpm.sha256
+          sha256sum *.rpm > proxyauth_${VERSION}_fedora_rpm.sha256
 
           cat proxyauth_${VERSION}_fedora_rpm.sha256
 
@@ -1248,12 +1057,9 @@ jobs:
             dist/*.rpm
             dist/*.sha256
 
-  # ────────────────────────────────────────────────────────────────────
-  # CentOS Stream
-  # ────────────────────────────────────────────────────────────────────
   centos:
     name: CentOS Stream (.rpm)
-    needs: validate
+    needs: [validate, sources]
     if: ${{ inputs.centos }}
 
     runs-on: ubuntu-latest
@@ -1262,233 +1068,44 @@ jobs:
       image: quay.io/centos/centos:stream9
 
     steps:
-      - name: Install build dependencies
+      - name: Install packaging tools
         run: |
-          dnf -y update
-
-          # Le nodejs par défaut de CentOS Stream 9 est la v16, trop
-          # ancienne pour actions/checkout@v6 : on active le module 22.
           dnf -y module enable nodejs:22
+          dnf -y install nodejs rpm-build
 
-          # CRB (CodeReady Builder) : contient une partie des -devel.
-          # postgresql-devel retiré : libpq-devel suffit.
-          dnf -y install --allowerasing --enablerepo=crb \
-            nodejs \
-            git \
-            gcc \
-            gcc-c++ \
-            make \
-            pkg-config \
-            openssl-devel \
-            libpq-devel \
-            mariadb-connector-c-devel \
-            rpm-build \
-            ca-certificates \
-            curl \
-            file \
-            openssl
-
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Download bundle
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
-          ref: ${{ inputs.tag }}
+          name: proxyauth-${{ needs.validate.outputs.version }}-bundle
+          path: bundle
 
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
-
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Build ProxyAuth
-        shell: bash
-        run: |
-          cargo build --release --locked
-
-      - name: Verify binary
-        shell: bash
-        run: |
-          test -x target/release/proxyauth
-
-          ./target/release/proxyauth --version || true
-
-          file target/release/proxyauth
-
-          echo "Dynamic dependencies:"
-          ldd target/release/proxyauth || true
-
-      - name: Prepare RPM
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
+      - name: Build RPM
         shell: bash
         run: |
           set -euo pipefail
 
           RPMROOT="$PWD/rpmbuild"
 
-          mkdir -p "$RPMROOT"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          mkdir -p "$RPMROOT"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS} dist
 
-          install -m 0755 target/release/proxyauth "$RPMROOT/SOURCES/proxyauth"
+          cp bundle/proxyauth-src.tar.gz \
+             bundle/proxyauth-build \
+             bundle/proxyauth-wrapper \
+             bundle/toolchain \
+             bundle/proxyauth.service \
+             "$RPMROOT/SOURCES/"
 
-          cat > "$RPMROOT/SOURCES/proxyauth.service" <<'EOF'
-          [Unit]
-          Description=ProxyAuth Authentication Proxy
-          After=network.target
+          cp bundle/proxyauth.spec "$RPMROOT/SPECS/"
 
-          [Service]
-          Type=simple
+          rpmbuild --define "_topdir $RPMROOT" -bb "$RPMROOT/SPECS/proxyauth.spec"
 
-          User=proxyauth
-          Group=proxyauth
-
-          ExecStart=/usr/bin/proxyauth
-
-          AmbientCapabilities=CAP_NET_BIND_SERVICE
-          CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-          Restart=on-failure
-          RestartSec=5
-
-          Environment=RUST_LOG=info
-
-          WorkingDirectory=/opt/proxyauth
-
-          StandardOutput=append:/var/log/proxyauth/proxyauth.log
-          StandardError=append:/var/log/proxyauth/proxyauth.err
-
-          NoNewPrivileges=true
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          cat > "$RPMROOT/SOURCES/proxyauth.sysusers" <<'EOF'
-          u proxyauth - "ProxyAuth service user" /opt/proxyauth /usr/sbin/nologin
-          EOF
-
-          cat > "$RPMROOT/SPECS/proxyauth.spec" <<EOF
-          %global debug_package %{nil}
-
-          Name:           proxyauth
-          Version:        ${VERSION}
-          Release:        1%{?dist}
-          Summary:        ProxyAuth authentication gateway
-          License:        Apache-2.0
-          URL:            https://proxyauth.app
-          Packager:       Vladimir Souchet <staff@proxyauth.app>
-
-          Source0:        proxyauth
-          Source1:        proxyauth.service
-          Source2:        proxyauth.sysusers
-
-          Requires:       openssl
-          Requires:       ca-certificates
-          Requires:       systemd
-          Requires(pre):  shadow-utils
-          Requires(post): openssl
-
-          %description
-          Secure authentication gateway and reverse proxy written in Rust.
-
-          %prep
-
-          %build
-
-          %install
-          install -Dm0755 %{SOURCE0} %{buildroot}/usr/bin/proxyauth
-          install -Dm0644 %{SOURCE1} %{buildroot}/usr/lib/systemd/system/proxyauth.service
-          install -Dm0644 %{SOURCE2} %{buildroot}/usr/lib/sysusers.d/proxyauth.conf
-
-          install -dm0750 %{buildroot}/etc/proxyauth/certs/routes
-          install -dm0750 %{buildroot}/opt/proxyauth/db
-          install -dm0750 %{buildroot}/var/log/proxyauth
-
-          %pre
-          getent group proxyauth >/dev/null || \
-              groupadd --system proxyauth
-
-          getent passwd proxyauth >/dev/null || \
-              useradd \
-                --system \
-                --gid proxyauth \
-                --no-create-home \
-                --shell /usr/sbin/nologin \
-                proxyauth
-
-          exit 0
-
-          %post
-          touch /var/log/proxyauth/proxyauth.log
-          touch /var/log/proxyauth/proxyauth.err
-
-          if [ ! -f /etc/proxyauth/certs/cert.pem ] || \
-             [ ! -f /etc/proxyauth/certs/key.pem ]; then
-
-              openssl req \
-                -x509 \
-                -newkey rsa:2048 \
-                -sha256 \
-                -days 7300 \
-                -nodes \
-                -keyout /etc/proxyauth/certs/key.pem \
-                -out /etc/proxyauth/certs/cert.pem \
-                -subj "/CN=localhost" \
-                >/dev/null 2>&1
-
-              chmod 644 /etc/proxyauth/certs/cert.pem
-              chmod 640 /etc/proxyauth/certs/key.pem
-          fi
-
-          timeout 60 /usr/bin/proxyauth prepare >/dev/null 2>&1 || true
-
-          chown -R proxyauth:proxyauth /etc/proxyauth
-          chown -R proxyauth:proxyauth /opt/proxyauth
-          chown -R proxyauth:proxyauth /var/log/proxyauth
-
-          chmod 640 \
-            /var/log/proxyauth/proxyauth.log \
-            /var/log/proxyauth/proxyauth.err
-
-          systemctl daemon-reload >/dev/null 2>&1 || true
-          systemctl enable proxyauth.service >/dev/null 2>&1 || true
-          systemctl restart proxyauth.service >/dev/null 2>&1 || true
-
-          %preun
-          if [ "\$1" -eq 0 ]; then
-              systemctl stop proxyauth.service 2>/dev/null || true
-              systemctl disable proxyauth.service 2>/dev/null || true
-          fi
-
-          %postun
-          systemctl daemon-reload >/dev/null 2>&1 || true
-
-          %files
-          %attr(0755, root, root) /usr/bin/proxyauth
-          /usr/lib/systemd/system/proxyauth.service
-          /usr/lib/sysusers.d/proxyauth.conf
-          %dir %attr(0750, proxyauth, proxyauth) /etc/proxyauth
-          %dir %attr(0750, proxyauth, proxyauth) /etc/proxyauth/certs
-          %dir %attr(0750, proxyauth, proxyauth) /etc/proxyauth/certs/routes
-          %dir %attr(0750, proxyauth, proxyauth) /opt/proxyauth
-          %dir %attr(0750, proxyauth, proxyauth) /opt/proxyauth/db
-          %dir %attr(0750, proxyauth, proxyauth) /var/log/proxyauth
-          EOF
-
-          rpmbuild \
-            --define "_topdir $RPMROOT" \
-            -bb "$RPMROOT/SPECS/proxyauth.spec"
-
-          mkdir -p dist
-
-          find "$RPMROOT/RPMS" \
-            -type f \
-            -name '*.rpm' \
-            -exec cp {} dist/ \;
+          find "$RPMROOT/RPMS" -type f -name '*.rpm' -exec cp {} dist/ \;
 
           ls -lh dist/
 
           rpm -qip dist/*.rpm
           rpm -qlp dist/*.rpm
+          rpm -qp --scripts dist/*.rpm
 
       - name: Generate SHA256
         env:
@@ -1496,9 +1113,7 @@ jobs:
         run: |
           cd dist
 
-          sha256sum \
-            *.rpm \
-            > proxyauth_${VERSION}_rpm.sha256
+          sha256sum *.rpm > proxyauth_${VERSION}_rpm.sha256
 
           cat proxyauth_${VERSION}_rpm.sha256
 
@@ -1510,13 +1125,167 @@ jobs:
             dist/*.rpm
             dist/*.sha256
 
-  # ────────────────────────────────────────────────────────────────────
-  # Summary
-  # ────────────────────────────────────────────────────────────────────
+  publish:
+    name: Publish to Forgejo packages
+    needs: [validate, debian, alpine, arch, fedora, centos]
+    if: always() && inputs.publish && needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Debian package
+        if: needs.debian.result == 'success'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-debian
+          path: pkgs/debian
+
+      - name: Download Alpine package
+        if: needs.alpine.result == 'success'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-alpine
+          path: pkgs/alpine
+
+      - name: Download Arch package
+        if: needs.arch.result == 'success'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-arch
+          path: pkgs/arch
+
+      - name: Download Fedora package
+        if: needs.fedora.result == 'success'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-fedora
+          path: pkgs/fedora
+
+      - name: Download CentOS package
+        if: needs.centos.result == 'success'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-centos
+          path: pkgs/centos
+
+      - name: Upload to the registry
+        shell: bash
+        env:
+          AUDIENCE: ${{ vars.PACKAGES_AUDIENCE }}
+          SERVER: ${{ github.server_url }}
+          OWNER: ${{ github.repository_owner }}
+          ALPINE_BRANCH: ${{ needs.alpine.outputs.branch }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+
+          if [ -z "${AUDIENCE:-}" ]; then
+            echo "::error::Missing PACKAGES_AUDIENCE variable (the Audience of your Authorized Integration)"
+            exit 1
+          fi
+
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::No OpenID Connect token available — is 'enable-openid-connect: true' set in the workflow?"
+            exit 1
+          fi
+
+          JWT=$(curl -sS --fail \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" \
+            | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || JWT=""
+
+          if [ -z "$JWT" ]; then
+            echo "::error::Could not get a JWT from Forgejo"
+            exit 1
+          fi
+
+          echo "::add-mask::$JWT"
+
+          REGISTRY="$SERVER/api/packages/$OWNER"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          FAILED=0
+
+          upload() {
+            local file="$1" url="$2" code
+
+            code=$(curl -sS -o /tmp/response -w '%{http_code}' \
+              -H "Authorization: Bearer $JWT" \
+              -X PUT \
+              -H 'Content-Type: application/octet-stream' \
+              --data-binary "@$file" \
+              "$url") || code=000
+
+            case "$code" in
+              201) echo "Published $(basename "$file")" ;;
+              409) echo "::warning::$(basename "$file") is already in the registry — delete it there to publish it again" ;;
+              *)
+                echo "::error::Upload of $(basename "$file") failed (HTTP $code)"
+                cat /tmp/response
+                echo
+                FAILED=1
+                ;;
+            esac
+          }
+
+          link() {
+            local type="$1" code
+
+            code=$(curl -sS -o /tmp/response -w '%{http_code}' \
+              -H "Authorization: Bearer $JWT" \
+              -X POST \
+              "$SERVER/api/v1/packages/$OWNER/$type/proxyauth/-/link/$REPO_NAME") || code=000
+
+            case "$code" in
+              2*) echo "Linked the $type package to $GITHUB_REPOSITORY" ;;
+              *)  echo "::warning::Could not link the $type package to $GITHUB_REPOSITORY (HTTP $code) — link it once from the package settings page" ;;
+            esac
+          }
+
+          files=(pkgs/debian/*.deb)
+          if [ ${#files[@]} -gt 0 ]; then
+            for f in "${files[@]}"; do
+              upload "$f" "$REGISTRY/debian/pool/stable/main/upload"
+            done
+            link debian
+          fi
+
+          files=(pkgs/alpine/*.apk)
+          if [ ${#files[@]} -gt 0 ]; then
+            for f in "${files[@]}"; do
+              upload "$f" "$REGISTRY/alpine/$ALPINE_BRANCH/main"
+            done
+            link alpine
+          fi
+
+          files=(pkgs/arch/*.pkg.tar.zst)
+          if [ ${#files[@]} -gt 0 ]; then
+            for f in "${files[@]}"; do
+              upload "$f" "$REGISTRY/arch/proxyauth"
+            done
+            link arch
+          fi
+
+          rpm_published=0
+
+          for f in pkgs/fedora/*.rpm; do
+            upload "$f" "$REGISTRY/rpm/fedora/upload"
+            rpm_published=1
+          done
+
+          for f in pkgs/centos/*.rpm; do
+            upload "$f" "$REGISTRY/rpm/el9/upload"
+            rpm_published=1
+          done
+
+          if [ "$rpm_published" -eq 1 ]; then
+            link rpm
+          fi
+
+          exit "$FAILED"
+
   summary:
     name: Summary
     runs-on: ubuntu-latest
-    needs: [validate, debian, alpine, arch, fedora, centos]
+    needs: [validate, sources, debian, alpine, arch, fedora, centos, publish]
     if: always() && needs.validate.result == 'success'
 
     steps:
@@ -1524,21 +1293,23 @@ jobs:
         shell: bash
         run: |
           {
-            echo "### Paquets — ProxyAuth ${{ needs.validate.outputs.version }}"
+            echo "### Packages — ProxyAuth ${{ needs.validate.outputs.version }}"
             echo
-            echo "| Cible | Format | Résultat |"
+            echo "| Target | Format | Result |"
             echo "|---|---|---|"
+            echo "| Sources | bundle | ${{ needs.sources.result }} |"
             echo "| Debian / Ubuntu | .deb | ${{ needs.debian.result }} |"
             echo "| Alpine | .apk | ${{ needs.alpine.result }} |"
             echo "| Arch Linux | .pkg.tar.zst | ${{ needs.arch.result }} |"
             echo "| Fedora | .rpm | ${{ needs.fedora.result }} |"
             echo "| CentOS Stream | .rpm | ${{ needs.centos.result }} |"
+            echo "| Registry | publish | ${{ needs.publish.result }} |"
             echo
-            echo "Les artefacts sont attachés à cette exécution, un par cible."
+            echo "Artifacts are attached to this run, one per target."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail if any enabled target failed
         if: contains(needs.*.result, 'failure')
         run: |
-          echo "::error::Au moins un paquet n'a pas été produit — voir le récapitulatif"
+          echo "::error::At least one package was not produced — see the summary"
           exit 1
