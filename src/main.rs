@@ -631,11 +631,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let redirect_protect_url_ips: Arc<DashMap<String, (Vec<ipnet::IpNet>, Vec<ipnet::IpNet>)>> =
-        Arc::new(DashMap::new());
+    Arc::new(DashMap::new());
     let any_redirect_protect_urls = routes.routes.iter().any(|r| {
         r.redirect_protect
-            .as_ref()
-            .is_some_and(|rp| rp.allow_url_ips.is_some() || rp.deny_url_ips.is_some())
+        .as_ref()
+        .is_some_and(|rp| rp.allow_url_ips.is_some() || rp.deny_url_ips.is_some())
     });
     if any_redirect_protect_urls {
         let rp_config = Arc::clone(&config);
@@ -643,10 +643,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rp_store = Arc::clone(&redirect_protect_url_ips);
         tokio::spawn(async move {
             network::ipblocklist::refresh_redirect_protect_urls(&rp_routes.routes, &rp_store)
-                .await;
+            .await;
             println!(
                 "[redirect_protect] loaded url-fetched allow/deny lists for {} route(s)",
-                rp_store.len()
+                     rp_store.len()
             );
 
             if rp_config.redirect_protect_refresh_interval_secs == 0 {
@@ -659,10 +659,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 ticker.tick().await;
                 network::ipblocklist::refresh_redirect_protect_urls(&rp_routes.routes, &rp_store)
-                    .await;
+                .await;
                 println!(
                     "[redirect_protect] refreshed url-fetched allow/deny lists for {} route(s)",
-                    rp_store.len()
+                         rp_store.len()
                 );
             }
         });
@@ -702,10 +702,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &run_user,
                 run_group.as_deref(),
             )
-            .await
-            {
-                error!("stats socket ({}) stopped: {e}", socket_path.display());
-            }
+                .await
+                {
+                    error!("stats socket ({}) stopped: {e}", socket_path.display());
+                }
         });
     }
 
@@ -839,7 +839,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /etc/proxyauth/oidc and a signing key nothing will ever read.
     if routes.routes.iter().any(|r| r.oidc.is_some()) {
         proto::oidc_provider::jwt::init_signing_key()
-            .map_err(|e| format!("Failed to initialize OIDC provider signing key: {e}"))?;
+        .map_err(|e| format!("Failed to initialize OIDC provider signing key: {e}"))?;
     }
 
     // load SMTP template if smtp use
@@ -998,7 +998,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?
             }
 
-            "RATELIMIT_GLOBAL_ON" | "RATELIMIT_GLOBAL_OFF" => {
+            // RATELIMIT_GLOBAL_OFF (both limits at 0) deliberately falls
+            // through to the `_` arm below: this branch computes
+            // `1.0 / requests_per_second` for both limiters, and a 0 there
+            // is an infinite period that makes `Duration::from_secs_f64`
+            // panic at startup.
+            "RATELIMIT_GLOBAL_ON" => {
                 let seconds_per_request_auth =
                 Duration::from_secs_f64(1.0 / requests_per_second_auth_config as f64);
                 let governor_auth_conf = GovernorConfigBuilder::default()
