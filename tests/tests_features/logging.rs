@@ -1,9 +1,7 @@
 use actix_web::HttpMessage;
 use proxyauth::config::config::{RouteConfig, RouteRule};
-use proxyauth::config::logging::{
-    LoggingConfig, VhostLogging, LOG_DIR, DEFAULT_FORMAT,
-};
-use proxyauth::network::accesslog::{LogContext, RequiredFields, compile_format, Field, Segment};
+use proxyauth::config::logging::{DEFAULT_FORMAT, LOG_DIR, LoggingConfig, VhostLogging};
+use proxyauth::network::accesslog::{Field, LogContext, RequiredFields, Segment, compile_format};
 
 fn minimal_rule(prefix: &str) -> RouteRule {
     RouteRule {
@@ -127,7 +125,10 @@ fn vhost_enabled_disabled_entry() {
     let mut cfg = LoggingConfig::default();
     cfg.vhosts.insert(
         "quiet.example.com".into(),
-        VhostLogging { enabled: Some(false), ..Default::default() },
+        VhostLogging {
+            enabled: Some(false),
+            ..Default::default()
+        },
     );
     assert!(!cfg.vhost_enabled("quiet.example.com"));
     assert!(cfg.vhost_enabled("other.example.com"));
@@ -138,7 +139,10 @@ fn vhost_enabled_entry_without_explicit_toggle() {
     let mut cfg = LoggingConfig::default();
     cfg.vhosts.insert(
         "loud.example.com".into(),
-        VhostLogging { enabled: None, log_file: Some("loud.log".into()) },
+        VhostLogging {
+            enabled: None,
+            log_file: Some("loud.log".into()),
+        },
     );
     assert!(cfg.vhost_enabled("loud.example.com"));
 }
@@ -193,7 +197,10 @@ fn validate_log_paths_vhost_absolute_rejected() {
     let mut cfg = LoggingConfig::default();
     cfg.vhosts.insert(
         "bad.example.com".into(),
-        VhostLogging { enabled: None, log_file: Some("/etc/passwd".into()) },
+        VhostLogging {
+            enabled: None,
+            log_file: Some("/etc/passwd".into()),
+        },
     );
     assert!(cfg.validate_log_paths().is_err());
 }
@@ -203,7 +210,10 @@ fn validate_log_paths_vhost_traversal_rejected() {
     let mut cfg = LoggingConfig::default();
     cfg.vhosts.insert(
         "bad.example.com".into(),
-        VhostLogging { enabled: None, log_file: Some("../../escape.log".into()) },
+        VhostLogging {
+            enabled: None,
+            log_file: Some("../../escape.log".into()),
+        },
     );
     assert!(cfg.validate_log_paths().is_err());
 }
@@ -213,7 +223,10 @@ fn validate_log_paths_vhost_ok() {
     let mut cfg = LoggingConfig::default();
     cfg.vhosts.insert(
         "good.example.com".into(),
-        VhostLogging { enabled: None, log_file: Some("good.log".into()) },
+        VhostLogging {
+            enabled: None,
+            log_file: Some("good.log".into()),
+        },
     );
     assert!(cfg.validate_log_paths().is_ok());
 }
@@ -230,7 +243,10 @@ fn validate_log_paths_vhost_subdir_rejected() {
     let mut cfg = LoggingConfig::default();
     cfg.vhosts.insert(
         "bad.example.com".into(),
-        VhostLogging { enabled: None, log_file: Some("sub/file.log".into()) },
+        VhostLogging {
+            enabled: None,
+            log_file: Some("sub/file.log".into()),
+        },
     );
     assert!(cfg.validate_log_paths().is_err());
 }

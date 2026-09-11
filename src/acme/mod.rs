@@ -31,7 +31,9 @@ pub enum RenewOutcome {
     /// Not due yet, `renew_before_days` not reached — carries how many
     /// days are actually left. Never produced when `force: true` was
     /// passed to `check_and_maybe_renew`.
-    NotDue { days_left: i64 },
+    NotDue {
+        days_left: i64,
+    },
     Renewed,
     Failed(String),
 }
@@ -62,9 +64,7 @@ pub fn collect_managed_vhosts(routes: &[RouteRule]) -> Vec<ManagedVhost> {
                 wants_renewal.insert(host.to_ascii_lowercase());
             }
         }
-        if let (Some(cert), Some(key)) =
-            (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key"))
-        {
+        if let (Some(cert), Some(key)) = (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key")) {
             for host in &rule.vhost {
                 cert_paths
                     .entry(host.to_ascii_lowercase())
@@ -105,8 +105,7 @@ pub fn collect_all_vhost_certs(routes: &[RouteRule]) -> Vec<ManagedVhost> {
         if rule.vhost.is_empty() {
             continue;
         }
-        let Some((cert, key)) = rule.vhost_cert.get("cert").zip(rule.vhost_cert.get("key"))
-        else {
+        let Some((cert, key)) = rule.vhost_cert.get("cert").zip(rule.vhost_cert.get("key")) else {
             continue;
         };
         for host in &rule.vhost {
@@ -206,10 +205,11 @@ pub fn find_vhost_cert_paths(
         if !rule.vhost.iter().any(|h| h.to_ascii_lowercase() == vhost) {
             continue;
         }
-        if let (Some(cert), Some(key)) =
-            (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key"))
-        {
-            return Some((std::path::PathBuf::from(cert), std::path::PathBuf::from(key)));
+        if let (Some(cert), Some(key)) = (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key")) {
+            return Some((
+                std::path::PathBuf::from(cert),
+                std::path::PathBuf::from(key),
+            ));
         }
     }
     None
@@ -265,7 +265,6 @@ pub async fn check_and_maybe_renew(
     }
 }
 
-
 /// Runs one full scan over every `certbot_renew: true` vhost in
 /// `routes`, immediately (not on a timer) — used both by the periodic
 /// task below and available for a manual on-demand trigger if one is
@@ -291,8 +290,9 @@ pub async fn run_scan(routes: &[RouteRule], acme_cfg: &AcmeConfig) {
 /// everything else in config today except TLS certificates themselves.
 pub fn spawn_periodic_scan(routes: std::sync::Arc<Vec<RouteRule>>, acme_cfg: AcmeConfig) {
     tokio::spawn(async move {
-        let mut ticker =
-            tokio::time::interval(std::time::Duration::from_secs(acme_cfg.check_interval_secs.max(1)));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            acme_cfg.check_interval_secs.max(1),
+        ));
         ticker.tick().await; // first tick fires immediately; skip it, run_scan below covers startup
         run_scan(&routes, &acme_cfg).await; // check once right at startup too, don't wait a full interval
         loop {
@@ -312,8 +312,9 @@ mod tests {
         // serde default) — every other field does have one, but this
         // helper still needs to supply *something* for `prefix`
         // specifically.
-        let mut r: RouteRule = serde_json::from_str(r#"{"prefix": "/"}"#)
-            .expect("RouteRule must deserialize given just prefix — every other field has a serde default");
+        let mut r: RouteRule = serde_json::from_str(r#"{"prefix": "/"}"#).expect(
+            "RouteRule must deserialize given just prefix — every other field has a serde default",
+        );
         r.vhost = vhost.iter().map(|s| s.to_string()).collect();
         r.certbot_renew = certbot_renew;
         if let Some((cert, key)) = cert_kv {
@@ -330,7 +331,10 @@ mod tests {
         let routes = vec![rule(
             &["a.example.com"],
             true,
-            Some(("/etc/proxyauth/cert/a.example.com/fullchain.pem", "/etc/proxyauth/cert/a.example.com/privkey.pem")),
+            Some((
+                "/etc/proxyauth/cert/a.example.com/fullchain.pem",
+                "/etc/proxyauth/cert/a.example.com/privkey.pem",
+            )),
         )];
         let managed = collect_managed_vhosts(&routes);
         assert_eq!(managed.len(), 1);
@@ -347,7 +351,10 @@ mod tests {
             rule(
                 &["b.example.com"],
                 false,
-                Some(("/etc/proxyauth/cert/b.example.com/fullchain.pem", "/etc/proxyauth/cert/b.example.com/privkey.pem")),
+                Some((
+                    "/etc/proxyauth/cert/b.example.com/fullchain.pem",
+                    "/etc/proxyauth/cert/b.example.com/privkey.pem",
+                )),
             ),
         ];
         let managed = collect_managed_vhosts(&routes);
@@ -359,7 +366,10 @@ mod tests {
     fn skips_rew_without_any_cert_path() {
         let routes = vec![rule(&["c.example.com"], true, None)];
         let managed = collect_managed_vhosts(&routes);
-        assert!(managed.is_empty(), "no vhost_cert anywhere -> nothing to manage");
+        assert!(
+            managed.is_empty(),
+            "no vhost_cert anywhere -> nothing to manage"
+        );
     }
 
     #[test]
@@ -371,7 +381,10 @@ mod tests {
         let routes = vec![rule(
             &["d.example.com"],
             false,
-            Some(("/etc/proxyauth/cert/d.example.com/fullchain.pem", "/etc/proxyauth/cert/d.example.com/privkey.pem")),
+            Some((
+                "/etc/proxyauth/cert/d.example.com/fullchain.pem",
+                "/etc/proxyauth/cert/d.example.com/privkey.pem",
+            )),
         )];
         let managed = collect_managed_vhosts(&routes);
         assert!(managed.is_empty());
@@ -383,7 +396,10 @@ mod tests {
             rule(
                 &["e.example.com"],
                 true,
-                Some(("/etc/proxyauth/cert/e.example.com/fullchain.pem", "/etc/proxyauth/cert/e.example.com/privkey.pem")),
+                Some((
+                    "/etc/proxyauth/cert/e.example.com/fullchain.pem",
+                    "/etc/proxyauth/cert/e.example.com/privkey.pem",
+                )),
             ),
             rule(&["e.example.com"], true, None),
         ];
@@ -393,7 +409,10 @@ mod tests {
 
     #[test]
     fn days_until_expiry_none_for_missing_file() {
-        assert_eq!(days_until_expiry(std::path::Path::new("/nonexistent/path.pem")), None);
+        assert_eq!(
+            days_until_expiry(std::path::Path::new("/nonexistent/path.pem")),
+            None
+        );
     }
 
     #[test]
@@ -401,13 +420,22 @@ mod tests {
         let routes = vec![rule(
             &["f.example.com"],
             false, // certbot_renew NOT set — must still be found by name
-            Some(("/etc/proxyauth/cert/f.example.com/fullchain.pem", "/etc/proxyauth/cert/f.example.com/privkey.pem")),
+            Some((
+                "/etc/proxyauth/cert/f.example.com/fullchain.pem",
+                "/etc/proxyauth/cert/f.example.com/privkey.pem",
+            )),
         )];
         let found = find_vhost_cert_paths(&routes, "f.example.com");
         assert!(found.is_some());
         let (cert, key) = found.unwrap();
-        assert_eq!(cert, std::path::PathBuf::from("/etc/proxyauth/cert/f.example.com/fullchain.pem"));
-        assert_eq!(key, std::path::PathBuf::from("/etc/proxyauth/cert/f.example.com/privkey.pem"));
+        assert_eq!(
+            cert,
+            std::path::PathBuf::from("/etc/proxyauth/cert/f.example.com/fullchain.pem")
+        );
+        assert_eq!(
+            key,
+            std::path::PathBuf::from("/etc/proxyauth/cert/f.example.com/privkey.pem")
+        );
     }
 
     #[test]
@@ -428,7 +456,10 @@ mod tests {
             false,
             Some(("/cert/h/fullchain.pem", "/cert/h/privkey.pem")),
         )];
-        assert_eq!(find_vhost_cert_paths(&routes, "not-configured.example.com"), None);
+        assert_eq!(
+            find_vhost_cert_paths(&routes, "not-configured.example.com"),
+            None
+        );
     }
 
     #[test]

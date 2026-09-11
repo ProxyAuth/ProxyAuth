@@ -711,8 +711,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                         let mut any_failed = false;
                         for mv in &managed {
                             print!("{}: ", mv.vhost);
-                            match crate::acme::check_and_maybe_renew(mv, &config.acme, *force)
-                                .await
+                            match crate::acme::check_and_maybe_renew(mv, &config.acme, *force).await
                             {
                                 crate::acme::RenewOutcome::NotDue { days_left } => {
                                     println!(
@@ -773,7 +772,8 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 crate::cli::command::CertbotAction::Check { vhost } => {
-                    let targets: Vec<crate::acme::ManagedVhost> = if vhost.eq_ignore_ascii_case("all")
+                    let targets: Vec<crate::acme::ManagedVhost> = if vhost
+                        .eq_ignore_ascii_case("all")
                     {
                         crate::acme::collect_all_vhost_certs(&routes.routes)
                     } else {

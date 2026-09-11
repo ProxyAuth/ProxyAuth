@@ -132,7 +132,8 @@ mod tests {
 
     #[test]
     fn app_config_secret_is_preserved() {
-        let json = r#"{"token_expiry_seconds": 3600, "secret": "my-secret-key", "users": [], "log": {}}"#;
+        let json =
+            r#"{"token_expiry_seconds": 3600, "secret": "my-secret-key", "users": [], "log": {}}"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.secret, "my-secret-key");
     }
@@ -156,7 +157,10 @@ mod tests {
         let json = r#"{"token_expiry_seconds": 3600, "secret": "s", "users": [], "log": {}, "cors_origins": ["https://app.example.com"]}"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.cors_origins.as_ref().unwrap().len(), 1);
-        assert_eq!(cfg.cors_origins.as_ref().unwrap()[0], "https://app.example.com");
+        assert_eq!(
+            cfg.cors_origins.as_ref().unwrap()[0],
+            "https://app.example.com"
+        );
     }
 
     #[test]

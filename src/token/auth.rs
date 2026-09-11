@@ -217,7 +217,10 @@ pub async fn check_login_credentials<'a>(
     };
 
     if !is_ip_allowed(ip, matched_user) {
-        warn!("[{}] Access ip denied for user {}", ip, matched_user.username);
+        warn!(
+            "[{}] Access ip denied for user {}",
+            ip, matched_user.username
+        );
         return LoginResult::Denied("Access denied");
     }
 
@@ -237,7 +240,10 @@ pub async fn check_login_credentials<'a>(
 
     if login_via_otp_enabled {
         let Some(totp_code) = totp_code.map(|c| c.trim()).filter(|c| !c.is_empty()) else {
-            warn!("[{}] Missing TOTP code for user {}", ip, matched_user.username);
+            warn!(
+                "[{}] Missing TOTP code for user {}",
+                ip, matched_user.username
+            );
             return LoginResult::Denied("Missing TOTP code");
         };
 
@@ -248,19 +254,25 @@ pub async fn check_login_credentials<'a>(
         );
 
         let Some(totp_key) = resolved_otpkey.as_deref() else {
-            warn!("[{}] Missing TOTP secret for user {}", ip, matched_user.username);
+            warn!(
+                "[{}] Missing TOTP secret for user {}",
+                ip, matched_user.username
+            );
             return LoginResult::Denied("Missing TOTP secret");
         };
 
         let Some(decoded_secret) =
             base32::decode(base32::Alphabet::Rfc4648 { padding: false }, totp_key)
         else {
-            warn!("Invalid base32 TOTP secret for user {}", matched_user.username);
+            warn!(
+                "Invalid base32 TOTP secret for user {}",
+                matched_user.username
+            );
             return LoginResult::Denied("Internal TOTP error");
         };
 
-        let totp = TOTP::new(Algorithm::SHA512, 6, 0, 30, decoded_secret)
-            .expect("TOTP creation failed");
+        let totp =
+            TOTP::new(Algorithm::SHA512, 6, 0, 30, decoded_secret).expect("TOTP creation failed");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -336,8 +348,12 @@ pub fn establish_session(
     };
 
     let session_max_age = max_age_session_cookie.min(config.token_expiry_seconds);
-    let seconds = expiry.signed_duration_since(Utc::now()).num_seconds().max(0) as u64;
-    let max_age = actix_web::cookie::time::Duration::seconds(seconds.min(session_max_age as u64) as i64);
+    let seconds = expiry
+        .signed_duration_since(Utc::now())
+        .num_seconds()
+        .max(0) as u64;
+    let max_age =
+        actix_web::cookie::time::Duration::seconds(seconds.min(session_max_age as u64) as i64);
 
     let cookie = Cookie::build("session_token", token_encrypt.clone())
         .path("/")
@@ -649,7 +665,10 @@ pub async fn auth(
         .query()
         .and_then(|q| {
             let pairs: Vec<(String, String)> = serde_urlencoded::from_str(q).ok()?;
-            pairs.into_iter().find(|(k, _)| k == "return_to").map(|(_, v)| v)
+            pairs
+                .into_iter()
+                .find(|(k, _)| k == "return_to")
+                .map(|(_, v)| v)
         })
         .and_then(|v| validate_return_to(&v).map(|s| s.to_string()))
         .unwrap_or_else(|| login_redirect_target.to_string());
@@ -663,9 +682,7 @@ pub async fn auth(
         .map(|r| r.resolved_max_age_session_cookie(&data.config))
         .unwrap_or(data.config.max_age_session_cookie);
 
-    if session_cookie_enabled
-        && csrf_enabled
-        && !validate_csrf(&req, &payload, &data.config.secret)
+    if session_cookie_enabled && csrf_enabled && !validate_csrf(&req, &payload, &data.config.secret)
     {
         return render_error_page(&req, data.clone(), "invalid csrf request").await;
     }
@@ -885,7 +902,10 @@ pub async fn auth(
         let token_encrypt = match issue_token(&auth.username, index_user, &expiry_ts, &id_token) {
             Ok(t) => t,
             Err(e) => {
-                error!("[{}] failed to issue token for {}: {}", ip, auth.username, e);
+                error!(
+                    "[{}] failed to issue token for {}: {}",
+                    ip, auth.username, e
+                );
                 return HttpResponse::InternalServerError().finish();
             }
         };

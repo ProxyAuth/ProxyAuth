@@ -218,7 +218,11 @@ fn expand_mixed_groups_and_flat_routes() {
     let cfg = cfg.expand_vhost_groups();
 
     assert_eq!(cfg.routes.len(), 2);
-    let from_group = cfg.routes.iter().find(|r| r.prefix == "/from-group").unwrap();
+    let from_group = cfg
+        .routes
+        .iter()
+        .find(|r| r.prefix == "/from-group")
+        .unwrap();
     let flat = cfg.routes.iter().find(|r| r.prefix == "/flat").unwrap();
 
     assert_eq!(from_group.cache_duration_secs, Some(120));

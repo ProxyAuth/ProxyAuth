@@ -29,45 +29,70 @@ fn compression_file_static_empty_by_default() {
 
 #[test]
 fn compression_spawn_blocking_threshold_default() {
-    assert_eq!(CompressionConfig::default().spawn_blocking_threshold, 262_144);
+    assert_eq!(
+        CompressionConfig::default().spawn_blocking_threshold,
+        262_144
+    );
 }
 
 // ── effective_level ─────────────────────────────────────────────
 
 #[test]
 fn effective_level_no_static_returns_level() {
-    let cfg = CompressionConfig { level: 7, level_static: None, ..Default::default() };
+    let cfg = CompressionConfig {
+        level: 7,
+        level_static: None,
+        ..Default::default()
+    };
     assert_eq!(cfg.effective_level(false), 7);
 }
 
 #[test]
 fn effective_level_static_with_override() {
-    let cfg = CompressionConfig { level: 3, level_static: Some(9), ..Default::default() };
+    let cfg = CompressionConfig {
+        level: 3,
+        level_static: Some(9),
+        ..Default::default()
+    };
     assert_eq!(cfg.effective_level(true), 9);
 }
 
 #[test]
 fn effective_level_static_without_override() {
-    let cfg = CompressionConfig { level: 3, level_static: None, ..Default::default() };
+    let cfg = CompressionConfig {
+        level: 3,
+        level_static: None,
+        ..Default::default()
+    };
     assert_eq!(cfg.effective_level(true), 3);
 }
 
 #[test]
 fn effective_level_static_zero() {
-    let cfg = CompressionConfig { level: 5, level_static: Some(0), ..Default::default() };
+    let cfg = CompressionConfig {
+        level: 5,
+        level_static: Some(0),
+        ..Default::default()
+    };
     assert_eq!(cfg.effective_level(true), 0);
 }
 
 #[test]
 fn effective_level_clamping_gzip() {
-    let cfg = CompressionConfig { level: 999, ..Default::default() };
+    let cfg = CompressionConfig {
+        level: 999,
+        ..Default::default()
+    };
     let clamped = cfg.level.min(9);
     assert_eq!(clamped, 9);
 }
 
 #[test]
 fn effective_level_clamping_brotli() {
-    let cfg = CompressionConfig { level: 999, ..Default::default() };
+    let cfg = CompressionConfig {
+        level: 999,
+        ..Default::default()
+    };
     let clamped = cfg.level.min(11);
     assert_eq!(clamped, 11);
 }
@@ -76,19 +101,28 @@ fn effective_level_clamping_brotli() {
 
 #[test]
 fn is_static_file_matches_with_dot() {
-    let cfg = CompressionConfig { file_static: vec![".js".into()], ..Default::default() };
+    let cfg = CompressionConfig {
+        file_static: vec![".js".into()],
+        ..Default::default()
+    };
     assert!(cfg.is_static_file("/app.js"));
 }
 
 #[test]
 fn is_static_file_matches_without_dot() {
-    let cfg = CompressionConfig { file_static: vec!["js".into()], ..Default::default() };
+    let cfg = CompressionConfig {
+        file_static: vec!["js".into()],
+        ..Default::default()
+    };
     assert!(cfg.is_static_file("/app.js"));
 }
 
 #[test]
 fn is_static_file_case_insensitive() {
-    let cfg = CompressionConfig { file_static: vec![".JS".into()], ..Default::default() };
+    let cfg = CompressionConfig {
+        file_static: vec![".JS".into()],
+        ..Default::default()
+    };
     assert!(cfg.is_static_file("/app.js"));
     assert!(cfg.is_static_file("/app.JS"));
     assert!(cfg.is_static_file("/app.Js"));
@@ -96,7 +130,10 @@ fn is_static_file_case_insensitive() {
 
 #[test]
 fn is_static_file_no_match() {
-    let cfg = CompressionConfig { file_static: vec![".js".into()], ..Default::default() };
+    let cfg = CompressionConfig {
+        file_static: vec![".js".into()],
+        ..Default::default()
+    };
     assert!(!cfg.is_static_file("/app.css"));
 }
 
@@ -108,13 +145,19 @@ fn is_static_file_empty_list() {
 
 #[test]
 fn is_static_file_no_extension() {
-    let cfg = CompressionConfig { file_static: vec![".js".into()], ..Default::default() };
+    let cfg = CompressionConfig {
+        file_static: vec![".js".into()],
+        ..Default::default()
+    };
     assert!(!cfg.is_static_file("/noext"));
 }
 
 #[test]
 fn is_static_file_dot_only() {
-    let cfg = CompressionConfig { file_static: vec![".js".into()], ..Default::default() };
+    let cfg = CompressionConfig {
+        file_static: vec![".js".into()],
+        ..Default::default()
+    };
     assert!(!cfg.is_static_file("/file."));
 }
 
@@ -132,7 +175,10 @@ fn is_static_file_multiple_extensions() {
 
 #[test]
 fn is_static_file_trailing_slash_no_ext() {
-    let cfg = CompressionConfig { file_static: vec![".js".into()], ..Default::default() };
+    let cfg = CompressionConfig {
+        file_static: vec![".js".into()],
+        ..Default::default()
+    };
     assert!(!cfg.is_static_file("/assets/"));
 }
 
@@ -140,7 +186,10 @@ fn is_static_file_trailing_slash_no_ext() {
 
 #[test]
 fn merged_over_inherits_level_static() {
-    let global = CompressionConfig { level_static: Some(9), ..Default::default() };
+    let global = CompressionConfig {
+        level_static: Some(9),
+        ..Default::default()
+    };
     let route = CompressionConfig::default();
     let merged = route.merged_over(&global);
     assert_eq!(merged.level_static, Some(9));
@@ -148,15 +197,24 @@ fn merged_over_inherits_level_static() {
 
 #[test]
 fn merged_over_route_level_static_wins() {
-    let global = CompressionConfig { level_static: Some(5), ..Default::default() };
-    let route = CompressionConfig { level_static: Some(11), ..Default::default() };
+    let global = CompressionConfig {
+        level_static: Some(5),
+        ..Default::default()
+    };
+    let route = CompressionConfig {
+        level_static: Some(11),
+        ..Default::default()
+    };
     let merged = route.merged_over(&global);
     assert_eq!(merged.level_static, Some(11));
 }
 
 #[test]
 fn merged_over_inherits_file_static() {
-    let global = CompressionConfig { file_static: vec![".js".into(), ".css".into()], ..Default::default() };
+    let global = CompressionConfig {
+        file_static: vec![".js".into(), ".css".into()],
+        ..Default::default()
+    };
     let route = CompressionConfig::default();
     let merged = route.merged_over(&global);
     assert_eq!(merged.file_static, vec![".js", ".css"]);
@@ -164,15 +222,24 @@ fn merged_over_inherits_file_static() {
 
 #[test]
 fn merged_over_route_file_static_wins() {
-    let global = CompressionConfig { file_static: vec![".js".into()], ..Default::default() };
-    let route = CompressionConfig { file_static: vec![".svg".into()], ..Default::default() };
+    let global = CompressionConfig {
+        file_static: vec![".js".into()],
+        ..Default::default()
+    };
+    let route = CompressionConfig {
+        file_static: vec![".svg".into()],
+        ..Default::default()
+    };
     let merged = route.merged_over(&global);
     assert_eq!(merged.file_static, vec![".svg"]);
 }
 
 #[test]
 fn merged_over_inherits_enabled() {
-    let global = CompressionConfig { enabled: Some(true), ..Default::default() };
+    let global = CompressionConfig {
+        enabled: Some(true),
+        ..Default::default()
+    };
     let route = CompressionConfig::default();
     let merged = route.merged_over(&global);
     assert!(merged.is_enabled());
@@ -180,15 +247,24 @@ fn merged_over_inherits_enabled() {
 
 #[test]
 fn merged_over_route_enabled_wins() {
-    let global = CompressionConfig { enabled: Some(true), ..Default::default() };
-    let route = CompressionConfig { enabled: Some(false), ..Default::default() };
+    let global = CompressionConfig {
+        enabled: Some(true),
+        ..Default::default()
+    };
+    let route = CompressionConfig {
+        enabled: Some(false),
+        ..Default::default()
+    };
     let merged = route.merged_over(&global);
     assert!(!merged.is_enabled());
 }
 
 #[test]
 fn merged_over_inherits_level() {
-    let global = CompressionConfig { level: 9, ..Default::default() };
+    let global = CompressionConfig {
+        level: 9,
+        ..Default::default()
+    };
     let route = CompressionConfig::default();
     let merged = route.merged_over(&global);
     assert_eq!(merged.level, 9);
@@ -196,15 +272,24 @@ fn merged_over_inherits_level() {
 
 #[test]
 fn merged_over_route_nondefault_level_wins() {
-    let global = CompressionConfig { level: 3, ..Default::default() };
-    let route = CompressionConfig { level: 7, ..Default::default() };
+    let global = CompressionConfig {
+        level: 3,
+        ..Default::default()
+    };
+    let route = CompressionConfig {
+        level: 7,
+        ..Default::default()
+    };
     let merged = route.merged_over(&global);
     assert_eq!(merged.level, 7);
 }
 
 #[test]
 fn merged_over_inherits_min_size() {
-    let global = CompressionConfig { min_size: 4096, ..Default::default() };
+    let global = CompressionConfig {
+        min_size: 4096,
+        ..Default::default()
+    };
     let route = CompressionConfig::default();
     let merged = route.merged_over(&global);
     assert_eq!(merged.min_size, 4096);
@@ -212,7 +297,10 @@ fn merged_over_inherits_min_size() {
 
 #[test]
 fn merged_over_inherits_algorithm() {
-    let global = CompressionConfig { algorithm: Some("br".into()), ..Default::default() };
+    let global = CompressionConfig {
+        algorithm: Some("br".into()),
+        ..Default::default()
+    };
     let route = CompressionConfig::default();
     let merged = route.merged_over(&global);
     assert_eq!(merged.algorithms(), vec!["br"]);
@@ -220,15 +308,24 @@ fn merged_over_inherits_algorithm() {
 
 #[test]
 fn merged_over_route_algorithm_wins() {
-    let global = CompressionConfig { algorithm: Some("br".into()), ..Default::default() };
-    let route = CompressionConfig { algorithm: Some("gzip".into()), ..Default::default() };
+    let global = CompressionConfig {
+        algorithm: Some("br".into()),
+        ..Default::default()
+    };
+    let route = CompressionConfig {
+        algorithm: Some("gzip".into()),
+        ..Default::default()
+    };
     let merged = route.merged_over(&global);
     assert_eq!(merged.algorithms(), vec!["gzip"]);
 }
 
 #[test]
 fn merged_over_inherits_upstream_identity() {
-    let global = CompressionConfig { upstream_identity: Some(false), ..Default::default() };
+    let global = CompressionConfig {
+        upstream_identity: Some(false),
+        ..Default::default()
+    };
     let route = CompressionConfig::default();
     let merged = route.merged_over(&global);
     assert!(!merged.strips_upstream_accept_encoding());
@@ -236,7 +333,10 @@ fn merged_over_inherits_upstream_identity() {
 
 #[test]
 fn merged_over_inherits_spawn_blocking_threshold() {
-    let global = CompressionConfig { spawn_blocking_threshold: 512_000, ..Default::default() };
+    let global = CompressionConfig {
+        spawn_blocking_threshold: 512_000,
+        ..Default::default()
+    };
     let route = CompressionConfig::default();
     let merged = route.merged_over(&global);
     assert_eq!(merged.spawn_blocking_threshold, 512_000);
@@ -254,25 +354,37 @@ fn algorithms_default_order() {
 
 #[test]
 fn algorithms_comma_separated() {
-    let cfg = CompressionConfig { algorithm: Some("gzip, br".into()), ..Default::default() };
+    let cfg = CompressionConfig {
+        algorithm: Some("gzip, br".into()),
+        ..Default::default()
+    };
     assert_eq!(cfg.algorithms(), vec!["gzip", "br"]);
 }
 
 #[test]
 fn algorithms_single() {
-    let cfg = CompressionConfig { algorithm: Some("deflate".into()), ..Default::default() };
+    let cfg = CompressionConfig {
+        algorithm: Some("deflate".into()),
+        ..Default::default()
+    };
     assert_eq!(cfg.algorithms(), vec!["deflate"]);
 }
 
 #[test]
 fn algorithms_empty_string_falls_back() {
-    let cfg = CompressionConfig { algorithm: Some("".into()), ..Default::default() };
+    let cfg = CompressionConfig {
+        algorithm: Some("".into()),
+        ..Default::default()
+    };
     assert_eq!(cfg.algorithms(), vec!["br", "gzip", "deflate"]);
 }
 
 #[test]
 fn algorithms_whitespace_trimmed() {
-    let cfg = CompressionConfig { algorithm: Some("  gzip ,  br  ".into()), ..Default::default() };
+    let cfg = CompressionConfig {
+        algorithm: Some("  gzip ,  br  ".into()),
+        ..Default::default()
+    };
     assert_eq!(cfg.algorithms(), vec!["gzip", "br"]);
 }
 
@@ -285,7 +397,10 @@ fn upstream_identity_defaults_to_true() {
 
 #[test]
 fn upstream_identity_explicit_false() {
-    let cfg = CompressionConfig { upstream_identity: Some(false), ..Default::default() };
+    let cfg = CompressionConfig {
+        upstream_identity: Some(false),
+        ..Default::default()
+    };
     assert!(!cfg.strips_upstream_accept_encoding());
 }
 

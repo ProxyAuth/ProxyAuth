@@ -1,6 +1,6 @@
-use proxyauth::revoke::load::is_token_revoked;
-use proxyauth::revoke::db::RevokedTokenMap;
 use dashmap::DashMap;
+use proxyauth::revoke::db::RevokedTokenMap;
+use proxyauth::revoke::load::is_token_revoked;
 use std::sync::Arc;
 
 #[cfg(test)]

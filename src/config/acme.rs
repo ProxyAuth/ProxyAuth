@@ -87,9 +87,15 @@ mod tests {
         let cfg = AcmeConfig::default();
         assert_eq!(cfg.check_interval_secs, 3600);
         assert_eq!(cfg.renew_before_days, 30);
-        assert_eq!(cfg.directory_url, "https://acme-v02.api.letsencrypt.org/directory");
+        assert_eq!(
+            cfg.directory_url,
+            "https://acme-v02.api.letsencrypt.org/directory"
+        );
         assert!(cfg.contact_email.is_none());
-        assert_eq!(cfg.account_credentials_path, "/etc/proxyauth/acme/account.json");
+        assert_eq!(
+            cfg.account_credentials_path,
+            "/etc/proxyauth/acme/account.json"
+        );
     }
 
     #[test]

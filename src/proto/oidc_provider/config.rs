@@ -4,7 +4,11 @@
 use serde::{Deserialize, Serialize};
 
 fn default_oidc_scopes() -> Vec<String> {
-    vec!["openid".to_string(), "profile".to_string(), "email".to_string()]
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+    ]
 }
 
 /// Registers exactly one relying party (the backend sitting behind
