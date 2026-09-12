@@ -337,36 +337,24 @@ fn matches_route(path: &str, rule: &RouteRule) -> bool {
 /// exactly as before `regex` existed. Shared by `init_routes_order`
 /// (the common case, precomputed once) and `match_route_idx`'s
 /// fallback for when that cache isn't ready yet.
-/// A non-empty `vhost` list containing only wildcard patterns. An
-/// empty list (catch-all) is `false` — see `build_route_order` for
-/// why catch-alls keep their existing rank.
-fn wildcard_only_vhost(vhosts: &[String]) -> bool {
-    !vhosts.is_empty() && vhosts.iter().all(|v| is_wildcard_vhost(v))
-}
-
 fn build_route_order(routes: &[RouteRule]) -> Vec<usize> {
+    // NOTE: wildcard vhosts are deliberately NOT demoted here.
+    //
+    // An earlier version sorted routes whose `vhost` list was entirely
+    // wildcards after every other route. That was wrong in two ways.
+    // A mixed list — `["*.example.com", "example.com"]` — is not
+    // *entirely* wildcards, so it escaped the demotion completely and
+    // went on competing with a route naming a host exactly. And more
+    // fundamentally, whether a route matched a host exactly or through
+    // a pattern depends on the host being asked for: that same mixed
+    // list is an exact match for `example.com` and a wildcard match for
+    // `a.example.com`. A comparator run once at startup cannot express
+    // a per-request distinction.
+    //
+    // `match_route_idx` resolves it in two passes over this order
+    // instead — see there.
     let mut idx: Vec<usize> = (0..routes.len()).collect();
     idx.sort_by(|&i, &j| {
-        // A route whose `vhost` list is entirely wildcards is tried
-        // after every non-wildcard route, so an exact `git.example.com`
-        // always wins over a `*.example.com` that would also match —
-        // without this the winner would depend on routes.yml ordering
-        // and prefix length, which is precisely the class of bug the
-        // rest of this ordering exists to avoid.
-        //
-        // Deliberately does NOT demote catch-all (empty `vhost`)
-        // routes: they rank alongside exact ones, exactly as before
-        // wildcards existed, so no existing configuration changes
-        // behaviour.
-        let wi = wildcard_only_vhost(&routes[i].vhost);
-        let wj = wildcard_only_vhost(&routes[j].vhost);
-        if wi != wj {
-            return if wi {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            };
-        }
         let ri = routes[i].regex_compiled.is_some();
         let rj = routes[j].regex_compiled.is_some();
         match (ri, rj) {
@@ -848,15 +836,52 @@ pub fn request_host(req: &HttpRequest) -> Option<String> {
 /// catch-all route can share the same prefix: whichever is reached
 /// first in prefix-length order wins, so put the more specific one
 /// first in `routes.yml` if both could otherwise match.
+/// Whether `routes[i]` is eligible on this pass — see
+/// `match_route_idx` for what the two passes are.
+///
+/// Pass one accepts a route that names `host` literally, and a
+/// catch-all (empty `vhost`). Catch-alls are deliberately kept in the
+/// first pass rather than demoted alongside wildcards: they ranked
+/// alongside exact routes before wildcards existed, and moving them
+/// would silently change the behaviour of configurations written
+/// before any of this.
+///
+/// Pass two accepts anything `vhost_matches` accepts, which adds
+/// exactly the wildcard matches.
+fn eligible_on_pass(host: Option<&str>, rule: &RouteRule, exact_pass: bool) -> bool {
+    if exact_pass {
+        rule.vhost.is_empty() || vhost_matches_exactly(host, &rule.vhost)
+    } else {
+        vhost_matches(host, &rule.vhost)
+    }
+}
+
+/// Finds the route index serving `raw_path` on `host`.
+///
+/// Two passes over the precomputed order. The first considers only
+/// routes naming `host` literally (plus catch-alls); the second adds
+/// routes matching it through a `*.` pattern. A host named explicitly
+/// anywhere in `routes.yml` therefore always wins over a pattern that
+/// would also cover it — regardless of file order, prefix length, and
+/// regardless of whether the pattern sits in a list that also contains
+/// literal names.
+///
+/// That last point is why this is two passes rather than a sort key:
+/// `["*.example.com", "example.com"]` is an exact match for
+/// `example.com` and a wildcard match for `a.example.com`, so the
+/// distinction only exists once the requested host is known.
 pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule]) -> Option<usize> {
     {
         let guard = ORDERED_ROUTE_IDX.read().unwrap();
         if let Some(order) = guard.as_ref() {
             if order.iter().all(|&i| i < routes.len()) {
-                for &i in order {
-                    if vhost_matches(host, &routes[i].vhost) && matches_route(raw_path, &routes[i])
-                    {
-                        return Some(i);
+                for exact_pass in [true, false] {
+                    for &i in order {
+                        if eligible_on_pass(host, &routes[i], exact_pass)
+                            && matches_route(raw_path, &routes[i])
+                        {
+                            return Some(i);
+                        }
                     }
                 }
                 return None;
@@ -865,9 +890,12 @@ pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule])
     }
 
     let idx = build_route_order(routes);
-    for &i in &idx {
-        if vhost_matches(host, &routes[i].vhost) && matches_route(raw_path, &routes[i]) {
-            return Some(i);
+    for exact_pass in [true, false] {
+        for &i in &idx {
+            if eligible_on_pass(host, &routes[i], exact_pass) && matches_route(raw_path, &routes[i])
+            {
+                return Some(i);
+            }
         }
     }
     None
