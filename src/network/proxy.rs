@@ -12,12 +12,12 @@ use crate::token::csrf::{fix_mime_actix, inject_csrf_token, validate_csrf_token}
 use crate::token::security::apply_filters_regex_allow_only;
 use crate::token::security::validate_token;
 use crate::{AppConfig, AppState};
-use actix_web::body::{BodySize, MessageBody};
 use actix_web::{
     Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
     web,
 };
-use http_body_util::{BodyExt, Empty, Full};
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, BodyStream, Empty, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::USER_AGENT;
 use hyper::http::request::Builder;
@@ -28,10 +28,8 @@ use regex::Regex;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::path::Path;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::RwLock;
-use std::task::{Context, Poll};
 use tokio::time::{Duration, timeout};
 use tracing::warn;
 
@@ -39,7 +37,7 @@ static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock
 
 fn to_actix_status(s: hyper::StatusCode) -> actix_web::http::StatusCode {
     actix_web::http::StatusCode::from_u16(s.as_u16())
-        .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)
+    .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn norm_len(prefix: &str) -> usize {
@@ -67,7 +65,7 @@ fn is_method_allowed(allowed: Option<&[String]>, method: &str) -> bool {
 static ALWAYS_TRUSTED: Lazy<Vec<IpNet>> = Lazy::new(|| {
     vec![
         "127.0.0.0/8".parse().unwrap(), // IPv4 loopback range
-        "::1/128".parse().unwrap(),     // IPv6 loopback
+                                                    "::1/128".parse().unwrap(),     // IPv6 loopback
     ]
 });
 
@@ -80,10 +78,10 @@ fn build_allow_header(allowed: Option<&[String]>) -> String {
                 return ALL.to_string();
             }
             let mut v: Vec<String> = list
-                .iter()
-                .map(|s| s.trim().to_ascii_uppercase())
-                .filter(|s| !s.is_empty())
-                .collect();
+            .iter()
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
             v.sort();
             v.dedup();
             if !v.iter().any(|s| s == "OPTIONS") {
@@ -128,18 +126,18 @@ pub fn compile_filters_on_routes(routes: &mut [RouteRule]) {
 pub fn compile_ip_lists_on_routes(routes: &mut [RouteRule]) {
     fn parse_all(prefix: &str, field: &str, entries: &[String]) -> Vec<IpNet> {
         entries
-            .iter()
-            .map(|entry| {
-                entry
-                    .parse::<IpNet>()
-                    .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "routes.yml: route \"{prefix}\": invalid entry \"{entry}\" in `{field}` — expected an IP address (e.g. \"10.0.0.5\") or a CIDR network (e.g. \"192.168.1.0/24\")"
-                        )
-                    })
+        .iter()
+        .map(|entry| {
+            entry
+            .parse::<IpNet>()
+            .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "routes.yml: route \"{prefix}\": invalid entry \"{entry}\" in `{field}` — expected an IP address (e.g. \"10.0.0.5\") or a CIDR network (e.g. \"192.168.1.0/24\")"
+                )
             })
-            .collect()
+        })
+        .collect()
     }
 
     for r in routes.iter_mut() {
@@ -191,21 +189,37 @@ pub fn validate_route_log_files(routes: &[RouteRule]) {
             if p.is_absolute() {
                 panic!(
                     "routes.yml: route \"{}\": log_file must be a relative filename, not an absolute path (got \"{}\")",
-                    rule.prefix, lf
+                       rule.prefix, lf
                 );
             }
             if lf.contains("..") {
                 panic!(
                     "routes.yml: route \"{}\": log_file must not contain path traversal (got \"{}\")",
-                    rule.prefix, lf
+                       rule.prefix, lf
                 );
             }
             if p.components().count() > 1 {
                 panic!(
                     "routes.yml: route \"{}\": log_file must be a single filename, not a path (got \"{}\")",
-                    rule.prefix, lf
+                       rule.prefix, lf
                 );
             }
+        }
+    }
+}
+
+/// Warns for every route asking for `streaming` while a body rewrite
+/// is active on it — the rewrite wins and streaming is ignored. A
+/// warning rather than a panic: the combination is contradictory but
+/// not dangerous, and refusing to boot over it would be out of
+/// proportion.
+pub fn validate_streaming_on_routes(routes: &[RouteRule]) {
+    for r in routes {
+        if r.streaming_enabled() && (r.tag_proxyauth_enabled() || r.has_hidden_blocks()) {
+            warn!(
+                "routes.yml: route \"{}\": `streaming` is ignored — `tag_proxyauth` or `hidden_blocks` rewrites the response body, which requires buffering it",
+                r.prefix
+            );
         }
     }
 }
@@ -215,6 +229,7 @@ pub fn init_routes(routes: &mut [RouteRule]) {
     compile_ip_lists_on_routes(routes);
     compile_regex_on_routes(routes);
     validate_route_log_files(routes);
+    validate_streaming_on_routes(routes);
     init_routes_order(routes);
 }
 
@@ -290,8 +305,8 @@ fn authority_of(s: &str) -> Option<String> {
         format!("http://{s}")
     };
     Uri::from_str(&normalized)
-        .ok()
-        .and_then(|u| u.authority().map(|a| a.to_string()))
+    .ok()
+    .and_then(|u| u.authority().map(|a| a.to_string()))
 }
 
 /// Guards against a regex capture smuggling a *different host* into a
@@ -329,23 +344,23 @@ fn build_route_order(routes: &[RouteRule]) -> Vec<usize> {
         let rj = routes[j].regex_compiled.is_some();
         match (ri, rj) {
             (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            (true, true) => i.cmp(&j),
-            (false, false) => {
-                let pi = routes[i].prefix.as_str();
-                let pj = routes[j].prefix.as_str();
-                let root_i = pi == "/";
-                let root_j = pj == "/";
-                match (root_i, root_j) {
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    _ => {
-                        let li = norm_len(pi);
-                        let lj = norm_len(pj);
-                        if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+                (false, true) => std::cmp::Ordering::Greater,
+                (true, true) => i.cmp(&j),
+                (false, false) => {
+                    let pi = routes[i].prefix.as_str();
+                    let pj = routes[j].prefix.as_str();
+                    let root_i = pi == "/";
+                    let root_j = pj == "/";
+                    match (root_i, root_j) {
+                        (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => {
+                    let li = norm_len(pi);
+                    let lj = norm_len(pj);
+                    if li != lj { lj.cmp(&li) } else { pi.cmp(pj) }
+                }
                     }
                 }
-            }
         }
     });
     idx
@@ -392,7 +407,7 @@ fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, ru
         // this achieves instead.
         if let (Ok(header_name), Ok(header_value)) = (
             actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
-            actix_web::http::header::HeaderValue::from_str(value),
+                                                      actix_web::http::header::HeaderValue::from_str(value),
         ) {
             builder.insert_header((header_name, header_value));
         } else {
@@ -427,7 +442,7 @@ fn apply_custom_headers(resp: &mut HttpResponse, rule: &RouteRule) {
     for (name, value) in &rule.headers {
         if let (Ok(header_name), Ok(header_value)) = (
             actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
-            actix_web::http::header::HeaderValue::from_str(value),
+                                                      actix_web::http::header::HeaderValue::from_str(value),
         ) {
             resp.headers_mut().insert(header_name, header_value);
         } else {
@@ -456,30 +471,30 @@ pub async fn extract_username_for_tags(
     ip: &str,
 ) -> Option<String> {
     let token = req
-        .headers()
-        .get("Authorization")
+    .headers()
+    .get("Authorization")
+    .and_then(|v| v.to_str().ok())
+    .and_then(|s| s.strip_prefix("Bearer "))
+    .map(str::to_string)
+    .or_else(|| {
+        if !is_secure_request(req, &data.config) {
+            return None;
+        }
+        req.headers()
+        .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(str::to_string)
-        .or_else(|| {
-            if !is_secure_request(req, &data.config) {
-                return None;
-            }
-            req.headers()
-                .get(header::COOKIE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|cookie_str| {
-                    cookie_str.split(';').find_map(|cookie| {
-                        let cookie = cookie.trim();
-                        let (key, value) = cookie.split_once('=')?;
-                        if key.trim() == "session_token" {
-                            Some(value.trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                })
-        })?;
+        .and_then(|cookie_str| {
+            cookie_str.split(';').find_map(|cookie| {
+                let cookie = cookie.trim();
+                let (key, value) = cookie.split_once('=')?;
+                if key.trim() == "session_token" {
+                    Some(value.trim().to_string())
+                } else {
+                    None
+                }
+            })
+        })
+    })?;
 
     match crate::token::security::validate_token(&token, data, &data.config, ip).await {
         Ok((username, _token_id, time_expire)) if time_expire > 0 => Some(username),
@@ -503,26 +518,22 @@ pub async fn extract_username_for_tags(
 /// every call in this process — read directly from `crate::VERSION`/
 /// `crate::ID` rather than needing to be threaded through as
 /// parameters too.
-pub fn substitute_proxyauth_tags(
-    content: &str,
-    username: Option<&str>,
-    csrf_token: Option<&str>,
-) -> String {
+pub fn substitute_proxyauth_tags(content: &str, username: Option<&str>, csrf_token: Option<&str>) -> String {
     let mut out = content.to_string();
     if let Some(u) = username {
         out = out.replace("{{ username }}", u).replace("{{username}}", u);
     }
     if let Some(t) = csrf_token {
         out = out
-            .replace("{{ csrf_token }}", t)
-            .replace("{{csrf_token}}", t);
+        .replace("{{ csrf_token }}", t)
+        .replace("{{csrf_token}}", t);
     }
     out = out
-        .replace("{{ proxyauth_version }}", crate::VERSION)
-        .replace("{{proxyauth_version}}", crate::VERSION);
+    .replace("{{ proxyauth_version }}", crate::VERSION)
+    .replace("{{proxyauth_version}}", crate::VERSION);
     out = out
-        .replace("{{ proxyauth_id }}", crate::ID)
-        .replace("{{proxyauth_id}}", crate::ID);
+    .replace("{{ proxyauth_id }}", crate::ID)
+    .replace("{{proxyauth_id}}", crate::ID);
     out
 }
 
@@ -604,9 +615,9 @@ async fn apply_hidden_blocks(
 
     for pp in &rp.paths {
         let matches = pp
-            .regex_compiled
-            .as_ref()
-            .is_some_and(|re| re.is_match(request_path));
+        .regex_compiled
+        .as_ref()
+        .is_some_and(|re| re.is_match(request_path));
         if !matches || pp.hidden_blocks.is_empty() {
             continue;
         }
@@ -620,9 +631,9 @@ async fn apply_hidden_blocks(
             pp.type_return,
             pp.expected_status,
             pp.expected_field.as_deref(),
-            pp.expected_value.as_deref(),
-            req,
-            data,
+                                                  pp.expected_value.as_deref(),
+                                                  req,
+                                                  data,
         )
         .await;
         for hb in &pp.hidden_blocks {
@@ -655,7 +666,7 @@ async fn apply_hidden_blocks(
 /// generate. See `tests_network/proxy.rs` for the regression test.
 pub fn resolve_tag_csrf_token(rule: &RouteRule, config: &AppConfig) -> Option<String> {
     rule.csrf_enabled(config)
-        .then(|| crate::token::csrf::make_csrf_token(&config.secret))
+    .then(|| crate::token::csrf::make_csrf_token(&config.secret))
 }
 
 /// A route with an empty `vhost` list is a catch-all — it matches
@@ -692,8 +703,8 @@ pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
 pub fn find_vhost_route<'a>(host: Option<&str>, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
     let host = host?;
     routes
-        .iter()
-        .find(|r| !r.vhost.is_empty() && vhost_matches(Some(host), &r.vhost))
+    .iter()
+    .find(|r| !r.vhost.is_empty() && vhost_matches(Some(host), &r.vhost))
 }
 
 /// Finds the route that should actually *serve* `path` on `host` —
@@ -838,15 +849,15 @@ pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
     matches!(
         name,
         "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "te"
-            | "trailer"
-            | "upgrade"
-            | "keep-alive"
-            | "proxy-connection"
-            | "proxy-authenticate"
-            | "proxy-authorization"
+        | "content-length"
+        | "transfer-encoding"
+        | "te"
+        | "trailer"
+        | "upgrade"
+        | "keep-alive"
+        | "proxy-connection"
+        | "proxy-authenticate"
+        | "proxy-authorization"
     )
 }
 
@@ -866,9 +877,9 @@ fn is_trusted_peer(req: &HttpRequest, config: &AppConfig) -> bool {
         None => false,
         Some(trusted) => trusted.iter().any(|entry| {
             entry.parse::<IpAddr>().map_or(false, |ip| ip == peer_ip)
-                || entry
-                    .parse::<IpNet>()
-                    .map_or(false, |net| net.contains(&peer_ip))
+            || entry
+            .parse::<IpNet>()
+            .map_or(false, |net| net.contains(&peer_ip))
         }),
     }
 }
@@ -883,133 +894,63 @@ pub fn client_ip(req: &HttpRequest, config: &AppConfig) -> Option<IpAddr> {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.split(',').next())
             .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        {
-            return Some(ip);
-        }
-        if let Some(ip) = req
-            .headers()
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        {
-            return Some(ip);
-        }
+            {
+                return Some(ip);
+            }
+            if let Some(ip) = req
+                .headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                {
+                    return Some(ip);
+                }
     }
 
     peer_ip
 }
 
-async fn incoming_to_boxbody(
-    res: hyper::Response<Incoming>,
-) -> Result<hyper::Response<BoxBody>, hyper::Error> {
+/// Response-side body type. Distinct from `BoxBody` (whose error type
+/// is `Infallible`, correct for the *request* bodies this proxy builds
+/// itself): a streamed upstream response can fail mid-body, so its
+/// error type has to be able to represent that.
+type ResponseBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+/// Boxes the upstream response without reading its body — the body
+/// stays a lazy stream, pulled as the client consumes it. The previous
+/// version called `collect().await` here, loading the entire response
+/// into memory before emitting a single byte: on a git packfile of a
+/// few hundred MB that is as much RAM pinned per concurrent request,
+/// plus a first-byte delay equal to the whole transfer.
+fn incoming_to_boxbody(res: hyper::Response<Incoming>) -> hyper::Response<ResponseBody> {
     let (parts, body) = res.into_parts();
-    let bytes = body.collect().await?.to_bytes();
-    let boxed: BoxBody = Full::new(bytes).map_err(|e: Infallible| e).boxed();
-    Ok(hyper::Response::from_parts(parts, boxed))
+    hyper::Response::from_parts(parts, body.boxed())
 }
 
-/// Where a proxied response's body comes from: already read fully
-/// into memory (`Buffered` — the failover path, which has to buffer
-/// so it can still retry another backend, and every response
-/// ProxyAuth may rewrite), or still arriving from the backend
-/// (`Streaming` — relayed to the client as it arrives, see
-/// `can_stream_response`).
-enum UpstreamBody {
-    Buffered(BoxBody),
-    Streaming(Incoming),
+/// Widens a `BoxBody` (error type `Infallible`) into a `ResponseBody`.
+/// `match e {}` is the standard way to discharge an `Infallible` — the
+/// value can never exist, so there is no arm to write.
+fn widen_boxbody(res: hyper::Response<BoxBody>) -> hyper::Response<ResponseBody> {
+    let (parts, body) = res.into_parts();
+    hyper::Response::from_parts(parts, body.map_err(|e: Infallible| match e {}).boxed())
 }
 
-/// Whether a backend response can be relayed to the client as it
-/// arrives instead of being read fully into memory first.
-///
-/// Only HTML is ever rewritten on its way back — `inject_csrf_token`,
-/// `substitute_proxyauth_tags` and `apply_hidden_blocks` all check
-/// for an HTML content type before touching the body — so every other
-/// response (package files, archives, images, video, JSON…) can be
-/// streamed. A large download then costs a few network buffers of
-/// memory instead of its full size, and the client starts receiving
-/// bytes before the backend has finished sending them.
-///
-/// HEAD responses, bodiless statuses (1xx, 204, 304) and server errors
-/// (which get replaced by ProxyAuth's own 500 anyway) keep the
-/// buffered path, exactly as before.
-fn can_stream_response(
-    headers: &hyper::HeaderMap,
-    status: hyper::StatusCode,
-    is_head: bool,
-) -> bool {
-    if is_head
-        || status.is_informational()
-        || status == hyper::StatusCode::NO_CONTENT
-        || status == hyper::StatusCode::NOT_MODIFIED
-        || status.is_server_error()
-    {
-        return false;
-    }
-
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let main_type = content_type.split(';').next().unwrap_or("").trim();
-
-    !(main_type.starts_with("text/html") || main_type.ends_with("+html"))
-}
-
-/// The backend's `Content-Length`, when it sent a valid one.
-fn upstream_content_length(headers: &hyper::HeaderMap) -> Option<u64> {
-    headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-}
-
-/// Relays a backend's response body to the client chunk by chunk, as
-/// it arrives. `size` is the backend's `Content-Length` when it sent
-/// one, so the client still receives a length rather than a chunked
-/// response (and download progress bars keep working). If the backend
-/// connection fails midway, actix aborts the client connection — the
-/// client sees a truncated transfer, never a silently incomplete one.
-struct StreamedUpstreamBody {
-    inner: Pin<Box<Incoming>>,
-    size: Option<u64>,
-}
-
-impl MessageBody for StreamedUpstreamBody {
-    type Error = hyper::Error;
-
-    fn size(&self) -> BodySize {
-        match self.size {
-            Some(n) => BodySize::Sized(n),
-            None => BodySize::Stream,
+/// Adapts an `http_body::Body` into the `Stream` that
+/// `HttpResponse::streaming` expects. Trailer frames are dropped —
+/// actix has no way to emit them to the client.
+fn body_to_actix_stream<B>(
+    body: B,
+) -> impl futures_util::Stream<Item = Result<Bytes, Box<dyn std::error::Error + 'static>>>
+where
+B: hyper::body::Body<Data = Bytes> + Send + 'static,
+B::Error: std::error::Error + Send + Sync + 'static,
+{
+    BodyStream::new(body).filter_map(|frame| async move {
+        match frame {
+            Ok(f) => f.into_data().ok().map(Ok),
+                                     Err(e) => Some(Err(Box::new(e) as Box<dyn std::error::Error + 'static>)),
         }
-    }
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Bytes, Self::Error>>> {
-        let this = self.get_mut();
-
-        loop {
-            match hyper::body::Body::poll_frame(this.inner.as_mut(), cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(Some(Ok(frame))) => {
-                    // Trailer frames and empty data frames carry nothing
-                    // actix can relay through a body — skip to the next
-                    // frame.
-                    if let Ok(data) = frame.into_data() {
-                        if !data.is_empty() {
-                            return Poll::Ready(Some(Ok(data)));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    })
 }
 
 /// Very small extension → MIME map, good enough for the kind of static
@@ -1038,15 +979,15 @@ async fn serve_redirect_protect_page(path: &str) -> HttpResponse {
         Ok(bytes) => {
             let content_type = guess_content_type(path_ref);
             HttpResponse::ServiceUnavailable()
-                .append_header(("server", "ProxyAuth"))
-                .content_type(content_type)
-                .body(bytes)
+            .append_header(("server", "ProxyAuth"))
+            .content_type(content_type)
+            .body(bytes)
         }
         Err(e) => {
             warn!("redirect_protect: path {path:?} is not readable: {e}");
             HttpResponse::InternalServerError()
-                .append_header(("server", "ProxyAuth"))
-                .body("500 Internal Server Error")
+            .append_header(("server", "ProxyAuth"))
+            .body("500 Internal Server Error")
         }
     }
 }
@@ -1064,10 +1005,10 @@ async fn proxy_to_redirect_protect_target(
     data: &web::Data<AppState>,
 ) -> Option<HttpResponse> {
     let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    .uri()
+    .path_and_query()
+    .map(|pq| pq.as_str())
+    .unwrap_or("/");
     let uri_str = format!("{}{}", target.trim_end_matches('/'), path_and_query);
     let uri = match Uri::from_str(&uri_str) {
         Ok(uri) => uri,
@@ -1093,21 +1034,23 @@ async fn proxy_to_redirect_protect_target(
             || name_str == "x-user"
             || name_str == "x-user-roles"
             || name_str == "x-groups"
-        {
-            continue;
-        }
-        // `name`/`value` are actix_web's own header types, backed by
-        // a different major version of the `http` crate than hyper
-        // uses here — no direct conversion exists between the two,
-        // so this goes through raw bytes instead, the same way the
-        // normal proxied-request path already does elsewhere in this
-        // file.
-        if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-            request_builder = request_builder.header(name_str, hv);
-        }
+            {
+                continue;
+            }
+            // `name`/`value` are actix_web's own header types, backed by
+            // a different major version of the `http` crate than hyper
+            // uses here — no direct conversion exists between the two,
+            // so this goes through raw bytes instead, the same way the
+            // normal proxied-request path already does elsewhere in this
+            // file.
+            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
+                request_builder = request_builder.header(name_str, hv);
+            }
     }
 
-    let hyper_req = request_builder.body(Full::new(body.clone()).boxed()).ok()?;
+    let hyper_req = request_builder
+    .body(Full::new(Bytes::from(body.to_vec())).boxed())
+    .ok()?;
 
     let client_opts = ClientOptions {
         use_proxy: false,
@@ -1122,12 +1065,7 @@ async fn proxy_to_redirect_protect_target(
     // meant to actually serve the response body a blocked visitor
     // sees, not a quick internal check, so it gets the same budget a
     // real backend request would.
-    let resp = match timeout(
-        data.config.backend_timeout_duration(),
-        client.request(hyper_req),
-    )
-    .await
-    {
+    let resp = match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
         Ok(Ok(resp)) => resp,
         _ => return None,
     };
@@ -1174,8 +1112,8 @@ async fn resolve_redirect_protect_response(
         // rather than serving the route's real content, which would
         // defeat the entire point of the gate having matched at all.
         None => HttpResponse::ServiceUnavailable()
-            .append_header(("server", "ProxyAuth"))
-            .body("503 Service Unavailable"),
+        .append_header(("server", "ProxyAuth"))
+        .body("503 Service Unavailable"),
     }
 }
 
@@ -1286,8 +1224,8 @@ async fn check_backend_session(
             const MAX_CHECK_BODY_BYTES: u64 = 65536;
             let body_bytes = match timeout(
                 Duration::from_millis(2000),
-                http_body_util::Limited::new(resp.into_body(), MAX_CHECK_BODY_BYTES as usize)
-                    .collect(),
+                                           http_body_util::Limited::new(resp.into_body(), MAX_CHECK_BODY_BYTES as usize)
+                                           .collect(),
             )
             .await
             {
@@ -1330,10 +1268,10 @@ fn json_value_as_flat_string(v: &serde_json::Value) -> Option<String> {
 
 fn guess_content_type(path: &Path) -> &'static str {
     let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    .extension()
+    .and_then(|e| e.to_str())
+    .unwrap_or("")
+    .to_ascii_lowercase();
     match ext.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -1390,15 +1328,15 @@ fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> 
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         warn!(
             "static route \"{prefix}\": permission denied reading {} — the \"proxyauth\" user needs read (and, for directories, execute/traverse) access to this path",
-            path.display()
+              path.display()
         );
         HttpResponse::InternalServerError()
-            .append_header(("server", "ProxyAuth"))
-            .body("500 Internal Server Error")
+        .append_header(("server", "ProxyAuth"))
+        .body("500 Internal Server Error")
     } else {
         HttpResponse::NotFound()
-            .append_header(("server", "ProxyAuth"))
-            .body("404 Not Found")
+        .append_header(("server", "ProxyAuth"))
+        .body("404 Not Found")
     }
 }
 
@@ -1412,8 +1350,8 @@ async fn serve_static_file(
 ) -> HttpResponse {
     let Some(static_path) = rule.static_path.as_deref() else {
         return HttpResponse::InternalServerError()
-            .append_header(("server", "ProxyAuth"))
-            .body("500 Internal Server Error");
+        .append_header(("server", "ProxyAuth"))
+        .body("500 Internal Server Error");
     };
 
     let root = match tokio::fs::canonicalize(static_path).await {
@@ -1421,11 +1359,11 @@ async fn serve_static_file(
         Err(e) => {
             warn!(
                 "static \"{}\" (route \"{}\") is not readable: {e}",
-                static_path, rule.prefix
+                  static_path, rule.prefix
             );
             return HttpResponse::InternalServerError()
-                .append_header(("server", "ProxyAuth"))
-                .body("500 Internal Server Error");
+            .append_header(("server", "ProxyAuth"))
+            .body("500 Internal Server Error");
         }
     };
 
@@ -1446,7 +1384,7 @@ async fn serve_static_file(
             Ok(bytes) => {
                 let content_type = guess_content_type(&root);
                 let bytes = if (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
-                    && content_type.starts_with("text/html")
+                && content_type.starts_with("text/html")
                 {
                     match String::from_utf8(bytes) {
                         Ok(text) => {
@@ -1463,17 +1401,13 @@ async fn serve_static_file(
                             // /auth never actually checks it).
                             let csrf_token = resolve_tag_csrf_token(rule, &data.config);
                             let tagged = if rule.tag_proxyauth_enabled() {
-                                substitute_proxyauth_tags(
-                                    &text,
-                                    username.as_deref(),
-                                    csrf_token.as_deref(),
-                                )
+                                substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
                             } else {
                                 text
                             };
                             apply_hidden_blocks(tagged, rule, req, data)
-                                .await
-                                .into_bytes()
+                            .await
+                            .into_bytes()
                         }
                         Err(e) => e.into_bytes(),
                     }
@@ -1482,12 +1416,9 @@ async fn serve_static_file(
                 };
                 let mut resp = HttpResponse::Ok();
                 resp.append_header(("server", "ProxyAuth"))
-                    .content_type(content_type);
+                .content_type(content_type);
                 if rule.cache_enabled() {
-                    resp.append_header((
-                        header::CACHE_CONTROL,
-                        format!("public, max-age={}", max_age),
-                    ));
+                    resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
                 } else {
                     resp.append_header((
                         header::CACHE_CONTROL,
@@ -1514,8 +1445,8 @@ async fn serve_static_file(
             Some(tpl) => {
                 remainder_owned = build_regex_target(re, tpl, req_path);
                 remainder_owned
-                    .trim_start_matches('/')
-                    .trim_end_matches('/')
+                .trim_start_matches('/')
+                .trim_end_matches('/')
             }
             None => "",
         }
@@ -1525,24 +1456,24 @@ async fn serve_static_file(
             req_path.trim_start_matches('/')
         } else {
             req_path
-                .strip_prefix(&prefix_norm)
-                .unwrap_or(req_path)
-                .trim_start_matches('/')
+            .strip_prefix(&prefix_norm)
+            .unwrap_or(req_path)
+            .trim_start_matches('/')
         }
     };
 
     if remainder.split('/').any(|seg| seg == "..") {
         return HttpResponse::Forbidden()
-            .append_header(("server", "ProxyAuth"))
-            .body("403 Forbidden");
+        .append_header(("server", "ProxyAuth"))
+        .body("403 Forbidden");
     }
 
     let mut candidate = root.join(remainder);
 
     let is_dir = tokio::fs::metadata(&candidate)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
+    .await
+    .map(|m| m.is_dir())
+    .unwrap_or(false);
     if is_dir || remainder.is_empty() {
         candidate = candidate.join(&rule.static_index);
     }
@@ -1559,35 +1490,31 @@ async fn serve_static_file(
             "blocked path-traversal attempt on route \"{}\": {} resolved outside {}",
             rule.prefix,
             candidate.display(),
-            root.display()
+              root.display()
         );
         return HttpResponse::Forbidden()
-            .append_header(("server", "ProxyAuth"))
-            .body("403 Forbidden");
+        .append_header(("server", "ProxyAuth"))
+        .body("403 Forbidden");
     }
 
     match tokio::fs::read(&resolved).await {
         Ok(bytes) => {
             let content_type = guess_content_type(&resolved);
             let bytes = if (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
-                && content_type.starts_with("text/html")
+            && content_type.starts_with("text/html")
             {
                 match String::from_utf8(bytes) {
                     Ok(text) => {
                         let username = extract_username_for_tags(req, data, ip).await;
                         let csrf_token = resolve_tag_csrf_token(rule, &data.config);
                         let tagged = if rule.tag_proxyauth_enabled() {
-                            substitute_proxyauth_tags(
-                                &text,
-                                username.as_deref(),
-                                csrf_token.as_deref(),
-                            )
+                            substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
                         } else {
                             text
                         };
                         apply_hidden_blocks(tagged, rule, req, data)
-                            .await
-                            .into_bytes()
+                        .await
+                        .into_bytes()
                     }
                     Err(e) => e.into_bytes(),
                 }
@@ -1596,12 +1523,9 @@ async fn serve_static_file(
             };
             let mut resp = HttpResponse::Ok();
             resp.append_header(("server", "ProxyAuth"))
-                .content_type(content_type);
+            .content_type(content_type);
             if rule.cache_enabled() {
-                resp.append_header((
-                    header::CACHE_CONTROL,
-                    format!("public, max-age={}", max_age),
-                ));
+                resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
             } else {
                 resp.append_header((
                     header::CACHE_CONTROL,
@@ -1651,46 +1575,46 @@ async fn check_static_auth(
     }
 
     let token_header = req
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .or_else(|| {
-            if !is_secure_request(req, &data.config) {
-                return None;
-            }
-            req.headers()
-                .get(header::COOKIE)
-                .and_then(|val| val.to_str().ok())
-                .and_then(|cookie_str| {
-                    cookie_str.split(';').find_map(|cookie| {
-                        let cookie = cookie.trim();
-                        let (key, value) = cookie.split_once('=')?;
-                        if key.trim() == "session_token" {
-                            Some(value.trim())
-                        } else {
-                            None
-                        }
-                    })
-                })
-        });
+    .headers()
+    .get("Authorization")
+    .and_then(|v| v.to_str().ok())
+    .and_then(|s| s.strip_prefix("Bearer "))
+    .or_else(|| {
+        if !is_secure_request(req, &data.config) {
+            return None;
+        }
+        req.headers()
+        .get(header::COOKIE)
+        .and_then(|val| val.to_str().ok())
+        .and_then(|cookie_str| {
+            cookie_str.split(';').find_map(|cookie| {
+                let cookie = cookie.trim();
+                let (key, value) = cookie.split_once('=')?;
+                if key.trim() == "session_token" {
+                    Some(value.trim())
+                } else {
+                    None
+                }
+            })
+        })
+    });
 
     let Some(token_header) = token_header else {
         return Err(HttpResponse::Unauthorized()
-            .append_header(("server", "ProxyAuth"))
-            .body("401 Unauthorized"));
+        .append_header(("server", "ProxyAuth"))
+        .body("401 Unauthorized"));
     };
 
     let (username, token_id) = match validate_token(token_header, data, &data.config, ip).await {
         Ok((username, token_id, _expiry)) => (username, token_id),
         Err(_) => {
             return Err(HttpResponse::Unauthorized()
-                .append_header(("server", "ProxyAuth"))
-                .append_header((
-                    "Set-Cookie",
-                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
-                ))
-                .body("401 Unauthorized"));
+            .append_header(("server", "ProxyAuth"))
+            .append_header((
+                "Set-Cookie",
+                "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+            ))
+            .body("401 Unauthorized"));
         }
     };
 
@@ -1698,13 +1622,13 @@ async fn check_static_auth(
         .config
         .route_access_decision(rule, &username)
         .is_allowed()
-    {
-        return Err(HttpResponse::Unauthorized()
+        {
+            return Err(HttpResponse::Unauthorized()
             .append_header(("server", "ProxyAuth"))
             .body("401 Unauthorized"));
-    }
+        }
 
-    Ok((username, token_id))
+        Ok((username, token_id))
 }
 
 pub async fn global_proxy(
@@ -1721,11 +1645,11 @@ pub async fn global_proxy(
                 "{} 403 {} {} — blocked by ip_blocklist",
                 ip,
                 req.method(),
-                req.path()
+                  req.path()
             );
             return Ok(HttpResponse::Forbidden()
-                .append_header(("server", "ProxyAuth"))
-                .body("403 Forbidden"));
+            .append_header(("server", "ProxyAuth"))
+            .body("403 Forbidden"));
         }
     }
 
@@ -1742,8 +1666,8 @@ pub async fn global_proxy(
             let vhost = normalize_host(&host);
             if let Some(key_authorization) = crate::acme::challenge::lookup(&vhost, token) {
                 return Ok(HttpResponse::Ok()
-                    .content_type("application/octet-stream")
-                    .body(key_authorization));
+                .content_type("application/octet-stream")
+                .body(key_authorization));
             }
         }
     }
@@ -1770,10 +1694,10 @@ pub async fn global_proxy(
                 // `deny_url_ips` at all — everything else here reduces
                 // to exactly the pre-existing `allow_ip`-only check.
                 let (url_allow, url_deny) = data
-                    .redirect_protect_url_ips
-                    .get(&rule.redirect_protect_route_key())
-                    .map(|entry| entry.value().clone())
-                    .unwrap_or_default();
+                .redirect_protect_url_ips
+                .get(&rule.redirect_protect_route_key())
+                .map(|entry| entry.value().clone())
+                .unwrap_or_default();
 
                 // Deny wins, unconditionally — checked first, same
                 // discipline `is_ip_allowed`'s own deny-before-allow
@@ -1782,7 +1706,7 @@ pub async fn global_proxy(
                     return false;
                 }
                 rp.allow_ip_compiled.iter().any(|net| net.contains(&ip))
-                    || url_allow.iter().any(|net| net.contains(&ip))
+                || url_allow.iter().any(|net| net.contains(&ip))
             });
             if !is_allowed {
                 return Ok(resolve_redirect_protect_response(rp, &req, &body, &data).await);
@@ -1817,23 +1741,24 @@ pub async fn global_proxy(
                 if !pp.hidden_blocks.is_empty() {
                     continue;
                 }
-                let session_valid = check_backend_session(
+                let session_valid =
+                check_backend_session(
                     &rule.target,
                     &pp.check_path,
                     pp.type_return,
                     pp.expected_status,
                     pp.expected_field.as_deref(),
-                    pp.expected_value.as_deref(),
-                    &req,
-                    &data,
+                                      pp.expected_value.as_deref(),
+                                      &req,
+                                      &data,
                 )
                 .await;
                 if !session_valid {
                     if let Some(location) = &rp.redirect_url {
                         return Ok(HttpResponse::SeeOther()
-                            .append_header(("server", "ProxyAuth"))
-                            .append_header(("location", location.as_str()))
-                            .finish());
+                        .append_header(("server", "ProxyAuth"))
+                        .append_header(("location", location.as_str()))
+                        .finish());
                     }
                     return Ok(resolve_redirect_protect_response(rp, &req, &body, &data).await);
                 }
@@ -1880,7 +1805,7 @@ pub async fn global_proxy(
                     if rule.oidc.is_some() {
                         let mut resp = crate::proto::oidc_provider::userinfo::userinfo_handler(
                             req.clone(),
-                            data.clone(),
+                                                                                               data.clone(),
                         )
                         .await;
                         apply_custom_headers(&mut resp, rule);
@@ -1898,7 +1823,7 @@ pub async fn global_proxy(
                     if rule.oidc.is_some() {
                         let mut resp = crate::proto::oidc_provider::logout::end_session_handler(
                             req.clone(),
-                            data.clone(),
+                                                                                                data.clone(),
                         )
                         .await;
                         apply_custom_headers(&mut resp, rule);
@@ -1907,6 +1832,7 @@ pub async fn global_proxy(
                 }
             }
         }
+
     }
 
     // `/oidc/authorize` needs the full request (query params, request
@@ -1924,121 +1850,112 @@ pub async fn global_proxy(
     // it can't live inside the GET-only block above for that reason.
     if req.path() == "/oidc/authorize"
         && (req.method() == actix_web::http::Method::GET
-            || req.method() == actix_web::http::Method::POST)
-    {
-        if let Some(host) = request_host(&req) {
-            if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
-                if rule.oidc.is_some() {
-                    let mut resp = crate::proto::oidc_provider::authorize::authorize_handler(
-                        req.clone(),
-                        body,
-                        data.clone(),
-                    )
-                    .await;
-                    apply_custom_headers(&mut resp, rule);
-                    return Ok(resp);
+        || req.method() == actix_web::http::Method::POST)
+        {
+            if let Some(host) = request_host(&req) {
+                if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
+                    if rule.oidc.is_some() {
+                        let mut resp = crate::proto::oidc_provider::authorize::authorize_handler(
+                            req.clone(),
+                                                                                                 body,
+                                                                                                 data.clone(),
+                        )
+                        .await;
+                        apply_custom_headers(&mut resp, rule);
+                        return Ok(resp);
+                    }
                 }
             }
         }
-    }
 
-    // `POST /token` — server-to-server, called by the relying party
-    // directly (never via the browser), so there's no return_to/login
-    // detour to consider here the way `/oidc/authorize` has. Same
-    // oidc-configured-vhost gate as every other interception in this
-    // block.
-    if req.method() == actix_web::http::Method::POST && req.path() == "/oidc/token" {
-        if let Some(host) = request_host(&req) {
-            if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
-                if rule.oidc.is_some() {
-                    let mut resp = crate::proto::oidc_provider::token::token_handler(
-                        req.clone(),
-                        body,
-                        data.clone(),
-                    )
-                    .await;
-                    apply_custom_headers(&mut resp, rule);
-                    return Ok(resp);
+        // `POST /token` — server-to-server, called by the relying party
+        // directly (never via the browser), so there's no return_to/login
+        // detour to consider here the way `/oidc/authorize` has. Same
+        // oidc-configured-vhost gate as every other interception in this
+        // block.
+        if req.method() == actix_web::http::Method::POST && req.path() == "/oidc/token" {
+            if let Some(host) = request_host(&req) {
+                if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
+                    if rule.oidc.is_some() {
+                        let mut resp = crate::proto::oidc_provider::token::token_handler(
+                            req.clone(),
+                                                                                         body,
+                                                                                         data.clone(),
+                        )
+                        .await;
+                        apply_custom_headers(&mut resp, rule);
+                        return Ok(resp);
+                    }
                 }
             }
         }
-    }
 
-    if req.method() == actix_web::http::Method::OPTIONS {
-        // The OIDC provider's own discovery/JWKS documents are meant
-        // to be publicly, universally fetchable — see
-        // `proto::oidc_provider::discovery`'s own reasoning for why
-        // their actual GET responses always carry
-        // `Access-Control-Allow-Origin: *` unconditionally, regardless
-        // of this vhost's own `cors_origins` allow-list. This preflight
-        // handler didn't know about that special case at all: it
-        // checked every path against the same vhost-wide allow-list,
-        // rejecting a genuinely legitimate preflight from any caller
-        // whose origin wasn't explicitly listed — exactly the callers
-        // these two endpoints exist to serve.
-        if req.path() == "/.well-known/openid-configuration" || req.path() == "/oidc/jwks.json" {
-            if let Some(rule) = find_vhost_route(request_host(&req).as_deref(), &data.routes.routes)
-            {
-                if rule.oidc.is_some() {
-                    return Ok(HttpResponse::Ok()
+        if req.method() == actix_web::http::Method::OPTIONS {
+            // The OIDC provider's own discovery/JWKS documents are meant
+            // to be publicly, universally fetchable — see
+            // `proto::oidc_provider::discovery`'s own reasoning for why
+            // their actual GET responses always carry
+            // `Access-Control-Allow-Origin: *` unconditionally, regardless
+            // of this vhost's own `cors_origins` allow-list. This preflight
+            // handler didn't know about that special case at all: it
+            // checked every path against the same vhost-wide allow-list,
+            // rejecting a genuinely legitimate preflight from any caller
+            // whose origin wasn't explicitly listed — exactly the callers
+            // these two endpoints exist to serve.
+            if req.path() == "/.well-known/openid-configuration" || req.path() == "/oidc/jwks.json" {
+                if let Some(rule) = find_vhost_route(request_host(&req).as_deref(), &data.routes.routes) {
+                    if rule.oidc.is_some() {
+                        return Ok(HttpResponse::Ok()
                         .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
                         .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"))
-                        .insert_header((
-                            header::ACCESS_CONTROL_ALLOW_HEADERS,
-                            "Authorization, Content-Type, Accept",
-                        ))
+                        .insert_header((header::ACCESS_CONTROL_ALLOW_HEADERS, "Authorization, Content-Type, Accept"))
                         .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
                         .finish());
+                    }
                 }
             }
-        }
 
-        let origin_header = req.headers().get(header::ORIGIN);
-        let origin = origin_header.and_then(|v| v.to_str().ok());
-        let preflight_vhost_route =
+            let origin_header = req.headers().get(header::ORIGIN);
+            let origin = origin_header.and_then(|v| v.to_str().ok());
+            let preflight_vhost_route =
             find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
 
-        // A same-origin request must never be blocked by CORS — CORS
-        // is fundamentally a *cross*-origin mechanism; enforcing it
-        // against the origin a request is already legitimately coming
-        // from was blocking a backend's own frontend from calling its
-        // own API (browsers send `Origin` even for a same-origin
-        // POST/PUT/DELETE, not just genuinely cross-origin ones), for
-        // no security benefit — nothing was ever being protected
-        // *from* the origin itself. Compares scheme too, not just
-        // host: `Origin` embeds both, and a request actually arriving
-        // over https shouldn't treat a same-host `http://` origin as
-        // equivalent — those are different origins per the Fetch
-        // spec's own definition, even though this vhost isn't
-        // expected to ever legitimately see one in practice.
-        let same_origin = origin
-            .and_then(|o| request_host(&req).map(|h| (o, h)))
-            .is_some_and(|(o, host)| {
-                let expected_scheme = if is_secure_request(&req, &data.config) {
-                    "https://"
-                } else {
-                    "http://"
-                };
-                o.strip_prefix(expected_scheme)
+            // A same-origin request must never be blocked by CORS — CORS
+            // is fundamentally a *cross*-origin mechanism; enforcing it
+            // against the origin a request is already legitimately coming
+            // from was blocking a backend's own frontend from calling its
+            // own API (browsers send `Origin` even for a same-origin
+            // POST/PUT/DELETE, not just genuinely cross-origin ones), for
+            // no security benefit — nothing was ever being protected
+            // *from* the origin itself. Compares scheme too, not just
+            // host: `Origin` embeds both, and a request actually arriving
+            // over https shouldn't treat a same-host `http://` origin as
+            // equivalent — those are different origins per the Fetch
+            // spec's own definition, even though this vhost isn't
+            // expected to ever legitimately see one in practice.
+            let same_origin = origin.and_then(|o| request_host(&req).map(|h| (o, h))).is_some_and(
+                |(o, host)| {
+                    let expected_scheme = if is_secure_request(&req, &data.config) { "https://" } else { "http://" };
+                    o.strip_prefix(expected_scheme)
                     .map(|rest| rest.trim_end_matches('/').eq_ignore_ascii_case(&host))
                     .unwrap_or(false)
-            });
+                },
+            );
 
-        let allowed = preflight_vhost_route
+            let allowed = preflight_vhost_route
             .and_then(|r| r.resolved_cors_origins(&data.config))
             .or(data.config.cors_origins.as_ref());
-        let is_allowed = same_origin
-            || match (origin, allowed) {
+            let is_allowed = same_origin || match (origin, allowed) {
                 (Some(o), Some(list)) => {
                     let origin_normalized = o.trim_end_matches('/');
                     list.iter()
-                        .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
+                    .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
                 }
                 _ => false,
             };
 
-        if let (Some(origin_str), true) = (origin, is_allowed) {
-            return Ok(HttpResponse::Ok()
+            if let (Some(origin_str), true) = (origin, is_allowed) {
+                return Ok(HttpResponse::Ok()
                 .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin_str))
                 .insert_header((
                     header::ACCESS_CONTROL_ALLOW_METHODS,
@@ -2050,146 +1967,141 @@ pub async fn global_proxy(
                 ))
                 .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
                 .finish());
-        } else {
-            return Ok(HttpResponse::Forbidden().body("CORS origin not allowed"));
+            } else {
+                return Ok(HttpResponse::Forbidden().body("CORS origin not allowed"));
+            }
         }
-    }
 
-    let path = req.path();
-    let method = req.method().as_str();
-    let ip = req
+        let path = req.path();
+        let method = req.method().as_str();
+        let ip = req
         .peer_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|| "-".to_string());
-    let user_agent = req
+        let user_agent = req
         .headers()
         .get("User-Agent")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
 
-    // UX: session_cookie mode only. If the visitor already has a valid
-    // session and lands on the home page or wherever logout_redirect_url
-    // points, skip straight into the app instead of showing that page as
-    // if they were logged out — landing on a "logged out"/home page while
-    // still actually authenticated is confusing. Any other path is left
-    // completely untouched (still goes through normal routes.yml matching
-    // below), so this only affects these two specific landing pages.
-    //
-    // No route has been matched yet at this point (that happens further
-    // down) — find_vhost_route resolves this vhost's own
-    // session_cookie/logout_redirect_url override, if routes.yml sets
-    // one, the same way the auth flow itself does.
-    let early_vhost_route = find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
-    // SECURITY/CORRECTNESS: same gap as the two `required_login`
-    // checks in `proxy_with_proxy`/`proxy_without_proxy` — this "skip
-    // the logged-out landing page if there's already a session" check
-    // was never meant to run at all on an oidc-enabled vhost (its
-    // backend has its own, entirely separate session/landing-page
-    // logic), but never had a code-level bypass added either. Left
-    // unfixed: it ran for every "/" visit regardless, and its own
-    // `existing_session_response` call can end up at
-    // `render_error_page`, which requires the *global*
-    // `logout_redirect_url` (a different setting from this vhost's
-    // own `oidc.logout_redirect_uris`) to be configured — failing
-    // with "logout_redirect_url is not configured" on a vhost that
-    // was never meant to need it in the first place.
-    let early_oidc_enabled = early_vhost_route.map(|r| r.oidc.is_some()).unwrap_or(false);
-    let early_session_cookie_enabled = !early_oidc_enabled
+        // UX: session_cookie mode only. If the visitor already has a valid
+        // session and lands on the home page or wherever logout_redirect_url
+        // points, skip straight into the app instead of showing that page as
+        // if they were logged out — landing on a "logged out"/home page while
+        // still actually authenticated is confusing. Any other path is left
+        // completely untouched (still goes through normal routes.yml matching
+        // below), so this only affects these two specific landing pages.
+        //
+        // No route has been matched yet at this point (that happens further
+        // down) — find_vhost_route resolves this vhost's own
+        // session_cookie/logout_redirect_url override, if routes.yml sets
+        // one, the same way the auth flow itself does.
+        let early_vhost_route =
+        find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
+        // SECURITY/CORRECTNESS: same gap as the two `required_login`
+        // checks in `proxy_with_proxy`/`proxy_without_proxy` — this "skip
+        // the logged-out landing page if there's already a session" check
+        // was never meant to run at all on an oidc-enabled vhost (its
+        // backend has its own, entirely separate session/landing-page
+        // logic), but never had a code-level bypass added either. Left
+        // unfixed: it ran for every "/" visit regardless, and its own
+        // `existing_session_response` call can end up at
+        // `render_error_page`, which requires the *global*
+        // `logout_redirect_url` (a different setting from this vhost's
+        // own `oidc.logout_redirect_uris`) to be configured — failing
+        // with "logout_redirect_url is not configured" on a vhost that
+        // was never meant to need it in the first place.
+        let early_oidc_enabled = early_vhost_route.map(|r| r.oidc.is_some()).unwrap_or(false);
+        let early_session_cookie_enabled = !early_oidc_enabled
         && early_vhost_route
-            .map(|r| r.session_cookie_enabled(&data.config))
-            .unwrap_or(data.config.session_cookie);
-    if early_session_cookie_enabled {
-        let early_logout_redirect_url = early_vhost_route
+        .map(|r| r.session_cookie_enabled(&data.config))
+        .unwrap_or(data.config.session_cookie);
+        if early_session_cookie_enabled {
+            let early_logout_redirect_url = early_vhost_route
             .and_then(|r| r.resolved_logout_redirect_url(&data.config))
             .or(data.config.logout_redirect_url.as_deref());
-        let is_home_or_logout_page = path == "/" || early_logout_redirect_url == Some(path);
-        if is_home_or_logout_page {
-            if let Some(resp) =
-                crate::token::auth::existing_session_response(&req, &data, &ip).await
-            {
-                return Ok(resp);
+            let is_home_or_logout_page = path == "/" || early_logout_redirect_url == Some(path);
+            if is_home_or_logout_page {
+                if let Some(resp) =
+                    crate::token::auth::existing_session_response(&req, &data, &ip).await
+                    {
+                        return Ok(resp);
+                    }
             }
         }
-    }
 
-    data.stats.incr();
+        data.stats.incr();
 
-    let host = request_host(&req);
-    if let Some(idx) = match_route_idx(path, host.as_deref(), &data.routes.routes) {
-        // Lets the access-log and compression middlewares resolve this
-        // route's settings without redoing the match themselves.
-        LogContext::set_route(&req, idx);
-        let rule = &data.routes.routes[idx];
-        let has_ip_restriction =
+        let host = request_host(&req);
+        if let Some(idx) = match_route_idx(path, host.as_deref(), &data.routes.routes) {
+            // Lets the access-log and compression middlewares resolve this
+            // route's settings without redoing the match themselves.
+            LogContext::set_route(&req, idx);
+            let rule = &data.routes.routes[idx];
+            let has_ip_restriction =
             !rule.allow_ips_compiled.is_empty() || !rule.deny_ips_compiled.is_empty();
-        if has_ip_restriction {
-            let resolved_ip = client_ip(&req, &data.config);
-            if !ip_allowed(resolved_ip, rule) {
-                warn!(
-                    "{} 403 {} {} {} — blocked by allow_ips/deny_ips on route \"{}\"",
-                    resolved_ip
+            if has_ip_restriction {
+                let resolved_ip = client_ip(&req, &data.config);
+                if !ip_allowed(resolved_ip, rule) {
+                    warn!(
+                        "{} 403 {} {} {} — blocked by allow_ips/deny_ips on route \"{}\"",
+                        resolved_ip
                         .map(|i| i.to_string())
                         .unwrap_or_else(|| "-".to_string()),
-                    method,
-                    path,
-                    user_agent,
-                    rule.prefix
-                );
-                return Ok(HttpResponse::Forbidden()
+                          method,
+                          path,
+                          user_agent,
+                          rule.prefix
+                    );
+                    return Ok(HttpResponse::Forbidden()
                     .append_header(("server", "ProxyAuth"))
                     .body("403 Forbidden"));
+                }
             }
-        }
 
-        let use_proxy = rule.proxy;
-        if rule.static_path.is_some() {
-            let ip_str = client_ip(&req, &data.config)
+            let use_proxy = rule.proxy;
+            if rule.static_path.is_some() {
+                let ip_str = client_ip(&req, &data.config)
                 .map(|i| i.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let (username, token_id) = match check_static_auth(&req, &data, rule, &ip_str).await {
-                Ok(identity) => identity,
-                Err(resp) => return Ok(resp),
-            };
-            // Same as the proxied-route handlers: publishes the resolved
-            // identity for the access log's [username]/[tid] fields. Was
-            // previously missing entirely on this path — static routes
-            // correctly enforced `required_login`, but the resolved
-            // identity never reached the access log, so it always showed
-            // `-` regardless.
-            LogContext::set_user(&req, &username, &token_id);
-            if method != "GET" && method != "HEAD" {
-                return Ok(HttpResponse::MethodNotAllowed()
+                let (username, token_id) = match check_static_auth(&req, &data, rule, &ip_str).await {
+                    Ok(identity) => identity,
+                    Err(resp) => return Ok(resp),
+                };
+                // Same as the proxied-route handlers: publishes the resolved
+                // identity for the access log's [username]/[tid] fields. Was
+                // previously missing entirely on this path — static routes
+                // correctly enforced `required_login`, but the resolved
+                // identity never reached the access log, so it always showed
+                // `-` regardless.
+                LogContext::set_user(&req, &username, &token_id);
+                if method != "GET" && method != "HEAD" {
+                    return Ok(HttpResponse::MethodNotAllowed()
                     .append_header(("server", "ProxyAuth"))
                     .append_header(("Allow", "GET, HEAD"))
                     .body("405 Method Not Allowed"));
+                }
+                let mut static_resp =
+                serve_static_file(rule, path, data.config.cache_duration_secs, &req, &data, &ip_str)
+                .await;
+                apply_custom_headers(&mut static_resp, rule);
+                return Ok(static_resp);
             }
-            let mut static_resp = serve_static_file(
-                rule,
-                path,
-                data.config.cache_duration_secs,
-                &req,
-                &data,
-                &ip_str,
-            )
-            .await;
-            apply_custom_headers(&mut static_resp, rule);
-            return Ok(static_resp);
-        }
-        if use_proxy {
-            proxy_with_proxy(req, body, data, idx).await
+            if use_proxy {
+                proxy_with_proxy(req, body, data, idx).await
+            } else {
+                proxy_without_proxy(req, body, data, idx).await
+            }
         } else {
-            proxy_without_proxy(req, body, data, idx).await
-        }
-    } else {
-        // No ad-hoc line here any more: the access-log middleware logs
-        // this 404 in the configured format, like everything else. That
-        // is the point of the rework — not a fourth logger alongside
-        // the others, but the removal of the ones that emitted
-        // divergent formats on a subset of code paths.
-        Ok(HttpResponse::NotFound()
+            // No ad-hoc line here any more: the access-log middleware logs
+            // this 404 in the configured format, like everything else. That
+            // is the point of the rework — not a fourth logger alongside
+            // the others, but the removal of the ones that emitted
+            // divergent formats on a subset of code paths.
+            Ok(HttpResponse::NotFound()
             .append_header(("server", "ProxyAuth"))
             .body("404 Not Found"))
-    }
+        }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2205,39 +2117,39 @@ pub async fn proxy_with_proxy(
 
     let path = req.path();
     let ip = client_ip(&req, &data.config)
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
-        .to_string();
+    .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+    .to_string();
     let method_str = req.method().as_str();
     let user_agent = req
-        .headers()
-        .get("User-Agent")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
+    .headers()
+    .get("User-Agent")
+    .and_then(|h| h.to_str().ok())
+    .unwrap_or("-");
 
     let add_cors_headers = |resp: &mut HttpResponseBuilder, req: &HttpRequest| {
         if let Some(origin) = req
             .headers()
             .get(header::ORIGIN)
             .and_then(|v| v.to_str().ok())
-        {
-            let origin_trimmed = origin.trim_end_matches('/');
-            let is_allowed = rule
+            {
+                let origin_trimmed = origin.trim_end_matches('/');
+                let is_allowed = rule
                 .resolved_cors_origins(&data.config)
                 .map(|list| {
                     list.iter()
-                        .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
+                    .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
                 })
                 .unwrap_or(false);
-            if is_allowed {
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, req.method().as_str()));
-                resp.insert_header((
-                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Authorization, Content-Type, Accept",
-                ));
-                resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                if is_allowed {
+                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
+                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, req.method().as_str()));
+                    resp.insert_header((
+                        header::ACCESS_CONTROL_ALLOW_HEADERS,
+                        "Authorization, Content-Type, Accept",
+                    ));
+                    resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                }
             }
-        }
     };
 
     // ── ACL ─────────────────────────────────────────────────────────
@@ -2276,11 +2188,7 @@ pub async fn proxy_with_proxy(
     // backend's own app makes to itself (through ProxyAuth) would be
     // rejected as an invalid CSRF request, breaking the backend
     // entirely rather than just the parts ProxyAuth itself handles.
-    if rule.session_cookie_enabled(&data.config)
-        && rule.csrf_enabled(&data.config)
-        && rule.requires_csrf()
-        && rule.oidc.is_none()
-    {
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() && rule.oidc.is_none() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
             LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>invalid csrf request</h1></body></html>"#;
@@ -2307,8 +2215,8 @@ pub async fn proxy_with_proxy(
     let path_no_query = original_uri.path();
     let prefix_norm = rule.prefix.trim_end_matches('/');
     let raw_forward = path_no_query
-        .strip_prefix(prefix_norm)
-        .unwrap_or(path_no_query);
+    .strip_prefix(prefix_norm)
+    .unwrap_or(path_no_query);
     let cleaned_remainder = raw_forward.trim_start_matches('/').trim_end_matches('/');
 
     let forward_path = if !rule.secure_path {
@@ -2336,11 +2244,11 @@ pub async fn proxy_with_proxy(
             if target_authority_tampered(&rule.target, &rewritten) {
                 warn!(
                     "[{}] {} {} 502 blocked: regex capture on route \"{}\" tried to change the target host ({} -> {})",
-                    ip, path, method_str, rule.prefix, rule.target, rewritten
+                      ip, path, method_str, rule.prefix, rule.target, rewritten
                 );
                 return Ok(HttpResponse::BadGateway()
-                    .append_header(("server", "ProxyAuth"))
-                    .body("502 Bad Gateway"));
+                .append_header(("server", "ProxyAuth"))
+                .body("502 Bad Gateway"));
             }
             rewritten
         } else {
@@ -2371,15 +2279,15 @@ pub async fn proxy_with_proxy(
         ClientOptions {
             use_proxy: true,
             proxy_addr: Some(rule.proxy_config.clone()),
-            use_cert: false,
-            cert_path: None,
-            key_path: None,
+                                           use_cert: false,
+                                           cert_path: None,
+                                           key_path: None,
         },
         &data.config,
     );
 
     let uri = Uri::from_str(&full_url)
-        .map_err(|e| error::ErrorBadRequest(format!("Invalid proxy URI: {}", e)))?;
+    .map_err(|e| error::ErrorBadRequest(format!("Invalid proxy URI: {}", e)))?;
 
     // ── Auth ────────────────────────────────────────────────────
     // SECURITY/CORRECTNESS: `oidc:` means this vhost's backend makes
@@ -2394,57 +2302,57 @@ pub async fn proxy_with_proxy(
     // to "/", redirecting "/" to "/" — exactly what it looks like).
     let (username, token_id) = if rule.required_login && rule.oidc.is_none() {
         let token_header = req
-            .headers()
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| {
-                if !is_secure_request(&req, &data.config) {
-                    return None;
-                }
-                req.headers()
-                    .get(header::COOKIE)
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|cookie_str| {
-                        cookie_str.split(';').find_map(|cookie| {
-                            let cookie = cookie.trim();
-                            if let Some((key, value)) = cookie.split_once('=') {
-                                if key.trim() == "session_token" {
-                                    return Some(value.trim());
-                                }
-                            }
-                            None
-                        })
-                    })
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| {
+            if !is_secure_request(&req, &data.config) {
+                return None;
+            }
+            req.headers()
+            .get(header::COOKIE)
+            .and_then(|val| val.to_str().ok())
+            .and_then(|cookie_str| {
+                cookie_str.split(';').find_map(|cookie| {
+                    let cookie = cookie.trim();
+                    if let Some((key, value)) = cookie.split_once('=') {
+                        if key.trim() == "session_token" {
+                            return Some(value.trim());
+                        }
+                    }
+                    None
+                })
             })
-            .ok_or_else(|| {
-                let mut resp = HttpResponse::Unauthorized();
-                resp.append_header(("server", "ProxyAuth"));
-                add_cors_headers(&mut resp, &req);
-                error::InternalError::from_response("Missing token", resp.finish())
-            })?;
+        })
+        .ok_or_else(|| {
+            let mut resp = HttpResponse::Unauthorized();
+            resp.append_header(("server", "ProxyAuth"));
+            add_cors_headers(&mut resp, &req);
+            error::InternalError::from_response("Missing token", resp.finish())
+        })?;
 
         let (username, token_id, _expiry) =
-            match validate_token(token_header, &data, &data.config, &ip).await {
-                Ok(result) => result,
-                Err(_err) => {
-                    warn!(
-                        "[{}] {} {} 401 Unauthorized token attempt {} {}",
-                        ip, path, method_str, user_agent, _err
-                    );
-                    let mut resp = HttpResponse::Unauthorized();
-                    resp.append_header(("server", "ProxyAuth"));
-                    resp.append_header((
-                        "Set-Cookie",
-                        "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
-                    ));
-                    if req.uri() != "/" || req.uri() != "" {
-                        resp.append_header(("location", "/"));
-                    }
-                    add_cors_headers(&mut resp, &req);
-                    return Ok(resp.body("401 Unauthorized"));
+        match validate_token(token_header, &data, &data.config, &ip).await {
+            Ok(result) => result,
+            Err(_err) => {
+                warn!(
+                    "[{}] {} {} 401 Unauthorized token attempt {} {}",
+                    ip, path, method_str, user_agent, _err
+                );
+                let mut resp = HttpResponse::Unauthorized();
+                resp.append_header(("server", "ProxyAuth"));
+                resp.append_header((
+                    "Set-Cookie",
+                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+                ));
+                if req.uri() != "/" && req.uri() != "" {
+                    resp.append_header(("location", "/"));
                 }
-            };
+                add_cors_headers(&mut resp, &req);
+                return Ok(resp.body("401 Unauthorized"));
+            }
+        };
 
         // Single source of truth for "does this username get through
         // this route" — see `AppConfig::route_access_decision`. Also
@@ -2460,34 +2368,34 @@ pub async fn proxy_with_proxy(
         // never resolved a real username to check in the first place.
         if rule.oidc.is_none()
             && !data
-                .config
-                .route_access_decision(rule, &username)
-                .is_allowed()
-        {
-            warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
-            let mut resp = HttpResponse::Unauthorized();
-            resp.append_header(("server", "ProxyAuth"));
-            add_cors_headers(&mut resp, &req);
-            return Ok(resp.body("403 Forbidden"));
-        }
+            .config
+            .route_access_decision(rule, &username)
+            .is_allowed()
+            {
+                warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
+                let mut resp = HttpResponse::Unauthorized();
+                resp.append_header(("server", "ProxyAuth"));
+                add_cors_headers(&mut resp, &req);
+                return Ok(resp.body("403 Forbidden"));
+            }
 
-        // SECURITY/CORRECTNESS: `login_redirect_url` defaults to "/"
-        // when unconfigured — without this check, an authenticated
-        // visitor hitting "/" on a vhost that never set its own
-        // `login_redirect_url` gets redirected to "/", which redirects
-        // to "/", forever (`NS_ERROR_REDIRECT_LOOP` in the browser).
-        // Redirecting only when there's genuinely somewhere else to
-        // go turns "misconfigured" into "just proxies '/' through
-        // normally" instead of a hard failure.
-        if (req.uri() == "/" || req.uri() == "") && redirect_target_is_meaningful(&data.config) {
-            let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
-            return Ok(HttpResponse::SeeOther()
+            // SECURITY/CORRECTNESS: `login_redirect_url` defaults to "/"
+            // when unconfigured — without this check, an authenticated
+            // visitor hitting "/" on a vhost that never set its own
+            // `login_redirect_url` gets redirected to "/", which redirects
+            // to "/", forever (`NS_ERROR_REDIRECT_LOOP` in the browser).
+            // Redirecting only when there's genuinely somewhere else to
+            // go turns "misconfigured" into "just proxies '/' through
+            // normally" instead of a hard failure.
+            if (req.uri() == "/" || req.uri() == "") && redirect_target_is_meaningful(&data.config) {
+                let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+                return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
                 .append_header(("location", redirect_target))
                 .finish());
-        }
+            }
 
-        (username, token_id)
+            (username, token_id)
     } else {
         (String::new(), String::new())
     };
@@ -2512,7 +2420,7 @@ pub async fn proxy_with_proxy(
         None => data.config.compression.clone(),
     };
     let strip_accept_encoding =
-        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+    route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
 
     let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
     let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
@@ -2584,13 +2492,25 @@ pub async fn proxy_with_proxy(
             // that block's own comment for why it still needs
             // excluding here (same append-not-replace reasoning as the
             // four `X-Forwarded-*`/`X-Real-IP` headers above).
+            // `content-encoding` describes the body as it was actually
+            // received. actix may have decoded the payload before it
+            // reached this handler, so relaying the client's original
+            // header would announce an encoding the body no longer
+            // carries and the backend would fail to decode it. This is
+            // what made `git clone` fail: git sends its upload-pack
+            // request gzipped, Forgejo got the header without the gzip
+            // and answered 500. Same discipline already applied to
+            // `content-length` via `is_hop_by_hop_header`.
+            && key_str != "content-encoding"
             && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
-        {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            {
+                if let Ok(hv) =
+                    hyper::header::HeaderValue::from_bytes(value.as_bytes())
+                    {
+                        request_builder = request_builder.header(key_str, hv);
+                    }
             }
-        }
     }
 
     if strip_accept_encoding {
@@ -2619,11 +2539,7 @@ pub async fn proxy_with_proxy(
                 request_builder = request_builder.header("X-Forwarded-Host", hv);
             }
         }
-        let proto = if is_secure_request(&req, &data.config) {
-            "https"
-        } else {
-            "http"
-        };
+        let proto = if is_secure_request(&req, &data.config) { "https" } else { "http" };
         request_builder = request_builder.header("X-Forwarded-Proto", proto);
         if let Ok(hv) = hyper::header::HeaderValue::from_str(&ip) {
             request_builder = request_builder.header("X-Real-IP", hv);
@@ -2634,8 +2550,8 @@ pub async fn proxy_with_proxy(
     }
 
     request_builder = request_builder
-        .header("Connection", "close")
-        .header(USER_AGENT, "ProxyAuth");
+    .header("Connection", "close")
+    .header(USER_AGENT, "ProxyAuth");
     request_builder = inject_header(request_builder, &username, &data.config);
 
     let hyper_req = if hyper_method == Method::GET || hyper_method == Method::HEAD {
@@ -2650,7 +2566,7 @@ pub async fn proxy_with_proxy(
             }
         }
     } else {
-        match request_builder.body(Full::new(body.clone()).boxed()) {
+        match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
             Ok(req) => req,
             Err(e) => {
                 warn!(client_ip = %ip, target = %full_url, "Request build failed: {}", e);
@@ -2663,18 +2579,18 @@ pub async fn proxy_with_proxy(
     };
 
     // ── send upstream ───────────────────────────────────────────────
-    let response_result: hyper::Response<UpstreamBody> = if !rule.backends.is_empty() {
+    let response_result: hyper::Response<ResponseBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
-            .backends
-            .iter()
-            .map(|b| match b {
-                BackendInput::Simple(url) => BackendConfig {
-                    url: url.clone(),
-                    weight: 1,
-                },
-                BackendInput::Detailed(cfg) => cfg.clone(),
-            })
-            .collect();
+        .backends
+        .iter()
+        .map(|b| match b {
+            BackendInput::Simple(url) => BackendConfig {
+                url: url.clone(),
+             weight: 1,
+            },
+            BackendInput::Detailed(cfg) => cfg.clone(),
+        })
+        .collect();
 
         // Uniquely identifies this route for the sticky-backend cache —
         // see `forward_failover`'s doc comment. `vhost` alone isn't
@@ -2683,36 +2599,17 @@ pub async fn proxy_with_proxy(
         // the same prefix) — the pair together is exactly what
         // `routes.yml` itself uses to distinguish routes.
         let route_key = format!("{}|{}", rule.vhost.join(","), rule.prefix);
-        forward_failover(hyper_req, &backends, Some(&rule.proxy_config), &route_key)
-            .await
-            .map_err(|e| {
-                warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
-                error::ErrorServiceUnavailable("503 Service Unavailable")
-            })?
-            .map(UpstreamBody::Buffered)
-    } else {
-        match timeout(
-            data.config.backend_timeout_duration(),
-            client.request(hyper_req),
-        )
-        .await
-        {
-            Ok(Ok(res))
-                if can_stream_response(
-                    res.headers(),
-                    res.status(),
-                    method_str.eq_ignore_ascii_case("HEAD"),
-                ) =>
-            {
-                res.map(UpstreamBody::Streaming)
-            }
-            Ok(Ok(res)) => incoming_to_boxbody(res)
+        widen_boxbody(
+            forward_failover(hyper_req, &backends, Some(&rule.proxy_config), &route_key)
                 .await
                 .map_err(|e| {
-                    warn!(client_ip = %ip, target = %full_url, "Body collect error: {}", e);
+                    warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
                     error::ErrorServiceUnavailable("503 Service Unavailable")
-                })?
-                .map(UpstreamBody::Buffered),
+                })?,
+        )
+    } else {
+        match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
+            Ok(Ok(res)) => incoming_to_boxbody(res),
             Ok(Err(e)) => {
                 warn!(client_ip = %ip, target = %full_url, "Upstream error: {}", e);
                 let mut resp = HttpResponse::ServiceUnavailable();
@@ -2731,12 +2628,14 @@ pub async fn proxy_with_proxy(
     };
 
     let status = response_result.status();
+    // Logged, not replaced. Substituting a bare 500 for the backend's
+    // real status and body leaves an operator with the one thing that
+    // cannot be diagnosed: a `server: ProxyAuth` 500 with
+    // `content-length: 0` is indistinguishable from a fault in the
+    // proxy itself, which is exactly how the git-upload-pack failure
+    // above stayed invisible.
     if status.is_server_error() {
         warn!(client_ip = %ip, target = %full_url, "Upstream returned server error: {}", status);
-        let mut resp = HttpResponse::InternalServerError();
-        resp.append_header(("server", "ProxyAuth"));
-        add_cors_headers(&mut resp, &req);
-        return Ok(resp.finish());
     }
 
     let mut client_resp = HttpResponse::build(to_actix_status(status));
@@ -2761,7 +2660,7 @@ pub async fn proxy_with_proxy(
         // matching GET would have returned. Kept identical here so the
         // two proxy paths do not answer HEAD differently.
         let keep_head_content_length =
-            method_str.eq_ignore_ascii_case("HEAD") && k.eq_ignore_ascii_case("content-length");
+        method_str.eq_ignore_ascii_case("HEAD") && k.eq_ignore_ascii_case("content-length");
         if is_hop_by_hop_header(k) && !keep_head_content_length {
             continue;
         }
@@ -2770,31 +2669,61 @@ pub async fn proxy_with_proxy(
         }
     }
 
-    let headers = response_result.headers().clone();
+    let (resp_parts, resp_body) = response_result.into_parts();
+    let headers: hyper::HeaderMap = resp_parts.headers;
 
-    let (streaming, mut body_bytes): (Option<Incoming>, Bytes) = match response_result.into_body() {
-        UpstreamBody::Streaming(incoming) => (Some(incoming), Bytes::new()),
-        UpstreamBody::Buffered(body) => {
-            let bytes = body
-                .collect()
-                .await
-                .map_err(|e| {
-                    warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
-                    let mut resp = HttpResponse::InternalServerError();
-                    resp.append_header(("server", "ProxyAuth"));
-                    add_cors_headers(&mut resp, &req);
-                    error::InternalError::from_response("500 Internal Server Error", resp.finish())
-                })?
-                .to_bytes();
-            (None, bytes)
+    // `streaming` is a request, not a guarantee: the three mechanisms
+    // below rewrite the whole body and therefore need it in full, so
+    // any of them being active on this route wins and the response is
+    // buffered as before. `validate_streaming_on_routes` reports that
+    // contradiction at startup.
+    let rewrites_body = rule.tag_proxyauth_enabled()
+    || rule.has_hidden_blocks()
+    || (rule.session_cookie_enabled(&data.config)
+    && rule.csrf_enabled(&data.config)
+    && rule.oidc.is_none());
+
+    if rule.streaming_enabled() && !rewrites_body && !method_str.eq_ignore_ascii_case("HEAD") {
+        if rule.cache_enabled() {
+            let max_age = rule
+            .cache_duration_secs
+            .unwrap_or(data.config.cache_duration_secs);
+            client_resp
+            .insert_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
+        } else {
+            client_resp.insert_header((
+                header::CACHE_CONTROL,
+                "no-store, no-cache, must-revalidate, max-age=0",
+            ));
+            client_resp.insert_header(("Pragma", "no-cache"));
+            client_resp.insert_header(("Expires", "0"));
         }
-    };
+
+        add_cors_headers(&mut client_resp, &req);
+        fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
+        apply_custom_headers_builder(&mut client_resp, rule);
+        client_resp.append_header(("server", "ProxyAuth"));
+
+        return Ok(client_resp.streaming(body_to_actix_stream(resp_body)));
+    }
+
+    let mut body_bytes: Bytes = resp_body
+    .collect()
+    .await
+    .map_err(|e| {
+        warn!(client_ip = %ip, target = %full_url, "Body read error: {}", e);
+        let mut resp = HttpResponse::InternalServerError();
+        resp.append_header(("server", "ProxyAuth"));
+        add_cors_headers(&mut resp, &req);
+        error::InternalError::from_response("500 Internal Server Error", resp.finish())
+    })?
+    .to_bytes();
 
     // ── Cache policy ────────────────────────────────────────────────
     if rule.cache_enabled() {
         let max_age = rule
-            .cache_duration_secs
-            .unwrap_or(data.config.cache_duration_secs);
+        .cache_duration_secs
+        .unwrap_or(data.config.cache_duration_secs);
         let cc = format!("public, max-age={}", max_age);
         client_resp.insert_header((header::CACHE_CONTROL, cc));
     } else {
@@ -2816,17 +2745,13 @@ pub async fn proxy_with_proxy(
     // going to contain — the backend doesn't speak ProxyAuth's own
     // templating on an oidc-enabled vhost, same reasoning as the CSRF
     // validation gate above.
-    if streaming.is_none()
-        && rule.session_cookie_enabled(&data.config)
-        && rule.csrf_enabled(&data.config)
-        && rule.oidc.is_none()
-    {
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.oidc.is_none() {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
-        {
-            body_bytes = new_body;
-            client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
-        }
+            {
+                body_bytes = new_body;
+                client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
+            }
     }
 
     // `{{ username }}`/`{{ proxyauth_version }}`/`{{ proxyauth_id }}`
@@ -2836,11 +2761,11 @@ pub async fn proxy_with_proxy(
     // also available in whatever HTML the backend itself returns, so
     // a target's own page can use them too, not just ProxyAuth's own
     // static content.
-    if streaming.is_none() && (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks()) {
+    if rule.tag_proxyauth_enabled() || rule.has_hidden_blocks() {
         let ct = headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
         if ct.to_ascii_lowercase().starts_with("text/html") {
             if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
                 let username = extract_username_for_tags(&req, &data, &ip).await;
@@ -2861,16 +2786,9 @@ pub async fn proxy_with_proxy(
     add_cors_headers(&mut client_resp, &req);
     fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
     apply_custom_headers_builder(&mut client_resp, rule);
-    client_resp.append_header(("server", "ProxyAuth"));
-
-    if let Some(incoming) = streaming {
-        return Ok(client_resp.body(StreamedUpstreamBody {
-            inner: Box::pin(incoming),
-            size: upstream_content_length(&headers),
-        }));
-    }
-
-    Ok(client_resp.body(body_bytes))
+    Ok(client_resp
+    .append_header(("server", "ProxyAuth"))
+    .body(body_bytes))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2886,16 +2804,16 @@ pub async fn proxy_without_proxy(
 
     let path = req.path();
     let ip = client_ip(&req, &data.config)
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
-        .to_string();
+    .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+    .to_string();
 
     let method_str = req.method().as_str();
 
     let user_agent = req
-        .headers()
-        .get("User-Agent")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
+    .headers()
+    .get("User-Agent")
+    .and_then(|h| h.to_str().ok())
+    .unwrap_or("-");
 
     let is_head = req.method() == actix_web::http::Method::HEAD;
 
@@ -2904,33 +2822,33 @@ pub async fn proxy_without_proxy(
             .headers()
             .get(header::ORIGIN)
             .and_then(|v| v.to_str().ok())
-        {
-            let origin_trimmed = origin.trim_end_matches('/');
+            {
+                let origin_trimmed = origin.trim_end_matches('/');
 
-            let is_allowed = rule
+                let is_allowed = rule
                 .resolved_cors_origins(&data.config)
                 .map(|list| {
                     list.iter()
-                        .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
+                    .any(|allowed| allowed.trim_end_matches('/') == origin_trimmed)
                 })
                 .unwrap_or(false);
 
-            if is_allowed {
-                resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
+                if is_allowed {
+                    resp.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, origin));
 
-                resp.insert_header((
-                    header::ACCESS_CONTROL_ALLOW_METHODS,
-                    "GET, HEAD, POST, PUT, DELETE, OPTIONS",
-                ));
+                    resp.insert_header((
+                        header::ACCESS_CONTROL_ALLOW_METHODS,
+                        "GET, HEAD, POST, PUT, DELETE, OPTIONS",
+                    ));
 
-                resp.insert_header((
-                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Authorization, Content-Type, Accept",
-                ));
+                    resp.insert_header((
+                        header::ACCESS_CONTROL_ALLOW_HEADERS,
+                        "Authorization, Content-Type, Accept",
+                    ));
 
-                resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                    resp.insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"));
+                }
             }
-        }
     };
 
     // ── ACL ─────────────────────────────────────────────────────────
@@ -2971,23 +2889,19 @@ pub async fn proxy_without_proxy(
     }
 
     // ── CSRF ─────────────────────────────────────────────────────────
-    if rule.session_cookie_enabled(&data.config)
-        && rule.csrf_enabled(&data.config)
-        && rule.requires_csrf()
-        && rule.oidc.is_none()
-    {
+    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() && rule.oidc.is_none() {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
             LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html>
-                <html lang="en">
-                <head>
-                <meta charset="utf-8">
-                <title>401 Unauthorized</title>
-                </head>
-                <body>
-                <h1>invalid csrf request</h1>
-                </body>
-                </html>"#;
+            <html lang="en">
+            <head>
+            <meta charset="utf-8">
+            <title>401 Unauthorized</title>
+            </head>
+            <body>
+            <h1>invalid csrf request</h1>
+            </body>
+            </html>"#;
 
             let mut resp = HttpResponse::build(StatusCode::UNAUTHORIZED);
 
@@ -3020,8 +2934,8 @@ pub async fn proxy_without_proxy(
     let prefix_norm = rule.prefix.trim_end_matches('/');
 
     let raw_forward = path_no_query
-        .strip_prefix(prefix_norm)
-        .unwrap_or(path_no_query);
+    .strip_prefix(prefix_norm)
+    .unwrap_or(path_no_query);
 
     let cleaned_remainder = raw_forward.trim_start_matches('/').trim_end_matches('/');
 
@@ -3052,12 +2966,12 @@ pub async fn proxy_without_proxy(
             if target_authority_tampered(&rule.target, &rewritten) {
                 warn!(
                     "[{}] {} {} 502 blocked: regex capture on route \"{}\" tried to change the target host ({} -> {})",
-                    ip, path, method_str, rule.prefix, rule.target, rewritten
+                      ip, path, method_str, rule.prefix, rule.target, rewritten
                 );
 
                 return Ok(HttpResponse::BadGateway()
-                    .append_header(("server", "ProxyAuth"))
-                    .body("502 Bad Gateway"));
+                .append_header(("server", "ProxyAuth"))
+                .body("502 Bad Gateway"));
             }
 
             rewritten
@@ -3117,7 +3031,7 @@ pub async fn proxy_without_proxy(
     })?;
 
     let uri = Uri::from_str(&full_url)
-        .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
+    .map_err(|e| error::ErrorBadRequest(format!("Invalid URI: {}", e)))?;
 
     // ── Auth ─────────────────────────────────────────────────────────
     // SECURITY/CORRECTNESS: `oidc:` means this vhost's backend makes
@@ -3132,70 +3046,70 @@ pub async fn proxy_without_proxy(
     // to "/", redirecting "/" to "/" — exactly what it looks like).
     let (username, token_id) = if rule.required_login && rule.oidc.is_none() {
         let token_header = req
-            .headers()
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| {
-                if !is_secure_request(&req, &data.config) {
-                    return None;
-                }
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| {
+            if !is_secure_request(&req, &data.config) {
+                return None;
+            }
 
-                req.headers()
-                    .get(header::COOKIE)
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|cookie_str| {
-                        cookie_str.split(';').find_map(|cookie| {
-                            let cookie = cookie.trim();
+            req.headers()
+            .get(header::COOKIE)
+            .and_then(|val| val.to_str().ok())
+            .and_then(|cookie_str| {
+                cookie_str.split(';').find_map(|cookie| {
+                    let cookie = cookie.trim();
 
-                            if let Some((key, value)) = cookie.split_once('=') {
-                                if key.trim() == "session_token" {
-                                    return Some(value.trim());
-                                }
-                            }
+                    if let Some((key, value)) = cookie.split_once('=') {
+                        if key.trim() == "session_token" {
+                            return Some(value.trim());
+                        }
+                    }
 
-                            None
-                        })
-                    })
+                    None
+                })
             })
-            .ok_or_else(|| {
+        })
+        .ok_or_else(|| {
+            let mut resp = HttpResponse::Unauthorized();
+
+            resp.append_header(("server", "ProxyAuth"));
+
+            add_cors_headers(&mut resp, &req);
+
+            error::InternalError::from_response("Missing token", resp.finish())
+        })?;
+
+        let (username, token_id, _expiry) =
+        match validate_token(token_header, &data, &data.config, &ip).await {
+            Ok(result) => result,
+
+            Err(_err) => {
+                warn!(
+                    "[{}] {} {} 401 Unauthorized token attempt {} {}",
+                    ip, path, method_str, user_agent, _err
+                );
+
                 let mut resp = HttpResponse::Unauthorized();
 
                 resp.append_header(("server", "ProxyAuth"));
 
+                resp.append_header((
+                    "Set-Cookie",
+                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+                ));
+
+                if req.uri() != "/" && req.uri() != "" {
+                    resp.append_header(("location", "/"));
+                }
+
                 add_cors_headers(&mut resp, &req);
 
-                error::InternalError::from_response("Missing token", resp.finish())
-            })?;
-
-        let (username, token_id, _expiry) =
-            match validate_token(token_header, &data, &data.config, &ip).await {
-                Ok(result) => result,
-
-                Err(_err) => {
-                    warn!(
-                        "[{}] {} {} 401 Unauthorized token attempt {} {}",
-                        ip, path, method_str, user_agent, _err
-                    );
-
-                    let mut resp = HttpResponse::Unauthorized();
-
-                    resp.append_header(("server", "ProxyAuth"));
-
-                    resp.append_header((
-                        "Set-Cookie",
-                        "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
-                    ));
-
-                    if req.uri() != "/" || req.uri() != "" {
-                        resp.append_header(("location", "/"));
-                    }
-
-                    add_cors_headers(&mut resp, &req);
-
-                    return Ok(resp.body("401 Unauthorized"));
-                }
-            };
+                return Ok(resp.body("401 Unauthorized"));
+            }
+        };
 
         // `rule.oidc.is_none()`: same reasoning as the twin check in
         // `proxy_with_proxy` above — an oidc-enabled vhost already
@@ -3204,38 +3118,39 @@ pub async fn proxy_without_proxy(
         // `allow_users`/`allow_groups`/`allow_roles` unconditionally.
         if rule.oidc.is_none()
             && !data
-                .config
-                .route_access_decision(rule, &username)
-                .is_allowed()
-        {
-            let mut resp = HttpResponse::Unauthorized();
+            .config
+            .route_access_decision(rule, &username)
+            .is_allowed()
+            {
 
-            resp.append_header(("server", "ProxyAuth"));
+                let mut resp = HttpResponse::Unauthorized();
 
-            resp.append_header((
-                "Set-Cookie",
-                "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
-            ));
+                resp.append_header(("server", "ProxyAuth"));
 
-            add_cors_headers(&mut resp, &req);
+                resp.append_header((
+                    "Set-Cookie",
+                    "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+                ));
 
-            return Ok(resp.body("401 Unauthorized"));
-        }
+                add_cors_headers(&mut resp, &req);
 
-        // SECURITY/CORRECTNESS: same guard as the twin check in
-        // `proxy_with_proxy` above — `login_redirect_url` defaulting
-        // to "/" when unconfigured otherwise makes an authenticated
-        // visit to "/" redirect to "/", forever.
-        if (req.uri() == "/" || req.uri() == "") && redirect_target_is_meaningful(&data.config) {
-            let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+                return Ok(resp.body("401 Unauthorized"));
+            }
 
-            return Ok(HttpResponse::SeeOther()
+            // SECURITY/CORRECTNESS: same guard as the twin check in
+            // `proxy_with_proxy` above — `login_redirect_url` defaulting
+            // to "/" when unconfigured otherwise makes an authenticated
+            // visit to "/" redirect to "/", forever.
+            if (req.uri() == "/" || req.uri() == "") && redirect_target_is_meaningful(&data.config) {
+                let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+
+                return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
                 .append_header(("location", redirect_target))
                 .finish());
-        }
+            }
 
-        (username, token_id)
+            (username, token_id)
     } else {
         (String::new(), String::new())
     };
@@ -3256,7 +3171,7 @@ pub async fn proxy_without_proxy(
         None => data.config.compression.clone(),
     };
     let strip_accept_encoding =
-        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+    route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
 
     // ── Build request Hyper ──────────────────────────────────────────
     //
@@ -3326,13 +3241,25 @@ pub async fn proxy_without_proxy(
             // that block's own comment for why it still needs
             // excluding here (same append-not-replace reasoning as the
             // four `X-Forwarded-*`/`X-Real-IP` headers above).
+            // `content-encoding` describes the body as it was actually
+            // received. actix may have decoded the payload before it
+            // reached this handler, so relaying the client's original
+            // header would announce an encoding the body no longer
+            // carries and the backend would fail to decode it. This is
+            // what made `git clone` fail: git sends its upload-pack
+            // request gzipped, Forgejo got the header without the gzip
+            // and answered 500. Same discipline already applied to
+            // `content-length` via `is_hop_by_hop_header`.
+            && key_str != "content-encoding"
             && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
-        {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            {
+                if let Ok(hv) =
+                    hyper::header::HeaderValue::from_bytes(value.as_bytes())
+                    {
+                        request_builder = request_builder.header(key_str, hv);
+                    }
             }
-        }
     }
 
     if strip_accept_encoding {
@@ -3361,11 +3288,7 @@ pub async fn proxy_without_proxy(
                 request_builder = request_builder.header("X-Forwarded-Host", hv);
             }
         }
-        let proto = if is_secure_request(&req, &data.config) {
-            "https"
-        } else {
-            "http"
-        };
+        let proto = if is_secure_request(&req, &data.config) { "https" } else { "http" };
         request_builder = request_builder.header("X-Forwarded-Proto", proto);
         if let Ok(hv) = hyper::header::HeaderValue::from_str(&ip) {
             request_builder = request_builder.header("X-Real-IP", hv);
@@ -3405,7 +3328,7 @@ pub async fn proxy_without_proxy(
             }
         }
     } else {
-        match request_builder.body(Full::new(body.clone()).boxed()) {
+        match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
             Ok(req) => req,
 
             Err(e) => {
@@ -3428,23 +3351,23 @@ pub async fn proxy_without_proxy(
     };
 
     // ── Send upstream ────────────────────────────────────────────────
-    let response_result: hyper::Response<UpstreamBody> = if !rule.backends.is_empty() {
+    let response_result: hyper::Response<ResponseBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
-            .backends
-            .iter()
-            .map(|b| match b {
-                BackendInput::Simple(url) => BackendConfig {
-                    url: url.clone(),
-                    weight: 1,
-                },
+        .backends
+        .iter()
+        .map(|b| match b {
+            BackendInput::Simple(url) => BackendConfig {
+                url: url.clone(),
+             weight: 1,
+            },
 
-                BackendInput::Detailed(cfg) => cfg.clone(),
-            })
-            .collect();
+            BackendInput::Detailed(cfg) => cfg.clone(),
+        })
+        .collect();
 
         let route_key = format!("{}|{}", rule.vhost.join(","), rule.prefix);
         match forward_failover(hyper_req, &backends, None, &route_key).await {
-            Ok(res) => res.map(UpstreamBody::Buffered),
+            Ok(res) => widen_boxbody(res),
 
             Err(e) => {
                 warn!(
@@ -3464,29 +3387,8 @@ pub async fn proxy_without_proxy(
             }
         }
     } else {
-        match timeout(
-            data.config.backend_timeout_duration(),
-            client.request(hyper_req),
-        )
-        .await
-        {
-            Ok(Ok(res)) if can_stream_response(res.headers(), res.status(), is_head) => {
-                res.map(UpstreamBody::Streaming)
-            }
-
-            Ok(Ok(res)) => incoming_to_boxbody(res)
-                .await
-                .map_err(|e| {
-                    warn!(
-                        client_ip = %ip,
-                        target = %full_url,
-                        "Body collect error: {}",
-                        e
-                    );
-
-                    error::ErrorServiceUnavailable("503 Service Unavailable")
-                })?
-                .map(UpstreamBody::Buffered),
+        match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
+            Ok(Ok(res)) => incoming_to_boxbody(res),
 
             Ok(Err(e)) => {
                 warn!(
@@ -3527,6 +3429,7 @@ pub async fn proxy_without_proxy(
     // ── Upstream status ──────────────────────────────────────────────
     let status = response_result.status();
 
+    // See the twin site in `proxy_with_proxy` for why this only logs.
     if status.is_server_error() {
         warn!(
             client_ip = %ip,
@@ -3534,14 +3437,6 @@ pub async fn proxy_without_proxy(
             "Upstream returned server error: {}",
             status
         );
-
-        let mut resp = HttpResponse::InternalServerError();
-
-        resp.append_header(("server", "ProxyAuth"));
-
-        add_cors_headers(&mut resp, &req);
-
-        return Ok(resp.finish());
     }
 
     // ── Split response ──────────────────────────────────────────────
@@ -3582,45 +3477,73 @@ pub async fn proxy_without_proxy(
         }
     }
 
+    // `streaming` is a request, not a guarantee: the three mechanisms
+    // below rewrite the whole body and therefore need it in full, so
+    // any of them being active on this route wins and the response is
+    // buffered as before. `validate_streaming_on_routes` reports that
+    // contradiction at startup.
+    let rewrites_body = rule.tag_proxyauth_enabled()
+    || rule.has_hidden_blocks()
+    || (rule.session_cookie_enabled(&data.config)
+    && rule.csrf_enabled(&data.config)
+    && rule.oidc.is_none());
+
+    if rule.streaming_enabled() && !rewrites_body && !is_head {
+        if rule.cache_enabled() {
+            let max_age = rule
+            .cache_duration_secs
+            .unwrap_or(data.config.cache_duration_secs);
+            client_resp
+            .insert_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
+        } else {
+            client_resp.insert_header((
+                header::CACHE_CONTROL,
+                "no-store, no-cache, must-revalidate, max-age=0",
+            ));
+            client_resp.insert_header(("Pragma", "no-cache"));
+            client_resp.insert_header(("Expires", "0"));
+        }
+
+        add_cors_headers(&mut client_resp, &req);
+        fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
+        apply_custom_headers_builder(&mut client_resp, rule);
+        client_resp.append_header(("server", "ProxyAuth"));
+
+        return Ok(client_resp.streaming(body_to_actix_stream(resp_body)));
+    }
+
     // ── Response body ───────────────────────────────────────────────
     //
     // HEAD:
     //   Do NOT collect/download the upstream body.
     //
-    // Streaming (see `can_stream_response`):
-    //   Leave the body with the backend connection — it is relayed to
-    //   the client as it arrives, at the very end.
-    //
     // GET/other:
     //   Collect normally.
     //
-    let (streaming, mut body_bytes): (Option<Incoming>, Bytes) = match resp_body {
-        _ if is_head => (None, Bytes::new()),
-        UpstreamBody::Streaming(incoming) => (Some(incoming), Bytes::new()),
-        UpstreamBody::Buffered(body) => {
-            let bytes = body
-                .collect()
-                .await
-                .map_err(|e| {
-                    warn!(
-                        client_ip = %ip,
-                        target = %full_url,
-                        "Body read error: {}",
-                        e
-                    );
+    let mut body_bytes: Bytes = if is_head {
+        Bytes::new()
+    } else {
+        resp_body
+        .collect()
+        .await
+        .map_err(|e| {
+            warn!(
+                client_ip = %ip,
+                target = %full_url,
+                "Body read error: {}",
+                e
+            );
 
-                    error::ErrorInternalServerError("500 Internal Server Error")
-                })?
-                .to_bytes();
-            (None, bytes)
-        }
+            error::ErrorInternalServerError("500 Internal Server Error")
+        })?
+        .to_bytes()
     };
 
     // ── Cache policy ────────────────────────────────────────────────
     if rule.cache_enabled() {
         let max_age = rule
-            .cache_duration_secs
-            .unwrap_or(data.config.cache_duration_secs);
+        .cache_duration_secs
+        .unwrap_or(data.config.cache_duration_secs);
         let cc = format!("public, max-age={}", max_age);
         client_resp.insert_header((header::CACHE_CONTROL, cc));
     } else {
@@ -3640,19 +3563,14 @@ pub async fn proxy_without_proxy(
     //
     // Never modify a HEAD response body.
     //
-    if !is_head
-        && streaming.is_none()
-        && rule.session_cookie_enabled(&data.config)
-        && rule.csrf_enabled(&data.config)
-        && rule.oidc.is_none()
-    {
+    if !is_head && rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.oidc.is_none() {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
-        {
-            body_bytes = new_body;
+            {
+                body_bytes = new_body;
 
-            client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
-        }
+                client_resp.insert_header((header::CONTENT_LENGTH, new_len.to_string()));
+            }
     }
 
     // `{{ username }}`/`{{ csrf_token }}`/`{{ proxyauth_version }}`/
@@ -3660,12 +3578,11 @@ pub async fn proxy_without_proxy(
     // static files and the other proxied-response path, so a target's
     // own HTML can use these tags too, not just ProxyAuth's own static
     // content.
-    if !is_head && streaming.is_none() && (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
-    {
+    if !is_head && (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks()) {
         let ct = headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
         if ct.to_ascii_lowercase().starts_with("text/html") {
             if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
                 let username = extract_username_for_tags(&req, &data, &ip).await;
@@ -3694,14 +3611,7 @@ pub async fn proxy_without_proxy(
     // remain intact.
     //
     apply_custom_headers_builder(&mut client_resp, rule);
-    client_resp.append_header(("server", "ProxyAuth"));
-
-    if let Some(incoming) = streaming {
-        return Ok(client_resp.body(StreamedUpstreamBody {
-            inner: Box::pin(incoming),
-            size: upstream_content_length(&headers),
-        }));
-    }
-
-    Ok(client_resp.body(body_bytes))
+    Ok(client_resp
+    .append_header(("server", "ProxyAuth"))
+    .body(body_bytes))
 }
