@@ -304,12 +304,17 @@ macro_rules! build_app {
             .wrap(AccessLogger {
                 state: state.clone(),
             })
-            .service(
-                web::resource("/auth")
-                    .route(web::post().to(auth_dispatch))
-                    .route(web::method(Method::OPTIONS).to(auth_options)),
-            )
-            .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
+            // `/auth`, `/reset-password` et `/adm/auth/totp/get` ne sont
+            // PAS enregistres ici: ce sont les trois seules ressources que
+            // les branches de `mode_actix` enveloppent d'un rate limiter,
+            // et actix retient la premiere route declaree pour un chemin
+            // donne. Les declarer ici aussi faisait gagner la version sans
+            // limiteur, et celle des branches n'etait jamais atteinte —
+            // `/auth` acceptait donc autant de tentatives de mot de passe
+            // qu'on lui en envoyait, quelle que soit la configuration.
+            //
+            // Chaque branche les declare desormais exactement une fois,
+            // via `auth_routes!` pour la version non limitee.
             .service(web::resource("/adm/stats").route(web::get().to(get_proxy_stats)))
             .service(web::resource("/adm/stats/sessions").route(web::get().to(get_proxy_sessions)))
             .service(web::resource("/adm/logs").route(web::get().to(get_logs)))
@@ -320,11 +325,25 @@ macro_rules! build_app {
                     .route(web::get().to(logout_dispatch))
                     .route(web::method(Method::OPTIONS).to(logout_options)),
             )
-            .service(
-                web::resource("/adm/auth/totp/get")
-                    .route(web::post().to(get_otpauth_uri))
-                    .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
-            )
+    }};
+}
+
+/// Les trois ressources sensibles, sans rate limiter — pour les modes ou
+/// `ratelimit_auth` est desactive. Les modes qui l'activent les declarent
+/// eux-memes avec `.wrap(Governor::new(...))` sur chaque route.
+macro_rules! auth_routes {
+    ($app:expr) => {{
+        $app.service(
+            web::resource("/auth")
+                .route(web::post().to(auth_dispatch))
+                .route(web::method(Method::OPTIONS).to(auth_options)),
+        )
+        .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
+        .service(
+            web::resource("/adm/auth/totp/get")
+                .route(web::post().to(get_otpauth_uri))
+                .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
+        )
     }};
 }
 
@@ -908,6 +927,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let num_instances = config.num_instances;
 
+    // Les compteurs de rate limiting sont construits ici, une seule
+    // fois, et partages par toutes les instances ci-dessous.
+    //
+    // `num_instances` ne cree PAS de processus : ce sont N serveurs
+    // actix dans le meme espace d'adressage, chacun avec sa propre
+    // boucle d'accept via SO_REUSEPORT (voir le join_all en fin de
+    // fonction). Construire le GovernorConfig a l'interieur de la
+    // boucle donnait donc a chaque instance son propre seau, et le
+    // burst reellement applique valait `burst * num_instances` — avec
+    // le defaut de 2, exactement le double de ce que config.json
+    // annonce, ce qu'un test de charge mesurait comme "rate limit non
+    // applique".
+    //
+    // Passe par un Arc plutot qu'un clone: `Governor::new` prend une
+    // reference, et l'Arc garantit que les N fermetures partagent le
+    // meme etat sans dependre de l'implementation de Clone sur
+    // GovernorConfig.
+    //
+    // `requests_per_second: 0` desactive le limiteur concerne, et
+    // `None` est la facon de le representer ici: aucun compteur n'est
+    // construit, et le bras de `mode_actix` correspondant n'enveloppe
+    // rien. Une valeur de repli (0 ramene a 1) transformerait
+    // "desactive" en "la limite la plus stricte possible", ce qui est
+    // l'inverse de ce que la configuration demande.
+    //
+    // Un `burst` de 0 alors que le limiteur est actif est un cas
+    // different: `GovernorConfigBuilder::finish()` renvoie None pour un
+    // burst nul, donc la valeur est ramenee a 1 — la plus stricte
+    // representable — et signalee, plutot que de paniquer au demarrage.
+    fn build_governor_period(requests_per_second: u64) -> Duration {
+        Duration::from_secs_f64(1.0 / requests_per_second as f64)
+    }
+
+    fn usable_burst(burst: u32, which: &str) -> u32 {
+        if burst == 0 {
+            warn!(
+                "ratelimit_{which}: `burst` is 0 while `requests_per_second` is not — a burst of 0 is not representable, using 1. Set `requests_per_second` to 0 to disable this rate limit entirely."
+            );
+            1
+        } else {
+            burst
+        }
+    }
+
+    let governor_auth_conf = (requests_per_second_auth_config > 0).then(|| {
+        std::sync::Arc::new(
+            GovernorConfigBuilder::default()
+                .burst_size(usable_burst(burst_auth_config, "auth"))
+                .use_headers()
+                .period(build_governor_period(requests_per_second_auth_config))
+                .finish()
+                .unwrap(),
+        )
+    });
+
+    let governor_proxy_conf = (requests_per_second_proxy_config > 0).then(|| {
+        std::sync::Arc::new(
+            GovernorConfigBuilder::default()
+                .burst_size(usable_burst(burst_proxy_config, "proxy"))
+                .key_extractor(UserToken)
+                .period(build_governor_period(requests_per_second_proxy_config))
+                .finish()
+                .unwrap(),
+        )
+    });
+
     let mut server_futures = Vec::new();
 
     print_launcher(mode_actix, VERSION, config.worker, &addrs.join(", "), ID);
@@ -930,18 +1015,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let server = match mode_actix.as_ref() {
             "NO_RATELIMIT_AUTH" => {
-                let seconds_per_request =
-                    Duration::from_secs_f64(1.0 / requests_per_second_proxy_config as f64);
-                let governor_proxy_conf = GovernorConfigBuilder::default()
-                    .burst_size(burst_proxy_config)
-                    .key_extractor(UserToken)
-                    .period(seconds_per_request)
-                    .finish()
-                    .unwrap();
+                // Clone d'Arc : meme compteur, pas un second seau.
+                let governor_proxy_conf = governor_proxy_conf
+                    .clone()
+                    .expect("NO_RATELIMIT_AUTH implies ratelimit_proxy is enabled");
 
                 bind_server(
                     move || {
-                        build_app!(state_cloned).default_service(
+                        auth_routes!(build_app!(state_cloned)).default_service(
                             web::to(global_proxy).wrap(Governor::new(&governor_proxy_conf)),
                         )
                     },
@@ -952,14 +1033,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             "NO_RATELIMIT_PROXY" => {
-                let seconds_per_request =
-                    Duration::from_secs_f64(1.0 / requests_per_second_auth_config as f64);
-                let governor_auth_conf = GovernorConfigBuilder::default()
-                    .burst_size(burst_auth_config)
-                    .use_headers()
-                    .period(seconds_per_request)
-                    .finish()
-                    .unwrap();
+                let governor_auth_conf = governor_auth_conf
+                    .clone()
+                    .expect("NO_RATELIMIT_PROXY implies ratelimit_auth is enabled");
 
                 bind_server(
                     move || {
@@ -997,24 +1073,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?
             }
 
-            "RATELIMIT_GLOBAL_ON" | "RATELIMIT_GLOBAL_OFF" => {
-                let seconds_per_request_auth =
-                    Duration::from_secs_f64(1.0 / requests_per_second_auth_config as f64);
-                let governor_auth_conf = GovernorConfigBuilder::default()
-                    .burst_size(burst_auth_config)
-                    .use_headers()
-                    .period(seconds_per_request_auth)
-                    .finish()
-                    .unwrap();
-
-                let seconds_per_request_proxy =
-                    Duration::from_secs_f64(1.0 / requests_per_second_proxy_config as f64);
-                let governor_proxy_conf = GovernorConfigBuilder::default()
-                    .burst_size(burst_proxy_config)
-                    .key_extractor(UserToken)
-                    .period(seconds_per_request_proxy)
-                    .finish()
-                    .unwrap();
+            // RATELIMIT_GLOBAL_OFF ne figure volontairement plus ici:
+            // les deux limites sont a 0, donc rien ne doit etre
+            // enveloppe. Ce mode tombe sur le bras `_` plus bas, qui
+            // construit l'application sans aucun governor.
+            "RATELIMIT_GLOBAL_ON" => {
+                // `expect`: ce mode signifie exactement "les deux
+                // limites sont actives", donc les deux Option sont Some
+                // par construction (voir mode_actix_web).
+                let governor_auth_conf = governor_auth_conf
+                    .clone()
+                    .expect("RATELIMIT_GLOBAL_ON implies ratelimit_auth is enabled");
+                let governor_proxy_conf = governor_proxy_conf
+                    .clone()
+                    .expect("RATELIMIT_GLOBAL_ON implies ratelimit_proxy is enabled");
 
                 bind_server(
                     move || {
@@ -1055,7 +1127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ => bind_server(
-                move || build_app!(state_cloned).default_service(web::to(global_proxy)),
+                move || {
+                    auth_routes!(build_app!(state_cloned)).default_service(web::to(global_proxy))
+                },
                 listener,
                 &config,
                 &routes.routes,
