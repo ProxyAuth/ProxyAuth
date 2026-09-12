@@ -442,12 +442,13 @@ impl VhostLogWriter {
                 if let Some(parent) = path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                match File::options().create(true).append(true).open(&path) {
+                match File::options()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
                     Ok(file) => {
-                        map.insert(
-                            full.clone(),
-                            Mutex::new(BufWriter::with_capacity(8192, file)),
-                        );
+                        map.insert(full.clone(), Mutex::new(BufWriter::with_capacity(8192, file)));
                     }
                     Err(e) => {
                         eprintln!("[accesslog] failed to open log file {full}: {e}");
@@ -676,11 +677,7 @@ where
                 path: req.path().to_string(),
                 query: if req_fields.query {
                     let q = req.query_string();
-                    if q.is_empty() {
-                        "-".into()
-                    } else {
-                        q.to_string()
-                    }
+                    if q.is_empty() { "-".into() } else { q.to_string() }
                 } else {
                     String::new()
                 },
@@ -829,7 +826,11 @@ fn route_logging_enabled(state: &web::Data<AppState>, ctx: Option<&LogContext>) 
 /// order: route `log_file` (from `routes.yml`) → vhost group
 /// `log_file` → `logging.vhosts[vhost].log_file` (from `config.json`)
 /// → `logging.log_file` (global default).
-fn resolve_log_file(state: &web::Data<AppState>, ctx: Option<&LogContext>, vhost: &str) -> String {
+fn resolve_log_file(
+    state: &web::Data<AppState>,
+    ctx: Option<&LogContext>,
+    vhost: &str,
+) -> String {
     // Per-route override (set in routes.yml).
     if let Some(idx) = ctx.and_then(|c| c.route_idx) {
         if let Some(rule) = state.routes.routes.get(idx) {
@@ -854,14 +855,7 @@ fn resolve_log_file(state: &web::Data<AppState>, ctx: Option<&LogContext>, vhost
     state.config.logging.log_file.clone()
 }
 
-fn emit(
-    c: &Captured,
-    ctx: Option<&LogContext>,
-    status: u16,
-    len: u64,
-    started: Instant,
-    log_file: &str,
-) {
+fn emit(c: &Captured, ctx: Option<&LogContext>, status: u16, len: u64, started: Instant, log_file: &str) {
     let segments = format_segments();
     if segments.is_empty() {
         return;

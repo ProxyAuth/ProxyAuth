@@ -212,3 +212,4 @@ pub fn patch_otpkey(username: &str, new_otpkey: Option<&str>) -> Result<(), Stri
     user.otpkey = new_otpkey.map(|s| s.to_string());
     write_snapshot(&users)
 }
+

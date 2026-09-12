@@ -45,7 +45,7 @@ struct ChallengeEntry {
 /// The default is the production path used by ProxyAuth.
 fn challenge_path() -> PathBuf {
     let base = std::env::var("PROXYAUTH_ACME_CHALLENGE_PATH")
-        .unwrap_or_else(|_| "/opt/proxyauth/db/acme_challenges".to_string());
+    .unwrap_or_else(|_| "/opt/proxyauth/db/acme_challenges".to_string());
 
     PathBuf::from(base)
 }
@@ -73,17 +73,21 @@ fn env() -> Result<&'static lmdb::Environment, String> {
         })?;
 
         let env = lmdb::Environment::new()
-            .set_max_dbs(1)
-            .open(Path::new(&path))
-            .map_err(|e| {
-                format!(
-                    "Failed to open ACME challenge LMDB at {}: {e}",
-                    path.display()
-                )
-            })?;
+        .set_max_dbs(1)
+        .open(Path::new(&path))
+        .map_err(|e| {
+            format!(
+                "Failed to open ACME challenge LMDB at {}: {e}",
+                path.display()
+            )
+        })?;
 
         env.create_db(Some(DB_NAME), lmdb::DatabaseFlags::empty())
-            .map_err(|e| format!("Failed to create/open ACME challenge LMDB database: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Failed to create/open ACME challenge LMDB database: {e}"
+            )
+        })?;
 
         Ok(env)
     })
@@ -114,16 +118,20 @@ fn make_key(vhost: &str, token: &str) -> Vec<u8> {
 /// Current UNIX timestamp.
 fn now() -> i64 {
     SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_secs() as i64)
+    .unwrap_or(0)
 }
 
 /// Publish an ACME HTTP-01 challenge.
 ///
 /// This function MUST complete successfully before the ACME order is
 /// told that the challenge is ready.
-pub fn publish(vhost: &str, token: &str, key_authorization: &str) -> Result<(), String> {
+pub fn publish(
+    vhost: &str,
+    token: &str,
+    key_authorization: &str,
+) -> Result<(), String> {
     use lmdb::{Transaction, WriteFlags};
 
     let env = env()?;
@@ -134,25 +142,54 @@ pub fn publish(vhost: &str, token: &str, key_authorization: &str) -> Result<(), 
     };
 
     let bytes = serde_json::to_vec(&entry)
-        .map_err(|e| format!("Failed to serialize ACME challenge entry: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "Failed to serialize ACME challenge entry: {e}"
+        )
+    })?;
 
     let _guard = CHALLENGE_MUTEX
-        .lock()
-        .map_err(|e| format!("Failed to lock ACME challenge store: {e}"))?;
+    .lock()
+    .map_err(|e| {
+        format!(
+            "Failed to lock ACME challenge store: {e}"
+        )
+    })?;
 
     let db = env
-        .open_db(Some(DB_NAME))
-        .map_err(|e| format!("Failed to open ACME challenge LMDB database: {e}"))?;
+    .open_db(Some(DB_NAME))
+    .map_err(|e| {
+        format!(
+            "Failed to open ACME challenge LMDB database: {e}"
+        )
+    })?;
 
     let mut txn = env
-        .begin_rw_txn()
-        .map_err(|e| format!("Failed to begin ACME challenge write transaction: {e}"))?;
+    .begin_rw_txn()
+    .map_err(|e| {
+        format!(
+            "Failed to begin ACME challenge write transaction: {e}"
+        )
+    })?;
 
-    txn.put(db, &make_key(vhost, token), &bytes, WriteFlags::empty())
-        .map_err(|e| format!("Failed to store ACME challenge for {vhost}: {e}"))?;
+    txn.put(
+        db,
+        &make_key(vhost, token),
+            &bytes,
+            WriteFlags::empty(),
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to store ACME challenge for {vhost}: {e}"
+        )
+    })?;
 
     txn.commit()
-        .map_err(|e| format!("Failed to commit ACME challenge for {vhost}: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "Failed to commit ACME challenge for {vhost}: {e}"
+        )
+    })?;
 
     // Visible at info level, unlike lookup()'s own debug-level logging
     // — so a real renewal attempt's logs show BOTH what was published
@@ -429,7 +466,10 @@ mod tests {
             ));
 
             unsafe {
-                std::env::set_var("PROXYAUTH_ACME_CHALLENGE_PATH", dir);
+                std::env::set_var(
+                    "PROXYAUTH_ACME_CHALLENGE_PATH",
+                    dir,
+                );
             }
         });
     }
@@ -437,34 +477,60 @@ mod tests {
     #[test]
     fn extract_token_matches_well_formed_path() {
         assert_eq!(
-            extract_token("/.well-known/acme-challenge/abc123"),
+            extract_token(
+                "/.well-known/acme-challenge/abc123"
+            ),
             Some("abc123")
         );
     }
 
     #[test]
     fn extract_token_rejects_unrelated_paths() {
-        assert_eq!(extract_token("/foo/bar"), None);
+        assert_eq!(
+            extract_token("/foo/bar"),
+                   None
+        );
 
-        assert_eq!(extract_token("/.well-known/acme-challenge/"), None);
+        assert_eq!(
+            extract_token("/.well-known/acme-challenge/"),
+                   None
+        );
 
-        assert_eq!(extract_token("/.well-known/acme-challenge"), None);
+        assert_eq!(
+            extract_token("/.well-known/acme-challenge"),
+                   None
+        );
     }
 
     #[test]
     fn extract_token_rejects_nested_paths() {
-        assert_eq!(extract_token("/.well-known/acme-challenge/a/b"), None);
+        assert_eq!(
+            extract_token(
+                "/.well-known/acme-challenge/a/b"
+            ),
+            None
+        );
     }
 
     #[test]
     fn publish_then_lookup_roundtrips() {
         setup();
 
-        publish("test-a.example.com", "tok-1", "key-auth-value-1").unwrap();
+        publish(
+            "test-a.example.com",
+            "tok-1",
+            "key-auth-value-1",
+        )
+        .unwrap();
 
         assert_eq!(
-            lookup("test-a.example.com", "tok-1"),
-            Some("key-auth-value-1".to_string())
+            lookup(
+                "test-a.example.com",
+                "tok-1"
+            ),
+            Some(
+                "key-auth-value-1".to_string()
+            )
         );
     }
 
@@ -472,15 +538,26 @@ mod tests {
     fn lookup_is_case_insensitive_on_vhost() {
         setup();
 
-        publish("Test-B.Example.com", "tok-2", "value-2").unwrap();
+        publish(
+            "Test-B.Example.com",
+            "tok-2",
+            "value-2",
+        )
+        .unwrap();
 
         assert_eq!(
-            lookup("test-b.example.com", "tok-2"),
+            lookup(
+                "test-b.example.com",
+                "tok-2"
+            ),
             Some("value-2".to_string())
         );
 
         assert_eq!(
-            lookup("TEST-B.EXAMPLE.COM", "tok-2"),
+            lookup(
+                "TEST-B.EXAMPLE.COM",
+                "tok-2"
+            ),
             Some("value-2".to_string())
         );
     }
@@ -489,24 +566,46 @@ mod tests {
     fn lookup_misses_unpublished_pair() {
         setup();
 
-        assert_eq!(lookup("never-published.example.com", "whatever"), None);
+        assert_eq!(
+            lookup(
+                "never-published.example.com",
+                "whatever"
+            ),
+            None
+        );
     }
 
     #[test]
     fn different_vhosts_dont_collide_on_same_token() {
         setup();
 
-        publish("host-one.example.com", "shared-token", "value-for-one").unwrap();
+        publish(
+            "host-one.example.com",
+            "shared-token",
+            "value-for-one",
+        )
+        .unwrap();
 
-        publish("host-two.example.com", "shared-token", "value-for-two").unwrap();
+        publish(
+            "host-two.example.com",
+            "shared-token",
+            "value-for-two",
+        )
+        .unwrap();
 
         assert_eq!(
-            lookup("host-one.example.com", "shared-token"),
+            lookup(
+                "host-one.example.com",
+                "shared-token"
+            ),
             Some("value-for-one".to_string())
         );
 
         assert_eq!(
-            lookup("host-two.example.com", "shared-token"),
+            lookup(
+                "host-two.example.com",
+                "shared-token"
+            ),
             Some("value-for-two".to_string())
         );
     }
@@ -515,20 +614,43 @@ mod tests {
     fn remove_clears_the_entry() {
         setup();
 
-        publish("test-c.example.com", "tok-3", "value-3").unwrap();
+        publish(
+            "test-c.example.com",
+            "tok-3",
+            "value-3",
+        )
+        .unwrap();
 
-        assert!(lookup("test-c.example.com", "tok-3").is_some());
+        assert!(
+            lookup(
+                "test-c.example.com",
+                "tok-3"
+            )
+            .is_some()
+        );
 
-        remove("test-c.example.com", "tok-3");
+        remove(
+            "test-c.example.com",
+            "tok-3"
+        );
 
-        assert_eq!(lookup("test-c.example.com", "tok-3"), None);
+        assert_eq!(
+            lookup(
+                "test-c.example.com",
+                "tok-3"
+            ),
+            None
+        );
     }
 
     #[test]
     fn remove_of_nonexistent_entry_is_a_harmless_no_op() {
         setup();
 
-        remove("never-published-either.example.com", "nope");
+        remove(
+            "never-published-either.example.com",
+            "nope"
+        );
     }
 
     #[test]
@@ -538,30 +660,42 @@ mod tests {
         let n = 50;
 
         let handles: Vec<_> = (0..n)
-            .map(|i| {
-                std::thread::spawn(move || {
-                    let vhost = format!("lmdb-thread-{i}.example.com");
+        .map(|i| {
+            std::thread::spawn(move || {
+                let vhost = format!(
+                    "lmdb-thread-{i}.example.com"
+                );
 
-                    let value = format!("value-{i}");
+                let value = format!("value-{i}");
 
-                    publish(&vhost, "shared-token-across-all-threads", &value).unwrap();
-                })
+                publish(
+                    &vhost,
+                    "shared-token-across-all-threads",
+                    &value,
+                )
+                .unwrap();
             })
-            .collect();
+        })
+        .collect();
 
         for h in handles {
             h.join().unwrap();
         }
 
         for i in 0..n {
-            let vhost = format!("lmdb-thread-{i}.example.com");
+            let vhost = format!(
+                "lmdb-thread-{i}.example.com"
+            );
 
             let expected = format!("value-{i}");
 
             assert_eq!(
-                lookup(&vhost, "shared-token-across-all-threads"),
+                lookup(
+                    &vhost,
+                    "shared-token-across-all-threads"
+                ),
                 Some(expected),
-                "lost concurrent publish for thread {i}"
+                    "lost concurrent publish for thread {i}"
             );
         }
     }

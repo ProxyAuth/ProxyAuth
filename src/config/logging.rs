@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub const DEFAULT_FORMAT: &str = "[time] [[vhost]] [[ip]] - [method] [protocol] [status] [length] [path] [tid:[token-id]] '[user-agent]' '[referer]' [request-time-ns]";
+pub const DEFAULT_FORMAT: &str =
+    "[time] [[vhost]] [[ip]] - [method] [protocol] [status] [length] [path] [tid:[token-id]] '[user-agent]' '[referer]' [request-time-ns]";
 
 fn default_true() -> bool {
     true
@@ -84,7 +85,11 @@ pub struct LoggingConfig {
     /// `[user-agent] [x-forwarded-for] [host] [protocol] [query]`
     /// `[referer] [request-time] [cpu-usage] [memory-usage]`
     /// `[username] [token-id] [route] [time] [error_detail]`
-    #[serde(default = "default_format", alias = "format-log", alias = "format_log")]
+    #[serde(
+        default = "default_format",
+        alias = "format-log",
+        alias = "format_log"
+    )]
     pub format: String,
 
     /// Per-vhost overrides, keyed by hostname (port stripped, compared
@@ -179,7 +184,10 @@ impl LoggingConfig {
         validate_log_filename(&self.log_file, "logging.log_file")?;
         for (vhost, entry) in &self.vhosts {
             if let Some(f) = &entry.log_file {
-                validate_log_filename(f, &format!("logging.vhosts.{}.log_file", vhost))?;
+                validate_log_filename(
+                    f,
+                    &format!("logging.vhosts.{}.log_file", vhost),
+                )?;
             }
         }
         Ok(())

@@ -119,8 +119,7 @@ pub async fn render_error_page(
                         .unwrap_or_else(|| "-".to_string());
                     let username =
                         crate::network::proxy::extract_username_for_tags(req, &data, &ip).await;
-                    let csrf_token =
-                        crate::network::proxy::resolve_tag_csrf_token(rule, &data.config);
+                    let csrf_token = crate::network::proxy::resolve_tag_csrf_token(rule, &data.config);
                     html = crate::network::proxy::substitute_proxyauth_tags(
                         &html,
                         username.as_deref(),

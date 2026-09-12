@@ -499,8 +499,6 @@ pub const DEFAULT_CONFIG_JSON: &str = concat!(
     "  },\n",
     "  \"stats\": false,\n",
     "  \"max_idle_per_host\": 500,\n",
-    "  \"max_body_size\": 10485760,\n",
-    "  \"backend_timeout\": 10000,\n",
     "  \"ratelimit_auth\": {\n",
     "    \"burst\": 100,\n",
     "    \"block_delay\": 5000,\n",

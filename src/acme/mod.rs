@@ -15,9 +15,37 @@ use tracing::{error, info, warn};
 /// One vhost that opted into automatic renewal, with the cert/key
 /// paths its `vhost_cert` points at.
 pub struct ManagedVhost {
-    pub vhost: String,
+    /// Every DNS name this one certificate has to cover, in
+    /// `routes.yml` order.
+    ///
+    /// This was a single `String`, which quietly broke any vhost group
+    /// listing more than one name: `collect_managed_vhosts` produced
+    /// one entry per name, each pointing at the *same* `vhost_cert`
+    /// path, so each issued its own single-SAN certificate into that
+    /// path and overwrote the previous one. The file ended up holding
+    /// a certificate valid for whichever name happened to be renewed
+    /// last, and every other name in the group was left uncovered —
+    /// the equivalent of running certbot once per `-d` instead of once
+    /// with every `-d` together. It also burned one ACME order per
+    /// name, which counts against Let's Encrypt's rate limits.
+    pub names: Vec<String>,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+}
+
+impl ManagedVhost {
+    /// The name this certificate is identified by in logs and CLI
+    /// output. Never empty in practice — both collectors only ever
+    /// build a `ManagedVhost` from at least one name.
+    pub fn primary(&self) -> &str {
+        self.names.first().map(String::as_str).unwrap_or("<unnamed>")
+    }
+
+    /// Every name, for messages where knowing the full SAN set
+    /// matters more than brevity.
+    pub fn display_names(&self) -> String {
+        self.names.join(", ")
+    }
 }
 
 /// Outcome of one `check_and_maybe_renew` call — lets a caller (the
@@ -31,9 +59,7 @@ pub enum RenewOutcome {
     /// Not due yet, `renew_before_days` not reached — carries how many
     /// days are actually left. Never produced when `force: true` was
     /// passed to `check_and_maybe_renew`.
-    NotDue {
-        days_left: i64,
-    },
+    NotDue { days_left: i64 },
     Renewed,
     Failed(String),
 }
@@ -64,7 +90,9 @@ pub fn collect_managed_vhosts(routes: &[RouteRule]) -> Vec<ManagedVhost> {
                 wants_renewal.insert(host.to_ascii_lowercase());
             }
         }
-        if let (Some(cert), Some(key)) = (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key")) {
+        if let (Some(cert), Some(key)) =
+            (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key"))
+        {
             for host in &rule.vhost {
                 cert_paths
                     .entry(host.to_ascii_lowercase())
@@ -73,22 +101,79 @@ pub fn collect_managed_vhosts(routes: &[RouteRule]) -> Vec<ManagedVhost> {
         }
     }
 
-    let mut managed = Vec::new();
-    for vhost in wants_renewal {
-        match cert_paths.get(&vhost) {
-            Some((cert, key)) => managed.push(ManagedVhost {
-                vhost: vhost.clone(),
-                cert_path: PathBuf::from(cert),
-                key_path: PathBuf::from(key),
-            }),
-            None => {
-                warn!(
-                    "acme: {vhost} has certbot_renew: true but no vhost_cert (cert/key) configured for it anywhere in routes.yml — nothing to renew into, skipping. Set vhost_cert for this vhost to e.g. /etc/proxyauth/cert/{vhost}/fullchain.pem and .../privkey.pem."
-                );
+    // Grouped by destination cert/key path, not by name: the path is
+    // what defines one issuance unit. Two names writing into the same
+    // `fullchain.pem` must end up on one certificate carrying both as
+    // SANs — issuing one certificate per name into a shared path meant
+    // each overwrote the last.
+    //
+    // Names are kept in `routes.yml` order (`wants_renewal` is walked
+    // via `routes`, not via the set) so the certificate's primary name
+    // is stable across runs rather than varying with hash iteration
+    // order.
+    let mut grouped: Vec<((String, String), Vec<String>)> = Vec::new();
+    for rule in routes {
+        for host in &rule.vhost {
+            let host = host.to_ascii_lowercase();
+            if !wants_renewal.contains(&host) {
+                continue;
+            }
+            let Some(paths) = cert_paths.get(&host) else {
+                continue;
+            };
+            match grouped.iter_mut().find(|(p, _)| p == paths) {
+                Some((_, names)) => {
+                    if !names.contains(&host) {
+                        names.push(host);
+                    }
+                }
+                None => grouped.push((paths.clone(), vec![host])),
             }
         }
     }
-    managed
+
+    for vhost in &wants_renewal {
+        if !cert_paths.contains_key(vhost) {
+            warn!(
+                "acme: {vhost} has certbot_renew: true but no vhost_cert (cert/key) configured for it anywhere in routes.yml — nothing to renew into, skipping. Set vhost_cert for this vhost to e.g. /etc/proxyauth/cert/{vhost}/fullchain.pem and .../privkey.pem."
+            );
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|((cert, key), names)| ManagedVhost {
+            names,
+            cert_path: PathBuf::from(cert),
+            key_path: PathBuf::from(key),
+        })
+        .collect()
+}
+
+/// Every name in `routes` whose `vhost_cert` points at `cert_path` —
+/// i.e. every name that must appear on that one certificate. Used by
+/// `proxyauth certbot renew <vhost>`, so naming a single member of a
+/// group still renews the whole group: reissuing just that one name
+/// would overwrite the shared file with a certificate no longer
+/// covering its siblings, which is the very bug grouping exists to
+/// prevent.
+pub fn names_sharing_cert(routes: &[RouteRule], cert_path: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for rule in routes {
+        let Some(cert) = rule.vhost_cert.get("cert") else {
+            continue;
+        };
+        if std::path::Path::new(cert) != cert_path {
+            continue;
+        }
+        for host in &rule.vhost {
+            let host = host.to_ascii_lowercase();
+            if !names.contains(&host) {
+                names.push(host);
+            }
+        }
+    }
+    names
 }
 
 /// Every distinct vhost across `routes` that has a usable `vhost_cert`
@@ -105,17 +190,29 @@ pub fn collect_all_vhost_certs(routes: &[RouteRule]) -> Vec<ManagedVhost> {
         if rule.vhost.is_empty() {
             continue;
         }
-        let Some((cert, key)) = rule.vhost_cert.get("cert").zip(rule.vhost_cert.get("key")) else {
+        let Some((cert, key)) = rule.vhost_cert.get("cert").zip(rule.vhost_cert.get("key"))
+        else {
             continue;
         };
         for host in &rule.vhost {
             let host = host.to_ascii_lowercase();
-            if seen.insert(host.clone()) {
-                out.push(ManagedVhost {
-                    vhost: host,
+            if !seen.insert(host.clone()) {
+                continue;
+            }
+            // Same grouping as `collect_managed_vhosts`: names sharing
+            // a cert path are one certificate, so they are one entry
+            // here too rather than N identical-looking lines in
+            // `certbot check all`.
+            match out
+                .iter_mut()
+                .find(|mv: &&mut ManagedVhost| mv.cert_path == PathBuf::from(cert))
+            {
+                Some(mv) => mv.names.push(host),
+                None => out.push(ManagedVhost {
+                    names: vec![host],
                     cert_path: PathBuf::from(cert),
                     key_path: PathBuf::from(key),
-                });
+                }),
             }
         }
     }
@@ -205,11 +302,10 @@ pub fn find_vhost_cert_paths(
         if !rule.vhost.iter().any(|h| h.to_ascii_lowercase() == vhost) {
             continue;
         }
-        if let (Some(cert), Some(key)) = (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key")) {
-            return Some((
-                std::path::PathBuf::from(cert),
-                std::path::PathBuf::from(key),
-            ));
+        if let (Some(cert), Some(key)) =
+            (rule.vhost_cert.get("cert"), rule.vhost_cert.get("key"))
+        {
+            return Some((std::path::PathBuf::from(cert), std::path::PathBuf::from(key)));
         }
     }
     None
@@ -234,36 +330,38 @@ pub async fn check_and_maybe_renew(
             Some(days) => {
                 info!(
                     "acme: {} has {days} day(s) left (renew_before_days: {}), renewing",
-                    vhost.vhost, acme_cfg.renew_before_days
+                    vhost.display_names(),
+                    acme_cfg.renew_before_days
                 );
             }
             None => {
                 info!(
                     "acme: {} has no existing/readable certificate at {} — issuing one",
-                    vhost.vhost,
+                    vhost.display_names(),
                     vhost.cert_path.display()
                 );
             }
         }
     } else {
-        info!("acme: {} — forced renewal requested", vhost.vhost);
+        info!("acme: {} — forced renewal requested", vhost.display_names());
     }
 
-    match renew::renew_certificate(&vhost.vhost, &vhost.cert_path, &vhost.key_path, acme_cfg).await
+    match renew::renew_certificate(&vhost.names, &vhost.cert_path, &vhost.key_path, acme_cfg).await
     {
         Ok(()) => {
-            info!("acme: renewal succeeded for {}", vhost.vhost);
+            info!("acme: renewal succeeded for {}", vhost.display_names());
             RenewOutcome::Renewed
         }
         Err(e) => {
             error!(
                 "acme: renewal FAILED for {} — the currently valid certificate keeps being used: {e}",
-                vhost.vhost
+                vhost.display_names()
             );
             RenewOutcome::Failed(e)
         }
     }
 }
+
 
 /// Runs one full scan over every `certbot_renew: true` vhost in
 /// `routes`, immediately (not on a timer) — used both by the periodic
@@ -290,9 +388,8 @@ pub async fn run_scan(routes: &[RouteRule], acme_cfg: &AcmeConfig) {
 /// everything else in config today except TLS certificates themselves.
 pub fn spawn_periodic_scan(routes: std::sync::Arc<Vec<RouteRule>>, acme_cfg: AcmeConfig) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-            acme_cfg.check_interval_secs.max(1),
-        ));
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(acme_cfg.check_interval_secs.max(1)));
         ticker.tick().await; // first tick fires immediately; skip it, run_scan below covers startup
         run_scan(&routes, &acme_cfg).await; // check once right at startup too, don't wait a full interval
         loop {
@@ -312,9 +409,8 @@ mod tests {
         // serde default) — every other field does have one, but this
         // helper still needs to supply *something* for `prefix`
         // specifically.
-        let mut r: RouteRule = serde_json::from_str(r#"{"prefix": "/"}"#).expect(
-            "RouteRule must deserialize given just prefix — every other field has a serde default",
-        );
+        let mut r: RouteRule = serde_json::from_str(r#"{"prefix": "/"}"#)
+            .expect("RouteRule must deserialize given just prefix — every other field has a serde default");
         r.vhost = vhost.iter().map(|s| s.to_string()).collect();
         r.certbot_renew = certbot_renew;
         if let Some((cert, key)) = cert_kv {
@@ -331,14 +427,11 @@ mod tests {
         let routes = vec![rule(
             &["a.example.com"],
             true,
-            Some((
-                "/etc/proxyauth/cert/a.example.com/fullchain.pem",
-                "/etc/proxyauth/cert/a.example.com/privkey.pem",
-            )),
+            Some(("/etc/proxyauth/cert/a.example.com/fullchain.pem", "/etc/proxyauth/cert/a.example.com/privkey.pem")),
         )];
         let managed = collect_managed_vhosts(&routes);
         assert_eq!(managed.len(), 1);
-        assert_eq!(managed[0].vhost, "a.example.com");
+        assert_eq!(managed[0].names, vec!["a.example.com".to_string()]);
     }
 
     #[test]
@@ -351,25 +444,19 @@ mod tests {
             rule(
                 &["b.example.com"],
                 false,
-                Some((
-                    "/etc/proxyauth/cert/b.example.com/fullchain.pem",
-                    "/etc/proxyauth/cert/b.example.com/privkey.pem",
-                )),
+                Some(("/etc/proxyauth/cert/b.example.com/fullchain.pem", "/etc/proxyauth/cert/b.example.com/privkey.pem")),
             ),
         ];
         let managed = collect_managed_vhosts(&routes);
         assert_eq!(managed.len(), 1);
-        assert_eq!(managed[0].vhost, "b.example.com");
+        assert_eq!(managed[0].names, vec!["b.example.com".to_string()]);
     }
 
     #[test]
     fn skips_rew_without_any_cert_path() {
         let routes = vec![rule(&["c.example.com"], true, None)];
         let managed = collect_managed_vhosts(&routes);
-        assert!(
-            managed.is_empty(),
-            "no vhost_cert anywhere -> nothing to manage"
-        );
+        assert!(managed.is_empty(), "no vhost_cert anywhere -> nothing to manage");
     }
 
     #[test]
@@ -381,10 +468,7 @@ mod tests {
         let routes = vec![rule(
             &["d.example.com"],
             false,
-            Some((
-                "/etc/proxyauth/cert/d.example.com/fullchain.pem",
-                "/etc/proxyauth/cert/d.example.com/privkey.pem",
-            )),
+            Some(("/etc/proxyauth/cert/d.example.com/fullchain.pem", "/etc/proxyauth/cert/d.example.com/privkey.pem")),
         )];
         let managed = collect_managed_vhosts(&routes);
         assert!(managed.is_empty());
@@ -396,10 +480,7 @@ mod tests {
             rule(
                 &["e.example.com"],
                 true,
-                Some((
-                    "/etc/proxyauth/cert/e.example.com/fullchain.pem",
-                    "/etc/proxyauth/cert/e.example.com/privkey.pem",
-                )),
+                Some(("/etc/proxyauth/cert/e.example.com/fullchain.pem", "/etc/proxyauth/cert/e.example.com/privkey.pem")),
             ),
             rule(&["e.example.com"], true, None),
         ];
@@ -409,10 +490,7 @@ mod tests {
 
     #[test]
     fn days_until_expiry_none_for_missing_file() {
-        assert_eq!(
-            days_until_expiry(std::path::Path::new("/nonexistent/path.pem")),
-            None
-        );
+        assert_eq!(days_until_expiry(std::path::Path::new("/nonexistent/path.pem")), None);
     }
 
     #[test]
@@ -420,22 +498,13 @@ mod tests {
         let routes = vec![rule(
             &["f.example.com"],
             false, // certbot_renew NOT set — must still be found by name
-            Some((
-                "/etc/proxyauth/cert/f.example.com/fullchain.pem",
-                "/etc/proxyauth/cert/f.example.com/privkey.pem",
-            )),
+            Some(("/etc/proxyauth/cert/f.example.com/fullchain.pem", "/etc/proxyauth/cert/f.example.com/privkey.pem")),
         )];
         let found = find_vhost_cert_paths(&routes, "f.example.com");
         assert!(found.is_some());
         let (cert, key) = found.unwrap();
-        assert_eq!(
-            cert,
-            std::path::PathBuf::from("/etc/proxyauth/cert/f.example.com/fullchain.pem")
-        );
-        assert_eq!(
-            key,
-            std::path::PathBuf::from("/etc/proxyauth/cert/f.example.com/privkey.pem")
-        );
+        assert_eq!(cert, std::path::PathBuf::from("/etc/proxyauth/cert/f.example.com/fullchain.pem"));
+        assert_eq!(key, std::path::PathBuf::from("/etc/proxyauth/cert/f.example.com/privkey.pem"));
     }
 
     #[test]
@@ -456,10 +525,7 @@ mod tests {
             false,
             Some(("/cert/h/fullchain.pem", "/cert/h/privkey.pem")),
         )];
-        assert_eq!(
-            find_vhost_cert_paths(&routes, "not-configured.example.com"),
-            None
-        );
+        assert_eq!(find_vhost_cert_paths(&routes, "not-configured.example.com"), None);
     }
 
     #[test]
@@ -479,7 +545,38 @@ mod tests {
         )];
         let all = collect_all_vhost_certs(&routes);
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].vhost, "j.example.com");
+        assert_eq!(all[0].names, vec!["j.example.com".to_string()]);
+    }
+
+    #[test]
+    fn group_with_several_names_becomes_one_certificate() {
+        // Regression: this used to produce two ManagedVhost entries
+        // pointing at the same cert path, so each issued its own
+        // single-SAN certificate and overwrote the other. One entry
+        // carrying both names is what makes a single multi-SAN
+        // certificate get issued.
+        let routes = vec![rule(
+            &["example.com", "www.example.com"],
+            true,
+            Some(("/cert/example/fullchain.pem", "/cert/example/privkey.pem")),
+        )];
+        let managed = collect_managed_vhosts(&routes);
+        assert_eq!(managed.len(), 1);
+        assert_eq!(
+            managed[0].names,
+            vec!["example.com".to_string(), "www.example.com".to_string()]
+        );
+        assert_eq!(managed[0].primary(), "example.com");
+    }
+
+    #[test]
+    fn distinct_cert_paths_stay_separate() {
+        let routes = vec![
+            rule(&["one.example.com"], true, Some(("/cert/one/fullchain.pem", "/cert/one/privkey.pem"))),
+            rule(&["two.example.com"], true, Some(("/cert/two/fullchain.pem", "/cert/two/privkey.pem"))),
+        ];
+        let managed = collect_managed_vhosts(&routes);
+        assert_eq!(managed.len(), 2);
     }
 
     #[test]

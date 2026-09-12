@@ -81,12 +81,7 @@ fn env() -> Result<&'static lmdb::Environment, String> {
     let env = lmdb::Environment::new()
         .set_max_dbs(1)
         .open(Path::new(&path))
-        .map_err(|e| {
-            format!(
-                "Failed to open OIDC authcode LMDB at {}: {e}",
-                path.display()
-            )
-        })?;
+        .map_err(|e| format!("Failed to open OIDC authcode LMDB at {}: {e}", path.display()))?;
 
     env.create_db(Some(DB_NAME), lmdb::DatabaseFlags::empty())
         .map_err(|e| format!("Failed to create/open OIDC authcode LMDB db: {e}"))?;
@@ -117,8 +112,8 @@ pub fn create_code(entry: AuthCodeEntry) -> Result<String, String> {
     getrandom::fill(&mut raw).expect("OS CSPRNG unavailable");
     let code = hex::encode(raw);
 
-    let serialized = serde_json::to_vec(&entry)
-        .map_err(|e| format!("Failed to serialize authcode entry: {e}"))?;
+    let serialized =
+        serde_json::to_vec(&entry).map_err(|e| format!("Failed to serialize authcode entry: {e}"))?;
 
     let mut txn = env
         .begin_rw_txn()

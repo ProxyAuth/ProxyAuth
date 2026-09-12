@@ -535,13 +535,7 @@ mod tests {
     fn cfg_with(algorithms: &[&str]) -> CompressionConfig {
         CompressionConfig {
             enabled: Some(true),
-            algorithm: Some(
-                algorithms
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ),
+            algorithm: Some(algorithms.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",")),
             level: 5,
             level_static: None,
             min_size: 1024,

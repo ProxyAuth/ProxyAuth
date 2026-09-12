@@ -69,8 +69,10 @@ where
             let mut res = fut.await?;
 
             if let Some(origin_str) = origin {
-                let vhost_route =
-                    crate::network::proxy::find_vhost_route(host.as_deref(), &config.routes.routes);
+                let vhost_route = crate::network::proxy::find_vhost_route(
+                    host.as_deref(),
+                    &config.routes.routes,
+                );
                 let cors_origins = vhost_route
                     .and_then(|r| r.resolved_cors_origins(&config.config))
                     .or(config.config.cors_origins.as_ref());

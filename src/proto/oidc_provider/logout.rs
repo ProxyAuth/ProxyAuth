@@ -81,11 +81,12 @@ pub async fn end_session_handler(req: HttpRequest, data: web::Data<AppState>) ->
         return logged_out_page(None);
     };
 
-    let params: EndSessionParams =
-        serde_urlencoded::from_str(req.query_string()).unwrap_or(EndSessionParams {
+    let params: EndSessionParams = serde_urlencoded::from_str(req.query_string()).unwrap_or(
+        EndSessionParams {
             post_logout_redirect_uri: None,
             state: None,
-        });
+        },
+    );
 
     let set_cookie_header = clear_session_cookie_header();
 

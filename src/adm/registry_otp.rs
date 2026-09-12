@@ -81,15 +81,11 @@ async fn clear_otpkey_anywhere(data: &web::Data<AppState>, username: &str) -> Re
             // succeeded, so this doesn't change the outcome reported
             // to the caller either way.
             if let Err(e) = crate::databases::cache::patch_otpkey(username, None) {
-                warn!(
-                    "Failed to patch LMDB fallback cache after clearing otpkey for {username}: {e}"
-                );
+                warn!("Failed to patch LMDB fallback cache after clearing otpkey for {username}: {e}");
             }
             Ok(())
         }
-        Ok(false) => Err(format!(
-            "User '{username}' not found in the configuration file or the database."
-        )),
+        Ok(false) => Err(format!("User '{username}' not found in the configuration file or the database.")),
         Err(e) => Err(format!("Database error clearing otpkey: {e}")),
     }
 }
@@ -179,9 +175,7 @@ async fn add_otpkey_anywhere(data: &web::Data<AppState>, username: &str) -> Resu
             // the database goes unreachable before the next full
             // refresh.
             if let Err(e) = crate::databases::cache::patch_otpkey(username, Some(&secret)) {
-                warn!(
-                    "Failed to patch LMDB fallback cache after provisioning otpkey for {username}: {e}"
-                );
+                warn!("Failed to patch LMDB fallback cache after provisioning otpkey for {username}: {e}");
             }
             Ok(secret)
         }

@@ -21,10 +21,8 @@
 //! instead of fail-directly.
 
 use crate::config::config::{AppState, AuthRequest};
-use crate::network::proxy::{
-    find_vhost_route, is_secure_request, request_host, resolve_tag_csrf_token,
-};
-use crate::proto::oidc_provider::authcode::{self, AUTHCODE_TTL_SECS, AuthCodeEntry};
+use crate::network::proxy::{find_vhost_route, is_secure_request, request_host, resolve_tag_csrf_token};
+use crate::proto::oidc_provider::authcode::{self, AuthCodeEntry, AUTHCODE_TTL_SECS};
 use actix_web::{HttpRequest, HttpResponse, http::header, web};
 use serde::Deserialize;
 use std::fs;
@@ -62,12 +60,7 @@ fn misconfigured_request_response(detail: &str) -> HttpResponse {
 /// echoed back exactly as received (even if empty/absent) — the
 /// relying party needs it to match up this response with the request
 /// it made, same as it would for a success.
-fn error_redirect(
-    redirect_uri: &str,
-    error: &str,
-    description: &str,
-    state: Option<&str>,
-) -> HttpResponse {
+fn error_redirect(redirect_uri: &str, error: &str, description: &str, state: Option<&str>) -> HttpResponse {
     let mut location = format!(
         "{redirect_uri}{sep}error={error}&error_description={desc}",
         sep = if redirect_uri.contains('?') { "&" } else { "?" },
@@ -119,11 +112,7 @@ pub async fn authorize_handler(
     };
     // Exact match only — see OidcProviderConfig::redirect_uris's own
     // doc comment for why this can never be prefix/wildcard matching.
-    if !oidc
-        .redirect_uris
-        .iter()
-        .any(|allowed| allowed == redirect_uri)
-    {
+    if !oidc.redirect_uris.iter().any(|allowed| allowed == redirect_uri) {
         return misconfigured_request_response("redirect_uri is not registered for this client");
     }
 
@@ -189,12 +178,7 @@ pub async fn authorize_handler(
         if csrf_enabled {
             let submitted = form.csrf_token.as_deref().unwrap_or("");
             if !crate::token::csrf::verify_csrf_token(&data.config.secret, submitted) {
-                return render_login_form(
-                    &req,
-                    &data,
-                    rule,
-                    Some("Invalid or expired form — please try again"),
-                );
+                return render_login_form(&req, &data, rule, Some("Invalid or expired form — please try again"));
             }
         }
 
@@ -248,9 +232,7 @@ pub async fn authorize_handler(
                     &req,
                     &data,
                     rule,
-                    Some(
-                        "Your password must be changed before you can sign in here — contact an administrator",
-                    ),
+                    Some("Your password must be changed before you can sign in here — contact an administrator"),
                 );
             }
         }

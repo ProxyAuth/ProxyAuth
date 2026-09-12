@@ -24,7 +24,6 @@ pub mod proto;
 pub mod reset;
 pub mod revoke;
 pub mod smtp;
-pub mod start_actix;
 pub mod stats;
 pub mod token;
 
