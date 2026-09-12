@@ -25,8 +25,8 @@ use std::sync::Arc;
 // config type from a single path (`crate::config::config::*`), as it
 // already did before these two blocks were split into their own
 // modules to keep this file from growing further.
-pub use crate::config::compression::CompressionConfig;
 pub use crate::config::acme::AcmeConfig;
+pub use crate::config::compression::CompressionConfig;
 pub use crate::config::logging::LoggingConfig;
 
 #[derive(Debug, Clone)]
@@ -262,7 +262,6 @@ pub struct ProtectedPathRule {
     /// keeps gating normally, unless explicitly configured here.
     #[serde(default)]
     pub hidden_blocks: Vec<HiddenBlockRule>,
-
 }
 
 /// One conditional HTML block under `ProtectedPathRule.hidden_blocks`
@@ -837,6 +836,25 @@ pub struct RouteRule {
     #[serde(default)]
     pub cache: Option<bool>,
 
+    /// Relays the backend's response as a stream instead of loading it
+    /// entirely into memory first. Needed for large transfers — git
+    /// packfiles, downloads, SSE — where buffering pins as much RAM as
+    /// the response weighs, per concurrent request, and delays the
+    /// first byte until the last one has arrived.
+    ///
+    /// Incompatible by construction with `tag_proxyauth`,
+    /// `hidden_blocks` and CSRF injection: all three rewrite the whole
+    /// body and therefore need to see it in full. When one of them is
+    /// active on this route it wins and the response is buffered as
+    /// before; `validate_streaming_on_routes` logs that at startup
+    /// rather than silently disabling a rewrite the operator
+    /// explicitly configured.
+    ///
+    /// `None`/unset means inherit from the vhost group, then `false` —
+    /// so no existing route changes behaviour.
+    #[serde(default)]
+    pub streaming: Option<bool>,
+
     /// Maintenance-mode gate for this route — see
     /// `RedirectProtectConfig`'s own doc comment for the full
     /// semantics. `None`/unset (the default) means no gate at all,
@@ -985,6 +1003,14 @@ impl RouteRule {
         self.cache.unwrap_or(true)
     }
 
+    /// Resolves `RouteRule.streaming` — route value, else the vhost
+    /// group's (already propagated above), else `false`. Defaulting to
+    /// `false` keeps every pre-existing route on the buffering path it
+    /// has always used.
+    pub fn streaming_enabled(&self) -> bool {
+        self.streaming.unwrap_or(false)
+    }
+
     /// A stable-enough identifier for this route, used only as a
     /// `redirect_protect_url_ips` DashMap key — not persisted, not
     /// exposed anywhere a person would see it. `vhost` (joined) plus
@@ -1015,7 +1041,10 @@ impl RouteRule {
             return false;
         }
 
-        if self.allow_users.is_empty() && self.allow_groups.is_empty() && self.allow_roles.is_empty() {
+        if self.allow_users.is_empty()
+            && self.allow_groups.is_empty()
+            && self.allow_roles.is_empty()
+        {
             return false;
         }
 
@@ -1051,7 +1080,6 @@ impl RouteRule {
     pub fn totp_reenroll_allowed(&self) -> bool {
         self.allow_totp_reenroll.unwrap_or(false)
     }
-
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1255,6 +1283,11 @@ pub struct VhostGroup {
     pub cache: Option<bool>,
 
     /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::streaming`.
+    #[serde(default)]
+    pub streaming: Option<bool>,
+
+    /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::redirect_protect`. Setting this directly on a
     /// `vhosts:` group (rather than on each individual route) is the
     /// normal way to use it: a maintenance-mode gate almost always
@@ -1398,6 +1431,9 @@ impl RouteConfig {
                 }
                 if route.cache.is_none() {
                     route.cache = group.cache;
+                }
+                if route.streaming.is_none() {
+                    route.streaming = group.streaming;
                 }
                 if route.redirect_protect.is_none() {
                     route.redirect_protect = group.redirect_protect.clone();
@@ -1762,6 +1798,21 @@ pub struct AppConfig {
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
 
+    /// How long a proxied request may take before it is abandoned, in
+    /// milliseconds.
+    ///
+    /// With `streaming` off this bounds the whole exchange, since the
+    /// response is collected before anything is sent on. With
+    /// `streaming` on it bounds only the arrival of the response
+    /// *headers* — the body then flows for as long as it takes, which
+    /// is the point of streaming a large transfer in the first place.
+    ///
+    /// Replaces a value that used to be hardcoded at both upstream
+    /// call sites, so a slow backend no longer requires a rebuild to
+    /// accommodate.
+    #[serde(default = "default_backend_timeout")]
+    pub backend_timeout: u64,
+
     #[serde(default = "default_max_idle_per_host")]
     pub max_idle_per_host: u16,
 
@@ -1942,7 +1993,6 @@ pub struct AppConfig {
     /// `should_use_database_as_fallback`.
     #[serde(skip)]
     pub blakegate_connected: std::sync::atomic::AtomicUsize,
-
 }
 
 impl Serialize for AppConfig {
@@ -2285,6 +2335,10 @@ fn default_max_body_size() -> usize {
     10 * 1024 * 1024 // 10 MB default if not set in config file
 }
 
+fn default_backend_timeout() -> u64 {
+    10_000 // 10 s, the value both upstream call sites used to hardcode
+}
+
 fn default_log() -> HashMap<String, String> {
     let mut log = HashMap::new();
     log.insert("type".to_string(), "local".to_string());
@@ -2412,6 +2466,25 @@ impl RouteAccessDecision {
 }
 
 impl AppConfig {
+    /// `backend_timeout` as a `Duration`, with `0` restored to the
+    /// default rather than taken literally.
+    ///
+    /// A zero-length timeout is never what an operator means: it would
+    /// abandon every proxied request the instant it is issued, turning
+    /// the whole instance into a `503` generator. Elsewhere in this
+    /// config a `0` legitimately means "off" — `ratelimit_*`,
+    /// `ip_blocklist_refresh_interval_secs` — so the value has to stay
+    /// accepted at parse time and be guarded here, at the point of use,
+    /// instead.
+    pub fn backend_timeout_duration(&self) -> std::time::Duration {
+        let ms = if self.backend_timeout == 0 {
+            default_backend_timeout()
+        } else {
+            self.backend_timeout
+        };
+        std::time::Duration::from_millis(ms)
+    }
+
     /// The address(es) to bind to — `address` (a list) if it's set and
     /// non-empty, otherwise the single `host` for backward
     /// compatibility. Always returns at least one entry.

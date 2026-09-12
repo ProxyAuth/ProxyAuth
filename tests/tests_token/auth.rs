@@ -124,7 +124,10 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(cfg),
-            routes: Arc::new(RouteConfig { routes, ..Default::default() }),
+            routes: Arc::new(RouteConfig {
+                routes,
+                ..Default::default()
+            }),
             counter: Arc::new(CounterToken::new()),
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
             stats,
@@ -154,6 +157,7 @@ mod tests {
             log_file: None,
             compression: None,
             cache: Some(true),
+            streaming: None,
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
@@ -164,21 +168,21 @@ mod tests {
             vhost_cert: std::collections::HashMap::new(),
             certbot_renew: false,
             headers: std::collections::HashMap::new(),
-        tag_csrf_token: None,
-        session_cookie: None,
-        max_age_session_cookie: None,
-        login_redirect_url: None,
-        logout_redirect_url: None,
-        login_via_otp: None,
-        page_change_password: None,
-        cors_origins: None,
-        smtp: None,
-        tag_proxyauth: None,
-        allow_users: vec![],
-        allow_groups: vec![],
-        allow_roles: vec![],
-        exclude_users: vec![],
-        allow_totp_reenroll: None,
+            tag_csrf_token: None,
+            session_cookie: None,
+            max_age_session_cookie: None,
+            login_redirect_url: None,
+            logout_redirect_url: None,
+            login_via_otp: None,
+            page_change_password: None,
+            cors_origins: None,
+            smtp: None,
+            tag_proxyauth: None,
+            allow_users: vec![],
+            allow_groups: vec![],
+            allow_roles: vec![],
+            exclude_users: vec![],
+            allow_totp_reenroll: None,
             allow_ips: vec![],
             deny_ips: vec![],
             allow_ips_compiled: vec![],
@@ -534,8 +538,7 @@ mod tests {
         // all happen inside the vault. The test no longer has to
         // reproduce the token layout by hand, which is what used to make
         // it break every time that layout changed.
-        issue_token(&user.username, index_user, &expiry_ts, token_id)
-            .expect("issue token for test")
+        issue_token(&user.username, index_user, &expiry_ts, token_id).expect("issue token for test")
     }
 
     // ---------- EitherAuth::Form end-to-end ----------------------------------
@@ -843,7 +846,10 @@ mod render_error_page_tests {
 
         let state = AppState {
             config: Arc::new(cfg),
-            routes: Arc::new(RouteConfig { routes, ..Default::default() }),
+            routes: Arc::new(RouteConfig {
+                routes,
+                ..Default::default()
+            }),
             counter: Arc::new(CounterToken::new()),
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
             stats,
@@ -909,6 +915,7 @@ mod render_error_page_tests {
             log_file: None,
             compression: None,
             cache: Some(true),
+            streaming: None,
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
@@ -919,21 +926,21 @@ mod render_error_page_tests {
             vhost_cert: std::collections::HashMap::new(),
             certbot_renew: false,
             headers: std::collections::HashMap::new(),
-        tag_csrf_token: None,
-        session_cookie: None,
-        max_age_session_cookie: None,
-        login_redirect_url: None,
-        logout_redirect_url: None,
-        login_via_otp: None,
-        page_change_password: None,
-        cors_origins: None,
-        smtp: None,
-        tag_proxyauth: None,
-        allow_users: vec![],
-        allow_groups: vec![],
-        allow_roles: vec![],
-        exclude_users: vec![],
-        allow_totp_reenroll: None,
+            tag_csrf_token: None,
+            session_cookie: None,
+            max_age_session_cookie: None,
+            login_redirect_url: None,
+            logout_redirect_url: None,
+            login_via_otp: None,
+            page_change_password: None,
+            cors_origins: None,
+            smtp: None,
+            tag_proxyauth: None,
+            allow_users: vec![],
+            allow_groups: vec![],
+            allow_roles: vec![],
+            exclude_users: vec![],
+            allow_totp_reenroll: None,
             allow_ips: vec![],
             deny_ips: vec![],
             allow_ips_compiled: vec![],

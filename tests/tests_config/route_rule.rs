@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use proxyauth::config::config::{RouteConfig, RouteRule, VhostGroup, RouteAccessDecision};
+    use proxyauth::config::config::{RouteAccessDecision, RouteConfig, RouteRule, VhostGroup};
 
     fn default_route(prefix: &str, target: &str) -> RouteRule {
         RouteRule {
@@ -10,21 +10,21 @@ mod tests {
             vhost_cert: std::collections::HashMap::new(),
             certbot_renew: false,
             headers: std::collections::HashMap::new(),
-        tag_csrf_token: None,
-        session_cookie: None,
-        max_age_session_cookie: None,
-        login_redirect_url: None,
-        logout_redirect_url: None,
-        login_via_otp: None,
-        page_change_password: None,
-        cors_origins: None,
-        smtp: None,
-        tag_proxyauth: None,
-        allow_users: vec![],
-        allow_groups: vec![],
-        allow_roles: vec![],
-        exclude_users: vec![],
-        allow_totp_reenroll: None,
+            tag_csrf_token: None,
+            session_cookie: None,
+            max_age_session_cookie: None,
+            login_redirect_url: None,
+            logout_redirect_url: None,
+            login_via_otp: None,
+            page_change_password: None,
+            cors_origins: None,
+            smtp: None,
+            tag_proxyauth: None,
+            allow_users: vec![],
+            allow_groups: vec![],
+            allow_roles: vec![],
+            exclude_users: vec![],
+            allow_totp_reenroll: None,
             allow_ips: vec![],
             deny_ips: vec![],
             allow_ips_compiled: vec![],
@@ -47,6 +47,7 @@ mod tests {
             log_file: None,
             compression: None,
             cache: Some(true),
+            streaming: None,
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
@@ -291,14 +292,14 @@ mod tests {
             "log": {}
         }"#;
         let cfg: proxyauth::AppConfig = serde_json::from_str(json).unwrap();
-        cfg.roles_index.write().unwrap().insert(
-            "alice".into(),
-            vec!["admin".into()],
-        );
-        cfg.groups_index.write().unwrap().insert(
-            "alice".into(),
-            vec!["ops".into()],
-        );
+        cfg.roles_index
+            .write()
+            .unwrap()
+            .insert("alice".into(), vec!["admin".into()]);
+        cfg.groups_index
+            .write()
+            .unwrap()
+            .insert("alice".into(), vec!["ops".into()]);
         cfg
     }
 
@@ -377,7 +378,10 @@ mod tests {
         let cfg = mk_cfg_with_users();
         let rule = default_route("/public", "http://localhost:3000");
         let decision = cfg.route_access_decision(&rule, "alice");
-        assert_eq!(decision, RouteAccessDecision::AllowedNoRestrictionConfigured);
+        assert_eq!(
+            decision,
+            RouteAccessDecision::AllowedNoRestrictionConfigured
+        );
         assert!(decision.is_allowed());
     }
 
@@ -386,7 +390,10 @@ mod tests {
         let cfg = mk_cfg_with_users();
         let rule = default_route("/public", "http://localhost:3000");
         let decision = cfg.route_access_decision(&rule, "unknown");
-        assert_eq!(decision, RouteAccessDecision::AllowedNoRestrictionConfigured);
+        assert_eq!(
+            decision,
+            RouteAccessDecision::AllowedNoRestrictionConfigured
+        );
     }
 
     #[test]

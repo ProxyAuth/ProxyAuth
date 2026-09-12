@@ -16,7 +16,8 @@ use actix_web::{
     Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
     web,
 };
-use http_body_util::{BodyExt, Empty, Full};
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, BodyStream, Empty, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::USER_AGENT;
 use hyper::http::request::Builder;
@@ -207,11 +208,28 @@ pub fn validate_route_log_files(routes: &[RouteRule]) {
     }
 }
 
+/// Warns for every route asking for `streaming` while a body rewrite
+/// is active on it — the rewrite wins and streaming is ignored. A
+/// warning rather than a panic: the combination is contradictory but
+/// not dangerous, and refusing to boot over it would be out of
+/// proportion.
+pub fn validate_streaming_on_routes(routes: &[RouteRule]) {
+    for r in routes {
+        if r.streaming_enabled() && (r.tag_proxyauth_enabled() || r.has_hidden_blocks()) {
+            warn!(
+                "routes.yml: route \"{}\": `streaming` is ignored — `tag_proxyauth` or `hidden_blocks` rewrites the response body, which requires buffering it",
+                r.prefix
+            );
+        }
+    }
+}
+
 pub fn init_routes(routes: &mut [RouteRule]) {
     compile_filters_on_routes(routes);
     compile_ip_lists_on_routes(routes);
     compile_regex_on_routes(routes);
     validate_route_log_files(routes);
+    validate_streaming_on_routes(routes);
     init_routes_order(routes);
 }
 
@@ -319,9 +337,36 @@ fn matches_route(path: &str, rule: &RouteRule) -> bool {
 /// exactly as before `regex` existed. Shared by `init_routes_order`
 /// (the common case, precomputed once) and `match_route_idx`'s
 /// fallback for when that cache isn't ready yet.
+/// A non-empty `vhost` list containing only wildcard patterns. An
+/// empty list (catch-all) is `false` — see `build_route_order` for
+/// why catch-alls keep their existing rank.
+fn wildcard_only_vhost(vhosts: &[String]) -> bool {
+    !vhosts.is_empty() && vhosts.iter().all(|v| is_wildcard_vhost(v))
+}
+
 fn build_route_order(routes: &[RouteRule]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..routes.len()).collect();
     idx.sort_by(|&i, &j| {
+        // A route whose `vhost` list is entirely wildcards is tried
+        // after every non-wildcard route, so an exact `git.example.com`
+        // always wins over a `*.example.com` that would also match —
+        // without this the winner would depend on routes.yml ordering
+        // and prefix length, which is precisely the class of bug the
+        // rest of this ordering exists to avoid.
+        //
+        // Deliberately does NOT demote catch-all (empty `vhost`)
+        // routes: they rank alongside exact ones, exactly as before
+        // wildcards existed, so no existing configuration changes
+        // behaviour.
+        let wi = wildcard_only_vhost(&routes[i].vhost);
+        let wj = wildcard_only_vhost(&routes[j].vhost);
+        if wi != wj {
+            return if wi {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
         let ri = routes[i].regex_compiled.is_some();
         let rj = routes[j].regex_compiled.is_some();
         match (ri, rj) {
@@ -500,7 +545,11 @@ pub async fn extract_username_for_tags(
 /// every call in this process — read directly from `crate::VERSION`/
 /// `crate::ID` rather than needing to be threaded through as
 /// parameters too.
-pub fn substitute_proxyauth_tags(content: &str, username: Option<&str>, csrf_token: Option<&str>) -> String {
+pub fn substitute_proxyauth_tags(
+    content: &str,
+    username: Option<&str>,
+    csrf_token: Option<&str>,
+) -> String {
     let mut out = content.to_string();
     if let Some(u) = username {
         out = out.replace("{{ username }}", u).replace("{{username}}", u);
@@ -656,6 +705,35 @@ pub fn resolve_tag_csrf_token(rule: &RouteRule, config: &AppConfig) -> Option<St
 /// every `routes.yml` had before `vhost` existed. A non-empty list
 /// requires an exact (case-insensitive, port-stripped) match against
 /// one of its entries.
+/// Whether a `vhost` entry is a wildcard pattern (`*.example.com`).
+/// Only a leading `*.` counts — `foo.*.example.com` or `*foo.com` are
+/// not patterns, they're (nonsensical) literal names, and treating
+/// them as patterns would be inventing syntax no certificate can
+/// match.
+pub fn is_wildcard_vhost(entry: &str) -> bool {
+    entry.starts_with("*.")
+}
+
+/// Matches one `vhost` entry against a normalized host.
+///
+/// `*.example.com` covers exactly one extra label: `a.example.com`
+/// yes, `example.com` no (the apex is a separate name), and
+/// `a.b.example.com` no. This is RFC 6125's rule — the same one
+/// browsers apply to certificate SANs. Matching more broadly here
+/// would let ProxyAuth route a hostname its own certificate doesn't
+/// actually cover, which fails at the TLS layer anyway but much less
+/// legibly.
+fn vhost_entry_matches(entry: &str, host_norm: &str) -> bool {
+    let entry_norm = normalize_host(entry);
+    match entry_norm.strip_prefix("*.") {
+        None => entry_norm == host_norm,
+        Some(suffix) => host_norm
+            .strip_suffix(suffix)
+            .and_then(|prefix| prefix.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.')),
+    }
+}
+
 pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
     if vhosts.is_empty() {
         return true;
@@ -664,7 +742,20 @@ pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
         return false;
     };
     let host_norm = normalize_host(host);
-    vhosts.iter().any(|v| normalize_host(v) == host_norm)
+    vhosts.iter().any(|v| vhost_entry_matches(v, &host_norm))
+}
+
+/// Whether any entry in `vhosts` names `host` literally, as opposed to
+/// covering it via a wildcard. Used to give an exact vhost precedence
+/// over a wildcard one — see `build_route_order`.
+fn vhost_matches_exactly(host: Option<&str>, vhosts: &[String]) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let host_norm = normalize_host(host);
+    vhosts
+        .iter()
+        .any(|v| !is_wildcard_vhost(v) && normalize_host(v) == host_norm)
 }
 
 /// Finds the first route that explicitly declares `host` in its
@@ -684,9 +775,19 @@ pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
 /// `RouteRule::resolved_*`/`*_enabled` method's own `.unwrap_or(...)`.
 pub fn find_vhost_route<'a>(host: Option<&str>, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
     let host = host?;
+    // Exact first, wildcard only as a fallback — same precedence
+    // `build_route_order` applies to request routing. Resolving
+    // vhost-level settings from a `*.example.com` route while requests
+    // to that host are routed by an exact `example.com` one would be a
+    // silent, hard-to-spot split.
     routes
         .iter()
-        .find(|r| !r.vhost.is_empty() && vhost_matches(Some(host), &r.vhost))
+        .find(|r| vhost_matches_exactly(Some(host), &r.vhost))
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|r| !r.vhost.is_empty() && vhost_matches(Some(host), &r.vhost))
+        })
 }
 
 /// Finds the route that should actually *serve* `path` on `host` —
@@ -892,13 +993,47 @@ pub fn client_ip(req: &HttpRequest, config: &AppConfig) -> Option<IpAddr> {
     peer_ip
 }
 
-async fn incoming_to_boxbody(
-    res: hyper::Response<Incoming>,
-) -> Result<hyper::Response<BoxBody>, hyper::Error> {
+/// Response-side body type. Distinct from `BoxBody` (whose error type
+/// is `Infallible`, correct for the *request* bodies this proxy builds
+/// itself): a streamed upstream response can fail mid-body, so its
+/// error type has to be able to represent that.
+type ResponseBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+/// Boxes the upstream response without reading its body — the body
+/// stays a lazy stream, pulled as the client consumes it. The previous
+/// version called `collect().await` here, loading the entire response
+/// into memory before emitting a single byte: on a git packfile of a
+/// few hundred MB that is as much RAM pinned per concurrent request,
+/// plus a first-byte delay equal to the whole transfer.
+fn incoming_to_boxbody(res: hyper::Response<Incoming>) -> hyper::Response<ResponseBody> {
     let (parts, body) = res.into_parts();
-    let bytes = body.collect().await?.to_bytes();
-    let boxed: BoxBody = Full::new(bytes).map_err(|e: Infallible| e).boxed();
-    Ok(hyper::Response::from_parts(parts, boxed))
+    hyper::Response::from_parts(parts, body.boxed())
+}
+
+/// Widens a `BoxBody` (error type `Infallible`) into a `ResponseBody`.
+/// `match e {}` is the standard way to discharge an `Infallible` — the
+/// value can never exist, so there is no arm to write.
+fn widen_boxbody(res: hyper::Response<BoxBody>) -> hyper::Response<ResponseBody> {
+    let (parts, body) = res.into_parts();
+    hyper::Response::from_parts(parts, body.map_err(|e: Infallible| match e {}).boxed())
+}
+
+/// Adapts an `http_body::Body` into the `Stream` that
+/// `HttpResponse::streaming` expects. Trailer frames are dropped —
+/// actix has no way to emit them to the client.
+fn body_to_actix_stream<B>(
+    body: B,
+) -> impl futures_util::Stream<Item = Result<Bytes, Box<dyn std::error::Error + 'static>>>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    BodyStream::new(body).filter_map(|frame| async move {
+        match frame {
+            Ok(f) => f.into_data().ok().map(Ok),
+            Err(e) => Some(Err(Box::new(e) as Box<dyn std::error::Error + 'static>)),
+        }
+    })
 }
 
 /// Very small extension → MIME map, good enough for the kind of static
@@ -1013,7 +1148,12 @@ async fn proxy_to_redirect_protect_target(
     // meant to actually serve the response body a blocked visitor
     // sees, not a quick internal check, so it gets the same budget a
     // real backend request would.
-    let resp = match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
+    let resp = match timeout(
+        data.config.backend_timeout_duration(),
+        client.request(hyper_req),
+    )
+    .await
+    {
         Ok(Ok(resp)) => resp,
         _ => return None,
     };
@@ -1349,7 +1489,11 @@ async fn serve_static_file(
                             // /auth never actually checks it).
                             let csrf_token = resolve_tag_csrf_token(rule, &data.config);
                             let tagged = if rule.tag_proxyauth_enabled() {
-                                substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                                substitute_proxyauth_tags(
+                                    &text,
+                                    username.as_deref(),
+                                    csrf_token.as_deref(),
+                                )
                             } else {
                                 text
                             };
@@ -1366,7 +1510,10 @@ async fn serve_static_file(
                 resp.append_header(("server", "ProxyAuth"))
                     .content_type(content_type);
                 if rule.cache_enabled() {
-                    resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
+                    resp.append_header((
+                        header::CACHE_CONTROL,
+                        format!("public, max-age={}", max_age),
+                    ));
                 } else {
                     resp.append_header((
                         header::CACHE_CONTROL,
@@ -1456,7 +1603,11 @@ async fn serve_static_file(
                         let username = extract_username_for_tags(req, data, ip).await;
                         let csrf_token = resolve_tag_csrf_token(rule, &data.config);
                         let tagged = if rule.tag_proxyauth_enabled() {
-                            substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+                            substitute_proxyauth_tags(
+                                &text,
+                                username.as_deref(),
+                                csrf_token.as_deref(),
+                            )
                         } else {
                             text
                         };
@@ -1473,7 +1624,10 @@ async fn serve_static_file(
             resp.append_header(("server", "ProxyAuth"))
                 .content_type(content_type);
             if rule.cache_enabled() {
-                resp.append_header((header::CACHE_CONTROL, format!("public, max-age={}", max_age)));
+                resp.append_header((
+                    header::CACHE_CONTROL,
+                    format!("public, max-age={}", max_age),
+                ));
             } else {
                 resp.append_header((
                     header::CACHE_CONTROL,
@@ -1689,18 +1843,17 @@ pub async fn global_proxy(
                 if !pp.hidden_blocks.is_empty() {
                     continue;
                 }
-                let session_valid =
-                    check_backend_session(
-                        &rule.target,
-                        &pp.check_path,
-                        pp.type_return,
-                        pp.expected_status,
-                        pp.expected_field.as_deref(),
-                        pp.expected_value.as_deref(),
-                        &req,
-                        &data,
-                    )
-                    .await;
+                let session_valid = check_backend_session(
+                    &rule.target,
+                    &pp.check_path,
+                    pp.type_return,
+                    pp.expected_status,
+                    pp.expected_field.as_deref(),
+                    pp.expected_value.as_deref(),
+                    &req,
+                    &data,
+                )
+                .await;
                 if !session_valid {
                     if let Some(location) = &rp.redirect_url {
                         return Ok(HttpResponse::SeeOther()
@@ -1780,7 +1933,6 @@ pub async fn global_proxy(
                 }
             }
         }
-
     }
 
     // `/oidc/authorize` needs the full request (query params, request
@@ -1851,12 +2003,16 @@ pub async fn global_proxy(
         // whose origin wasn't explicitly listed — exactly the callers
         // these two endpoints exist to serve.
         if req.path() == "/.well-known/openid-configuration" || req.path() == "/oidc/jwks.json" {
-            if let Some(rule) = find_vhost_route(request_host(&req).as_deref(), &data.routes.routes) {
+            if let Some(rule) = find_vhost_route(request_host(&req).as_deref(), &data.routes.routes)
+            {
                 if rule.oidc.is_some() {
                     return Ok(HttpResponse::Ok()
                         .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
                         .insert_header((header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"))
-                        .insert_header((header::ACCESS_CONTROL_ALLOW_HEADERS, "Authorization, Content-Type, Accept"))
+                        .insert_header((
+                            header::ACCESS_CONTROL_ALLOW_HEADERS,
+                            "Authorization, Content-Type, Accept",
+                        ))
                         .insert_header((header::ACCESS_CONTROL_MAX_AGE, "3600"))
                         .finish());
                 }
@@ -1881,26 +2037,31 @@ pub async fn global_proxy(
         // equivalent — those are different origins per the Fetch
         // spec's own definition, even though this vhost isn't
         // expected to ever legitimately see one in practice.
-        let same_origin = origin.and_then(|o| request_host(&req).map(|h| (o, h))).is_some_and(
-            |(o, host)| {
-                let expected_scheme = if is_secure_request(&req, &data.config) { "https://" } else { "http://" };
+        let same_origin = origin
+            .and_then(|o| request_host(&req).map(|h| (o, h)))
+            .is_some_and(|(o, host)| {
+                let expected_scheme = if is_secure_request(&req, &data.config) {
+                    "https://"
+                } else {
+                    "http://"
+                };
                 o.strip_prefix(expected_scheme)
                     .map(|rest| rest.trim_end_matches('/').eq_ignore_ascii_case(&host))
                     .unwrap_or(false)
-            },
-        );
+            });
 
         let allowed = preflight_vhost_route
             .and_then(|r| r.resolved_cors_origins(&data.config))
             .or(data.config.cors_origins.as_ref());
-        let is_allowed = same_origin || match (origin, allowed) {
-            (Some(o), Some(list)) => {
-                let origin_normalized = o.trim_end_matches('/');
-                list.iter()
-                    .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
-            }
-            _ => false,
-        };
+        let is_allowed = same_origin
+            || match (origin, allowed) {
+                (Some(o), Some(list)) => {
+                    let origin_normalized = o.trim_end_matches('/');
+                    list.iter()
+                        .any(|allowed| allowed.trim_end_matches('/') == origin_normalized)
+                }
+                _ => false,
+            };
 
         if let (Some(origin_str), true) = (origin, is_allowed) {
             return Ok(HttpResponse::Ok()
@@ -1944,8 +2105,7 @@ pub async fn global_proxy(
     // down) — find_vhost_route resolves this vhost's own
     // session_cookie/logout_redirect_url override, if routes.yml sets
     // one, the same way the auth flow itself does.
-    let early_vhost_route =
-        find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
+    let early_vhost_route = find_vhost_route(request_host(&req).as_deref(), &data.routes.routes);
     // SECURITY/CORRECTNESS: same gap as the two `required_login`
     // checks in `proxy_with_proxy`/`proxy_without_proxy` — this "skip
     // the logged-out landing page if there's already a session" check
@@ -2029,9 +2189,15 @@ pub async fn global_proxy(
                     .append_header(("Allow", "GET, HEAD"))
                     .body("405 Method Not Allowed"));
             }
-            let mut static_resp =
-                serve_static_file(rule, path, data.config.cache_duration_secs, &req, &data, &ip_str)
-                    .await;
+            let mut static_resp = serve_static_file(
+                rule,
+                path,
+                data.config.cache_duration_secs,
+                &req,
+                &data,
+                &ip_str,
+            )
+            .await;
             apply_custom_headers(&mut static_resp, rule);
             return Ok(static_resp);
         }
@@ -2136,7 +2302,11 @@ pub async fn proxy_with_proxy(
     // backend's own app makes to itself (through ProxyAuth) would be
     // rejected as an invalid CSRF request, breaking the backend
     // entirely rather than just the parts ProxyAuth itself handles.
-    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() && rule.oidc.is_none() {
+    if rule.session_cookie_enabled(&data.config)
+        && rule.csrf_enabled(&data.config)
+        && rule.requires_csrf()
+        && rule.oidc.is_none()
+    {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
             LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>invalid csrf request</h1></body></html>"#;
@@ -2294,7 +2464,7 @@ pub async fn proxy_with_proxy(
                         "Set-Cookie",
                         "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
                     ));
-                    if req.uri() != "/" || req.uri() != "" {
+                    if req.uri() != "/" && req.uri() != "" {
                         resp.append_header(("location", "/"));
                     }
                     add_cors_headers(&mut resp, &req);
@@ -2440,15 +2610,23 @@ pub async fn proxy_with_proxy(
             // that block's own comment for why it still needs
             // excluding here (same append-not-replace reasoning as the
             // four `X-Forwarded-*`/`X-Real-IP` headers above).
+            // `content-encoding` describes the body as it was actually
+            // received. actix may have decoded the payload before it
+            // reached this handler, so relaying the client's original
+            // header would announce an encoding the body no longer
+            // carries and the backend would fail to decode it. This is
+            // what made `git clone` fail: git sends its upload-pack
+            // request gzipped, Forgejo got the header without the gzip
+            // and answered 500. Same discipline already applied to
+            // `content-length` via `is_hop_by_hop_header`.
+            && key_str != "content-encoding"
             && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
-            {
-                if let Ok(hv) =
-                    hyper::header::HeaderValue::from_bytes(value.as_bytes())
-                    {
-                        request_builder = request_builder.header(key_str, hv);
-                    }
+        {
+            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
+                request_builder = request_builder.header(key_str, hv);
             }
+        }
     }
 
     if strip_accept_encoding {
@@ -2477,7 +2655,11 @@ pub async fn proxy_with_proxy(
                 request_builder = request_builder.header("X-Forwarded-Host", hv);
             }
         }
-        let proto = if is_secure_request(&req, &data.config) { "https" } else { "http" };
+        let proto = if is_secure_request(&req, &data.config) {
+            "https"
+        } else {
+            "http"
+        };
         request_builder = request_builder.header("X-Forwarded-Proto", proto);
         if let Ok(hv) = hyper::header::HeaderValue::from_str(&ip) {
             request_builder = request_builder.header("X-Real-IP", hv);
@@ -2517,7 +2699,7 @@ pub async fn proxy_with_proxy(
     };
 
     // ── send upstream ───────────────────────────────────────────────
-    let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
+    let response_result: hyper::Response<ResponseBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
             .backends
             .iter()
@@ -2537,18 +2719,22 @@ pub async fn proxy_with_proxy(
         // the same prefix) — the pair together is exactly what
         // `routes.yml` itself uses to distinguish routes.
         let route_key = format!("{}|{}", rule.vhost.join(","), rule.prefix);
-        forward_failover(hyper_req, &backends, Some(&rule.proxy_config), &route_key)
-            .await
-            .map_err(|e| {
-                warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
-                error::ErrorServiceUnavailable("503 Service Unavailable")
-            })?
+        widen_boxbody(
+            forward_failover(hyper_req, &backends, Some(&rule.proxy_config), &route_key)
+                .await
+                .map_err(|e| {
+                    warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
+                    error::ErrorServiceUnavailable("503 Service Unavailable")
+                })?,
+        )
     } else {
-        match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
-            Ok(Ok(res)) => incoming_to_boxbody(res).await.map_err(|e| {
-                warn!(client_ip = %ip, target = %full_url, "Body collect error: {}", e);
-                error::ErrorServiceUnavailable("503 Service Unavailable")
-            })?,
+        match timeout(
+            data.config.backend_timeout_duration(),
+            client.request(hyper_req),
+        )
+        .await
+        {
+            Ok(Ok(res)) => incoming_to_boxbody(res),
             Ok(Err(e)) => {
                 warn!(client_ip = %ip, target = %full_url, "Upstream error: {}", e);
                 let mut resp = HttpResponse::ServiceUnavailable();
@@ -2567,12 +2753,14 @@ pub async fn proxy_with_proxy(
     };
 
     let status = response_result.status();
+    // Logged, not replaced. Substituting a bare 500 for the backend's
+    // real status and body leaves an operator with the one thing that
+    // cannot be diagnosed: a `server: ProxyAuth` 500 with
+    // `content-length: 0` is indistinguishable from a fault in the
+    // proxy itself, which is exactly how the git-upload-pack failure
+    // above stayed invisible.
     if status.is_server_error() {
         warn!(client_ip = %ip, target = %full_url, "Upstream returned server error: {}", status);
-        let mut resp = HttpResponse::InternalServerError();
-        resp.append_header(("server", "ProxyAuth"));
-        add_cors_headers(&mut resp, &req);
-        return Ok(resp.finish());
     }
 
     let mut client_resp = HttpResponse::build(to_actix_status(status));
@@ -2606,10 +2794,47 @@ pub async fn proxy_with_proxy(
         }
     }
 
-    let headers = response_result.headers().clone();
+    let (resp_parts, resp_body) = response_result.into_parts();
+    let headers: hyper::HeaderMap = resp_parts.headers;
 
-    let mut body_bytes: Bytes = response_result
-        .into_body()
+    // `streaming` is a request, not a guarantee: the three mechanisms
+    // below rewrite the whole body and therefore need it in full, so
+    // any of them being active on this route wins and the response is
+    // buffered as before. `validate_streaming_on_routes` reports that
+    // contradiction at startup.
+    let rewrites_body = rule.tag_proxyauth_enabled()
+        || rule.has_hidden_blocks()
+        || (rule.session_cookie_enabled(&data.config)
+            && rule.csrf_enabled(&data.config)
+            && rule.oidc.is_none());
+
+    if rule.streaming_enabled() && !rewrites_body && !method_str.eq_ignore_ascii_case("HEAD") {
+        if rule.cache_enabled() {
+            let max_age = rule
+                .cache_duration_secs
+                .unwrap_or(data.config.cache_duration_secs);
+            client_resp.insert_header((
+                header::CACHE_CONTROL,
+                format!("public, max-age={}", max_age),
+            ));
+        } else {
+            client_resp.insert_header((
+                header::CACHE_CONTROL,
+                "no-store, no-cache, must-revalidate, max-age=0",
+            ));
+            client_resp.insert_header(("Pragma", "no-cache"));
+            client_resp.insert_header(("Expires", "0"));
+        }
+
+        add_cors_headers(&mut client_resp, &req);
+        fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
+        apply_custom_headers_builder(&mut client_resp, rule);
+        client_resp.append_header(("server", "ProxyAuth"));
+
+        return Ok(client_resp.streaming(body_to_actix_stream(resp_body)));
+    }
+
+    let mut body_bytes: Bytes = resp_body
         .collect()
         .await
         .map_err(|e| {
@@ -2647,7 +2872,10 @@ pub async fn proxy_with_proxy(
     // going to contain — the backend doesn't speak ProxyAuth's own
     // templating on an oidc-enabled vhost, same reasoning as the CSRF
     // validation gate above.
-    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.oidc.is_none() {
+    if rule.session_cookie_enabled(&data.config)
+        && rule.csrf_enabled(&data.config)
+        && rule.oidc.is_none()
+    {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {
@@ -2791,7 +3019,11 @@ pub async fn proxy_without_proxy(
     }
 
     // ── CSRF ─────────────────────────────────────────────────────────
-    if rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.requires_csrf() && rule.oidc.is_none() {
+    if rule.session_cookie_enabled(&data.config)
+        && rule.csrf_enabled(&data.config)
+        && rule.requires_csrf()
+        && rule.oidc.is_none()
+    {
         if !validate_csrf_token(req.method(), &req, &body, &data.config.secret) {
             LogContext::set_error_detail(&req, "invalid csrf token");
             let html = r#"<!doctype html>
@@ -3003,7 +3235,7 @@ pub async fn proxy_without_proxy(
                         "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
                     ));
 
-                    if req.uri() != "/" || req.uri() != "" {
+                    if req.uri() != "/" && req.uri() != "" {
                         resp.append_header(("location", "/"));
                     }
 
@@ -3024,7 +3256,6 @@ pub async fn proxy_without_proxy(
                 .route_access_decision(rule, &username)
                 .is_allowed()
         {
-
             let mut resp = HttpResponse::Unauthorized();
 
             resp.append_header(("server", "ProxyAuth"));
@@ -3143,15 +3374,23 @@ pub async fn proxy_without_proxy(
             // that block's own comment for why it still needs
             // excluding here (same append-not-replace reasoning as the
             // four `X-Forwarded-*`/`X-Real-IP` headers above).
+            // `content-encoding` describes the body as it was actually
+            // received. actix may have decoded the payload before it
+            // reached this handler, so relaying the client's original
+            // header would announce an encoding the body no longer
+            // carries and the backend would fail to decode it. This is
+            // what made `git clone` fail: git sends its upload-pack
+            // request gzipped, Forgejo got the header without the gzip
+            // and answered 500. Same discipline already applied to
+            // `content-length` via `is_hop_by_hop_header`.
+            && key_str != "content-encoding"
             && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
-            {
-                if let Ok(hv) =
-                    hyper::header::HeaderValue::from_bytes(value.as_bytes())
-                    {
-                        request_builder = request_builder.header(key_str, hv);
-                    }
+        {
+            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
+                request_builder = request_builder.header(key_str, hv);
             }
+        }
     }
 
     if strip_accept_encoding {
@@ -3180,7 +3419,11 @@ pub async fn proxy_without_proxy(
                 request_builder = request_builder.header("X-Forwarded-Host", hv);
             }
         }
-        let proto = if is_secure_request(&req, &data.config) { "https" } else { "http" };
+        let proto = if is_secure_request(&req, &data.config) {
+            "https"
+        } else {
+            "http"
+        };
         request_builder = request_builder.header("X-Forwarded-Proto", proto);
         if let Ok(hv) = hyper::header::HeaderValue::from_str(&ip) {
             request_builder = request_builder.header("X-Real-IP", hv);
@@ -3243,7 +3486,7 @@ pub async fn proxy_without_proxy(
     };
 
     // ── Send upstream ────────────────────────────────────────────────
-    let response_result: hyper::Response<BoxBody> = if !rule.backends.is_empty() {
+    let response_result: hyper::Response<ResponseBody> = if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
             .backends
             .iter()
@@ -3259,7 +3502,7 @@ pub async fn proxy_without_proxy(
 
         let route_key = format!("{}|{}", rule.vhost.join(","), rule.prefix);
         match forward_failover(hyper_req, &backends, None, &route_key).await {
-            Ok(res) => res,
+            Ok(res) => widen_boxbody(res),
 
             Err(e) => {
                 warn!(
@@ -3279,17 +3522,13 @@ pub async fn proxy_without_proxy(
             }
         }
     } else {
-        match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
-            Ok(Ok(res)) => incoming_to_boxbody(res).await.map_err(|e| {
-                warn!(
-                    client_ip = %ip,
-                    target = %full_url,
-                    "Body collect error: {}",
-                    e
-                );
-
-                error::ErrorServiceUnavailable("503 Service Unavailable")
-            })?,
+        match timeout(
+            data.config.backend_timeout_duration(),
+            client.request(hyper_req),
+        )
+        .await
+        {
+            Ok(Ok(res)) => incoming_to_boxbody(res),
 
             Ok(Err(e)) => {
                 warn!(
@@ -3330,6 +3569,7 @@ pub async fn proxy_without_proxy(
     // ── Upstream status ──────────────────────────────────────────────
     let status = response_result.status();
 
+    // See the twin site in `proxy_with_proxy` for why this only logs.
     if status.is_server_error() {
         warn!(
             client_ip = %ip,
@@ -3337,14 +3577,6 @@ pub async fn proxy_without_proxy(
             "Upstream returned server error: {}",
             status
         );
-
-        let mut resp = HttpResponse::InternalServerError();
-
-        resp.append_header(("server", "ProxyAuth"));
-
-        add_cors_headers(&mut resp, &req);
-
-        return Ok(resp.finish());
     }
 
     // ── Split response ──────────────────────────────────────────────
@@ -3383,6 +3615,43 @@ pub async fn proxy_without_proxy(
         if k != "user-agent" && k != "authorization" && k != "server" {
             client_resp.append_header((k, value.as_bytes()));
         }
+    }
+
+    // `streaming` is a request, not a guarantee: the three mechanisms
+    // below rewrite the whole body and therefore need it in full, so
+    // any of them being active on this route wins and the response is
+    // buffered as before. `validate_streaming_on_routes` reports that
+    // contradiction at startup.
+    let rewrites_body = rule.tag_proxyauth_enabled()
+        || rule.has_hidden_blocks()
+        || (rule.session_cookie_enabled(&data.config)
+            && rule.csrf_enabled(&data.config)
+            && rule.oidc.is_none());
+
+    if rule.streaming_enabled() && !rewrites_body && !is_head {
+        if rule.cache_enabled() {
+            let max_age = rule
+                .cache_duration_secs
+                .unwrap_or(data.config.cache_duration_secs);
+            client_resp.insert_header((
+                header::CACHE_CONTROL,
+                format!("public, max-age={}", max_age),
+            ));
+        } else {
+            client_resp.insert_header((
+                header::CACHE_CONTROL,
+                "no-store, no-cache, must-revalidate, max-age=0",
+            ));
+            client_resp.insert_header(("Pragma", "no-cache"));
+            client_resp.insert_header(("Expires", "0"));
+        }
+
+        add_cors_headers(&mut client_resp, &req);
+        fix_mime_actix(req.uri().path(), &mut client_resp, to_actix_status(status));
+        apply_custom_headers_builder(&mut client_resp, rule);
+        client_resp.append_header(("server", "ProxyAuth"));
+
+        return Ok(client_resp.streaming(body_to_actix_stream(resp_body)));
     }
 
     // ── Response body ───────────────────────────────────────────────
@@ -3436,7 +3705,11 @@ pub async fn proxy_without_proxy(
     //
     // Never modify a HEAD response body.
     //
-    if !is_head && rule.session_cookie_enabled(&data.config) && rule.csrf_enabled(&data.config) && rule.oidc.is_none() {
+    if !is_head
+        && rule.session_cookie_enabled(&data.config)
+        && rule.csrf_enabled(&data.config)
+        && rule.oidc.is_none()
+    {
         if let Some((new_body, new_len)) =
             inject_csrf_token(&headers, &body_bytes, &data.config.secret)
         {

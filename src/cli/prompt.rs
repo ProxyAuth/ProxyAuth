@@ -710,8 +710,8 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
 
                         let mut any_failed = false;
                         for mv in &managed {
-                            print!("{}: ", mv.vhost);
-                            match crate::acme::check_and_maybe_renew(mv, &config.acme, *force)
+                            print!("{}: ", mv.display_names());
+                            match crate::acme::check_and_maybe_renew(mv, &config.acme, *force, true)
                                 .await
                             {
                                 crate::acme::RenewOutcome::NotDue { days_left } => {
@@ -741,13 +741,35 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(1);
                     };
 
+                    // Naming one member of a group renews the whole
+                    // group: reissuing just this name would overwrite
+                    // the shared cert file with one no longer covering
+                    // its siblings.
+                    let names = crate::acme::names_sharing_cert(&routes.routes, &cert_path);
                     let mv = crate::acme::ManagedVhost {
-                        vhost: vhost.clone(),
+                        names: if names.is_empty() {
+                            vec![vhost.to_ascii_lowercase()]
+                        } else {
+                            names
+                        },
                         cert_path,
                         key_path,
                     };
+                    if mv.names.len() > 1 {
+                        println!(
+                            "'{vhost}' shares its certificate with {} — renewing all of them onto one certificate.",
+                            mv.display_names()
+                        );
+                    }
 
-                    match crate::acme::check_and_maybe_renew(&mv, &config.acme, *force).await {
+                    if crate::acme::renew::needs_dns01(&mv.names) {
+                        println!(
+                            "This certificate includes a wildcard — validation will be manual (DNS-01)."
+                        );
+                    }
+
+                    match crate::acme::check_and_maybe_renew(&mv, &config.acme, *force, true).await
+                    {
                         crate::acme::RenewOutcome::NotDue { days_left } => {
                             println!(
                                 "'{vhost}' has {days_left} day(s) left (renew_before_days: {}) — not due yet. Use --force to renew anyway.",
@@ -773,13 +795,14 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 crate::cli::command::CertbotAction::Check { vhost } => {
-                    let targets: Vec<crate::acme::ManagedVhost> = if vhost.eq_ignore_ascii_case("all")
+                    let targets: Vec<crate::acme::ManagedVhost> = if vhost
+                        .eq_ignore_ascii_case("all")
                     {
                         crate::acme::collect_all_vhost_certs(&routes.routes)
                     } else {
                         match crate::acme::find_vhost_cert_paths(&routes.routes, vhost) {
                             Some((cert_path, key_path)) => vec![crate::acme::ManagedVhost {
-                                vhost: vhost.clone(),
+                                names: vec![vhost.to_ascii_lowercase()],
                                 cert_path,
                                 key_path,
                             }],
@@ -802,7 +825,7 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                         if i > 0 {
                             println!();
                         }
-                        println!("{}", mv.vhost);
+                        println!("{}", mv.display_names());
                         println!("  cert file:  {}", mv.cert_path.display());
                         match crate::acme::read_cert_info(&mv.cert_path) {
                             Ok(info) => {
@@ -835,12 +858,42 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(1);
                     };
 
-                    println!("Issuing a new certificate for '{vhost}'...");
+                    // Same grouping as `renew`: the certificate is
+                    // identified by the file it's written to, so every
+                    // name whose `vhost_cert` points at that file has
+                    // to be on it. Issuing for the named vhost alone
+                    // would write a single-SAN certificate into a path
+                    // its siblings also serve from, leaving them
+                    // covered by a certificate that doesn't name them.
+                    let names = crate::acme::names_sharing_cert(&routes.routes, &cert_path);
+                    let names = if names.is_empty() {
+                        vec![vhost.to_ascii_lowercase()]
+                    } else {
+                        names
+                    };
+
+                    if names.len() > 1 {
+                        println!(
+                            "Issuing one certificate covering {} (they share {})...",
+                            names.join(", "),
+                            cert_path.display()
+                        );
+                    } else {
+                        println!("Issuing a new certificate for '{vhost}'...");
+                    }
+
+                    if crate::acme::renew::needs_dns01(&names) {
+                        println!(
+                            "This certificate includes a wildcard — validation will be manual (DNS-01)."
+                        );
+                    }
+
                     match crate::acme::renew::renew_certificate(
-                        vhost,
+                        &names,
                         &cert_path,
                         &key_path,
                         &config.acme,
+                        true,
                     )
                     .await
                     {

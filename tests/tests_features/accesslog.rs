@@ -1,9 +1,8 @@
 use actix_web::HttpMessage;
-use proxyauth::config::logging::LoggingConfig;
 use proxyauth::config::logging::LOG_DIR;
+use proxyauth::config::logging::LoggingConfig;
 use proxyauth::network::accesslog::{
-    compile_format, Field, LogContext, RequiredFields, Segment,
-    VhostLogWriter,
+    Field, LogContext, RequiredFields, Segment, VhostLogWriter, compile_format,
 };
 
 // ── compile_format: all known placeholders ──────────────────────
@@ -52,7 +51,11 @@ fn compile_all_placeholders() {
 fn compile_error_detail_aliases() {
     for alias in &["[error_detail]", "[error-detail]", "[error]"] {
         let segs = compile_format(alias);
-        assert_eq!(segs.len(), 1, "alias {alias} should produce exactly one segment");
+        assert_eq!(
+            segs.len(),
+            1,
+            "alias {alias} should produce exactly one segment"
+        );
         assert!(matches!(segs[0], Segment::Field(Field::ErrorDetail)));
     }
 }
@@ -457,7 +460,10 @@ fn default_format_compiles_all_known() {
             false
         }
     });
-    assert!(!has_unknown, "DEFAULT_FORMAT should not contain unknown placeholders");
+    assert!(
+        !has_unknown,
+        "DEFAULT_FORMAT should not contain unknown placeholders"
+    );
 }
 
 // ── Multiple commas in format ───────────────────────────────────
@@ -495,7 +501,11 @@ fn writer_works_even_with_logging_disabled() {
     w.write(fname, "logged even when access log is off");
     w.flush_all();
 
-    assert!(std::fs::read_to_string(&path).unwrap().contains("logged even when access log is off"));
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("logged even when access log is off")
+    );
 
     let _ = std::fs::remove_file(&path);
 }

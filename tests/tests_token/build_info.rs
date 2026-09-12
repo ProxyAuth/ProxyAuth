@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use proxyauth::build::build_info::{get, update_build_info, update, BuildInfo};
+    use proxyauth::build::build_info::{BuildInfo, get, update, update_build_info};
 
     /// A 64-character build secret, matching what build.rs now emits.
     const TEST_HK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

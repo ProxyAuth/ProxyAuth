@@ -9,12 +9,12 @@ use proxyauth::token::security::check_date_token;
 use proxyauth::token::security::cond_matches_strict;
 use proxyauth::token::security::extract_token_user;
 use proxyauth::token::security::format_long_date;
-use proxyauth::token::security::issue_token;
 use proxyauth::token::security::get_build_datetime;
 use proxyauth::token::security::get_build_epochdate;
 use proxyauth::token::security::get_build_rand;
 use proxyauth::token::security::get_build_seed2;
 use proxyauth::token::security::get_build_time;
+use proxyauth::token::security::issue_token;
 use proxyauth::token::security::parse_query_map;
 use serde_json::Value as JsonValue;
 
@@ -48,21 +48,21 @@ mod tests {
             vhost_cert: std::collections::HashMap::new(),
             certbot_renew: false,
             headers: std::collections::HashMap::new(),
-        tag_csrf_token: None,
-        session_cookie: None,
-        max_age_session_cookie: None,
-        login_redirect_url: None,
-        logout_redirect_url: None,
-        login_via_otp: None,
-        page_change_password: None,
-        cors_origins: None,
-        smtp: None,
-        tag_proxyauth: None,
-        allow_users: vec![],
-        allow_groups: vec![],
-        allow_roles: vec![],
-        exclude_users: vec![],
-        allow_totp_reenroll: None,
+            tag_csrf_token: None,
+            session_cookie: None,
+            max_age_session_cookie: None,
+            login_redirect_url: None,
+            logout_redirect_url: None,
+            login_via_otp: None,
+            page_change_password: None,
+            cors_origins: None,
+            smtp: None,
+            tag_proxyauth: None,
+            allow_users: vec![],
+            allow_groups: vec![],
+            allow_roles: vec![],
+            exclude_users: vec![],
+            allow_totp_reenroll: None,
             allow_ips: vec![],
             deny_ips: vec![],
             allow_ips_compiled: vec![],
@@ -85,6 +85,7 @@ mod tests {
             log_file: None,
             compression: None,
             cache: Some(true),
+            streaming: None,
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
@@ -512,21 +513,21 @@ mod more_unit_tests {
             vhost_cert: std::collections::HashMap::new(),
             certbot_renew: false,
             headers: std::collections::HashMap::new(),
-        tag_csrf_token: None,
-        session_cookie: None,
-        max_age_session_cookie: None,
-        login_redirect_url: None,
-        logout_redirect_url: None,
-        login_via_otp: None,
-        page_change_password: None,
-        cors_origins: None,
-        smtp: None,
-        tag_proxyauth: None,
-        allow_users: vec![],
-        allow_groups: vec![],
-        allow_roles: vec![],
-        exclude_users: vec![],
-        allow_totp_reenroll: None,
+            tag_csrf_token: None,
+            session_cookie: None,
+            max_age_session_cookie: None,
+            login_redirect_url: None,
+            logout_redirect_url: None,
+            login_via_otp: None,
+            page_change_password: None,
+            cors_origins: None,
+            smtp: None,
+            tag_proxyauth: None,
+            allow_users: vec![],
+            allow_groups: vec![],
+            allow_roles: vec![],
+            exclude_users: vec![],
+            allow_totp_reenroll: None,
             allow_ips: vec![],
             deny_ips: vec![],
             allow_ips_compiled: vec![],
@@ -549,6 +550,7 @@ mod more_unit_tests {
             log_file: None,
             compression: None,
             cache: Some(true),
+            streaming: None,
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,
@@ -682,8 +684,8 @@ mod validate_token_path_tests {
     use proxyauth::AppConfig;
     use proxyauth::AppState;
     use proxyauth::config::config::{RouteConfig, User};
-    use proxyauth::revoke::db::RevokedTokenMap;
     use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
+    use proxyauth::revoke::db::RevokedTokenMap;
     use proxyauth::stats::tokencount::CounterToken;
     use proxyauth::token::security::{issue_token, validate_token};
 
@@ -719,7 +721,10 @@ mod validate_token_path_tests {
 
         web::Data::new(AppState {
             config: Arc::new(cfg),
-            routes: Arc::new(RouteConfig { routes: vec![], ..Default::default() }),
+            routes: Arc::new(RouteConfig {
+                routes: vec![],
+                ..Default::default()
+            }),
             counter: Arc::new(CounterToken::new()),
             revoked_tokens: Arc::new(DashMap::new()) as RevokedTokenMap,
             stats,
@@ -765,7 +770,11 @@ mod validate_token_path_tests {
         bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
         let tampered = String::from_utf8(bytes).expect("still utf8");
 
-        assert!(validate_token(&tampered, &st, &cfg, "127.0.0.1").await.is_err());
+        assert!(
+            validate_token(&tampered, &st, &cfg, "127.0.0.1")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -806,7 +815,11 @@ mod validate_token_path_tests {
 
         let token = mint("alice", 9_999, &expiry_in(600), "tid-idx");
 
-        assert!(validate_token(&token, &st, &cfg, "127.0.0.1").await.is_err());
+        assert!(
+            validate_token(&token, &st, &cfg, "127.0.0.1")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

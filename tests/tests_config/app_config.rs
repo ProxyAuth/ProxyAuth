@@ -132,7 +132,8 @@ mod tests {
 
     #[test]
     fn app_config_secret_is_preserved() {
-        let json = r#"{"token_expiry_seconds": 3600, "secret": "my-secret-key", "users": [], "log": {}}"#;
+        let json =
+            r#"{"token_expiry_seconds": 3600, "secret": "my-secret-key", "users": [], "log": {}}"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.secret, "my-secret-key");
     }
@@ -156,7 +157,10 @@ mod tests {
         let json = r#"{"token_expiry_seconds": 3600, "secret": "s", "users": [], "log": {}, "cors_origins": ["https://app.example.com"]}"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.cors_origins.as_ref().unwrap().len(), 1);
-        assert_eq!(cfg.cors_origins.as_ref().unwrap()[0], "https://app.example.com");
+        assert_eq!(
+            cfg.cors_origins.as_ref().unwrap()[0],
+            "https://app.example.com"
+        );
     }
 
     #[test]
@@ -373,5 +377,100 @@ mod tests {
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.user_by_index(0).unwrap().username, "alice");
         assert_eq!(cfg.user_by_index(1).unwrap().username, "bob");
+    }
+
+    // ── Robustness: invalid / edge-case configuration must not crash ──
+    //
+    // Two startup crashes were already found the hard way: both rate
+    // limits at 0, and a missing/zero `burst`. These pin down that
+    // AppConfig itself either fills in a sane default or fails with a
+    // clean deserialization error, and never panics — plus the
+    // `backend_timeout_duration` guard that turns a 0 into the default
+    // rather than a per-request instant failure.
+
+    const BASE: &str = r#""token_expiry_seconds": 3600, "secret": "s", "users": [], "log": {}"#;
+
+    #[test]
+    fn app_config_default_max_body_size_is_10_mib() {
+        let json = format!("{{{BASE}}}");
+        let cfg: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.max_body_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn app_config_default_backend_timeout_is_10s() {
+        let json = format!("{{{BASE}}}");
+        let cfg: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.backend_timeout, 10000);
+    }
+
+    #[test]
+    fn app_config_missing_ratelimit_sections_get_defaults() {
+        // A config that never mentions rate limiting must still produce
+        // usable maps, not something that panics when they're read.
+        let json = format!("{{{BASE}}}");
+        let cfg: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(cfg.ratelimit_proxy.contains_key("requests_per_second"));
+        assert!(cfg.ratelimit_auth.contains_key("requests_per_second"));
+    }
+
+    #[test]
+    fn app_config_accepts_zero_values() {
+        // Zeroes are a valid way to say "off" and must parse. Guarding a
+        // 0 that would break something at runtime happens where the value
+        // is used (see backend_timeout_duration below), not by rejecting
+        // it here.
+        let json = format!(
+            r#"{{{BASE},
+                "max_body_size": 0,
+                "backend_timeout": 0,
+                "ratelimit_proxy": {{"requests_per_second": 0, "burst": 0}},
+                "ratelimit_auth": {{"requests_per_second": 0, "burst": 0}}
+            }}"#
+        );
+        let cfg: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.max_body_size, 0);
+        assert_eq!(cfg.backend_timeout, 0);
+    }
+
+    #[test]
+    fn backend_timeout_zero_falls_back_to_default_duration() {
+        // A literal 0 would otherwise be a zero-length timeout — every
+        // proxied request failing instantly. The guard restores the
+        // default instead.
+        let json = format!(r#"{{{BASE}, "backend_timeout": 0}}"#);
+        let cfg: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            cfg.backend_timeout_duration(),
+            std::time::Duration::from_millis(10000)
+        );
+    }
+
+    #[test]
+    fn backend_timeout_nonzero_is_used_as_is() {
+        let json = format!(r#"{{{BASE}, "backend_timeout": 45000}}"#);
+        let cfg: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            cfg.backend_timeout_duration(),
+            std::time::Duration::from_millis(45000)
+        );
+    }
+
+    #[test]
+    fn app_config_wrong_types_are_a_clean_error_not_a_panic() {
+        // A string where a number belongs must surface as a normal Err
+        // (which load_config turns into a clear message), never an
+        // unwrap panic somewhere downstream.
+        let bad_port = r#"{"token_expiry_seconds": 3600, "secret": "s", "users": [], "log": {}, "port": "not-a-number"}"#;
+        assert!(serde_json::from_str::<AppConfig>(bad_port).is_err());
+
+        let bad_size = r#"{"token_expiry_seconds": 3600, "secret": "s", "users": [], "log": {}, "max_body_size": "big"}"#;
+        assert!(serde_json::from_str::<AppConfig>(bad_size).is_err());
+    }
+
+    #[test]
+    fn app_config_malformed_json_is_an_error_not_a_panic() {
+        assert!(serde_json::from_str::<AppConfig>(r#"{"secret": "s","#).is_err());
+        assert!(serde_json::from_str::<AppConfig>("not json at all").is_err());
     }
 }

@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
     use proxyauth::config::config::{AppConfig, RouteRule};
-    use proxyauth::network::proxy::{find_route_for_redirect_path, resolve_tag_csrf_token};
+    use proxyauth::network::proxy::{
+        find_route_for_redirect_path, init_routes_order, match_route_idx, resolve_tag_csrf_token,
+    };
 
     /// `prefix` is `RouteRule`'s one genuinely required field (no
     /// serde default) — every other field does have one, so a minimal
@@ -210,4 +212,81 @@ mod tests {
         let route = rule_with_csrf("/", Some(true));
         assert!(resolve_tag_csrf_token(&route, &global).is_some());
     }
+
+    // ── URL bypass: a protected prefix stays protected however the
+    //    path is disguised ─────────────────────────────────────────────
+    //
+    // The whole value of a route's `prefix` is that a protected prefix
+    // can't be dodged by dressing the path up. These go through the same
+    // public `match_route_idx` real request routing uses, so they cover
+    // canonicalisation AND route selection together: every disguised
+    // spelling of `/app` must resolve to the protected route, never slip
+    // to a weaker catch-all, and genuinely different paths must not be
+    // caught by `/app`.
+
+    /// `/app` (protected) plus a catch-all `/`. `build_route_order` puts
+    /// `/` last, so `/app` and every disguised spelling must resolve to
+    /// index 0, and only genuinely different paths fall to index 1.
+    fn protected_then_catch_all() -> Vec<RouteRule> {
+        let routes = vec![rule("/app", &[]), rule("/", &[])];
+        init_routes_order(&routes);
+        routes
+    }
+
+    #[test]
+    fn disguised_paths_resolve_to_the_protected_route() {
+        let routes = protected_then_catch_all();
+        for path in [
+            "/app",
+            "/app/",
+            "/app/sub",
+            "/app/../app",       // dot segments normalise back to /app
+            "/app/./sub",
+            "//app",             // redundant leading slashes
+            "///app///sub",
+            "/app%2Fsub",        // percent-encoded slash
+            "/app%2f..%2fapp",
+            "/app\\sub",         // backslash separator
+            "/./app",
+        ] {
+            assert_eq!(
+                match_route_idx(path, None, &routes),
+                Some(0),
+                "path {path:?} must route to the protected /app route, not the catch-all"
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_and_different_paths_do_not_hit_the_protected_route() {
+        let routes = protected_then_catch_all();
+        for path in [
+            "/application", // substring, not a prefix boundary
+            "/app-extra",
+            "/apps",
+            "/other",
+            "/APP", // case-sensitive: a different path
+        ] {
+            assert_eq!(
+                match_route_idx(path, None, &routes),
+                Some(1),
+                "path {path:?} must fall to the catch-all, never silently onto /app"
+            );
+        }
+    }
+
+    #[test]
+    fn no_catch_all_means_disguised_paths_still_match_but_outsiders_miss() {
+        // Without a catch-all, the disguises still match /app (Some(0)),
+        // and a path outside the prefix matches nothing at all rather
+        // than leaking onto the protected route.
+        let routes = vec![rule("/app", &[])];
+        init_routes_order(&routes);
+
+        assert_eq!(match_route_idx("/app/../app", None, &routes), Some(0));
+        assert_eq!(match_route_idx("//app//x", None, &routes), Some(0));
+        assert_eq!(match_route_idx("/application", None, &routes), None);
+        assert_eq!(match_route_idx("/APP", None, &routes), None);
+    }
+
 }

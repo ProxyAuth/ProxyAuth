@@ -52,13 +52,13 @@ fn load_cert_chain(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> 
 
     // rustls 0.23 : CertificateDer<'static> au lieu de Certificate(der)
     let certs = CertificateDer::pem_reader_iter(&mut reader)
-    .filter_map(|r| r.ok())
-    .collect::<Vec<_>>();
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
 
     anyhow::ensure!(
         !certs.is_empty(),
-                    "no certificates found in {}",
-                    path.display()
+        "no certificates found in {}",
+        path.display()
     );
     Ok(certs)
 }
@@ -69,13 +69,13 @@ fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
 
     // rustls 0.23 : PrivateKeyDer<'static> au lieu de PrivateKey(der)
     let keys = PrivateKeyDer::pem_reader_iter(&mut reader)
-    .filter_map(|r| r.ok())
-    .collect::<Vec<PrivateKeyDer<'static>>>();
+        .filter_map(|r| r.ok())
+        .collect::<Vec<PrivateKeyDer<'static>>>();
 
     anyhow::ensure!(
         !keys.is_empty(),
-                    "no private key found in {}",
-                    path.display()
+        "no private key found in {}",
+        path.display()
     );
     Ok(keys.into_iter().next().unwrap())
 }
@@ -87,9 +87,9 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> anyhow::Result<Arc<C
     // rustls 0.23 : crypto_provider().key_provider.load_private_key()
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let sk = provider
-    .key_provider
-    .load_private_key(key)
-    .map_err(|e| anyhow::anyhow!("Failed to load private key: {e}"))?;
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| anyhow::anyhow!("Failed to load private key: {e}"))?;
 
     Ok(Arc::new(CertifiedKey::new(chain, sk)))
 }
@@ -130,25 +130,53 @@ impl ResolvesServerCert for HotResolver {
 #[derive(Debug)]
 struct MultiHotResolver {
     default: Arc<HotResolver>,
-        by_host: HashMap<String, Arc<HotResolver>>,
+    by_host: HashMap<String, Arc<HotResolver>>,
 }
 
 impl ResolvesServerCert for MultiHotResolver {
     fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
         if let Some(sni) = hello.server_name() {
-            if let Some(r) = self.by_host.get(&sni.to_ascii_lowercase()) {
+            let sni = sni.to_ascii_lowercase();
+            // Exact name first: a vhost that has its own certificate
+            // must keep getting it even when a wildcard for the same
+            // parent domain is also configured.
+            if let Some(r) = self.by_host.get(&sni) {
                 return Some(r.get());
+            }
+            // Then wildcard patterns, stored in the same map under
+            // their literal `*.example.com` key. Linear scan: this only
+            // ever walks the wildcard entries, of which a deployment
+            // has a handful, and only on the exact-miss path.
+            for (pattern, r) in &self.by_host {
+                if crate::network::proxy::is_wildcard_vhost(pattern)
+                    && wildcard_covers(pattern, &sni)
+                {
+                    return Some(r.get());
+                }
             }
         }
         Some(self.default.get())
     }
 }
 
+/// Same single-label rule as `proxy::vhost_entry_matches` — kept in
+/// sync deliberately: routing a host and choosing its certificate must
+/// agree, or a request gets routed somewhere its certificate doesn't
+/// cover.
+fn wildcard_covers(pattern: &str, host: &str) -> bool {
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    host.strip_suffix(suffix)
+        .and_then(|prefix| prefix.strip_suffix('.'))
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+}
+
 fn build_rustls_config_with_resolver(resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
     // rustls 0.23 : with_safe_defaults() supprimé — builder() configure automatiquement
     let mut cfg = ServerConfig::builder()
-    .with_no_client_auth()
-    .with_cert_resolver(resolver);
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     cfg
 }
@@ -186,8 +214,8 @@ fn load_vhost_resolvers(routes: &[RouteRule]) -> HashMap<String, Arc<HotResolver
             // that anything is wrong.
             warn!(
                 "vhost_cert for {:?} has keys {:?} but no \"cert\"/\"key\" — expected exactly those two keys (not e.g. \"file\"). Falling back to the default certificate for this vhost.",
-                  rule.vhost,
-                  rule.vhost_cert.keys().collect::<Vec<_>>()
+                rule.vhost,
+                rule.vhost_cert.keys().collect::<Vec<_>>()
             );
             continue;
         };
@@ -211,9 +239,9 @@ fn load_vhost_resolvers(routes: &[RouteRule]) -> HashMap<String, Arc<HotResolver
                     tokio::spawn(async move {
                         if let Err(e) =
                             watch_cert_key(watch_resolver, watch_cert, watch_key, label).await
-                            {
-                                warn!("Watch TLS (vhost) stopped: {e:?}");
-                            }
+                        {
+                            warn!("Watch TLS (vhost) stopped: {e:?}");
+                        }
                     });
 
                     resolver
@@ -221,7 +249,7 @@ fn load_vhost_resolvers(routes: &[RouteRule]) -> HashMap<String, Arc<HotResolver
                 Err(e) => {
                     warn!(
                         "vhost_cert for {:?} ({} / {}): failed to load: {e:?} — falling back to the default certificate",
-                          rule.vhost, cert, key
+                        rule.vhost, cert, key
                     );
                     continue;
                 }
@@ -268,13 +296,13 @@ async fn watch_cert_key(
     // it, so a watch on the directory survives indefinitely instead —
     // the standard fix for this well-known inotify limitation.
     let cert_dir = cert
-    .parent()
-    .map(Path::to_path_buf)
-    .unwrap_or_else(|| PathBuf::from("."));
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
     let key_dir = key
-    .parent()
-    .map(Path::to_path_buf)
-    .unwrap_or_else(|| PathBuf::from("."));
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     watcher.watch(&cert_dir, RecursiveMode::NonRecursive)?;
     if key_dir != cert_dir {
@@ -283,12 +311,12 @@ async fn watch_cert_key(
 
     rate_limited_log(
         &format!("watch:{label}"),
-                     Duration::from_secs(60),
-                     format!(
-                         "TLS hot-reload watching {} and {} ({label})",
-                             cert.display(),
-                             key.display()
-                     ),
+        Duration::from_secs(60),
+        format!(
+            "TLS hot-reload watching {} and {} ({label})",
+            cert.display(),
+            key.display()
+        ),
     );
 
     while let Some(ev) = rx.recv().await {
@@ -320,15 +348,15 @@ async fn watch_cert_key(
                                     resolver.swap(ck);
                                     rate_limited_log(
                                         &format!("reload_ok:{label}"),
-                                                     Duration::from_secs(60),
-                                                     format!("Certificat TLS reloaded successfully ({label})."),
+                                        Duration::from_secs(60),
+                                        format!("Certificat TLS reloaded successfully ({label})."),
                                     );
                                 }
                                 Err(e) => {
                                     rate_limited_log(
                                         &format!("reload_err:{label}"),
-                                                     Duration::from_secs(60),
-                                                     format!("Error reload certificat ({label}): {e:?}"),
+                                        Duration::from_secs(60),
+                                        format!("Error reload certificat ({label}): {e:?}"),
                                     );
                                 }
                             }
@@ -355,28 +383,28 @@ pub fn bind_server<T, F>(
     routes: &[RouteRule],
 ) -> std::io::Result<actix_web::dev::Server>
 where
-T: ServiceFactory<
-ServiceRequest,
-Config = (),
-Response = ServiceResponse<BoxBody>,
-Error = Error,
-InitError = (),
-> + 'static,
-F: Fn() -> App<T> + Clone + Send + 'static,
+    T: ServiceFactory<
+            ServiceRequest,
+            Config = (),
+            Response = ServiceResponse<BoxBody>,
+            Error = Error,
+            InitError = (),
+        > + 'static,
+    F: Fn() -> App<T> + Clone + Send + 'static,
 {
     let mut builder = HttpServer::new(app_factory)
-    .workers(config.worker as usize)
-    .keep_alive(Duration::from_millis(config.keep_alive))
-    .backlog(config.pending_connections_limit)
-    .max_connections(config.max_connections)
-    .client_request_timeout(Duration::from_millis(config.client_timeout));
+        .workers(config.worker as usize)
+        .keep_alive(Duration::from_millis(config.keep_alive))
+        .backlog(config.pending_connections_limit)
+        .max_connections(config.max_connections)
+        .client_request_timeout(Duration::from_millis(config.client_timeout));
 
     if config.tls {
         let cert_path = PathBuf::from("/etc/proxyauth/certs/cert.pem");
         let key_path = PathBuf::from("/etc/proxyauth/certs/key.pem");
 
         let initial =
-        load_certified_key(&cert_path, &key_path).expect("TLS: error initialization cert/key");
+            load_certified_key(&cert_path, &key_path).expect("TLS: error initialization cert/key");
 
         let default_resolver = Arc::new(HotResolver::new(initial));
 
@@ -390,10 +418,10 @@ F: Fn() -> App<T> + Clone + Send + 'static,
                 default_key_path,
                 "default".to_string(),
             )
-                .await
-                {
-                    warn!("Watch TLS stopped: {e:?}");
-                }
+            .await
+            {
+                warn!("Watch TLS stopped: {e:?}");
+            }
         });
 
         // One certificate per vhost that declared its own `vhost_cert`
@@ -405,14 +433,14 @@ F: Fn() -> App<T> + Clone + Send + 'static,
         if !by_host.is_empty() {
             info!(
                 "TLS: {} vhost certificate(s) loaded ({})",
-                  by_host.len(),
-                  by_host.keys().cloned().collect::<Vec<_>>().join(", ")
+                by_host.len(),
+                by_host.keys().cloned().collect::<Vec<_>>().join(", ")
             );
         }
 
         let resolver: Arc<dyn ResolvesServerCert> = Arc::new(MultiHotResolver {
             default: default_resolver,
-                by_host,
+            by_host,
         });
         let tls_cfg = build_rustls_config_with_resolver(resolver);
 
