@@ -1148,7 +1148,12 @@ async fn proxy_to_redirect_protect_target(
     // meant to actually serve the response body a blocked visitor
     // sees, not a quick internal check, so it gets the same budget a
     // real backend request would.
-    let resp = match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
+    let resp = match timeout(
+        data.config.backend_timeout_duration(),
+        client.request(hyper_req),
+    )
+    .await
+    {
         Ok(Ok(resp)) => resp,
         _ => return None,
     };
@@ -2723,7 +2728,12 @@ pub async fn proxy_with_proxy(
                 })?,
         )
     } else {
-        match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
+        match timeout(
+            data.config.backend_timeout_duration(),
+            client.request(hyper_req),
+        )
+        .await
+        {
             Ok(Ok(res)) => incoming_to_boxbody(res),
             Ok(Err(e)) => {
                 warn!(client_ip = %ip, target = %full_url, "Upstream error: {}", e);
@@ -3512,7 +3522,12 @@ pub async fn proxy_without_proxy(
             }
         }
     } else {
-        match timeout(Duration::from_millis(10000), client.request(hyper_req)).await {
+        match timeout(
+            data.config.backend_timeout_duration(),
+            client.request(hyper_req),
+        )
+        .await
+        {
             Ok(Ok(res)) => incoming_to_boxbody(res),
 
             Ok(Err(e)) => {

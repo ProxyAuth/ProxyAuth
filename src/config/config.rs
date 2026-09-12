@@ -1798,6 +1798,21 @@ pub struct AppConfig {
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
 
+    /// How long a proxied request may take before it is abandoned, in
+    /// milliseconds.
+    ///
+    /// With `streaming` off this bounds the whole exchange, since the
+    /// response is collected before anything is sent on. With
+    /// `streaming` on it bounds only the arrival of the response
+    /// *headers* — the body then flows for as long as it takes, which
+    /// is the point of streaming a large transfer in the first place.
+    ///
+    /// Replaces a value that used to be hardcoded at both upstream
+    /// call sites, so a slow backend no longer requires a rebuild to
+    /// accommodate.
+    #[serde(default = "default_backend_timeout")]
+    pub backend_timeout: u64,
+
     #[serde(default = "default_max_idle_per_host")]
     pub max_idle_per_host: u16,
 
@@ -2320,6 +2335,10 @@ fn default_max_body_size() -> usize {
     10 * 1024 * 1024 // 10 MB default if not set in config file
 }
 
+fn default_backend_timeout() -> u64 {
+    10_000 // 10 s, the value both upstream call sites used to hardcode
+}
+
 fn default_log() -> HashMap<String, String> {
     let mut log = HashMap::new();
     log.insert("type".to_string(), "local".to_string());
@@ -2447,6 +2466,25 @@ impl RouteAccessDecision {
 }
 
 impl AppConfig {
+    /// `backend_timeout` as a `Duration`, with `0` restored to the
+    /// default rather than taken literally.
+    ///
+    /// A zero-length timeout is never what an operator means: it would
+    /// abandon every proxied request the instant it is issued, turning
+    /// the whole instance into a `503` generator. Elsewhere in this
+    /// config a `0` legitimately means "off" — `ratelimit_*`,
+    /// `ip_blocklist_refresh_interval_secs` — so the value has to stay
+    /// accepted at parse time and be guarded here, at the point of use,
+    /// instead.
+    pub fn backend_timeout_duration(&self) -> std::time::Duration {
+        let ms = if self.backend_timeout == 0 {
+            default_backend_timeout()
+        } else {
+            self.backend_timeout
+        };
+        std::time::Duration::from_millis(ms)
+    }
+
     /// The address(es) to bind to — `address` (a list) if it's set and
     /// non-empty, otherwise the single `host` for backward
     /// compatibility. Always returns at least one entry.

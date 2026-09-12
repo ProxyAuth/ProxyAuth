@@ -47,6 +47,7 @@ mod tests {
             log_file: None,
             compression: None,
             cache: Some(true),
+            streaming: None,
             cache_duration_secs: None,
             secure_path: false,
             preserve_prefix: false,

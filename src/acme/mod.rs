@@ -37,6 +37,13 @@ impl ManagedVhost {
     /// The name this certificate is identified by in logs and CLI
     /// output. Never empty in practice — both collectors only ever
     /// build a `ManagedVhost` from at least one name.
+    ///
+    /// `#[allow(dead_code)]`: only the `#[cfg(test)]` module below
+    /// calls this, and `cfg(test)` does not apply when the bin target
+    /// is built, so that target's dead-code pass cannot see the use.
+    /// Same situation as the two annotated functions in
+    /// `network::proxy`.
+    #[allow(dead_code)]
     pub fn primary(&self) -> &str {
         self.names
             .first()
