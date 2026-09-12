@@ -711,8 +711,13 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                         let mut any_failed = false;
                         for mv in &managed {
                             print!("{}: ", mv.display_names());
-                            match crate::acme::check_and_maybe_renew(mv, &config.acme, *force)
-                                .await
+                            match crate::acme::check_and_maybe_renew(
+                                mv,
+                                &config.acme,
+                                *force,
+                                true,
+                            )
+                            .await
                             {
                                 crate::acme::RenewOutcome::NotDue { days_left } => {
                                     println!(
@@ -762,7 +767,14 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
 
-                    match crate::acme::check_and_maybe_renew(&mv, &config.acme, *force).await {
+                    if crate::acme::renew::needs_dns01(&mv.names) {
+                        println!(
+                            "This certificate includes a wildcard — validation will be manual (DNS-01)."
+                        );
+                    }
+
+                    match crate::acme::check_and_maybe_renew(&mv, &config.acme, *force, true).await
+                    {
                         crate::acme::RenewOutcome::NotDue { days_left } => {
                             println!(
                                 "'{vhost}' has {days_left} day(s) left (renew_before_days: {}) — not due yet. Use --force to renew anyway.",
@@ -874,11 +886,18 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                         println!("Issuing a new certificate for '{vhost}'...");
                     }
 
+                    if crate::acme::renew::needs_dns01(&names) {
+                        println!(
+                            "This certificate includes a wildcard — validation will be manual (DNS-01)."
+                        );
+                    }
+
                     match crate::acme::renew::renew_certificate(
                         &names,
                         &cert_path,
                         &key_path,
                         &config.acme,
+                        true,
                     )
                     .await
                     {

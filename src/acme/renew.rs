@@ -42,14 +42,43 @@ use tracing::info;
 /// this returns, success or failure — via a guard, not a
 /// success-path-only call, so a `?`-propagated error partway through
 /// can't leave a stale challenge response behind.
+/// Whether `names` contains a wildcard, which forces DNS-01: Let's
+/// Encrypt only ever issues a wildcard certificate through DNS-01
+/// validation. This is a CA rule, not a ProxyAuth limitation — there
+/// is no hostname to serve an HTTP-01 response on for `*.example.com`.
+pub fn needs_dns01(names: &[String]) -> bool {
+    names.iter().any(|n| n.starts_with("*."))
+}
+
+/// The TXT value to publish for a DNS-01 challenge:
+/// base64url-nopad(SHA256(key authorization)). Computed here rather
+/// than through instant-acme's own helper so the exact shape of that
+/// API across 0.8.x point releases can't silently change what gets
+/// printed to an operator who is about to paste it into a DNS zone.
+fn dns01_txt_value(key_auth: &str) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key_auth.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
 pub async fn renew_certificate(
     names: &[String],
     cert_path: &Path,
     key_path: &Path,
     acme_cfg: &AcmeConfig,
+    manual_dns: bool,
 ) -> Result<(), String> {
     if names.is_empty() {
         return Err("renew_certificate called with no DNS names".to_string());
+    }
+    if needs_dns01(names) && !manual_dns {
+        return Err(format!(
+            "{} includes a wildcard, which Let's Encrypt only issues via DNS-01. \
+             DNS-01 here is manual, so it cannot run unattended — issue it with \
+             `proxyauth certbot new <vhost>` (or `renew <vhost>`) from a terminal instead.",
+            names.join(", ")
+        ));
     }
     let account = load_or_create_account(acme_cfg).await?;
 
@@ -83,6 +112,9 @@ pub async fn renew_certificate(
         tokens: Vec::new(),
     };
 
+    let dns01 = needs_dns01(names);
+    let mut pending_txt: Vec<String> = Vec::new();
+
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
         let mut authz = result
@@ -96,6 +128,20 @@ pub async fn renew_certificate(
                     "authorization for {vhost} in unexpected state {other:?}"
                 ));
             }
+        }
+
+        if dns01 {
+            // DNS-01 needs every TXT record live *before* any challenge
+            // is marked ready, so this pass only collects them; a
+            // second pass below calls set_ready once the operator
+            // confirms. Marking ready here would have Let's Encrypt
+            // query a record that doesn't exist yet.
+            let challenge = authz
+            .challenge(ChallengeType::Dns01)
+            .ok_or_else(|| format!("no DNS-01 challenge offered for {vhost}"))?;
+            let value = dns01_txt_value(challenge.key_authorization().as_str());
+            pending_txt.push(value);
+            continue;
         }
 
         let mut challenge = authz
@@ -127,6 +173,30 @@ pub async fn renew_certificate(
         .map_err(|e| format!("failed to mark challenge ready for {vhost}: {e}"))?;
     }
 
+    if dns01 {
+        prompt_for_dns_records(names, &pending_txt)?;
+
+        // Second pass: every TXT record is live now, so the challenges
+        // can be marked ready. Authorizations are re-fetched rather
+        // than held across the prompt — the handles borrow `order`,
+        // and the operator may take minutes to add the records.
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result
+            .map_err(|e| format!("failed to re-fetch an authorization for {vhost}: {e}"))?;
+            if authz.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            let mut challenge = authz
+            .challenge(ChallengeType::Dns01)
+            .ok_or_else(|| format!("no DNS-01 challenge offered for {vhost}"))?;
+            challenge
+            .set_ready()
+            .await
+            .map_err(|e| format!("failed to mark DNS-01 challenge ready for {vhost}: {e}"))?;
+        }
+    }
+
     // Built-in exponential backoff while Let's Encrypt validates the
     // challenge, replacing what used to be a hand-rolled retry loop —
     // instant-acme 0.8 added this itself.
@@ -135,7 +205,7 @@ pub async fn renew_certificate(
     .await
     .map_err(|e| format!("failed waiting for order to become ready for {vhost}: {e}"))?;
     if status != OrderStatus::Ready {
-        let reason = describe_failure(&mut order).await;
+        let reason = describe_failure(&mut order, dns01).await;
         return Err(format!(
             "order for {vhost} ended in state {status:?}, expected Ready — {reason}"
         ));
@@ -193,7 +263,7 @@ pub async fn renew_certificate(
 /// problem, a connection refused, an unexpected response body, etc.)
 /// instead of just "ended in state Invalid", which on its own gives no
 /// hint about what to actually go fix.
-async fn describe_failure(order: &mut instant_acme::Order) -> String {
+async fn describe_failure(order: &mut instant_acme::Order, wildcard: bool) -> String {
     let mut reasons = Vec::new();
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
@@ -206,8 +276,17 @@ async fn describe_failure(order: &mut instant_acme::Order) -> String {
         // `.challenge()` ties its returned handle to the same
         // borrowed lifetime as `authz` itself, so calling it more than
         // once per authorization doesn't borrow-check cleanly anyway).
+        // DNS-01 for a wildcard order, HTTP-01 otherwise — reporting
+        // only the HTTP-01 error would leave a failed wildcard
+        // validation with no detail at all, since no HTTP-01 challenge
+        // was ever attempted for it.
+        let wanted = if wildcard {
+            instant_acme::ChallengeType::Dns01
+        } else {
+            instant_acme::ChallengeType::Http01
+        };
         if let Some(reason) = authz
-            .challenge(instant_acme::ChallengeType::Http01)
+            .challenge(wanted)
             .and_then(|c| c.error.as_ref().map(|p| p.to_string()))
             {
                 reasons.push(reason);
@@ -215,7 +294,11 @@ async fn describe_failure(order: &mut instant_acme::Order) -> String {
     }
 
     if reasons.is_empty() {
-        "Let's Encrypt gave no further detail — check that the domain is publicly resolvable and reachable on port 80 from outside your network.".to_string()
+        if wildcard {
+            "Let's Encrypt gave no further detail — check that the _acme-challenge TXT record(s) are visible from a public resolver.".to_string()
+        } else {
+            "Let's Encrypt gave no further detail — check that the domain is publicly resolvable and reachable on port 80 from outside your network.".to_string()
+        }
     } else {
         reasons.join("; ")
     }
@@ -323,6 +406,81 @@ async fn load_or_create_account(acme_cfg: &AcmeConfig) -> Result<Account, String
     );
 
     Ok(account)
+}
+
+/// Prints the TXT records the operator has to create, then waits for
+/// them to confirm. Every record lives at `_acme-challenge.<base
+/// domain>`; an order covering both an apex and its wildcard produces
+/// **two different values at the same record name**, and both must
+/// exist simultaneously — a DNS UI that treats a TXT record as
+/// single-valued will silently replace one with the other and the
+/// order will fail validation for whichever name lost.
+fn prompt_for_dns_records(names: &[String], values: &[String]) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    // `*.example.com` and `example.com` both validate under
+    // `_acme-challenge.example.com` — the wildcard's `*.` is stripped,
+    // not turned into a label of its own.
+    let mut record_names: Vec<String> = names
+    .iter()
+    .map(|n| format!("_acme-challenge.{}", n.trim_start_matches("*.")))
+    .collect();
+    record_names.sort();
+    record_names.dedup();
+
+    println!();
+    println!("Manual DNS-01 validation for: {}", names.join(", "));
+    println!();
+    println!("Create the following TXT record(s), then come back here:");
+    println!();
+    for record in &record_names {
+        for value in values {
+            println!("  {record}  IN  TXT  \"{value}\"");
+        }
+    }
+    println!();
+    if values.len() > 1 {
+        println!(
+            "NOTE: {} separate values are listed. They must ALL exist at the same time —"
+            , values.len()
+        );
+        println!(
+            "      add them as multiple TXT records, do not overwrite one with the next."
+        );
+        println!();
+    }
+    println!("Verify with:");
+    for record in &record_names {
+        println!("  dig +short TXT {record}");
+    }
+    println!();
+    println!(
+        "Wait until the value(s) are visible before continuing — Let's Encrypt queries"
+    );
+    println!(
+        "authoritative nameservers directly, so propagation is usually quick, but a"
+    );
+    println!("premature confirmation burns a validation attempt against the rate limit.");
+    println!();
+    print!("Press Enter once the record(s) are live (or Ctrl-C to abort): ");
+    std::io::stdout()
+    .flush()
+    .map_err(|e| format!("failed to write the DNS-01 prompt: {e}"))?;
+
+    let mut line = String::new();
+    std::io::stdin()
+    .lock()
+    .read_line(&mut line)
+    .map_err(|e| format!("failed to read confirmation: {e}"))?;
+
+    println!("Continuing — asking Let's Encrypt to validate.");
+    println!();
+    println!(
+        "Remember to delete the TXT record(s) afterwards; they serve no purpose once"
+    );
+    println!("the certificate is issued.");
+    println!();
+    Ok(())
 }
 
 /// Writes `contents` to `path` via a temp file + rename in the same

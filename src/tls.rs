@@ -136,12 +136,40 @@ struct MultiHotResolver {
 impl ResolvesServerCert for MultiHotResolver {
     fn resolve(&self, hello: ClientHello) -> Option<Arc<CertifiedKey>> {
         if let Some(sni) = hello.server_name() {
-            if let Some(r) = self.by_host.get(&sni.to_ascii_lowercase()) {
+            let sni = sni.to_ascii_lowercase();
+            // Exact name first: a vhost that has its own certificate
+            // must keep getting it even when a wildcard for the same
+            // parent domain is also configured.
+            if let Some(r) = self.by_host.get(&sni) {
                 return Some(r.get());
+            }
+            // Then wildcard patterns, stored in the same map under
+            // their literal `*.example.com` key. Linear scan: this only
+            // ever walks the wildcard entries, of which a deployment
+            // has a handful, and only on the exact-miss path.
+            for (pattern, r) in &self.by_host {
+                if crate::network::proxy::is_wildcard_vhost(pattern)
+                    && wildcard_covers(pattern, &sni)
+                {
+                    return Some(r.get());
+                }
             }
         }
         Some(self.default.get())
     }
+}
+
+/// Same single-label rule as `proxy::vhost_entry_matches` — kept in
+/// sync deliberately: routing a host and choosing its certificate must
+/// agree, or a request gets routed somewhere its certificate doesn't
+/// cover.
+fn wildcard_covers(pattern: &str, host: &str) -> bool {
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return false;
+    };
+    host.strip_suffix(suffix)
+        .and_then(|prefix| prefix.strip_suffix('.'))
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'))
 }
 
 fn build_rustls_config_with_resolver(resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {

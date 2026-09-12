@@ -337,9 +337,36 @@ fn matches_route(path: &str, rule: &RouteRule) -> bool {
 /// exactly as before `regex` existed. Shared by `init_routes_order`
 /// (the common case, precomputed once) and `match_route_idx`'s
 /// fallback for when that cache isn't ready yet.
+/// A non-empty `vhost` list containing only wildcard patterns. An
+/// empty list (catch-all) is `false` — see `build_route_order` for
+/// why catch-alls keep their existing rank.
+fn wildcard_only_vhost(vhosts: &[String]) -> bool {
+    !vhosts.is_empty() && vhosts.iter().all(|v| is_wildcard_vhost(v))
+}
+
 fn build_route_order(routes: &[RouteRule]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..routes.len()).collect();
     idx.sort_by(|&i, &j| {
+        // A route whose `vhost` list is entirely wildcards is tried
+        // after every non-wildcard route, so an exact `git.example.com`
+        // always wins over a `*.example.com` that would also match —
+        // without this the winner would depend on routes.yml ordering
+        // and prefix length, which is precisely the class of bug the
+        // rest of this ordering exists to avoid.
+        //
+        // Deliberately does NOT demote catch-all (empty `vhost`)
+        // routes: they rank alongside exact ones, exactly as before
+        // wildcards existed, so no existing configuration changes
+        // behaviour.
+        let wi = wildcard_only_vhost(&routes[i].vhost);
+        let wj = wildcard_only_vhost(&routes[j].vhost);
+        if wi != wj {
+            return if wi {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
         let ri = routes[i].regex_compiled.is_some();
         let rj = routes[j].regex_compiled.is_some();
         match (ri, rj) {
@@ -674,6 +701,35 @@ pub fn resolve_tag_csrf_token(rule: &RouteRule, config: &AppConfig) -> Option<St
 /// every `routes.yml` had before `vhost` existed. A non-empty list
 /// requires an exact (case-insensitive, port-stripped) match against
 /// one of its entries.
+/// Whether a `vhost` entry is a wildcard pattern (`*.example.com`).
+/// Only a leading `*.` counts — `foo.*.example.com` or `*foo.com` are
+/// not patterns, they're (nonsensical) literal names, and treating
+/// them as patterns would be inventing syntax no certificate can
+/// match.
+pub fn is_wildcard_vhost(entry: &str) -> bool {
+    entry.starts_with("*.")
+}
+
+/// Matches one `vhost` entry against a normalized host.
+///
+/// `*.example.com` covers exactly one extra label: `a.example.com`
+/// yes, `example.com` no (the apex is a separate name), and
+/// `a.b.example.com` no. This is RFC 6125's rule — the same one
+/// browsers apply to certificate SANs. Matching more broadly here
+/// would let ProxyAuth route a hostname its own certificate doesn't
+/// actually cover, which fails at the TLS layer anyway but much less
+/// legibly.
+fn vhost_entry_matches(entry: &str, host_norm: &str) -> bool {
+    let entry_norm = normalize_host(entry);
+    match entry_norm.strip_prefix("*.") {
+        None => entry_norm == host_norm,
+        Some(suffix) => host_norm
+            .strip_suffix(suffix)
+            .and_then(|prefix| prefix.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.')),
+    }
+}
+
 pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
     if vhosts.is_empty() {
         return true;
@@ -682,7 +738,20 @@ pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
         return false;
     };
     let host_norm = normalize_host(host);
-    vhosts.iter().any(|v| normalize_host(v) == host_norm)
+    vhosts.iter().any(|v| vhost_entry_matches(v, &host_norm))
+}
+
+/// Whether any entry in `vhosts` names `host` literally, as opposed to
+/// covering it via a wildcard. Used to give an exact vhost precedence
+/// over a wildcard one — see `build_route_order`.
+fn vhost_matches_exactly(host: Option<&str>, vhosts: &[String]) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    let host_norm = normalize_host(host);
+    vhosts
+        .iter()
+        .any(|v| !is_wildcard_vhost(v) && normalize_host(v) == host_norm)
 }
 
 /// Finds the first route that explicitly declares `host` in its
@@ -702,9 +771,19 @@ pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
 /// `RouteRule::resolved_*`/`*_enabled` method's own `.unwrap_or(...)`.
 pub fn find_vhost_route<'a>(host: Option<&str>, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
     let host = host?;
+    // Exact first, wildcard only as a fallback — same precedence
+    // `build_route_order` applies to request routing. Resolving
+    // vhost-level settings from a `*.example.com` route while requests
+    // to that host are routed by an exact `example.com` one would be a
+    // silent, hard-to-spot split.
     routes
         .iter()
-        .find(|r| !r.vhost.is_empty() && vhost_matches(Some(host), &r.vhost))
+        .find(|r| vhost_matches_exactly(Some(host), &r.vhost))
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|r| !r.vhost.is_empty() && vhost_matches(Some(host), &r.vhost))
+        })
 }
 
 /// Finds the route that should actually *serve* `path` on `host` —

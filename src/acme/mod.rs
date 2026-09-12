@@ -142,6 +142,24 @@ pub fn collect_managed_vhosts(routes: &[RouteRule]) -> Vec<ManagedVhost> {
 
     grouped
         .into_iter()
+        .filter(|(_, names)| {
+            // A group containing a wildcard can only be validated via
+            // DNS-01, which is manual here and therefore cannot run
+            // from an unattended timer. Excluded with a clear message
+            // rather than left in to fail every scan interval — and
+            // rather than silently dropped, which would look like the
+            // vhost was simply forgotten.
+            if crate::acme::renew::needs_dns01(names) {
+                warn!(
+                    "acme: {} includes a wildcard — Let's Encrypt only issues those via DNS-01, which is manual in ProxyAuth. Automatic renewal is skipped for this certificate; run `proxyauth certbot renew {}` by hand before it expires.",
+                    names.join(", "),
+                    names.first().map(String::as_str).unwrap_or("<vhost>")
+                );
+                false
+            } else {
+                true
+            }
+        })
         .map(|((cert, key), names)| ManagedVhost {
             names,
             cert_path: PathBuf::from(cert),
@@ -321,6 +339,12 @@ pub async fn check_and_maybe_renew(
     vhost: &ManagedVhost,
     acme_cfg: &AcmeConfig,
     force: bool,
+    // Whether the caller can run an interactive manual DNS-01
+    // validation. `true` only from the CLI, which has a terminal to
+    // prompt on; the periodic task passes `false` and a wildcard
+    // certificate is refused rather than left hanging on a prompt
+    // nobody will ever see.
+    manual_dns: bool,
 ) -> RenewOutcome {
     if !force {
         match days_until_expiry(&vhost.cert_path) {
@@ -346,7 +370,14 @@ pub async fn check_and_maybe_renew(
         info!("acme: {} — forced renewal requested", vhost.display_names());
     }
 
-    match renew::renew_certificate(&vhost.names, &vhost.cert_path, &vhost.key_path, acme_cfg).await
+    match renew::renew_certificate(
+        &vhost.names,
+        &vhost.cert_path,
+        &vhost.key_path,
+        acme_cfg,
+        manual_dns,
+    )
+    .await
     {
         Ok(()) => {
             info!("acme: renewal succeeded for {}", vhost.display_names());
@@ -376,7 +407,10 @@ pub async fn run_scan(routes: &[RouteRule], acme_cfg: &AcmeConfig) {
         // Outcome already logged inside check_and_maybe_renew via
         // tracing — the periodic scan itself has nothing further to
         // do with it.
-        let _ = check_and_maybe_renew(vhost, acme_cfg, false).await;
+        // Unattended: no terminal, so no manual DNS-01. Wildcard
+        // groups are already filtered out of `collect_managed_vhosts`,
+        // so this never silently skips one here.
+        let _ = check_and_maybe_renew(vhost, acme_cfg, false, false).await;
     }
 }
 
