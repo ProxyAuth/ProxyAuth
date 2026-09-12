@@ -82,10 +82,7 @@ pub async fn userinfo_handler(req: HttpRequest, data: web::Data<AppState>) -> Ht
                 if let Some(emails) = &user.email {
                     let chosen = emails.iter().find(|e| e.primary).or(emails.first());
                     if let Some(entry) = chosen {
-                        response.insert(
-                            "email".to_string(),
-                            Value::String(entry.address.clone()),
-                        );
+                        response.insert("email".to_string(), Value::String(entry.address.clone()));
                         response.insert("email_verified".to_string(), Value::Bool(true));
                     }
                 }

@@ -92,12 +92,11 @@ pub async fn renew_certificate(
     // single multi-SAN certificate is issued. Note this means a name
     // that doesn't resolve to this server fails the *whole* order: a
     // group listing `www.` needs that DNS record to exist.
-    let identifiers: Vec<Identifier> =
-    names.iter().map(|n| Identifier::Dns(n.clone())).collect();
+    let identifiers: Vec<Identifier> = names.iter().map(|n| Identifier::Dns(n.clone())).collect();
     let mut order = account
-    .new_order(&NewOrder::new(&identifiers))
-    .await
-    .map_err(|e| format!("failed to create ACME order for {vhost}: {e}"))?;
+        .new_order(&NewOrder::new(&identifiers))
+        .await
+        .map_err(|e| format!("failed to create ACME order for {vhost}: {e}"))?;
 
     let state = order.state();
     if state.status == OrderStatus::Invalid {
@@ -117,8 +116,8 @@ pub async fn renew_certificate(
 
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
-        let mut authz = result
-        .map_err(|e| format!("failed to fetch an authorization for {vhost}: {e}"))?;
+        let mut authz =
+            result.map_err(|e| format!("failed to fetch an authorization for {vhost}: {e}"))?;
 
         match authz.status {
             AuthorizationStatus::Valid => continue,
@@ -137,16 +136,16 @@ pub async fn renew_certificate(
             // confirms. Marking ready here would have Let's Encrypt
             // query a record that doesn't exist yet.
             let challenge = authz
-            .challenge(ChallengeType::Dns01)
-            .ok_or_else(|| format!("no DNS-01 challenge offered for {vhost}"))?;
+                .challenge(ChallengeType::Dns01)
+                .ok_or_else(|| format!("no DNS-01 challenge offered for {vhost}"))?;
             let value = dns01_txt_value(challenge.key_authorization().as_str());
             pending_txt.push(value);
             continue;
         }
 
         let mut challenge = authz
-        .challenge(ChallengeType::Http01)
-        .ok_or_else(|| format!("no HTTP-01 challenge offered for {vhost}"))?;
+            .challenge(ChallengeType::Http01)
+            .ok_or_else(|| format!("no HTTP-01 challenge offered for {vhost}"))?;
 
         let key_auth = challenge.key_authorization();
         // ChallengeHandle derefs to Challenge, so .token is the real
@@ -163,14 +162,14 @@ pub async fn renew_certificate(
         // authorization, so the entries never collide.
         for name in names {
             challenge::publish(name, &token, key_auth.as_str())
-            .map_err(|e| format!("failed to publish HTTP-01 challenge for {name}: {e}"))?;
+                .map_err(|e| format!("failed to publish HTTP-01 challenge for {name}: {e}"))?;
         }
         cleanup.tokens.push(token);
 
         challenge
-        .set_ready()
-        .await
-        .map_err(|e| format!("failed to mark challenge ready for {vhost}: {e}"))?;
+            .set_ready()
+            .await
+            .map_err(|e| format!("failed to mark challenge ready for {vhost}: {e}"))?;
     }
 
     if dns01 {
@@ -183,17 +182,17 @@ pub async fn renew_certificate(
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
             let mut authz = result
-            .map_err(|e| format!("failed to re-fetch an authorization for {vhost}: {e}"))?;
+                .map_err(|e| format!("failed to re-fetch an authorization for {vhost}: {e}"))?;
             if authz.status == AuthorizationStatus::Valid {
                 continue;
             }
             let mut challenge = authz
-            .challenge(ChallengeType::Dns01)
-            .ok_or_else(|| format!("no DNS-01 challenge offered for {vhost}"))?;
+                .challenge(ChallengeType::Dns01)
+                .ok_or_else(|| format!("no DNS-01 challenge offered for {vhost}"))?;
             challenge
-            .set_ready()
-            .await
-            .map_err(|e| format!("failed to mark DNS-01 challenge ready for {vhost}: {e}"))?;
+                .set_ready()
+                .await
+                .map_err(|e| format!("failed to mark DNS-01 challenge ready for {vhost}: {e}"))?;
         }
     }
 
@@ -201,9 +200,9 @@ pub async fn renew_certificate(
     // challenge, replacing what used to be a hand-rolled retry loop —
     // instant-acme 0.8 added this itself.
     let status = order
-    .poll_ready(&RetryPolicy::default())
-    .await
-    .map_err(|e| format!("failed waiting for order to become ready for {vhost}: {e}"))?;
+        .poll_ready(&RetryPolicy::default())
+        .await
+        .map_err(|e| format!("failed waiting for order to become ready for {vhost}: {e}"))?;
     if status != OrderStatus::Ready {
         let reason = describe_failure(&mut order, dns01).await;
         return Err(format!(
@@ -216,41 +215,41 @@ pub async fn renew_certificate(
     // entry in the CN too, so `routes.yml` order decides the primary
     // name.
     let mut params = CertificateParams::new(names.to_vec())
-    .map_err(|e| format!("failed to build certificate params for {vhost}: {e}"))?;
+        .map_err(|e| format!("failed to build certificate params for {vhost}: {e}"))?;
     params.distinguished_name = DistinguishedName::new();
     let private_key =
-    KeyPair::generate().map_err(|e| format!("failed to generate key pair for {vhost}: {e}"))?;
+        KeyPair::generate().map_err(|e| format!("failed to generate key pair for {vhost}: {e}"))?;
     let csr = params
-    .serialize_request(&private_key)
-    .map_err(|e| format!("failed to build CSR for {vhost}: {e}"))?;
+        .serialize_request(&private_key)
+        .map_err(|e| format!("failed to build CSR for {vhost}: {e}"))?;
 
     // finalize_csr (bring your own CSR/key), not the newer finalize()
     // (which generates its own key internally) — keeps a fresh,
     // locally-generated key per renewal under our own control, same
     // as before.
     order
-    .finalize_csr(csr.der())
-    .await
-    .map_err(|e| format!("failed to finalize order for {vhost}: {e}"))?;
+        .finalize_csr(csr.der())
+        .await
+        .map_err(|e| format!("failed to finalize order for {vhost}: {e}"))?;
 
     let cert_chain_pem = order
-    .poll_certificate(&RetryPolicy::default())
-    .await
-    .map_err(|e| format!("failed to fetch certificate for {vhost}: {e}"))?;
+        .poll_certificate(&RetryPolicy::default())
+        .await
+        .map_err(|e| format!("failed to fetch certificate for {vhost}: {e}"))?;
 
     // Write the new cert/key to disk only once both are ready to go —
     // never leave a half-written pair for the file watcher to trip
     // over mid-write (see write_atomically's own doc comment for how
     // "atomically" is done here).
     write_atomically(cert_path, cert_chain_pem.as_bytes())
-    .map_err(|e| format!("failed to write {}: {e}", cert_path.display()))?;
+        .map_err(|e| format!("failed to write {}: {e}", cert_path.display()))?;
     write_atomically(key_path, private_key.serialize_pem().as_bytes())
-    .map_err(|e| format!("failed to write {}: {e}", key_path.display()))?;
+        .map_err(|e| format!("failed to write {}: {e}", key_path.display()))?;
 
     info!(
         "ACME: renewed certificate for {vhost} -> {} / {}",
         cert_path.display(),
-          key_path.display()
+        key_path.display()
     );
 
     Ok(())
@@ -288,9 +287,9 @@ async fn describe_failure(order: &mut instant_acme::Order, wildcard: bool) -> St
         if let Some(reason) = authz
             .challenge(wanted)
             .and_then(|c| c.error.as_ref().map(|p| p.to_string()))
-            {
-                reasons.push(reason);
-            }
+        {
+            reasons.push(reason);
+        }
     }
 
     if reasons.is_empty() {
@@ -345,10 +344,10 @@ async fn load_or_create_account(acme_cfg: &AcmeConfig) -> Result<Account, String
         if let Ok(stored) = serde_json::from_slice::<StoredAccount>(&existing) {
             if stored.directory_url == acme_cfg.directory_url {
                 return Account::builder()
-                .map_err(|e| format!("failed to build ACME account client: {e}"))?
-                .from_credentials(stored.credentials)
-                .await
-                .map_err(|e| format!("failed to restore ACME account: {e}"));
+                    .map_err(|e| format!("failed to build ACME account client: {e}"))?
+                    .from_credentials(stored.credentials)
+                    .await
+                    .map_err(|e| format!("failed to restore ACME account: {e}"));
             }
             info!(
                 "ACME: stored account was registered against {} but {} is now configured — registering a new account instead of reusing an account from a different ACME environment",
@@ -358,38 +357,38 @@ async fn load_or_create_account(acme_cfg: &AcmeConfig) -> Result<Account, String
     }
 
     let contact: Vec<String> = acme_cfg
-    .contact_email
-    .as_ref()
-    .map(|e| vec![format!("mailto:{e}")])
-    .unwrap_or_default();
+        .contact_email
+        .as_ref()
+        .map(|e| vec![format!("mailto:{e}")])
+        .unwrap_or_default();
     let contact_refs: Vec<&str> = contact.iter().map(String::as_str).collect();
 
     let (account, credentials) = Account::builder()
-    .map_err(|e| format!("failed to build ACME account client: {e}"))?
-    .create(
-        &NewAccount {
-            contact: &contact_refs,
-            terms_of_service_agreed: true,
-            only_return_existing: false,
-        },
-        acme_cfg.directory_url.clone(),
+        .map_err(|e| format!("failed to build ACME account client: {e}"))?
+        .create(
+            &NewAccount {
+                contact: &contact_refs,
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            acme_cfg.directory_url.clone(),
             None,
-    )
-    .await
-    .map_err(|e| format!("failed to register ACME account: {e}"))?;
+        )
+        .await
+        .map_err(|e| format!("failed to register ACME account: {e}"))?;
 
     let stored = StoredAccount {
         directory_url: acme_cfg.directory_url.clone(),
         credentials,
     };
     let serialized = serde_json::to_vec_pretty(&stored)
-    .map_err(|e| format!("failed to serialize new ACME account credentials: {e}"))?;
+        .map_err(|e| format!("failed to serialize new ACME account credentials: {e}"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     write_atomically(path, &serialized)
-    .map_err(|e| format!("failed to persist ACME account credentials: {e}"))?;
+        .map_err(|e| format!("failed to persist ACME account credentials: {e}"))?;
 
     // 0600 — this is effectively a bearer credential for the ACME
     // account (whoever holds it can request certificates under it).
@@ -422,9 +421,9 @@ fn prompt_for_dns_records(names: &[String], values: &[String]) -> Result<(), Str
     // `_acme-challenge.example.com` — the wildcard's `*.` is stripped,
     // not turned into a label of its own.
     let mut record_names: Vec<String> = names
-    .iter()
-    .map(|n| format!("_acme-challenge.{}", n.trim_start_matches("*.")))
-    .collect();
+        .iter()
+        .map(|n| format!("_acme-challenge.{}", n.trim_start_matches("*.")))
+        .collect();
     record_names.sort();
     record_names.dedup();
 
@@ -441,12 +440,10 @@ fn prompt_for_dns_records(names: &[String], values: &[String]) -> Result<(), Str
     println!();
     if values.len() > 1 {
         println!(
-            "NOTE: {} separate values are listed. They must ALL exist at the same time —"
-            , values.len()
+            "NOTE: {} separate values are listed. They must ALL exist at the same time —",
+            values.len()
         );
-        println!(
-            "      add them as multiple TXT records, do not overwrite one with the next."
-        );
+        println!("      add them as multiple TXT records, do not overwrite one with the next.");
         println!();
     }
     println!("Verify with:");
@@ -454,30 +451,24 @@ fn prompt_for_dns_records(names: &[String], values: &[String]) -> Result<(), Str
         println!("  dig +short TXT {record}");
     }
     println!();
-    println!(
-        "Wait until the value(s) are visible before continuing — Let's Encrypt queries"
-    );
-    println!(
-        "authoritative nameservers directly, so propagation is usually quick, but a"
-    );
+    println!("Wait until the value(s) are visible before continuing — Let's Encrypt queries");
+    println!("authoritative nameservers directly, so propagation is usually quick, but a");
     println!("premature confirmation burns a validation attempt against the rate limit.");
     println!();
     print!("Press Enter once the record(s) are live (or Ctrl-C to abort): ");
     std::io::stdout()
-    .flush()
-    .map_err(|e| format!("failed to write the DNS-01 prompt: {e}"))?;
+        .flush()
+        .map_err(|e| format!("failed to write the DNS-01 prompt: {e}"))?;
 
     let mut line = String::new();
     std::io::stdin()
-    .lock()
-    .read_line(&mut line)
-    .map_err(|e| format!("failed to read confirmation: {e}"))?;
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("failed to read confirmation: {e}"))?;
 
     println!("Continuing — asking Let's Encrypt to validate.");
     println!();
-    println!(
-        "Remember to delete the TXT record(s) afterwards; they serve no purpose once"
-    );
+    println!("Remember to delete the TXT record(s) afterwards; they serve no purpose once");
     println!("the certificate is issued.");
     println!();
     Ok(())

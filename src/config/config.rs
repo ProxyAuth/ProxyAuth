@@ -25,8 +25,8 @@ use std::sync::Arc;
 // config type from a single path (`crate::config::config::*`), as it
 // already did before these two blocks were split into their own
 // modules to keep this file from growing further.
-pub use crate::config::compression::CompressionConfig;
 pub use crate::config::acme::AcmeConfig;
+pub use crate::config::compression::CompressionConfig;
 pub use crate::config::logging::LoggingConfig;
 
 #[derive(Debug, Clone)]
@@ -262,7 +262,6 @@ pub struct ProtectedPathRule {
     /// keeps gating normally, unless explicitly configured here.
     #[serde(default)]
     pub hidden_blocks: Vec<HiddenBlockRule>,
-
 }
 
 /// One conditional HTML block under `ProtectedPathRule.hidden_blocks`
@@ -1042,7 +1041,10 @@ impl RouteRule {
             return false;
         }
 
-        if self.allow_users.is_empty() && self.allow_groups.is_empty() && self.allow_roles.is_empty() {
+        if self.allow_users.is_empty()
+            && self.allow_groups.is_empty()
+            && self.allow_roles.is_empty()
+        {
             return false;
         }
 
@@ -1078,7 +1080,6 @@ impl RouteRule {
     pub fn totp_reenroll_allowed(&self) -> bool {
         self.allow_totp_reenroll.unwrap_or(false)
     }
-
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1977,7 +1978,6 @@ pub struct AppConfig {
     /// `should_use_database_as_fallback`.
     #[serde(skip)]
     pub blakegate_connected: std::sync::atomic::AtomicUsize,
-
 }
 
 impl Serialize for AppConfig {

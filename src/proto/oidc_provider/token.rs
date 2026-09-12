@@ -68,7 +68,11 @@ struct TokenErrorResponse {
     error_description: String,
 }
 
-fn token_error(status: actix_web::http::StatusCode, error: &'static str, description: &str) -> HttpResponse {
+fn token_error(
+    status: actix_web::http::StatusCode,
+    error: &'static str,
+    description: &str,
+) -> HttpResponse {
     HttpResponse::build(status)
         .append_header(("server", "ProxyAuth"))
         .append_header(("cache-control", "no-store"))
@@ -130,7 +134,11 @@ fn verify_pkce(code_verifier: &str, code_challenge: &str) -> bool {
     computed.as_bytes().ct_eq(code_challenge.as_bytes()).into()
 }
 
-pub async fn token_handler(req: HttpRequest, body: web::Bytes, data: web::Data<AppState>) -> HttpResponse {
+pub async fn token_handler(
+    req: HttpRequest,
+    body: web::Bytes,
+    data: web::Data<AppState>,
+) -> HttpResponse {
     let Some(host) = request_host(&req) else {
         return token_error(
             actix_web::http::StatusCode::BAD_REQUEST,
@@ -298,7 +306,8 @@ pub async fn token_handler(req: HttpRequest, body: web::Bytes, data: web::Data<A
         exp: now + ACCESS_TOKEN_TTL_SECS,
         iat: now,
     };
-    let access_token = match jsonwebtoken::encode(&key.header(), &access_claims, &key.encoding_key) {
+    let access_token = match jsonwebtoken::encode(&key.header(), &access_claims, &key.encoding_key)
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("Failed to sign OIDC access_token: {e}");
@@ -331,7 +340,9 @@ pub async fn token_handler(req: HttpRequest, body: web::Bytes, data: web::Data<A
 fn basic_auth_credentials(req: &HttpRequest) -> Option<(String, String)> {
     let header = req.headers().get("Authorization")?.to_str().ok()?;
     let encoded = header.strip_prefix("Basic ")?;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
     let decoded = String::from_utf8(decoded).ok()?;
     let (id, secret) = decoded.split_once(':')?;
     let id = urlencoding::decode(id).ok()?.into_owned();
