@@ -8,4 +8,5 @@ docker-compose.yml
 !/.cargo/audit.toml
 work.ai
 src/src.zip
+*.zip
 
