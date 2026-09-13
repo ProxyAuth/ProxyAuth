@@ -1,0 +1,1182 @@
+name: Official packages — upstream distributions
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to package (e.g. v1.2.2)"
+        required: true
+        type: string
+
+      revision:
+        description: "Debian revision (1 for a first upload of this version)"
+        type: string
+        default: "1"
+
+      debian:
+        description: "Debian — source package + mentors.debian.net"
+        type: boolean
+        default: true
+
+      ubuntu:
+        description: "Ubuntu — Launchpad PPA"
+        type: boolean
+        default: true
+
+      fedora:
+        description: "Fedora — SRPM + COPR"
+        type: boolean
+        default: true
+
+      epel:
+        description: "CentOS Stream / RHEL — EPEL chroots on COPR"
+        type: boolean
+        default: true
+
+      alpine:
+        description: "Alpine — merge request on alpine/aports"
+        type: boolean
+        default: true
+
+      arch:
+        description: "Arch Linux — AUR"
+        type: boolean
+        default: true
+
+      vendor:
+        description: "Embed cargo vendor/ (fine for the PPA and the AUR, refused by Debian and Fedora)"
+        type: boolean
+        default: true
+
+      qa:
+        description: "Full QA: lintian, sbuild, autopkgtest, piuparts, rpmlint, mock, apkbuild-lint, namcap"
+        type: boolean
+        default: true
+
+      ppa_target:
+        description: "PPA to upload to"
+        type: string
+        default: "ppa:proxyauth/stable"
+
+      ppa_series:
+        description: "Ubuntu series, space separated"
+        type: string
+        default: "noble plucky questing"
+
+      fedora_chroots:
+        description: "COPR chroots for Fedora, space separated"
+        type: string
+        default: "fedora-rawhide-x86_64 fedora-42-x86_64 fedora-41-x86_64"
+
+      epel_chroots:
+        description: "COPR chroots for EPEL, space separated"
+        type: string
+        default: "epel-10-x86_64 epel-9-x86_64"
+
+      dry_run:
+        description: "Build and check everything, upload nothing"
+        type: boolean
+        default: true
+
+concurrency:
+  group: official-packages
+  cancel-in-progress: false
+
+jobs:
+
+  validate:
+    name: Validate ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      upstream: ${{ steps.check.outputs.upstream }}
+      series: ${{ steps.check.outputs.series }}
+      chroots: ${{ steps.check.outputs.chroots }}
+
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Check the tag against Cargo.toml
+        id: check
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          REVISION: ${{ inputs.revision }}
+          SERIES: ${{ inputs.ppa_series }}
+          FEDORA_CHROOTS: ${{ inputs.fedora_chroots }}
+          EPEL_CHROOTS: ${{ inputs.epel_chroots }}
+          WANT_FEDORA: ${{ inputs.fedora }}
+          WANT_EPEL: ${{ inputs.epel }}
+        run: |
+          set -euo pipefail
+
+          case "$TAG" in
+            v[0-9]*) ;;
+            *)
+              echo "::error::The tag must look like vX.Y.Z — got '$TAG'"
+              exit 1
+              ;;
+          esac
+
+          VERSION="${TAG#v}"
+
+          CARGO=$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml \
+            | grep '^version' \
+            | head -n1 \
+            | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')
+
+          if [ "$VERSION" != "$CARGO" ]; then
+            echo "::error::Tag $TAG announces $VERSION, but Cargo.toml declares ${CARGO:-nothing}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}-${REVISION}" >> "$GITHUB_OUTPUT"
+          echo "upstream=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          to_json() {
+            printf '%s\n' $1 | sed 's/.*/"&"/' | paste -sd, -
+          }
+
+          echo "series=[$(to_json "$SERIES")]" >> "$GITHUB_OUTPUT"
+
+          CHROOTS=""
+          [ "$WANT_FEDORA" = "true" ] && CHROOTS="$CHROOTS $FEDORA_CHROOTS"
+          [ "$WANT_EPEL" = "true" ] && CHROOTS="$CHROOTS $EPEL_CHROOTS"
+
+          echo "chroots=[$(to_json "$CHROOTS")]" >> "$GITHUB_OUTPUT"
+
+      - name: Check the recipes
+        shell: bash
+        env:
+          WANT_DEB: ${{ inputs.debian }}
+          WANT_UBUNTU: ${{ inputs.ubuntu }}
+          WANT_FEDORA: ${{ inputs.fedora }}
+          WANT_EPEL: ${{ inputs.epel }}
+          WANT_ALPINE: ${{ inputs.alpine }}
+          WANT_ARCH: ${{ inputs.arch }}
+        run: |
+          set -uo pipefail
+
+          FAIL=0
+
+          need() {
+            if [ ! -e "$2" ]; then
+              echo "::error::$1 needs $2 in the repository — the recipe is what gets reviewed"
+              FAIL=1
+            fi
+          }
+
+          if [ "$WANT_DEB" = "true" ] || [ "$WANT_UBUNTU" = "true" ]; then
+            for f in debian/control debian/rules debian/copyright debian/changelog debian/source/format; do
+              need "Debian/Ubuntu" "$f"
+            done
+
+            if [ -f debian/source/format ] && ! grep -q '3\.0 (quilt)' debian/source/format; then
+              echo "::error::debian/source/format must contain '3.0 (quilt)'"
+              FAIL=1
+            fi
+
+            [ -f debian/watch ] || echo "::warning::No debian/watch — lintian complains and sponsors ask for it"
+            [ -f debian/tests/control ] || echo "::warning::No autopkgtest (debian/tests/control)"
+          fi
+
+          if [ "$WANT_FEDORA" = "true" ] || [ "$WANT_EPEL" = "true" ]; then
+            need "Fedora/EPEL" packaging/fedora/proxyauth.spec
+          fi
+
+          [ "$WANT_ALPINE" = "true" ] && need "Alpine" packaging/alpine/APKBUILD
+          [ "$WANT_ARCH" = "true" ] && need "Arch" packaging/arch/PKGBUILD
+
+          exit "$FAIL"
+
+      - name: Check the release tarball is published
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+
+          # Alpine, Arch and Fedora fetch the source from a public URL at build
+          # time, so the tag archive must be reachable before checksums are refreshed
+          URL="${SERVER}/${REPO}/archive/${TAG}.tar.gz"
+
+          if curl -fsSL --head "$URL" >/dev/null; then
+            echo "Release tarball reachable: $URL"
+          else
+            echo "::warning::$URL is not reachable — abuild checksum and updpkgsums will fail"
+          fi
+
+  # ---------------------------------------------------------------- Debian
+
+  deb-source:
+    name: Debian source package
+    needs: validate
+    if: ${{ inputs.debian || inputs.ubuntu }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install the packaging toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO="sudo"
+          fi
+
+          $SUDO apt-get update
+
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            devscripts dpkg-dev debhelper dh-cargo lintian fakeroot \
+            xz-utils git curl ca-certificates
+
+      - name: Install Rust
+        if: ${{ inputs.vendor }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build the upstream tarball
+        shell: bash
+        env:
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+        run: |
+          set -euo pipefail
+
+          SRC="proxyauth-${UPSTREAM}"
+
+          mkdir -p build
+          rm -rf "build/$SRC"
+          mkdir -p "build/$SRC"
+
+          # debian/ must not live inside the orig tarball
+          git archive --format=tar HEAD | tar -x -C "build/$SRC"
+          rm -rf "build/$SRC/debian"
+
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@$(git log -1 --format=%ct)" \
+            -C build -cf - "$SRC" \
+            | xz -6 > "build/proxyauth_${UPSTREAM}.orig.tar.xz"
+
+          cp -a debian "build/$SRC/debian"
+
+          ls -l build/*.orig.tar.xz
+
+      - name: Vendor the crates into an extra tarball
+        if: ${{ inputs.vendor }}
+        shell: bash
+        env:
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+        run: |
+          set -euo pipefail
+
+          SRC="build/proxyauth-${UPSTREAM}"
+
+          cd "$SRC"
+          cargo vendor --locked --versioned-dirs vendor > /tmp/vendor-config.toml
+          mkdir -p .cargo
+          cat /tmp/vendor-config.toml >> .cargo/config.toml
+          cd - >/dev/null
+
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
+            -C "$SRC" -cf - vendor \
+            | xz -6 > "build/proxyauth_${UPSTREAM}.orig-vendor.tar.xz"
+
+          echo "::warning::vendor/ is fine for a PPA, not for Debian — every crate must exist as librust-*-dev"
+
+      - name: Refresh debian/changelog
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+          DEBFULLNAME: ${{ vars.DEBFULLNAME }}
+          DEBEMAIL: ${{ vars.DEBEMAIL }}
+        run: |
+          set -euo pipefail
+
+          cd "build/proxyauth-${UPSTREAM}"
+
+          if [ "$(dpkg-parsechangelog --show-field Version)" != "$VERSION" ]; then
+            dch --newversion "$VERSION" \
+                --distribution unstable --force-distribution \
+                "New upstream release ${UPSTREAM}."
+          fi
+
+          head -n 10 debian/changelog
+
+      - name: Import the signing key
+        shell: bash
+        env:
+          GPG_KEY: ${{ secrets.DEBIAN_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.DEBIAN_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GPG_KEY:-}" ]; then
+            echo "::error::DEBIAN_GPG_PRIVATE_KEY is not set — unsigned uploads are refused"
+            exit 1
+          fi
+
+          GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+          printf '%s' "$GPG_KEY" | gpg --batch --quiet --import
+
+          printf '%s' "$GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+          chmod 600 "$GNUPGHOME/passphrase"
+
+          cat > "$GNUPGHOME/gpg-loopback" <<'EOF'
+          #!/bin/sh
+          exec gpg --batch --yes --pinentry-mode loopback \
+               --passphrase-file "$GNUPGHOME/passphrase" "$@"
+          EOF
+          chmod 0755 "$GNUPGHOME/gpg-loopback"
+
+          gpg --list-secret-keys --keyid-format LONG
+
+      - name: Build and sign the source package
+        shell: bash
+        env:
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+          KEYID: ${{ vars.DEBIAN_GPG_KEYID }}
+        run: |
+          set -euo pipefail
+
+          cd "build/proxyauth-${UPSTREAM}"
+
+          # -sa: include the orig tarball(s), needed for a first upload of this version
+          dpkg-buildpackage -S -sa -us -uc -d
+
+          cd ..
+
+          debsign --no-re-sign -k "$KEYID" -p "$GNUPGHOME/gpg-loopback" \
+            proxyauth_*_source.changes
+
+          ls -l *.dsc *.changes *.tar.*
+
+      - name: Lintian
+        if: ${{ inputs.qa }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          cd build
+
+          lintian --info --display-info --pedantic --fail-on error \
+            proxyauth_*_source.changes | tee /tmp/lintian.txt
+          STATUS=${PIPESTATUS[0]}
+
+          {
+            echo "### Lintian"
+            echo
+            echo '```'
+            cat /tmp/lintian.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$STATUS"
+
+      - name: Upload the source package
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-deb-source
+          path: |
+            build/*.dsc
+            build/*.changes
+            build/*.tar.xz
+            build/*.buildinfo
+
+  deb-qa:
+    name: sbuild + autopkgtest (unstable)
+    needs: [validate, deb-source]
+    if: ${{ inputs.qa && (inputs.debian || inputs.ubuntu) }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download the source package
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-deb-source
+          path: src
+
+      - name: Install sbuild and friends
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO="sudo"
+          fi
+
+          $SUDO apt-get update
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            sbuild mmdebstrap uidmap autopkgtest piuparts \
+            debian-archive-keyring devscripts dpkg-dev lintian
+
+      - name: Bootstrap an unstable chroot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.cache/sbuild
+
+          mmdebstrap --variant=buildd \
+            --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+            unstable \
+            ~/.cache/sbuild/unstable-amd64.tar.zst \
+            http://deb.debian.org/debian
+
+          cat > ~/.sbuildrc <<'EOF'
+          $chroot_mode = 'unshare';
+          $run_lintian = 1;
+          $lintian_opts = ['--info', '--display-info', '--pedantic'];
+          $run_autopkgtest = 1;
+          $autopkgtest_root_args = '';
+          $autopkgtest_opts = ['--', 'unshare', '--release', '%r', '--arch', '%a'];
+          $build_arch_all = 1;
+          $build_source = 0;
+          EOF
+
+      - name: Build in the chroot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd src
+          sbuild --dist=unstable --arch=amd64 --no-apt-upgrade proxyauth_*.dsc
+          ls -l
+
+      - name: piuparts (install / upgrade / purge)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO="sudo"
+          fi
+
+          cd src
+          $SUDO piuparts --distribution=sid \
+            --mirror=http://deb.debian.org/debian \
+            proxyauth_*.deb
+
+      - name: Upload the binaries produced by sbuild
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-sbuild
+          path: |
+            src/*.deb
+            src/*.build
+            src/*.buildinfo
+
+  mentors:
+    name: mentors.debian.net
+    needs: [validate, deb-source, deb-qa]
+    if: always() && inputs.debian && needs.deb-source.result == 'success' && (needs.deb-qa.result == 'success' || needs.deb-qa.result == 'skipped')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refuse a vendored upload
+        if: ${{ inputs.vendor }}
+        run: |
+          echo "::error::This source package embeds vendor/. Debian requires the crates to be"
+          echo "::error::packaged individually (librust-*-dev). Re-run with vendor = false."
+          exit 1
+
+      - name: Download the source package
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-deb-source
+          path: src
+
+      - name: Install dput
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO="sudo"
+          fi
+
+          $SUDO apt-get update
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y dput-ng devscripts
+
+      - name: Upload
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cat > ~/.dput.cf <<'EOF'
+          [mentors]
+          fqdn = mentors.debian.net
+          incoming = /upload
+          method = https
+          allow_unsigned_uploads = 0
+          progress_indicator = 2
+          allowed_distributions = (?!UNRELEASED)
+          EOF
+
+          cd src
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run — would upload:"
+            ls -l proxyauth_*_source.changes
+            exit 0
+          fi
+
+          dput mentors proxyauth_*_source.changes
+
+          {
+            echo "### mentors.debian.net"
+            echo
+            echo "Source package uploaded. Manual steps left:"
+            echo "1. \`reportbug wnpp\` -> ITP, if this is a first upload."
+            echo "2. RFS bug against \`sponsorship-requests\`, subject:"
+            echo "   \`RFS: proxyauth/${VERSION} [ITP] -- authentication gateway\`"
+            echo "3. Subscribe to debian-mentors and answer the review."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- Ubuntu
+
+  ppa:
+    name: PPA — ${{ matrix.series }}
+    needs: [validate, deb-source, deb-qa]
+    if: always() && inputs.ubuntu && needs.deb-source.result == 'success' && (needs.deb-qa.result == 'success' || needs.deb-qa.result == 'skipped')
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        series: ${{ fromJSON(needs.validate.outputs.series) }}
+
+    steps:
+      - name: Download the source package
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-deb-source
+          path: src
+
+      - name: Install the toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO="sudo"
+          fi
+
+          $SUDO apt-get update
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            devscripts dpkg-dev dput
+
+      - name: Import the signing key
+        shell: bash
+        env:
+          GPG_KEY: ${{ secrets.DEBIAN_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.DEBIAN_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+          printf '%s' "$GPG_KEY" | gpg --batch --quiet --import
+
+          printf '%s' "$GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+          chmod 600 "$GNUPGHOME/passphrase"
+
+          cat > "$GNUPGHOME/gpg-loopback" <<'EOF'
+          #!/bin/sh
+          exec gpg --batch --yes --pinentry-mode loopback \
+               --passphrase-file "$GNUPGHOME/passphrase" "$@"
+          EOF
+          chmod 0755 "$GNUPGHOME/gpg-loopback"
+
+      - name: Rebuild the source package for ${{ matrix.series }}
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SERIES: ${{ matrix.series }}
+          KEYID: ${{ vars.DEBIAN_GPG_KEYID }}
+          DEBFULLNAME: ${{ vars.DEBFULLNAME }}
+          DEBEMAIL: ${{ vars.DEBEMAIL }}
+        run: |
+          set -euo pipefail
+
+          cd src
+
+          dpkg-source -x proxyauth_*.dsc extracted
+          cd extracted
+
+          # Launchpad refuses a version that already exists, and the ~ suffix keeps
+          # the ordering right when the user upgrades from one series to the next
+          dch --newversion "${VERSION}~${SERIES}1" \
+              --distribution "$SERIES" --force-distribution \
+              "Rebuild for ${SERIES}."
+
+          dpkg-buildpackage -S -sa -us -uc -d
+
+          cd ..
+
+          debsign --no-re-sign -k "$KEYID" -p "$GNUPGHOME/gpg-loopback" \
+            "proxyauth_${VERSION}~${SERIES}1_source.changes"
+
+      - name: Upload to ${{ inputs.ppa_target }}
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SERIES: ${{ matrix.series }}
+          TARGET: ${{ inputs.ppa_target }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          cd src
+          CHANGES="proxyauth_${VERSION}~${SERIES}1_source.changes"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run — would upload $CHANGES to $TARGET"
+            cat "$CHANGES"
+            exit 0
+          fi
+
+          dput "$TARGET" "$CHANGES"
+
+      - name: Upload the artifacts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-ppa-${{ matrix.series }}
+          path: |
+            src/proxyauth_*.dsc
+            src/proxyauth_*.changes
+            src/proxyauth_*.tar.xz
+
+  # ------------------------------------------------- Fedora / CentOS / EPEL
+
+  srpm:
+    name: SRPM + rpmlint
+    needs: validate
+    if: ${{ inputs.fedora || inputs.epel }}
+    runs-on: ubuntu-latest
+
+    container:
+      image: fedora:latest
+
+    steps:
+      - name: Install packaging tools
+        run: |
+          dnf -y install nodejs git rpm-build rpmdevtools rpmlint curl ca-certificates
+
+      - name: Checkout the tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Build the SRPM
+        shell: bash
+        env:
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+        run: |
+          set -euo pipefail
+
+          rpmdev-setuptree
+
+          cp packaging/fedora/proxyauth.spec ~/rpmbuild/SPECS/
+
+          # The spec stays authoritative, only the version comes from the tag
+          sed -i -E "s/^Version:.*/Version:        ${UPSTREAM}/" ~/rpmbuild/SPECS/proxyauth.spec
+
+          # Source0 is a URL, as Fedora expects: let spectool fetch it
+          spectool -g -R ~/rpmbuild/SPECS/proxyauth.spec
+
+          rpmbuild -bs ~/rpmbuild/SPECS/proxyauth.spec
+
+          mkdir -p dist
+          cp ~/rpmbuild/SRPMS/*.src.rpm dist/
+          ls -l dist/
+
+      - name: rpmlint
+        if: ${{ inputs.qa }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          rpmlint ~/rpmbuild/SPECS/proxyauth.spec dist/*.src.rpm | tee /tmp/rpmlint.txt
+          STATUS=${PIPESTATUS[0]}
+
+          {
+            echo "### rpmlint"
+            echo
+            echo '```'
+            cat /tmp/rpmlint.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$STATUS"
+
+      - name: Upload the SRPM
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-srpm
+          path: dist/*.src.rpm
+
+  mock:
+    name: mock — ${{ matrix.chroot }}
+    needs: [validate, srpm]
+    if: ${{ inputs.qa && (inputs.fedora || inputs.epel) }}
+    runs-on: ubuntu-latest
+
+    # mock needs a privileged container. If the runner refuses, COPR runs the
+    # same builds anyway, so this job warns rather than blocking the upload.
+    continue-on-error: true
+
+    container:
+      image: fedora:latest
+      options: --privileged
+
+    strategy:
+      fail-fast: false
+      matrix:
+        chroot: ${{ fromJSON(needs.validate.outputs.chroots) }}
+
+    steps:
+      - name: Install mock
+        run: dnf -y install nodejs mock
+
+      - name: Download the SRPM
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-srpm
+          path: dist
+
+      - name: Rebuild in ${{ matrix.chroot }}
+        shell: bash
+        env:
+          CHROOT: ${{ matrix.chroot }}
+        run: |
+          set -euo pipefail
+
+          mock -r "$CHROOT" --isolation=simple --rebuild dist/*.src.rpm
+
+          ls -l "/var/lib/mock/$CHROOT/result/"
+
+      - name: Upload the RPMs
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-mock-${{ matrix.chroot }}
+          path: /var/lib/mock/${{ matrix.chroot }}/result/*
+
+  copr:
+    name: COPR
+    needs: [validate, srpm, mock]
+    if: always() && (inputs.fedora || inputs.epel) && needs.srpm.result == 'success'
+    runs-on: ubuntu-latest
+
+    container:
+      image: fedora:latest
+
+    steps:
+      - name: Install copr-cli
+        run: dnf -y install nodejs copr-cli
+
+      - name: Download the SRPM
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-srpm
+          path: dist
+
+      - name: Submit the build
+        shell: bash
+        env:
+          COPR_CONFIG_CONTENT: ${{ secrets.COPR_CONFIG }}
+          TARGET: ${{ vars.COPR_TARGET }}
+          FEDORA_CHROOTS: ${{ inputs.fedora_chroots }}
+          EPEL_CHROOTS: ${{ inputs.epel_chroots }}
+          WANT_FEDORA: ${{ inputs.fedora }}
+          WANT_EPEL: ${{ inputs.epel }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          CHROOTS=""
+          [ "$WANT_FEDORA" = "true" ] && CHROOTS="$CHROOTS $FEDORA_CHROOTS"
+          [ "$WANT_EPEL" = "true" ] && CHROOTS="$CHROOTS $EPEL_CHROOTS"
+
+          ARGS=""
+          for c in $CHROOTS; do
+            ARGS="$ARGS --chroot $c"
+          done
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run — would run: copr-cli build $ARGS $TARGET dist/*.src.rpm"
+            exit 0
+          fi
+
+          if [ -z "${COPR_CONFIG_CONTENT:-}" ]; then
+            echo "::error::COPR_CONFIG is not set"
+            exit 1
+          fi
+
+          mkdir -p ~/.config
+          printf '%s' "$COPR_CONFIG_CONTENT" > ~/.config/copr
+          chmod 600 ~/.config/copr
+
+          copr-cli build $ARGS "$TARGET" dist/*.src.rpm
+
+          {
+            echo "### COPR"
+            echo
+            echo "Built on \`$TARGET\` for:$CHROOTS"
+            echo
+            echo "For the Fedora archive itself the next step is manual: open a"
+            echo "package review bug on Bugzilla (component \`Package Review\`) with"
+            echo "the .spec and .src.rpm URLs, find a sponsor, then push to dist-git"
+            echo "with fedpkg. EPEL branches are requested once the review passes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- Alpine
+
+  alpine:
+    name: Alpine — aports
+    needs: validate
+    if: ${{ inputs.alpine }}
+    runs-on: ubuntu-latest
+
+    container:
+      image: alpine:edge
+
+    steps:
+      - name: Install packaging tools
+        run: |
+          apk add --no-cache nodejs git bash alpine-sdk atools curl jq sudo
+
+      - name: Checkout the tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Set up a build user
+        run: |
+          set -eu
+
+          adduser -D builder
+          addgroup builder abuild
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+
+          su builder -c 'abuild-keygen -a -n'
+
+      - name: Build the aport
+        shell: sh
+        env:
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+        run: |
+          set -eu
+
+          APORT=/home/builder/aport
+          mkdir -p "$APORT"
+
+          # APKBUILD plus whatever it references: init scripts, patches, confd
+          cp -a packaging/alpine/. "$APORT/"
+
+          sed -i "s/^pkgver=.*/pkgver=${UPSTREAM}/" "$APORT/APKBUILD"
+          sed -i "s/^pkgrel=.*/pkgrel=0/" "$APORT/APKBUILD"
+
+          chown -R builder:builder /home/builder
+
+          # abuild refuses a stale checksum, which is the first thing reviewers hit
+          su builder -c "cd $APORT && abuild checksum"
+          su builder -c "cd $APORT && abuild -r"
+
+          cp "$APORT/APKBUILD" ./APKBUILD.generated
+          find /home/builder/packages -name '*.apk' -exec ls -l {} +
+
+      - name: apkbuild-lint
+        if: ${{ inputs.qa }}
+        shell: sh
+        run: |
+          apkbuild-lint /home/builder/aport/APKBUILD > /tmp/lint.txt 2>&1 || true
+          cat /tmp/lint.txt
+
+          {
+            echo "### apkbuild-lint"
+            echo
+            echo '```'
+            cat /tmp/lint.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open the merge request on alpine/aports
+        shell: sh
+        env:
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+          TOKEN: ${{ secrets.APORTS_TOKEN }}
+          FORK: ${{ vars.APORTS_FORK }}
+          FULLNAME: ${{ vars.DEBFULLNAME }}
+          EMAIL: ${{ vars.DEBEMAIL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -eu
+
+          BRANCH="proxyauth-${UPSTREAM}"
+          TITLE="testing/proxyauth: upgrade to ${UPSTREAM}"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run — would push $BRANCH to $FORK and open: $TITLE"
+            cat /home/builder/aport/APKBUILD
+            exit 0
+          fi
+
+          if [ -z "${TOKEN:-}" ] || [ -z "${FORK:-}" ]; then
+            echo "::error::APORTS_TOKEN and APORTS_FORK are required to open the MR"
+            exit 1
+          fi
+
+          API=https://gitlab.alpinelinux.org/api/v4
+          FORK_ENC=$(printf '%s' "$FORK" | sed 's|/|%2F|')
+
+          git config --global user.name "$FULLNAME"
+          git config --global user.email "$EMAIL"
+
+          git clone --depth 1 "https://oauth2:${TOKEN}@gitlab.alpinelinux.org/${FORK}.git" /tmp/aports
+          cd /tmp/aports
+          git checkout -b "$BRANCH"
+
+          mkdir -p testing/proxyauth
+          cp /home/builder/aport/* testing/proxyauth/
+
+          git add testing/proxyauth
+          git commit -m "$TITLE"
+          git push -f origin "$BRANCH"
+
+          TARGET_ID=$(curl -fsSL "$API/projects/alpine%2Faports" | jq -r .id)
+          SOURCE_ID=$(curl -fsSL --header "PRIVATE-TOKEN: $TOKEN" \
+            "$API/projects/$FORK_ENC" | jq -r .id)
+
+          URL=$(curl -fsSL --request POST \
+            --header "PRIVATE-TOKEN: $TOKEN" \
+            --data "source_branch=$BRANCH" \
+            --data "target_branch=master" \
+            --data "target_project_id=$TARGET_ID" \
+            --data-urlencode "title=$TITLE" \
+            "$API/projects/$SOURCE_ID/merge_requests" | jq -r .web_url)
+
+          {
+            echo "### Alpine"
+            echo
+            echo "Merge request: $URL"
+            echo
+            echo "New aports land in testing/ first, and move to community/ once"
+            echo "they have proven themselves and a maintainer keeps them current."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the aport
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-aport
+          path: APKBUILD.generated
+
+  # ------------------------------------------------------------ Arch Linux
+
+  arch:
+    name: Arch — AUR
+    needs: validate
+    if: ${{ inputs.arch }}
+    runs-on: ubuntu-latest
+
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install packaging tools
+        run: |
+          pacman -Syu --noconfirm --needed nodejs base-devel git namcap \
+            openssh pacman-contrib
+
+      - name: Checkout the tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Set up a build user
+        run: |
+          set -eu
+
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+
+      - name: Build and check the package
+        shell: bash
+        env:
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+        run: |
+          set -euo pipefail
+
+          PKG=/home/builder/pkg
+          mkdir -p "$PKG"
+
+          cp -a packaging/arch/. "$PKG/"
+
+          sed -i "s/^pkgver=.*/pkgver=${UPSTREAM}/" "$PKG/PKGBUILD"
+          sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKG/PKGBUILD"
+
+          chown -R builder:builder "$PKG"
+
+          # updpkgsums downloads the sources and rewrites sha256sums=()
+          su builder -c "cd $PKG && updpkgsums"
+          su builder -c "cd $PKG && makepkg -s --noconfirm"
+          su builder -c "cd $PKG && makepkg --printsrcinfo > .SRCINFO"
+
+          cp "$PKG/PKGBUILD" "$PKG/.SRCINFO" .
+          ls -l "$PKG"/*.pkg.tar.zst
+
+      - name: namcap
+        if: ${{ inputs.qa }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          PKG=/home/builder/pkg
+
+          namcap "$PKG/PKGBUILD" > /tmp/namcap.txt 2>&1 || true
+          namcap "$PKG"/*.pkg.tar.zst >> /tmp/namcap.txt 2>&1 || true
+          cat /tmp/namcap.txt
+
+          {
+            echo "### namcap"
+            echo
+            echo '```'
+            cat /tmp/namcap.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push to the AUR
+        shell: bash
+        env:
+          UPSTREAM: ${{ needs.validate.outputs.upstream }}
+          SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          FULLNAME: ${{ vars.DEBFULLNAME }}
+          EMAIL: ${{ vars.DEBEMAIL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run — would push proxyauth ${UPSTREAM} to the AUR"
+            cat PKGBUILD
+            exit 0
+          fi
+
+          if [ -z "${SSH_KEY:-}" ]; then
+            echo "::error::AUR_SSH_PRIVATE_KEY is not set"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+
+          git config --global user.name "$FULLNAME"
+          git config --global user.email "$EMAIL"
+          git config --global --add safe.directory '*'
+
+          git clone ssh://aur@aur.archlinux.org/proxyauth.git /tmp/aur
+          cp PKGBUILD .SRCINFO /tmp/aur/
+
+          cd /tmp/aur
+          git add PKGBUILD .SRCINFO
+
+          if git diff --cached --quiet; then
+            echo "Nothing changed on the AUR side"
+            exit 0
+          fi
+
+          git commit -m "upgpkg: proxyauth ${UPSTREAM}-1"
+          git push
+
+          {
+            echo "### AUR"
+            echo
+            echo "https://aur.archlinux.org/packages/proxyauth"
+            echo
+            echo "Moving to [extra] is not something you can do yourself: a Package"
+            echo "Maintainer has to adopt the package. The AUR is the normal home for"
+            echo "most projects, and popularity there is the argument you would use."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the PKGBUILD
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ needs.validate.outputs.version }}-pkgbuild
+          path: |
+            PKGBUILD
+            .SRCINFO
+
+  # --------------------------------------------------------------- Summary
+
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [validate, deb-source, deb-qa, mentors, ppa, srpm, mock, copr, alpine, arch]
+    if: always() && needs.validate.result == 'success'
+
+    steps:
+      - name: Report
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "### Official packages — ProxyAuth ${{ needs.validate.outputs.version }}"
+            echo
+            echo "| Distribution | Automated step | Result | Left to do by hand |"
+            echo "|---|---|---|---|"
+            echo "| Debian | source package | ${{ needs.deb-source.result }} | — |"
+            echo "| Debian | QA (sbuild, autopkgtest) | ${{ needs.deb-qa.result }} | — |"
+            echo "| Debian | mentors.debian.net | ${{ needs.mentors.result }} | ITP + RFS bug, find a DD |"
+            echo "| Ubuntu | Launchpad PPA | ${{ needs.ppa.result }} | archive: go through Debian |"
+            echo "| Fedora | SRPM + rpmlint | ${{ needs.srpm.result }} | — |"
+            echo "| Fedora / EPEL | mock | ${{ needs.mock.result }} | — |"
+            echo "| Fedora / EPEL | COPR | ${{ needs.copr.result }} | Bugzilla review, sponsor, dist-git |"
+            echo "| Alpine | aports merge request | ${{ needs.alpine.result }} | answer the review, testing/ first |"
+            echo "| Arch | AUR | ${{ needs.arch.result }} | [extra] needs a Package Maintainer |"
+            echo
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "**Dry run: nothing was uploaded anywhere.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if a step failed
+        if: contains(needs.*.result, 'failure')
+        run: |
+          echo "::error::At least one step failed — see the summary"
+          exit 1
