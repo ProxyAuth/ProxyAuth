@@ -1,0 +1,318 @@
+name: Debian — upload to mentors
+
+# One job, one container, no privileges needed.
+#
+#   Builds a signed SOURCE package from the tag and dputs it to
+#   mentors.debian.net. Nothing here touches ftp.debian.org: that needs a
+#   Debian Developer key. mentors is the sponsorship queue, and the upload
+#   is matched against the GPG key registered on your mentors account.
+#
+#   Requires debian/ in the repository (control, rules, copyright, changelog,
+#   source/format).
+#
+#   Secrets:   DEBIAN_GPG_PRIVATE_KEY, DEBIAN_GPG_PASSPHRASE (omit if none)
+#   Variables: DEBIAN_GPG_KEYID, DEBFULLNAME, DEBEMAIL
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to package (e.g. v1.2.2)"
+        required: true
+        type: string
+
+      revision:
+        description: "Debian revision (1 for a first upload of this version)"
+        type: string
+        default: "1"
+
+      distribution:
+        description: "Target suite"
+        type: choice
+        options: [unstable, experimental]
+        default: unstable
+
+      vendor:
+        description: "Embed cargo vendor/ (lets the build work offline, but a sponsor will ask you to drop it)"
+        type: boolean
+        default: true
+
+      upload:
+        description: "Actually dput to mentors (off = build and lint only)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: mentors
+  cancel-in-progress: false
+
+jobs:
+
+  mentors:
+    name: Source package -> mentors.debian.net
+    runs-on: ubuntu-latest
+
+    # sid so that lintian and debhelper match what a sponsor will run
+    container:
+      image: debian:sid
+
+    steps:
+      - name: Install the packaging toolchain
+        run: |
+          set -eu
+
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            nodejs \
+            git ca-certificates curl xz-utils \
+            devscripts dpkg-dev debhelper dh-cargo lintian fakeroot \
+            dput-ng gnupg
+
+      - name: Checkout the tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Check the tag and the debian directory
+        id: check
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+
+          git config --global --add safe.directory "$PWD"
+
+          case "$TAG" in
+            v[0-9]*) ;;
+            *)
+              echo "::error::The tag must look like vX.Y.Z — got '$TAG'"
+              exit 1
+              ;;
+          esac
+
+          UPSTREAM="${TAG#v}"
+
+          CARGO=$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml \
+            | grep '^version' | head -n1 \
+            | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')
+
+          if [ "$UPSTREAM" != "$CARGO" ]; then
+            echo "::error::Tag $TAG announces $UPSTREAM, Cargo.toml declares ${CARGO:-nothing}"
+            exit 1
+          fi
+
+          for f in debian/control debian/rules debian/copyright debian/changelog debian/source/format; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing $f"
+              exit 1
+            fi
+          done
+
+          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "version=${UPSTREAM}-${REVISION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        if: ${{ inputs.vendor }}
+        run: |
+          set -eu
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y --no-install-recommends cargo rustc
+
+      - name: Build the upstream tarball
+        shell: bash
+        env:
+          UPSTREAM: ${{ steps.check.outputs.upstream }}
+        run: |
+          set -euo pipefail
+
+          SRC="proxyauth-${UPSTREAM}"
+
+          rm -rf build
+          mkdir -p "build/$SRC"
+
+          # debian/ must not live inside the orig tarball
+          git archive --format=tar HEAD | tar -x -C "build/$SRC"
+          rm -rf "build/$SRC/debian"
+
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@$(git log -1 --format=%ct)" \
+            -C build -cf - "$SRC" \
+            | xz -6 > "build/proxyauth_${UPSTREAM}.orig.tar.xz"
+
+          cp -a debian "build/$SRC/debian"
+
+          ls -l build/*.orig.tar.xz
+
+      - name: Vendor the crates
+        if: ${{ inputs.vendor }}
+        shell: bash
+        env:
+          UPSTREAM: ${{ steps.check.outputs.upstream }}
+        run: |
+          set -euo pipefail
+
+          SRC="build/proxyauth-${UPSTREAM}"
+
+          (cd "$SRC" && cargo vendor --locked --versioned-dirs vendor >/dev/null)
+
+          # Supplementary component tarball: dpkg-source unpacks it into vendor/
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
+            -C "$SRC/vendor" -cf - . \
+            | xz -6 > "build/proxyauth_${UPSTREAM}.orig-vendor.tar.xz"
+
+          rm -rf "$SRC/vendor"
+
+          echo "::warning::vendor/ makes the build work offline, but Debian wants librust-*-dev packages — expect the sponsor to raise it"
+
+      - name: Refresh debian/changelog
+        shell: bash
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          UPSTREAM: ${{ steps.check.outputs.upstream }}
+          DISTRIBUTION: ${{ inputs.distribution }}
+          DEBFULLNAME: ${{ vars.DEBFULLNAME }}
+          DEBEMAIL: ${{ vars.DEBEMAIL }}
+        run: |
+          set -euo pipefail
+
+          cd "build/proxyauth-${UPSTREAM}"
+
+          if [ "$(dpkg-parsechangelog --show-field Version)" != "$VERSION" ]; then
+            dch --newversion "$VERSION" \
+                --distribution "$DISTRIBUTION" --force-distribution \
+                "New upstream release ${UPSTREAM}."
+          fi
+
+          head -n 10 debian/changelog
+
+      - name: Import the signing key
+        shell: bash
+        env:
+          GPG_KEY: ${{ secrets.DEBIAN_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.DEBIAN_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GPG_KEY:-}" ]; then
+            echo "::error::DEBIAN_GPG_PRIVATE_KEY is not set — mentors refuses unsigned uploads"
+            exit 1
+          fi
+
+          GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+          printf '%s' "$GPG_KEY" | gpg --batch --quiet --import
+
+          if [ -n "${GPG_PASSPHRASE:-}" ]; then
+            printf '%s' "$GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+            chmod 600 "$GNUPGHOME/passphrase"
+
+            cat > "$GNUPGHOME/gpg-wrapper" <<'EOF'
+          #!/bin/sh
+          exec gpg --batch --yes --pinentry-mode loopback \
+               --passphrase-file "$GNUPGHOME/passphrase" "$@"
+          EOF
+          else
+            cat > "$GNUPGHOME/gpg-wrapper" <<'EOF'
+          #!/bin/sh
+          exec gpg --batch --yes "$@"
+          EOF
+          fi
+
+          chmod 0755 "$GNUPGHOME/gpg-wrapper"
+
+          gpg --list-secret-keys --keyid-format LONG
+
+      - name: Build and sign the source package
+        shell: bash
+        env:
+          UPSTREAM: ${{ steps.check.outputs.upstream }}
+          KEYID: ${{ vars.DEBIAN_GPG_KEYID }}
+        run: |
+          set -euo pipefail
+
+          cd "build/proxyauth-${UPSTREAM}"
+
+          # -sa includes the orig tarball(s): mentors needs them on a first upload
+          dpkg-buildpackage -S -sa -us -uc -d
+
+          cd ..
+
+          debsign --no-re-sign -k "$KEYID" -p "$GNUPGHOME/gpg-wrapper" \
+            proxyauth_*_source.changes
+
+          ls -l *.dsc *.changes *.tar.*
+
+      - name: Lintian
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          cd build
+
+          lintian --info --display-info --pedantic --fail-on error \
+            proxyauth_*_source.changes > /tmp/lintian.txt 2>&1
+          STATUS=$?
+
+          cat /tmp/lintian.txt
+
+          {
+            echo "### Lintian"
+            echo
+            echo '```'
+            cat /tmp/lintian.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$STATUS"
+
+      - name: Upload to mentors
+        if: ${{ inputs.upload }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cat > ~/.dput.cf <<'EOF'
+          [mentors]
+          fqdn = mentors.debian.net
+          incoming = /upload
+          method = https
+          allow_unsigned_uploads = 0
+          progress_indicator = 2
+          allowed_distributions = (?!UNRELEASED)
+          EOF
+
+          cd build
+          dput mentors proxyauth_*_source.changes
+
+          {
+            echo "### mentors.debian.net"
+            echo
+            echo "https://mentors.debian.net/package/proxyauth/"
+            echo
+            echo "Left to do by hand:"
+            echo "1. \`reportbug wnpp\` -> ITP bug, if this is a first upload"
+            echo "2. RFS bug against \`sponsorship-requests\`:"
+            echo "   \`RFS: proxyauth/${VERSION} [ITP] -- authentication gateway\`"
+            echo "3. Subscribe to debian-mentors and answer the review"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the artifacts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: proxyauth-${{ steps.check.outputs.version }}-source
+          path: |
+            build/*.dsc
+            build/*.changes
+            build/*.tar.xz
+            build/*.buildinfo
