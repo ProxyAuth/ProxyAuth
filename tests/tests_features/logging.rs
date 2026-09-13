@@ -49,6 +49,7 @@ fn minimal_rule(prefix: &str) -> RouteRule {
         compression: None,
         cache: Some(true),
         streaming: None,
+        if_vhost: Vec::new(),
         cache_duration_secs: None,
         secure_path: false,
         preserve_prefix: false,
