@@ -10,8 +10,10 @@ name: Debian — upload to mentors
 #   Requires debian/ in the repository (control, rules, copyright, changelog,
 #   source/format).
 #
-#   Secrets:   DEBIAN_GPG_PRIVATE_KEY, DEBIAN_GPG_PASSPHRASE (omit if none)
-#   Variables: DEBIAN_GPG_KEYID, DEBFULLNAME, DEBEMAIL
+#   Secrets:   DEBIAN_GPG_PRIVATE_KEY   (required)
+#              DEBIAN_GPG_PASSPHRASE   (omit entirely if the key has none)
+#              DEBIAN_GPG_KEYID, DEBFULLNAME, DEBEMAIL
+#                                      (optional: derived from the key when unset)
 
 on:
   workflow_dispatch:
@@ -37,10 +39,15 @@ on:
         type: boolean
         default: true
 
+      bootstrap_debian:
+        description: "Write a throwaway debian/ if the repository has none (pipeline test only)"
+        type: boolean
+        default: true
+
       upload:
         description: "Actually dput to mentors (off = build and lint only)"
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: mentors
@@ -70,11 +77,210 @@ jobs:
             devscripts dpkg-dev debhelper dh-cargo lintian fakeroot \
             dput-ng gnupg
 
-      - name: Checkout the tag
+      - name: Import the signing key
+        shell: bash
+        env:
+          GPG_KEY: ${{ secrets.DEBIAN_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.DEBIAN_GPG_PASSPHRASE }}
+          KEYID_OVERRIDE: ${{ secrets.DEBIAN_GPG_KEYID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GPG_KEY:-}" ]; then
+            echo "::error::DEBIAN_GPG_PRIVATE_KEY is not set — mentors refuses unsigned uploads"
+            exit 1
+          fi
+
+          GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+          printf '%s' "$GPG_KEY" | gpg --batch --quiet --import
+
+          # Everything else is derived from the key: the fingerprint debsign needs,
+          # and the identity debian/changelog must carry so the two agree
+          FPR=$(gpg --list-secret-keys --with-colons \
+            | awk -F: '/^fpr:/ { print $10; exit }')
+          UID_LINE=$(gpg --list-secret-keys --with-colons \
+            | awk -F: '/^uid:/ { print $10; exit }')
+
+          if [ -z "$FPR" ]; then
+            echo "::error::No secret key after import — is DEBIAN_GPG_PRIVATE_KEY the private block?"
+            exit 1
+          fi
+
+          SIGN_KEYID="${KEYID_OVERRIDE:-$FPR}"
+          SIGN_NAME="${UID_LINE%% <*}"
+          SIGN_EMAIL="${UID_LINE##*<}"
+          SIGN_EMAIL="${SIGN_EMAIL%>}"
+
+          {
+            echo "SIGN_KEYID=$SIGN_KEYID"
+            echo "SIGN_NAME=$SIGN_NAME"
+            echo "SIGN_EMAIL=$SIGN_EMAIL"
+          } >> "$GITHUB_ENV"
+
+          echo "Signing as $SIGN_NAME <$SIGN_EMAIL> with $SIGN_KEYID"
+
+          if [ -n "${GPG_PASSPHRASE:-}" ]; then
+            printf '%s' "$GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
+            chmod 600 "$GNUPGHOME/passphrase"
+
+            cat > "$GNUPGHOME/gpg-wrapper" <<'EOF'
+          #!/bin/sh
+          exec gpg --batch --yes --pinentry-mode loopback \
+               --passphrase-file "$GNUPGHOME/passphrase" "$@"
+          EOF
+          else
+            cat > "$GNUPGHOME/gpg-wrapper" <<'EOF'
+          #!/bin/sh
+          exec gpg --batch --yes "$@"
+          EOF
+          fi
+
+          chmod 0755 "$GNUPGHOME/gpg-wrapper"
+
+      - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          # The packaging branch, not the tag: debian/ lives here and the
+          # upstream content is read out of the tag further down
           fetch-depth: 0
+
+      - name: Bootstrap a throwaway debian/
+        if: ${{ inputs.bootstrap_debian }}
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          DEBFULLNAME: ${{ secrets.DEBFULLNAME }}
+          DEBEMAIL: ${{ secrets.DEBEMAIL }}
+        run: |
+          set -euo pipefail
+
+          if [ -f debian/control ]; then
+            echo "debian/ already in the repository, leaving it alone"
+            exit 0
+          fi
+
+          echo "::warning::Generating a throwaway debian/ — this validates the GPG"
+          echo "::warning::and dput plumbing only. A sponsor reviews debian/ as a"
+          echo "::warning::versioned deliverable, so commit a real one before asking"
+          echo "::warning::for sponsorship, and expect Salsa hosting to be required."
+
+          UPSTREAM="${TAG#v}"
+
+          # The changelog author must match the signing key, otherwise debsign
+          # looks up an identity gpg does not hold
+          NAME="${DEBFULLNAME:-$SIGN_NAME}"
+          MAIL="${DEBEMAIL:-$SIGN_EMAIL}"
+
+          mkdir -p debian/source debian/tests
+
+          cat > debian/control <<EOF
+          Source: proxyauth
+          Section: net
+          Priority: optional
+          Maintainer: ${NAME} <${MAIL}>
+          Build-Depends:
+           debhelper-compat (= 13),
+           cargo,
+           rustc,
+           pkgconf,
+           libssl-dev,
+           zlib1g-dev,
+          Standards-Version: 4.7.0
+          Homepage: https://proxyauth.app
+          Rules-Requires-Root: no
+
+          Package: proxyauth
+          Architecture: any
+          Depends:
+           \${shlibs:Depends},
+           \${misc:Depends},
+          Description: authentication gateway and reverse proxy
+           ProxyAuth terminates TLS, authenticates callers and forwards requests to
+           the services behind it.
+          EOF
+
+          # @@ marks a recipe line: Make needs a real tab there, and a tab
+          # cannot be written directly inside a YAML block scalar
+          cat > /tmp/rules.in <<'EOF'
+          #!/usr/bin/make -f
+
+          export CARGO_HOME = $(CURDIR)/debian/cargo
+          export CARGO_TARGET_DIR = $(CURDIR)/target
+
+          %:
+          @@dh $@
+
+          override_dh_auto_configure:
+          @@mkdir -p .cargo
+          @@printf '%s\n' '[source.crates-io]' 'replace-with = "vendored-sources"' '' '[source.vendored-sources]' 'directory = "vendor"' > .cargo/config.toml
+
+          override_dh_auto_build:
+          @@cargo build --release --locked --offline
+
+          override_dh_auto_test:
+          @@cargo test --release --locked --offline || true
+
+          override_dh_auto_install:
+          @@install -D -m 0755 target/release/proxyauth debian/proxyauth/usr/bin/proxyauth
+
+          override_dh_auto_clean:
+          @@rm -rf target debian/cargo .cargo
+          EOF
+
+          sed 's/^@@/\t/' /tmp/rules.in > debian/rules
+
+          chmod 0755 debian/rules
+
+          echo '3.0 (quilt)' > debian/source/format
+
+          cat > debian/changelog <<EOF
+          proxyauth (${UPSTREAM}-1) unstable; urgency=medium
+
+            * Initial packaging.
+
+           -- ${NAME} <${MAIL}>  $(date -R)
+          EOF
+
+          cat > debian/copyright <<EOF
+          Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+          Upstream-Name: proxyauth
+          Source: https://proxyauth.app
+
+          Files: *
+          Copyright: 2024-2026 ${NAME} <${MAIL}>
+          License: Apache-2.0
+
+          Files: vendor/*
+          Copyright: the respective crate authors
+          License: Apache-2.0 or MIT
+          Comment: PLACEHOLDER. Every vendored crate must be listed with its own
+           copyright holders and licence. Run licensecheck -r vendor/ to build the
+           inventory. A sponsor will not accept the package until this is done.
+
+          License: Apache-2.0
+           On Debian systems the full text of the Apache License 2.0 can be found in
+           /usr/share/common-licenses/Apache-2.0.
+
+          License: MIT
+           Permission is hereby granted, free of charge, to any person obtaining a
+           copy of this software and associated documentation files (the "Software"),
+           to deal in the Software without restriction, subject to the conditions of
+           the MIT licence.
+          EOF
+
+          cat > debian/tests/control <<'EOF'
+          Test-Command: /usr/bin/proxyauth --version
+          Depends: @
+          Restrictions: allow-stderr
+          EOF
+
+          find debian -type f | sort
+          echo
+          echo "Note: this debian/ is NOT committed — it exists only in this run."
 
       - name: Check the tag and the debian directory
         id: check
@@ -95,9 +301,16 @@ jobs:
               ;;
           esac
 
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG does not exist in this repository"
+            exit 1
+          fi
+
           UPSTREAM="${TAG#v}"
 
-          CARGO=$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml \
+          # Read the version from the tag, not from the branch we are standing on
+          CARGO=$(git show "$TAG:Cargo.toml" \
+            | sed -n '/^\[package\]/,/^\[/p' \
             | grep '^version' | head -n1 \
             | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')
 
@@ -106,12 +319,16 @@ jobs:
             exit 1
           fi
 
+          MISSING=""
           for f in debian/control debian/rules debian/copyright debian/changelog debian/source/format; do
-            if [ ! -f "$f" ]; then
-              echo "::error::Missing $f"
-              exit 1
-            fi
+            [ -f "$f" ] || MISSING="$MISSING $f"
           done
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing on branch $(git rev-parse --abbrev-ref HEAD):$MISSING"
+            echo "::error::debian/ is read from the current branch, not from $TAG — commit it there"
+            exit 1
+          fi
 
           echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
           echo "version=${UPSTREAM}-${REVISION}" >> "$GITHUB_OUTPUT"
@@ -128,6 +345,7 @@ jobs:
         shell: bash
         env:
           UPSTREAM: ${{ steps.check.outputs.upstream }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
@@ -136,12 +354,13 @@ jobs:
           rm -rf build
           mkdir -p "build/$SRC"
 
-          # debian/ must not live inside the orig tarball
-          git archive --format=tar HEAD | tar -x -C "build/$SRC"
+          # Upstream content comes from the tag, debian/ from the branch. That
+          # split is what lets you fix the packaging and re-run without retagging.
+          git archive --format=tar "$TAG" | tar -x -C "build/$SRC"
           rm -rf "build/$SRC/debian"
 
           tar --sort=name --owner=0 --group=0 --numeric-owner \
-            --mtime="@$(git log -1 --format=%ct)" \
+            --mtime="@$(git log -1 --format=%ct "$TAG")" \
             -C build -cf - "$SRC" \
             | xz -6 > "build/proxyauth_${UPSTREAM}.orig.tar.xz"
 
@@ -176,10 +395,13 @@ jobs:
           VERSION: ${{ steps.check.outputs.version }}
           UPSTREAM: ${{ steps.check.outputs.upstream }}
           DISTRIBUTION: ${{ inputs.distribution }}
-          DEBFULLNAME: ${{ vars.DEBFULLNAME }}
-          DEBEMAIL: ${{ vars.DEBEMAIL }}
+          DEBFULLNAME: ${{ secrets.DEBFULLNAME }}
+          DEBEMAIL: ${{ secrets.DEBEMAIL }}
         run: |
           set -euo pipefail
+
+          export DEBFULLNAME="${DEBFULLNAME:-$SIGN_NAME}"
+          export DEBEMAIL="${DEBEMAIL:-$SIGN_EMAIL}"
 
           cd "build/proxyauth-${UPSTREAM}"
 
@@ -191,51 +413,10 @@ jobs:
 
           head -n 10 debian/changelog
 
-      - name: Import the signing key
-        shell: bash
-        env:
-          GPG_KEY: ${{ secrets.DEBIAN_GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.DEBIAN_GPG_PASSPHRASE }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${GPG_KEY:-}" ]; then
-            echo "::error::DEBIAN_GPG_PRIVATE_KEY is not set — mentors refuses unsigned uploads"
-            exit 1
-          fi
-
-          GNUPGHOME=$(mktemp -d)
-          chmod 700 "$GNUPGHOME"
-          export GNUPGHOME
-          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
-
-          printf '%s' "$GPG_KEY" | gpg --batch --quiet --import
-
-          if [ -n "${GPG_PASSPHRASE:-}" ]; then
-            printf '%s' "$GPG_PASSPHRASE" > "$GNUPGHOME/passphrase"
-            chmod 600 "$GNUPGHOME/passphrase"
-
-            cat > "$GNUPGHOME/gpg-wrapper" <<'EOF'
-          #!/bin/sh
-          exec gpg --batch --yes --pinentry-mode loopback \
-               --passphrase-file "$GNUPGHOME/passphrase" "$@"
-          EOF
-          else
-            cat > "$GNUPGHOME/gpg-wrapper" <<'EOF'
-          #!/bin/sh
-          exec gpg --batch --yes "$@"
-          EOF
-          fi
-
-          chmod 0755 "$GNUPGHOME/gpg-wrapper"
-
-          gpg --list-secret-keys --keyid-format LONG
-
       - name: Build and sign the source package
         shell: bash
         env:
           UPSTREAM: ${{ steps.check.outputs.upstream }}
-          KEYID: ${{ vars.DEBIAN_GPG_KEYID }}
         run: |
           set -euo pipefail
 
@@ -246,7 +427,7 @@ jobs:
 
           cd ..
 
-          debsign --no-re-sign -k "$KEYID" -p "$GNUPGHOME/gpg-wrapper" \
+          debsign --no-re-sign -k "$SIGN_KEYID" -p "$GNUPGHOME/gpg-wrapper" \
             proxyauth_*_source.changes
 
           ls -l *.dsc *.changes *.tar.*
