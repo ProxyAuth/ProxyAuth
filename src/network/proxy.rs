@@ -711,7 +711,7 @@ pub fn is_wildcard_vhost(entry: &str) -> bool {
 /// would let ProxyAuth route a hostname its own certificate doesn't
 /// actually cover, which fails at the TLS layer anyway but much less
 /// legibly.
-fn vhost_entry_matches(entry: &str, host_norm: &str) -> bool {
+pub fn vhost_entry_matches(entry: &str, host_norm: &str) -> bool {
     let entry_norm = normalize_host(entry);
     match entry_norm.strip_prefix("*.") {
         None => entry_norm == host_norm,

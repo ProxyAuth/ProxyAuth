@@ -855,6 +855,27 @@ pub struct RouteRule {
     #[serde(default)]
     pub streaming: Option<bool>,
 
+    /// Narrows this route to a subset of the hosts its `vhosts:` group
+    /// declares.
+    ///
+    /// Lets one group hold several routes at the same prefix, each
+    /// serving a different host — typically a `/` for the apex and a
+    /// `/` for the subdomains — without duplicating the certificate,
+    /// the session policy and everything else the group sets.
+    ///
+    /// Deliberately distinct from `vhost`. `vhost` on a route
+    /// *declares* the hosts it serves: that is the historical form, the
+    /// one top-level routes outside any group use, and nothing checks
+    /// it against anything. `if_vhost` *filters* among what the group
+    /// already declared, and every entry is validated against that list
+    /// at startup — an uncovered value would name a host the group's
+    /// `vhost_cert` does not, which only ever surfaces in production.
+    ///
+    /// Meaningless outside a group, since there is nothing to narrow.
+    /// That case is refused at startup rather than silently ignored.
+    #[serde(default)]
+    pub if_vhost: Vec<String>,
+
     /// Maintenance-mode gate for this route — see
     /// `RedirectProtectConfig`'s own doc comment for the full
     /// semantics. `None`/unset (the default) means no gate at all,
@@ -1373,9 +1394,49 @@ impl RouteConfig {
     /// routes-audit`/`check-access` — only ever sees the flat `routes`
     /// list it already understands.
     pub fn expand_vhost_groups(mut self) -> Self {
+        // Verifie avant d'aplatir: a ce stade `self.routes` ne contient
+        // que les routes de premier niveau, celles ecrites hors de tout
+        // groupe. Une fois la boucle passee, les routes issues des
+        // groupes y sont melees et on ne peut plus distinguer les deux
+        // origines autrement que par une heuristique.
+        //
+        // Une route de premier niveau n'a pas de groupe, donc rien a
+        // filtrer. Signale plutot qu'ignore: un operateur qui ecrit
+        // `if_vhost` ici attend une restriction qui n'aurait pas lieu.
+        for route in &self.routes {
+            if !route.if_vhost.is_empty() {
+                panic!(
+                    "routes.yml: route \"{}\": `if_vhost` is only meaningful inside a `vhosts:` group, where it narrows the route to some of the hosts that group declares. A top-level route has nothing to narrow — use `vhost` to declare the hosts it serves.",
+                    route.prefix
+                );
+            }
+        }
+
         for group in self.vhosts.drain(..) {
             for mut route in group.routes {
-                if route.vhost.is_empty() {
+                if !route.if_vhost.is_empty() {
+                    // Every entry must be covered by the group's own
+                    // list, literally or through one of its patterns.
+                    // Fatal rather than ignored: an uncovered entry
+                    // would have this route serve a host the group's
+                    // `vhost_cert` does not name, and the browser would
+                    // refuse the connection before routing even ran.
+                    for entry in &route.if_vhost {
+                        let entry_norm = crate::network::proxy::normalize_host(entry);
+                        let covered = group.vhost.iter().any(|g| {
+                            let g_norm = crate::network::proxy::normalize_host(g);
+                            g_norm == entry_norm
+                                || crate::network::proxy::vhost_entry_matches(&g_norm, &entry_norm)
+                        });
+                        if !covered {
+                            panic!(
+                                "routes.yml: route \"{}\": `if_vhost` entry \"{entry}\" is not covered by its group's `vhost` list ({:?}). `if_vhost` narrows a route to some of the hosts the group already declares — it cannot add one. Either add \"{entry}\" to the group's `vhost`, or use `vhost` on the route to declare an unrelated host outright.",
+                                route.prefix, group.vhost
+                            );
+                        }
+                    }
+                    route.vhost = route.if_vhost.clone();
+                } else if route.vhost.is_empty() {
                     route.vhost = group.vhost.clone();
                 }
                 if route.vhost_cert.is_empty() {
@@ -1473,6 +1534,7 @@ impl RouteConfig {
                 self.routes.push(route);
             }
         }
+
         self
     }
 }
