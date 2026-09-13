@@ -627,7 +627,7 @@ jobs:
             -d '{"username":"admin","password":"admin123"}' |
             jq -r '.token')
 
-          last="${token: -1}"
+          last=$(printf '%s' "$token" | tail -c 1)
 
           if [ "$last" = "A" ]; then
             repl="B"
