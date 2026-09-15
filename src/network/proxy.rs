@@ -2111,10 +2111,12 @@ pub async fn global_proxy(
 
     let path = req.path();
     let method = req.method().as_str();
+
     let ip = req
         .peer_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|| "-".to_string());
+
     let user_agent = req
         .headers()
         .get("User-Agent")
@@ -2262,6 +2264,7 @@ pub async fn proxy_with_proxy(
         .unwrap_or(IpAddr::from([127, 0, 0, 1]))
         .to_string();
     let method_str = req.method().as_str();
+
     let user_agent = req
         .headers()
         .get("User-Agent")
@@ -2699,7 +2702,7 @@ pub async fn proxy_with_proxy(
 
     request_builder = request_builder
         .header("Connection", "close")
-        .header(USER_AGENT, "ProxyAuth");
+        .header(USER_AGENT, user_agent);
     request_builder = inject_header(request_builder, &username, &data.config);
 
     let hyper_req = if hyper_method == Method::GET || hyper_method == Method::HEAD {
@@ -2817,6 +2820,7 @@ pub async fn proxy_with_proxy(
         if is_hop_by_hop_header(k) && !keep_head_content_length {
             continue;
         }
+
         if k != "user-agent" && k != "authorization" && k != "server" {
             client_resp.append_header((k, value.as_bytes()));
         }
@@ -3461,8 +3465,7 @@ pub async fn proxy_without_proxy(
         }
     }
 
-    request_builder = request_builder.header(USER_AGENT, "ProxyAuth");
-
+    request_builder = request_builder.header(USER_AGENT, user_agent);
     request_builder = inject_header(request_builder, &username, &data.config);
 
     // ── Build request body ───────────────────────────────────────────
