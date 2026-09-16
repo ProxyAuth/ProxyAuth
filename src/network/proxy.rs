@@ -449,8 +449,162 @@ fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, ru
 /// oidc-enabled vhost specifically, but the underlying bug applies to
 /// any vhost with `required_login: true` on "/" and no
 /// `login_redirect_url` configured, oidc or not.
-fn redirect_target_is_meaningful(config: &AppConfig) -> bool {
-    config.login_redirect_url.as_deref().unwrap_or("/") != "/"
+fn redirect_target_is_meaningful(target: &str) -> bool {
+    target != "/"
+}
+
+/// Where a visitor that reached a `required_login` route without a
+/// usable session should be sent, or `None` to keep answering `401`.
+///
+/// The target is the route's `redirect_login_url`, falling back to its
+/// `logout_redirect_url` (vhost, then global) — the page ProxyAuth
+/// already treats as the login page, since that is where a failed login
+/// displays its error.
+///
+/// Only `GET`/`HEAD` requests are redirected, and never one that is
+/// clearly an API call: an `Authorization` header, an
+/// `X-Requested-With` header, a `Sec-Fetch-Mode` other than `navigate`
+/// (`fetch()`, XHR, images, scripts), or an `Accept` asking for JSON or
+/// XML rather than HTML. Those keep the `401` they can act on. A plain
+/// `curl` or a browser navigation is redirected.
+///
+/// A page is never redirected to itself.
+pub fn login_page_redirect_target<'a>(
+    req: &HttpRequest,
+    rule: &'a RouteRule,
+    config: &'a AppConfig,
+) -> Option<&'a str> {
+    let target = rule.resolved_redirect_login_url().or_else(|| {
+        rule.resolved_logout_redirect_url(config)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    })?;
+
+    let method = req.method().as_str();
+    if method != "GET" && method != "HEAD" {
+        return None;
+    }
+
+    if looks_like_api_call(req) {
+        return None;
+    }
+
+    if target.starts_with('/') {
+        let target_path = target.split(['?', '#']).next().unwrap_or(target);
+        if target_path.trim_end_matches('/') == req.path().trim_end_matches('/') {
+            warn!(
+                "route \"{}\": login page \"{target}\" is the protected page itself; answering 401 instead of looping",
+                rule.prefix
+            );
+            return None;
+        }
+    }
+
+    // Not a reason to refuse the redirect — the visitor still needs the
+    // login page — but the likely reason they keep landing on it.
+    let has_session_cookie = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|cookies| {
+            cookies
+                .split(';')
+                .any(|c| c.trim_start().starts_with("session_token="))
+        });
+    if has_session_cookie && !is_secure_request(req, config) {
+        warn!(
+            "route \"{}\": a session cookie was sent but is ignored because the connection is not considered secure (enable tls, or list the TLS-terminating proxy in trust_proxy_forward_for); sending the visitor to the login page again",
+            rule.prefix
+        );
+    }
+
+    Some(target)
+}
+
+/// Requests a program makes, as opposed to a page someone opens.
+fn looks_like_api_call(req: &HttpRequest) -> bool {
+    let headers = req.headers();
+
+    if headers.contains_key(header::AUTHORIZATION) || headers.contains_key("x-requested-with") {
+        return true;
+    }
+
+    if let Some(mode) = headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) {
+        if !mode.eq_ignore_ascii_case("navigate") {
+            return true;
+        }
+    }
+
+    if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
+        let accept = accept.to_ascii_lowercase();
+        if !accept.contains("text/html")
+            && (accept.contains("json") || accept.contains("xml") || accept.contains("text/event-stream"))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Path of the page visitors sign in on, for this vhost: its
+/// `redirect_login_url`, else its `logout_redirect_url` (vhost, then
+/// global), else `/` — the historical layout where the login form is the
+/// site root. Query string and fragment are dropped; for an absolute URL,
+/// only its path is kept.
+pub fn login_page_path<'a>(route: Option<&'a RouteRule>, config: &'a AppConfig) -> &'a str {
+    let configured = route
+        .and_then(|r| {
+            r.resolved_redirect_login_url()
+                .or_else(|| r.resolved_logout_redirect_url(config))
+        })
+        .or(config.logout_redirect_url.as_deref())
+        .map(str::trim)
+        .filter(|url| !url.is_empty());
+
+    let Some(url) = configured else {
+        return "/";
+    };
+
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]),
+        None => url,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    if path.is_empty() { "/" } else { path }
+}
+
+/// Whether `path` is this vhost's login page — the only page where a
+/// visitor who is already signed in is sent on to `login_redirect_url`.
+/// Every other page, public ones included, is served normally to a
+/// signed-in visitor.
+pub fn is_login_page(path: &str, route: Option<&RouteRule>, config: &AppConfig) -> bool {
+    let login = login_page_path(route, config);
+    let normalize = |p: &str| {
+        let trimmed = p.trim_end_matches('/');
+        if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+    };
+    normalize(path) == normalize(login)
+}
+
+/// `302 Found` to the login page. `clear_session` also expires a
+/// `session_token` cookie that was sent but is no longer valid, so the
+/// login page starts from a clean state.
+pub fn login_page_redirect(target: &str, clear_session: bool) -> HttpResponse {
+    let mut resp = HttpResponse::Found();
+    resp.insert_header(("server", "ProxyAuth"));
+    resp.insert_header((header::LOCATION, target));
+    resp.insert_header((
+        header::CACHE_CONTROL,
+        "no-store, no-cache, must-revalidate, max-age=0",
+    ));
+    if clear_session {
+        resp.append_header((
+            header::SET_COOKIE,
+            "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+        ));
+    }
+    resp.finish()
 }
 
 fn apply_custom_headers(resp: &mut HttpResponse, rule: &RouteRule) {
@@ -1730,6 +1884,10 @@ async fn check_static_auth(
         });
 
     let Some(token_header) = token_header else {
+        if let Some(target) = login_page_redirect_target(req, rule, &data.config) {
+            LogContext::set_error_detail(req, "no session, sent to redirect_login_url");
+            return Err(login_page_redirect(target, false));
+        }
         return Err(HttpResponse::Unauthorized()
             .append_header(("server", "ProxyAuth"))
             .body("401 Unauthorized"));
@@ -1738,6 +1896,10 @@ async fn check_static_auth(
     let (username, token_id) = match validate_token(token_header, data, &data.config, ip).await {
         Ok((username, token_id, _expiry)) => (username, token_id),
         Err(_) => {
+            if let Some(target) = login_page_redirect_target(req, rule, &data.config) {
+                LogContext::set_error_detail(req, "expired or invalid session, sent to redirect_login_url");
+                return Err(login_page_redirect(target, true));
+            }
             return Err(HttpResponse::Unauthorized()
                 .append_header(("server", "ProxyAuth"))
                 .append_header((
@@ -1753,9 +1915,10 @@ async fn check_static_auth(
         .route_access_decision(rule, &username)
         .is_allowed()
     {
-        return Err(HttpResponse::Unauthorized()
+        LogContext::set_error_detail(req, "signed in but not allowed on this route");
+        return Err(HttpResponse::Forbidden()
             .append_header(("server", "ProxyAuth"))
-            .body("401 Unauthorized"));
+            .body("403 Forbidden"));
     }
 
     Ok((username, token_id))
@@ -2154,12 +2317,15 @@ pub async fn global_proxy(
         && early_vhost_route
             .map(|r| r.session_cookie_enabled(&data.config))
             .unwrap_or(data.config.session_cookie);
+    // Only on the login page itself. This used to run on every "/" too,
+    // which is right when the login form *is* the site root, but on a
+    // site whose login page lives elsewhere (`/login`) it sent every
+    // signed-in visitor of the public home page to `login_redirect_url`
+    // — and showed an error page to anyone with an expired cookie.
+    // `is_login_page` still resolves to "/" when no login page is
+    // configured, so the historical layout keeps its behaviour.
     if early_session_cookie_enabled {
-        let early_logout_redirect_url = early_vhost_route
-            .and_then(|r| r.resolved_logout_redirect_url(&data.config))
-            .or(data.config.logout_redirect_url.as_deref());
-        let is_home_or_logout_page = path == "/" || early_logout_redirect_url == Some(path);
-        if is_home_or_logout_page {
+        if is_login_page(path, early_vhost_route, &data.config) {
             if let Some(resp) =
                 crate::token::auth::existing_session_response(&req, &data, &ip).await
             {
@@ -2474,12 +2640,18 @@ pub async fn proxy_with_proxy(
                         })
                     })
             })
-            .ok_or_else(|| {
-                let mut resp = HttpResponse::Unauthorized();
-                resp.append_header(("server", "ProxyAuth"));
-                add_cors_headers(&mut resp, &req);
-                error::InternalError::from_response("Missing token", resp.finish())
-            })?;
+            ;
+
+        let Some(token_header) = token_header else {
+            if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
+                LogContext::set_error_detail(&req, "no session, sent to redirect_login_url");
+                return Ok(login_page_redirect(target, false));
+            }
+            let mut resp = HttpResponse::Unauthorized();
+            resp.append_header(("server", "ProxyAuth"));
+            add_cors_headers(&mut resp, &req);
+            return Err(error::InternalError::from_response("Missing token", resp.finish()).into());
+        };
 
         let (username, token_id, _expiry) =
             match validate_token(token_header, &data, &data.config, &ip).await {
@@ -2489,6 +2661,10 @@ pub async fn proxy_with_proxy(
                         "[{}] {} {} 401 Unauthorized token attempt {} {}",
                         ip, path, method_str, user_agent, _err
                     );
+                    if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
+                        LogContext::set_error_detail(&req, "expired or invalid session, sent to redirect_login_url");
+                        return Ok(login_page_redirect(target, true));
+                    }
                     let mut resp = HttpResponse::Unauthorized();
                     resp.append_header(("server", "ProxyAuth"));
                     resp.append_header((
@@ -2521,8 +2697,13 @@ pub async fn proxy_with_proxy(
                 .route_access_decision(rule, &username)
                 .is_allowed()
         {
+            // Signed in, but not allowed on this route: a real 403. Not a
+            // redirect to the login page — signing in again cannot change
+            // the answer, and a login page that forwards signed-in
+            // visitors would bounce straight back here.
             warn!(client_ip = %ip, username = %username, path = %forward_path, target = %full_url, "This username is not authorized to access");
-            let mut resp = HttpResponse::Unauthorized();
+            LogContext::set_error_detail(&req, "signed in but not allowed on this route");
+            let mut resp = HttpResponse::Forbidden();
             resp.append_header(("server", "ProxyAuth"));
             add_cors_headers(&mut resp, &req);
             return Ok(resp.body("403 Forbidden"));
@@ -2536,8 +2717,14 @@ pub async fn proxy_with_proxy(
         // Redirecting only when there's genuinely somewhere else to
         // go turns "misconfigured" into "just proxies '/' through
         // normally" instead of a hard failure.
-        if (req.uri() == "/" || req.uri() == "") && redirect_target_is_meaningful(&data.config) {
-            let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+        // The route's own `login_redirect_url` (inherited from its
+        // `vhosts:` group), then the global one — this used to read the
+        // global value only, so a per-vhost setting was ignored here.
+        let redirect_target = rule
+            .resolved_login_redirect_url(&data.config)
+            .unwrap_or("/");
+        let on_login_page = req.uri() == "" || is_login_page(req.path(), Some(rule), &data.config);
+        if on_login_page && req.path() == "/" && redirect_target_is_meaningful(redirect_target) {
             return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
                 .append_header(("location", redirect_target))
@@ -3238,15 +3425,22 @@ pub async fn proxy_without_proxy(
                         })
                     })
             })
-            .ok_or_else(|| {
-                let mut resp = HttpResponse::Unauthorized();
+            ;
 
-                resp.append_header(("server", "ProxyAuth"));
+        let Some(token_header) = token_header else {
+            if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
+                LogContext::set_error_detail(&req, "no session, sent to redirect_login_url");
+                return Ok(login_page_redirect(target, false));
+            }
 
-                add_cors_headers(&mut resp, &req);
+            let mut resp = HttpResponse::Unauthorized();
 
-                error::InternalError::from_response("Missing token", resp.finish())
-            })?;
+            resp.append_header(("server", "ProxyAuth"));
+
+            add_cors_headers(&mut resp, &req);
+
+            return Err(error::InternalError::from_response("Missing token", resp.finish()).into());
+        };
 
         let (username, token_id, _expiry) =
             match validate_token(token_header, &data, &data.config, &ip).await {
@@ -3257,6 +3451,11 @@ pub async fn proxy_without_proxy(
                         "[{}] {} {} 401 Unauthorized token attempt {} {}",
                         ip, path, method_str, user_agent, _err
                     );
+
+                    if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
+                        LogContext::set_error_detail(&req, "expired or invalid session, sent to redirect_login_url");
+                        return Ok(login_page_redirect(target, true));
+                    }
 
                     let mut resp = HttpResponse::Unauthorized();
 
@@ -3288,26 +3487,33 @@ pub async fn proxy_without_proxy(
                 .route_access_decision(rule, &username)
                 .is_allowed()
         {
-            let mut resp = HttpResponse::Unauthorized();
+            // Same as `proxy_with_proxy`: signed in, but not allowed on
+            // this route. A 403 — and the session is kept, since it is
+            // still valid for the routes this user may reach.
+            warn!(client_ip = %ip, username = %username, path = %path, target = %full_url, "This username is not authorized to access");
+            LogContext::set_error_detail(&req, "signed in but not allowed on this route");
+
+            let mut resp = HttpResponse::Forbidden();
 
             resp.append_header(("server", "ProxyAuth"));
 
-            resp.append_header((
-                "Set-Cookie",
-                "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
-            ));
-
             add_cors_headers(&mut resp, &req);
 
-            return Ok(resp.body("401 Unauthorized"));
+            return Ok(resp.body("403 Forbidden"));
         }
 
         // SECURITY/CORRECTNESS: same guard as the twin check in
         // `proxy_with_proxy` above — `login_redirect_url` defaulting
         // to "/" when unconfigured otherwise makes an authenticated
         // visit to "/" redirect to "/", forever.
-        if (req.uri() == "/" || req.uri() == "") && redirect_target_is_meaningful(&data.config) {
-            let redirect_target = data.config.login_redirect_url.as_deref().unwrap_or("/");
+        // The route's own `login_redirect_url` (inherited from its
+        // `vhosts:` group), then the global one — this used to read the
+        // global value only, so a per-vhost setting was ignored here.
+        let redirect_target = rule
+            .resolved_login_redirect_url(&data.config)
+            .unwrap_or("/");
+        let on_login_page = req.uri() == "" || is_login_page(req.path(), Some(rule), &data.config);
+        if on_login_page && req.path() == "/" && redirect_target_is_meaningful(redirect_target) {
 
             return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
@@ -3792,3 +3998,4 @@ pub async fn proxy_without_proxy(
         .append_header(("server", "ProxyAuth"))
         .body(body_bytes))
 }
+

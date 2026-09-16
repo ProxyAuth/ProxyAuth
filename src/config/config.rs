@@ -566,8 +566,29 @@ pub struct RouteRule {
     /// Per-vhost override of `AppConfig.max_age_session_cookie` (the
     /// session cookie's `Max-Age`, in seconds). `None` inherits from
     /// the `vhosts:` group, then the global default.
-    #[serde(default)]
+    ///
+    /// `session_cookie_age` is accepted as an alias: it is the name
+    /// people naturally reach for, and without the alias serde silently
+    /// ignored it, leaving the global default in force with no warning.
+    #[serde(default, alias = "session_cookie_age")]
     pub max_age_session_cookie: Option<i64>,
+
+    /// Where a browser without a valid session is sent when it opens a
+    /// `required_login` route: a `302 Found` to this page instead of a
+    /// bare `401`. Typically the vhost's login page (`"/login"`), or an
+    /// absolute `https://` URL.
+    ///
+    /// Different job from `login_redirect_url`, which is where a visitor
+    /// lands *after* a successful login. `None` inherits from the
+    /// `vhosts:` group, then falls back to `logout_redirect_url` — the
+    /// page ProxyAuth already treats as the login page. With neither
+    /// set, the historical `401` is kept.
+    ///
+    /// Only `GET`/`HEAD` requests are redirected, and API calls
+    /// (`Authorization` header, `fetch()`/XHR, `Accept: application/json`)
+    /// keep getting a `401` they can act on instead of an HTML page.
+    #[serde(default, alias = "login_page_url")]
+    pub redirect_login_url: Option<String>,
 
     /// Per-vhost override of `AppConfig.login_redirect_url` — where an
     /// already-authenticated visitor (a still-valid `session_token`
@@ -953,6 +974,16 @@ impl RouteRule {
             .or(global.login_redirect_url.as_deref())
     }
 
+    /// The page an unauthenticated browser is sent to on this route, if
+    /// any — see `RouteRule::redirect_login_url`. Blank values count as
+    /// unset.
+    pub fn resolved_redirect_login_url(&self) -> Option<&str> {
+        self.redirect_login_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    }
+
     /// Resolves `AppConfig.logout_redirect_url` for this vhost: its
     /// own value if set, otherwise the global default.
     pub fn resolved_logout_redirect_url<'a>(&'a self, global: &'a AppConfig) -> Option<&'a str> {
@@ -1250,8 +1281,13 @@ pub struct VhostGroup {
 
     /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::max_age_session_cookie`.
-    #[serde(default)]
+    #[serde(default, alias = "session_cookie_age")]
     pub max_age_session_cookie: Option<i64>,
+
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::redirect_login_url`.
+    #[serde(default, alias = "login_page_url")]
+    pub redirect_login_url: Option<String>,
 
     /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::login_redirect_url`.
@@ -1469,6 +1505,9 @@ impl RouteConfig {
                 if route.login_redirect_url.is_none() {
                     route.login_redirect_url = group.login_redirect_url.clone();
                 }
+                if route.redirect_login_url.is_none() {
+                    route.redirect_login_url = group.redirect_login_url.clone();
+                }
                 if route.logout_redirect_url.is_none() {
                     route.logout_redirect_url = group.logout_redirect_url.clone();
                 }
@@ -1532,6 +1571,23 @@ impl RouteConfig {
                     route.cache_duration_secs = group.cache_duration_secs;
                 }
                 self.routes.push(route);
+            }
+        }
+
+        // A redirect target is written straight into a `Location`
+        // header, so only a same-site path or an explicit http(s) URL is
+        // accepted. `//host` would be read by browsers as another site.
+        for route in &self.routes {
+            if let Some(url) = route.resolved_redirect_login_url() {
+                let same_site_path = url.starts_with('/') && !url.starts_with("//");
+                let absolute = url.starts_with("https://") || url.starts_with("http://");
+                let clean = !url.chars().any(|c| c.is_control() || c.is_whitespace());
+                if !(same_site_path || absolute) || !clean {
+                    panic!(
+                        "routes.yml: route \"{}\": `redirect_login_url` \"{url}\" must be a path starting with `/` (for example \"/login\") or an absolute http(s):// URL, without spaces.",
+                        route.prefix
+                    );
+                }
             }
         }
 
@@ -3299,3 +3355,4 @@ impl AllowRegexCfg {
         })
     }
 }
+

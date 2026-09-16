@@ -12,6 +12,7 @@ fn default_route(prefix: &str, target: &str) -> RouteRule {
         session_cookie: None,
         max_age_session_cookie: None,
         login_redirect_url: None,
+        redirect_login_url: None,
         logout_redirect_url: None,
         login_via_otp: None,
         page_change_password: None,
