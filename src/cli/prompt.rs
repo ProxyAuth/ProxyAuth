@@ -1,4 +1,4 @@
-use crate::cli::command::{Cli, Commands};
+use crate::cli::command::{Cli, Commands, QuickstartAction};
 use crate::config::config::{AppConfig, EmailEntry, User, load_config};
 use crate::config::def_config::{
     ensure_run_user_exists, ensure_running_as, ensure_running_as_root,
@@ -105,6 +105,30 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
 
     match &cli.command {
         None => return Ok(()),
+
+        Some(Commands::Quickstart { action }) => {
+            // Same privilege dance as every other config-touching
+            // command: read config.json while still root (that is what
+            // names `run_user`), then drop to that account before
+            // writing anything, so the files keep the ownership the
+            // running server expects rather than silently becoming
+            // root-owned.
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
+
+            let result = match action {
+                QuickstartAction::Vhost => crate::cli::quickstart::run_vhost(),
+                QuickstartAction::Users => crate::cli::quickstart::run_users(&config),
+                QuickstartAction::VhostAccess => crate::cli::quickstart::run_vhost_access(),
+            };
+
+            if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
 
         Some(Commands::Prepare { insecure }) => {
             switch_to_user("root")?;

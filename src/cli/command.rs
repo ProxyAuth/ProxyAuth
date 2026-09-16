@@ -11,6 +11,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Guided setup for the three things people configure most often.
+    /// Every step has a default, nothing is written before it has been
+    /// shown and confirmed, and the generated block is printed again at
+    /// the end with its file path — so the next one can be written by
+    /// hand. `routes.yml` is edited textually and re-parsed before the
+    /// write is committed, so comments survive and a block that would
+    /// not load is rolled back instead of left on disk.
+    Quickstart {
+        #[command(subcommand)]
+        action: QuickstartAction,
+    },
     /// Certificate management (native ACME/Let's Encrypt integration
     /// — see `certbot_renew` in routes.yml).
     Certbot {
@@ -204,6 +215,33 @@ pub enum Commands {
         #[arg(long)]
         list: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum QuickstartAction {
+    /// Creates one `vhosts:` entry in routes.yml — hostnames, TLS,
+    /// session policy, the login page and the application behind it.
+    /// Appended to the existing `vhosts:` block, or that block is
+    /// created if the file has none. routes.yml reloads live, so the
+    /// vhost is in force as soon as it is written; a brand-new
+    /// certificate still needs `certbot new` and one restart, for the
+    /// same file-watcher reason `certbot new` itself documents.
+    Vhost,
+
+    /// Creates an account, in the database when `databases` is
+    /// configured or in config.json otherwise. The password is read
+    /// twice with hidden input and stored as an Argon2id hash. Writing
+    /// to config.json needs a restart to take effect; writing to the
+    /// database does not — every instance picks it up on its next
+    /// incremental scan.
+    Users,
+
+    /// Sets who may sign in on a vhost — `allow_users`,
+    /// `allow_groups`, `allow_roles` and `exclude_users` on its
+    /// `vhosts:` entry. This is the gate at login, distinct from what a
+    /// route lets an already-signed-in visitor reach. Shows what is in
+    /// force first, resolved exactly the way the server resolves it.
+    VhostAccess,
 }
 
 #[derive(Subcommand)]

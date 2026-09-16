@@ -15,3 +15,4 @@
 pub mod audit;
 pub mod command;
 pub mod prompt;
+pub mod quickstart;
