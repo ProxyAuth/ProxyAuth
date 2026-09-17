@@ -9,7 +9,10 @@ mod tests {
         is_token_revoked, pack_rotation, revocation_purge_at, revoke_token_after, rotated_key,
         unpack_rotation,
     };
-    use proxyauth::token::refresh::{RenewalDecision, decide, renewed_expiry, session_cookie};
+    use proxyauth::token::refresh::{
+        IN_FLIGHT_SECS, RenewalDecision, decide, predecessor_deadline, renewed_expiry,
+        session_cookie,
+    };
     use proxyauth::token::security::{TokenData, ValidSession, now_secs};
     use std::sync::Arc;
 
@@ -37,6 +40,7 @@ mod tests {
                 index_user: 0,
                 issued_at,
                 session_started_at: NOW - session_age,
+                previous_token_id: None,
             },
         }
     }
@@ -91,13 +95,53 @@ mod tests {
     }
 
     #[test]
-    fn no_renewal_when_the_current_token_already_reaches_the_hard_limit() {
-        // Session limit in 35 minutes; current token expires in 43: a
-        // new token could not last longer, so none is issued.
+    fn tokens_rotate_even_when_the_session_end_cannot_move() {
+        // Session limit in 35 minutes, current token valid 43 more: a new
+        // token cannot extend anything, but the token is still rotated.
         let p = policy(900, 30, 3600);
         let s = session(1000, 1500);
         assert!(s.expires_at >= s.data.session_started_at + 3600);
-        assert_eq!(decide(&p, &s, LIFETIME, NOW), RenewalDecision::Keep);
+        assert_eq!(decide(&p, &s, LIFETIME, NOW), RenewalDecision::Renew);
+        assert_eq!(
+            renewed_expiry(&p, s.data.session_started_at, LIFETIME, NOW),
+            s.data.session_started_at + 3600,
+            "and ends with the session"
+        );
+    }
+
+    /// The configuration from the field: a token lifetime of 5 days (the
+    /// default), renewal every minute, sessions capped at one hour.
+    #[test]
+    fn long_tokens_with_a_short_session_cap_are_renewed() {
+        const FIVE_DAYS: u64 = 432_000;
+        let p = policy(60, 30, 3600);
+        let issued_at = NOW - 61;
+        let s = ValidSession {
+            username: "admin".into(),
+            token_id: "t".into(),
+            remaining_secs: FIVE_DAYS - 61,
+            expires_at: issued_at + FIVE_DAYS,
+            data: TokenData {
+                index_user: 0,
+                issued_at,
+                session_started_at: issued_at,
+                previous_token_id: None,
+            },
+        };
+        assert_eq!(decide(&p, &s, FIVE_DAYS, NOW), RenewalDecision::Renew);
+        assert_eq!(renewed_expiry(&p, issued_at, FIVE_DAYS, NOW), issued_at + 3600);
+
+        let young = ValidSession {
+            data: TokenData { issued_at: NOW - 30, ..s.data.clone() },
+            ..s.clone()
+        };
+        assert_eq!(decide(&p, &young, FIVE_DAYS, NOW), RenewalDecision::Keep);
+
+        let over = ValidSession {
+            data: TokenData { session_started_at: NOW - 3600, ..s.data.clone() },
+            ..s
+        };
+        assert_eq!(decide(&p, &over, FIVE_DAYS, NOW), RenewalDecision::TooOld);
     }
 
     #[test]
@@ -129,6 +173,7 @@ mod tests {
             index_user: 7,
             issued_at: 1_800_000_000,
             session_started_at: 1_790_000_000,
+            previous_token_id: None,
         };
         assert_eq!(data.encode(), "7:1800000000:1790000000");
         assert_eq!(TokenData::parse(&data.encode()), Some(data));
@@ -141,14 +186,16 @@ mod tests {
             Some(TokenData {
                 index_user: 3,
                 issued_at: 0,
-                session_started_at: 0
+                session_started_at: 0,
+                previous_token_id: None,
             })
         );
     }
 
     #[test]
     fn malformed_token_data_is_refused() {
-        for raw in ["", "x", "1:y", "1:2:z", "1:2:3:4", "-1:2:3"] {
+        let too_long = format!("1:2:3:{}", "a".repeat(129));
+        for raw in ["", "x", "1:y", "1:2:z", "1:2:3:", "1:2:3:has space", "1:2:3:a/b", "1:2:3:ab:cd", "-1:2:3", too_long.as_str()] {
             assert_eq!(TokenData::parse(raw), None, "{raw:?}");
         }
     }
@@ -292,5 +339,87 @@ routes:
         assert_eq!(written["session_max_lifetime_secs"], 43200);
         assert_eq!(written["trust_proxy_forward_for"][0], "10.0.0.10");
         assert_eq!(written["max_body_size"], 1234);
+    }
+
+    // ── the token a renewal replaced ─────────────────────────
+
+    const PREV: &str = "3f2c9a0b1d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8";
+
+    #[test]
+    fn a_renewed_token_names_its_predecessor() {
+        let data = TokenData {
+            index_user: 2,
+            issued_at: 1_900_000_000,
+            session_started_at: 1_899_990_000,
+            previous_token_id: Some(PREV.to_string()),
+        };
+        assert_eq!(data.encode(), format!("2:1900000000:1899990000:{PREV}"));
+        assert_eq!(TokenData::parse(&data.encode()), Some(data));
+    }
+
+    #[test]
+    fn token_ids_that_can_be_carried() {
+        use proxyauth::token::security::is_token_id;
+        assert!(is_token_id(PREV));
+        assert!(is_token_id("legacy-id_1.2"));
+        assert!(!is_token_id(""));
+        assert!(!is_token_id("a:b"));
+        assert!(!is_token_id("a b"));
+        assert!(!is_token_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn a_token_without_predecessor_keeps_the_three_part_format() {
+        let data = TokenData {
+            index_user: 2,
+            issued_at: 1,
+            session_started_at: 1,
+            previous_token_id: None,
+        };
+        assert_eq!(data.encode(), "2:1:1");
+    }
+
+    #[test]
+    fn using_the_successor_brings_the_refusal_forward() {
+        let p = policy(900, 30, 0);
+        // Renewed a moment ago: refused in 30 s, purged in an hour.
+        let existing = pack_rotation(NOW + 30, NOW + 3600);
+        assert_eq!(
+            predecessor_deadline(Some(existing), &p, LIFETIME, NOW),
+            Some((NOW + IN_FLIGHT_SECS, NOW + 3600))
+        );
+    }
+
+    #[test]
+    fn nothing_to_write_once_the_predecessor_is_already_refused() {
+        let p = policy(900, 30, 0);
+        let retired = pack_rotation(NOW + IN_FLIGHT_SECS, NOW + 3600);
+        assert_eq!(predecessor_deadline(Some(retired), &p, LIFETIME, NOW), None);
+        let long_gone = pack_rotation(NOW - 100, NOW + 3600);
+        assert_eq!(predecessor_deadline(Some(long_gone), &p, LIFETIME, NOW), None);
+    }
+
+    #[test]
+    fn a_predecessor_renewed_elsewhere_is_bounded_by_the_token_lifetime() {
+        let p = policy(900, 30, 0);
+        assert_eq!(
+            predecessor_deadline(None, &p, LIFETIME, NOW),
+            Some((NOW + IN_FLIGHT_SECS, NOW + LIFETIME))
+        );
+    }
+
+    #[test]
+    fn a_shorter_grace_period_is_kept() {
+        let p = policy(900, 1, 0);
+        assert_eq!(
+            predecessor_deadline(Some(pack_rotation(NOW + 1, NOW + 3600)), &p, LIFETIME, NOW),
+            None,
+            "a one-second grace is already shorter than the in-flight margin"
+        );
+        let none = policy(900, 0, 0);
+        assert_eq!(
+            predecessor_deadline(None, &none, LIFETIME, NOW),
+            Some((NOW, NOW + LIFETIME))
+        );
     }
 }

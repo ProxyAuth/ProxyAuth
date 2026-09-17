@@ -144,6 +144,7 @@ pub fn issue_token(
             index_user,
             issued_at: now,
             session_started_at: now,
+            previous_token_id: None,
         },
     )
 }
@@ -176,11 +177,12 @@ pub fn now_secs() -> u64 {
 
 /// What ProxyAuth stores in a token's data field.
 ///
-/// Encoded as `index:issued_at:session_started_at`. Tokens issued
-/// before session renewal existed hold only `index`; they still
-/// validate, and their two dates are unknown (`0`) until they are
-/// renewed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Encoded as `index:issued_at:session_started_at[:previous_token_id]`.
+/// Tokens issued before session renewal existed hold only `index`; they
+/// still validate, and their two dates are unknown (`0`) until they are
+/// renewed. A token issued by a renewal names the token it replaces, so
+/// that one can be retired as soon as the new token is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenData {
     /// Position of the account in `AppConfig::combined_users()`.
     pub index_user: usize,
@@ -189,14 +191,34 @@ pub struct TokenData {
     /// When the session began — the original login, kept across
     /// renewals (Unix seconds).
     pub session_started_at: u64,
+    /// The id of the token this one replaced, for a token issued by a
+    /// session renewal.
+    pub previous_token_id: Option<String>,
+}
+
+/// Whether `value` can be carried as a token id in the data field.
+/// Token ids are hex digests; letters, digits, `-`, `_` and `.` are
+/// accepted, and nothing that could break the `:`-separated layout.
+pub fn is_token_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 impl TokenData {
     pub fn encode(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.index_user, self.issued_at, self.session_started_at
-        )
+        match &self.previous_token_id {
+            Some(prev) => format!(
+                "{}:{}:{}:{}",
+                self.index_user, self.issued_at, self.session_started_at, prev
+            ),
+            None => format!(
+                "{}:{}:{}",
+                self.index_user, self.issued_at, self.session_started_at
+            ),
+        }
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
@@ -210,6 +232,11 @@ impl TokenData {
             Some(v) => v.parse().ok()?,
             None => issued_at,
         };
+        let previous_token_id = match parts.next() {
+            Some(v) if is_token_id(v) => Some(v.to_string()),
+            Some(_) => return None,
+            None => None,
+        };
         if parts.next().is_some() {
             return None;
         }
@@ -217,6 +244,7 @@ impl TokenData {
             index_user,
             issued_at,
             session_started_at,
+            previous_token_id,
         })
     }
 }

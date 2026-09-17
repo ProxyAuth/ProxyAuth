@@ -119,6 +119,7 @@ vhosts:
                 index_user: 0,
                 issued_at: now,
                 session_started_at: now,
+                previous_token_id: None,
             },
         )
         .unwrap();
@@ -224,6 +225,56 @@ vhosts:
         let record = proxyauth::revoke::db::lmdb_get_record("dated").expect("written to LMDB");
         assert!(record.revoked_at >= before && record.revoked_at <= now_secs());
         assert_eq!(record.value, *state.revoked_tokens.get("dated").unwrap());
+    }
+
+    #[actix_web::test]
+    async fn logout_also_ends_the_token_a_renewal_replaced() {
+        let state = state();
+        ensure_lmdb().await;
+        config();
+        let now = now_secs();
+        let prev = "70c0000000000000000000000000000000000000000000000000000000000001";
+        // The replaced token is still inside a long grace period.
+        state.revoked_tokens.insert(
+            proxyauth::revoke::load::rotated_key(prev),
+            proxyauth::revoke::load::pack_rotation(now + 600, now + LIFETIME),
+        );
+        let successor = issue_session_token(
+            "admin",
+            now + LIFETIME,
+            "70c0000000000000000000000000000000000000000000000000000000000002",
+            &TokenData {
+                index_user: 0,
+                issued_at: now,
+                session_started_at: now - 60,
+                previous_token_id: Some(prev.to_string()),
+            },
+        )
+        .unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state.clone()))
+                .route("/logout", web::get().to(proxyauth::token::logout::logout_dispatch)),
+        )
+        .await;
+        let req = TestRequest::get()
+            .uri("/logout")
+            .peer_addr("127.0.0.1:45002".parse().unwrap())
+            .insert_header((header::HOST, HOST))
+            .insert_header(("x-forwarded-proto", "https"))
+            .insert_header((header::COOKIE, format!("session_token={successor}")))
+            .to_request();
+        let _ = app.call(req).await.expect("logout");
+
+        let (refuse, purge) = proxyauth::revoke::load::unpack_rotation(
+            *state
+                .revoked_tokens
+                .get(&proxyauth::revoke::load::rotated_key(prev))
+                .unwrap(),
+        );
+        assert!(refuse <= now_secs(), "refused from the logout on");
+        assert_eq!(purge, now + LIFETIME);
     }
 
     #[actix_web::test]

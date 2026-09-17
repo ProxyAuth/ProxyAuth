@@ -189,6 +189,7 @@ vhosts:
                 index_user: 0,
                 issued_at,
                 session_started_at: now - session_age,
+                previous_token_id: None,
             },
         )
         .expect("issue token")
@@ -322,9 +323,33 @@ vhosts:
         assert!(cache.starts_with("public"), "{cache}");
         let _ = expires;
 
-        let (cache, _, cookie) =
+    }
+
+    #[actix_web::test]
+    async fn a_signed_in_visitors_page_is_private_and_revalidated() {
+        let state = state();
+        // Public page, recent session: nothing to send back, but the
+        // browser must come back to ProxyAuth next time, or the session
+        // could not be renewed on this page.
+        let (cache, expires, cookie) =
             cache_headers(&state, open(SITE, "/cached/page", &token("cached-fresh", 30, 30))).await;
         assert!(!cookie, "recent session: nothing sent back");
+        assert_eq!(cache.as_deref(), Some("private, no-cache"));
+        assert_eq!(expires, None);
+
+        // Same on a protected page.
+        let (cache, _, cookie) =
+            cache_headers(&state, open(SITE, "/admin", &token("cached-admin", 30, 30))).await;
+        assert!(!cookie);
+        assert_eq!(cache.as_deref(), Some("private, no-cache"));
+    }
+
+    #[actix_web::test]
+    async fn renewal_off_leaves_public_caching_alone() {
+        let state = state();
+        let (cache, _, cookie) =
+            cache_headers(&state, open(NO_REFRESH, "/cached/page", &token("cached-off", 30, 30))).await;
+        assert!(!cookie);
         assert!(cache.unwrap().starts_with("public"));
     }
 
@@ -542,6 +567,114 @@ vhosts:
     }
 
     #[actix_web::test]
+    async fn using_the_new_token_retires_the_old_one_right_away() {
+        let state = state();
+        let old = token("5e1f00000000000000000000000000000000000000000000000000000000a001", 1000, 1000);
+        let old_id = "5e1f00000000000000000000000000000000000000000000000000000000a001";
+
+        let first = send(&state, open(SITE, "/admin", &old)).await;
+        let new_token = first.new_token.expect("renewed");
+        let before = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
+        let (refuse_before, purge) = proxyauth::revoke::load::unpack_rotation(before);
+        assert!(refuse_before >= now_secs() + GRACE - 2, "full grace until the new token is used");
+
+        // The browser now sends the new token.
+        let next = send(&state, open(SITE, "/admin/next", &new_token)).await;
+        assert_eq!(next.status, StatusCode::OK);
+        let after = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
+        let (refuse_after, purge_after) = proxyauth::revoke::load::unpack_rotation(after);
+        assert!(refuse_after <= now_secs() + proxyauth::token::refresh::IN_FLIGHT_SECS);
+        assert_eq!(purge_after, purge, "still forgotten when the old token expires");
+
+        // The session carries the id of the token it replaced.
+        let session = proxyauth::token::vault::vault().verify(&new_token).unwrap();
+        let data = TokenData::parse(session.data()).unwrap();
+        assert_eq!(data.previous_token_id.as_deref(), Some(old_id));
+
+        // Within the in-flight margin, a late request with the old token
+        // still gets the same successor — and does not push the refusal back.
+        let late = send(&state, open(SITE, "/admin/late", &old)).await;
+        assert_eq!(late.status, StatusCode::OK);
+        assert_eq!(late.new_token.as_deref(), Some(new_token.as_str()));
+        let still = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
+        assert_eq!(still, after, "a late request never postpones the refusal");
+
+        // After the margin, the old token is refused.
+        actix_web::rt::time::sleep(std::time::Duration::from_millis(
+            proxyauth::token::refresh::IN_FLIGHT_SECS * 1000 + 1100,
+        ))
+        .await;
+        let refused = send(&state, open(SITE, "/admin", &old)).await;
+        assert_eq!(refused.status, StatusCode::FOUND);
+        assert_eq!(refused.location.as_deref(), Some("/login"));
+        assert_eq!(refused.new_token, None);
+
+        // The new token keeps working.
+        let ok = send(&state, open(SITE, "/admin", &new_token)).await;
+        assert_eq!(ok.status, StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn the_old_token_is_retired_once_not_on_every_request() {
+        let state = state();
+        let old_id = "5e1f00000000000000000000000000000000000000000000000000000000a002";
+        let old = token(old_id, 1000, 1000);
+        let new_token = send(&state, open(SITE, "/admin", &old)).await.new_token.unwrap();
+
+        let _ = send(&state, open(SITE, "/admin/1", &new_token)).await;
+        let first = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
+        actix_web::rt::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let _ = send(&state, open(SITE, "/admin/2", &new_token)).await;
+        let second = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
+        assert_eq!(first, second, "no second write for the same predecessor");
+    }
+
+    #[actix_web::test]
+    async fn a_predecessor_renewed_on_another_instance_is_retired_too() {
+        let state = state();
+        // A token issued by a renewal elsewhere: this instance has no
+        // record of the token it replaced yet.
+        config();
+        let now = now_secs();
+        let prev = "5e1f00000000000000000000000000000000000000000000000000000000a003";
+        let successor = issue_session_token(
+            "admin",
+            now + LIFETIME,
+            "successor-from-elsewhere",
+            &TokenData {
+                index_user: 0,
+                issued_at: now,
+                session_started_at: now - 100,
+                previous_token_id: Some(prev.to_string()),
+            },
+        )
+        .unwrap();
+
+        let out = send(&state, open(SITE, "/admin", &successor)).await;
+        assert_eq!(out.status, StatusCode::OK);
+        let entry = *state
+            .revoked_tokens
+            .get(&rotated_key(prev))
+            .expect("the predecessor is recorded here");
+        let (refuse, purge) = proxyauth::revoke::load::unpack_rotation(entry);
+        assert!(refuse <= now_secs() + proxyauth::token::refresh::IN_FLIGHT_SECS);
+        assert!(purge >= now + LIFETIME, "kept as long as the predecessor could live");
+    }
+
+    #[actix_web::test]
+    async fn a_public_page_retires_the_old_token_too() {
+        let state = state();
+        let old_id = "5e1f00000000000000000000000000000000000000000000000000000000a004";
+        let old = token(old_id, 1000, 1000);
+        let new_token = send(&state, open(SITE, "/blog", &old)).await.new_token.unwrap();
+        let _ = send(&state, open(SITE, "/blog/next", &new_token)).await;
+        let (refuse, _) = proxyauth::revoke::load::unpack_rotation(
+            *state.revoked_tokens.get(&rotated_key(old_id)).unwrap(),
+        );
+        assert!(refuse <= now_secs() + proxyauth::token::refresh::IN_FLIGHT_SECS);
+    }
+
+    #[actix_web::test]
     async fn the_old_token_is_refused_after_the_grace_period() {
         let state = state();
         let old = token("expired-grace", 1000, 1000);
@@ -580,13 +713,18 @@ vhosts:
     }
 
     #[actix_web::test]
-    async fn no_renewal_when_it_could_not_extend_the_session() {
+    async fn the_token_rotates_even_when_the_session_end_is_already_set() {
         let state = state();
         // Started 5000s ago with a 7200s limit: the session ends before
-        // the current token does, so there is nothing to renew.
+        // the current token does. The token is still replaced, and the
+        // new one ends with the session.
         let out = send(&state, open(SHORT, "/admin", &token("at-limit", 1000, 5000))).await;
         assert_eq!(out.status, StatusCode::OK);
-        assert_eq!(out.new_token, None);
+        let new_token = out.new_token.expect("rotated");
+        let session = proxyauth::token::vault::vault().verify(&new_token).unwrap();
+        let data = TokenData::parse(session.data()).unwrap();
+        assert_eq!(session.expires_at(), data.session_started_at + 7200);
+        assert!(state.revoked_tokens.contains_key(&rotated_key("at-limit")));
     }
 
     #[actix_web::test]

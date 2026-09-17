@@ -90,6 +90,16 @@ pub async fn logout_session(req: HttpRequest, data: web::Data<AppState>) -> Http
 
         match validate_session(cookie.value(), &data, &data.config, &ip).await {
             Ok(session) => {
+                // A token issued by a renewal: the one it replaced may
+                // still be inside its grace period. End it too.
+                if let Some(previous) = &session.data.previous_token_id {
+                    crate::token::refresh::retire_predecessor_now(
+                        previous,
+                        data.config.token_expiry_seconds.max(0) as u64,
+                        &data.revoked_tokens,
+                    )
+                    .await;
+                }
                 // Kept until the token would have expired on its own —
                 // past that, the record serves no purpose.
                 let keep_until = logout_record_until(session.expires_at, now_secs());

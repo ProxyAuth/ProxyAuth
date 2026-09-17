@@ -39,7 +39,7 @@
 
 use crate::AppState;
 use crate::config::config::{RouteRule, SessionRefreshPolicy};
-use crate::revoke::load::revoke_token_after;
+use crate::revoke::load::{revoke_token_after, rotated_key, unpack_rotation};
 use crate::token::auth::generate_random_string;
 use crate::token::security::{TokenData, ValidSession, issue_session_token, now_secs};
 use actix_web::cookie::{Cookie, SameSite};
@@ -172,21 +172,28 @@ pub async fn refresh_session(
     let lifetime = data.config.token_expiry_seconds.max(0) as u64;
     let now = now_secs();
 
+    // This token came from a renewal and is being used: the browser has
+    // it, so the token it replaced has no reason to stay valid until the
+    // end of its grace period.
+    if let Some(previous) = &session.data.previous_token_id {
+        retire_predecessor(previous, &policy, lifetime, now, &data.revoked_tokens).await;
+    }
+
     match decide(&policy, session, lifetime, now) {
         RenewalDecision::Keep => {
-            // debug!(
-            //     "session of {}: no renewal ({})",
-            //     session.username,
-            //     if policy.enabled() {
-            //         format!(
-            //             "token issued {}s ago, renewal after {}s",
-            //             now.saturating_sub(effective_issued_at(session, lifetime)),
-            //             policy.interval_secs
-            //         )
-            //     } else {
-            //         "session_refresh_interval_secs is 0 for this route".to_string()
-            //     }
-            // );
+            debug!(
+                "session of {}: no renewal ({})",
+                session.username,
+                if policy.enabled() {
+                    format!(
+                        "token issued {}s ago, renewal after {}s",
+                        now.saturating_sub(effective_issued_at(session, lifetime)),
+                        policy.interval_secs
+                    )
+                } else {
+                    "session_refresh_interval_secs is 0 for this route".to_string()
+                }
+            );
             return SessionRefresh::Keep;
         }
         RenewalDecision::TooOld => {
@@ -200,10 +207,10 @@ pub async fn refresh_session(
     }
 
     if !token_came_from_cookie(req) {
-        // debug!(
-        //     "session of {}: due for renewal but sent as a Bearer token, which cannot receive a cookie",
-        //     session.username
-        // );
+        debug!(
+            "session of {}: due for renewal but sent as a Bearer token, which cannot receive a cookie",
+            session.username
+        );
         return SessionRefresh::Keep;
     }
 
@@ -223,6 +230,10 @@ pub async fn refresh_session(
         index_user: session.data.index_user,
         issued_at: now,
         session_started_at: started_at,
+        // An id that cannot be carried is simply left out: the old token
+        // then keeps its full grace period, and the session still works.
+        previous_token_id: crate::token::security::is_token_id(&session.token_id)
+            .then(|| session.token_id.clone()),
     };
 
     let token = match issue_session_token(&session.username, expires_at, &new_id, &token_data) {
@@ -241,7 +252,12 @@ pub async fn refresh_session(
         expires_at.saturating_sub(now),
     );
 
-    let refuse_from = now.saturating_add(policy.grace_secs);
+    // Never push a refusal later than one already recorded — for
+    // instance by an earlier renewal whose successor has been used.
+    let refuse_from = match data.revoked_tokens.get(&rotated_key(&session.token_id)) {
+        Some(value) => unpack_rotation(*value).0.min(now.saturating_add(policy.grace_secs)),
+        None => now.saturating_add(policy.grace_secs),
+    };
     if let Err(e) = revoke_token_after(
         &session.token_id,
         refuse_from,
@@ -268,6 +284,74 @@ pub async fn refresh_session(
     );
 
     SessionRefresh::Renewed(cookie)
+}
+
+/// Seconds a replaced token still gets once its successor has been used:
+/// requests already on their way with the old cookie are not refused
+/// halfway through a page load.
+pub const IN_FLIGHT_SECS: u64 = 2;
+
+/// When a replaced token must stop being accepted, given that its
+/// successor has just been used. `None` if it is already refused by then
+/// (nothing to write).
+pub fn predecessor_deadline(
+    existing: Option<u64>,
+    policy: &SessionRefreshPolicy,
+    lifetime: u64,
+    now: u64,
+) -> Option<(u64, u64)> {
+    let refuse_from = now.saturating_add(policy.grace_secs.min(IN_FLIGHT_SECS));
+    let (current_refusal, purge_at) = match existing {
+        Some(value) => unpack_rotation(value),
+        // Renewed on another instance whose revocation has not reached
+        // this one yet: bound it by the longest a token can live.
+        None => (u64::MAX, now.saturating_add(lifetime)),
+    };
+    if current_refusal <= refuse_from {
+        return None;
+    }
+    Some((refuse_from, purge_at.max(refuse_from)))
+}
+
+/// Ends the predecessor of a session being logged out, at once: after a
+/// logout there is no in-flight request worth protecting.
+pub async fn retire_predecessor_now(
+    previous: &str,
+    lifetime: u64,
+    revoked: &crate::revoke::db::RevokedTokenMap,
+) {
+    let no_margin = SessionRefreshPolicy {
+        interval_secs: 0,
+        grace_secs: 0,
+        max_lifetime_secs: 0,
+    };
+    retire_predecessor(previous, &no_margin, lifetime, now_secs(), revoked).await;
+}
+
+/// Brings the refusal of a replaced token forward to now (plus
+/// [`IN_FLIGHT_SECS`], or less with a shorter grace period). Written
+/// once: later requests find the entry already due and do nothing. Goes
+/// through the revocation store, so every instance sharing Redis applies
+/// it.
+async fn retire_predecessor(
+    previous: &str,
+    policy: &SessionRefreshPolicy,
+    lifetime: u64,
+    now: u64,
+    revoked: &crate::revoke::db::RevokedTokenMap,
+) {
+    let existing = revoked.get(&rotated_key(previous)).map(|v| *v);
+    let Some((refuse_from, purge_at)) = predecessor_deadline(existing, policy, lifetime, now) else {
+        return;
+    };
+    if let Err(e) = revoke_token_after(previous, refuse_from, purge_at, revoked).await {
+        warn!("could not retire the token replaced by a renewal: {e}");
+    } else {
+        debug!("token replaced by a renewal retired: its successor is in use");
+    }
+    // The shared renewal stays in `recent_renewals`: a request still in
+    // flight with the old token gets the same successor, instead of
+    // triggering a second renewal.
 }
 
 fn remember(
