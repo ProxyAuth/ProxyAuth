@@ -120,6 +120,7 @@ vhosts:
                 issued_at: now,
                 session_started_at: now,
                 previous_token_id: None,
+                ..TokenData::default()
             },
         )
         .unwrap();
@@ -248,6 +249,7 @@ vhosts:
                 issued_at: now,
                 session_started_at: now - 60,
                 previous_token_id: Some(prev.to_string()),
+                ..TokenData::default()
             },
         )
         .unwrap();

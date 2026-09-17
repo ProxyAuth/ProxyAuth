@@ -4,6 +4,7 @@ mod build_info;
 mod crypto;
 mod csrf;
 mod security;
+mod refresh_token;
 mod session_refresh;
 
 /// Initialises the process-wide token vault for this test binary.

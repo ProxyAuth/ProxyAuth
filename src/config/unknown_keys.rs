@@ -224,6 +224,11 @@ pub fn suggest(key: &str, known: &BTreeSet<String>) -> Option<String> {
 /// (`refresh`, `renew`) are not the ones spelling distance favours.
 fn intent_hint(key: &str) -> Option<&'static str> {
     let has = |w: &str| key.contains(w);
+    // `refresh_token…` names the API refresh token, unless the key is
+    // clearly about the cookie session (`session`, `interval`).
+    if has("refresh") && has("token") && !has("session") && !has("interval") && !has("grace") {
+        return Some("refresh_token_expiry_seconds");
+    }
     if (has("refresh") || has("renew") || has("rotat") || has("sliding"))
         && !has("blocklist")
         && !has("protect")

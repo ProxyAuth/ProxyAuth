@@ -57,12 +57,11 @@ mod tests {
     #[test]
     fn misnamed_renewal_settings_point_to_the_real_one() {
         for key in [
-            "refresh_token",
-            "token_refresh",
             "session_refresh",
             "session_refresh_interval",
             "refresh_interval",
             "renew_session_after",
+            "session_token_refresh",
         ] {
             let json = with(serde_json::json!({ key: 900 }));
             let found = check_app_config(&json, &app_config(&json));
@@ -93,12 +92,26 @@ mod tests {
     }
 
     #[test]
+    fn misnamed_refresh_token_settings_point_to_the_real_one() {
+        for key in ["refresh_token", "token_refresh", "refresh_token_ttl", "refresh_token_expiry"] {
+            let json = with(serde_json::json!({ key: 86400 }));
+            let found = check_app_config(&json, &app_config(&json));
+            assert_eq!(found.len(), 1, "{key}");
+            assert_eq!(
+                found[0].suggestion.as_deref(),
+                Some("refresh_token_expiry_seconds"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn the_message_says_what_happens() {
         let json = with(serde_json::json!({ "refresh_token": 900 }));
         let found = check_app_config(&json, &app_config(&json));
         assert_eq!(
             found[0].to_string(),
-            "config.json: unknown key `refresh_token` is ignored — did you mean `session_refresh_interval_secs`?"
+            "config.json: unknown key `refresh_token` is ignored — did you mean `refresh_token_expiry_seconds`?"
         );
     }
 

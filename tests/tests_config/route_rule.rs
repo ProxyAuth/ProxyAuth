@@ -18,6 +18,7 @@ mod tests {
             session_refresh_interval_secs: None,
             session_refresh_grace_secs: None,
             session_max_lifetime_secs: None,
+            refresh_token_expiry_seconds: None,
             logout_redirect_url: None,
             login_via_otp: None,
             page_change_password: None,

@@ -234,6 +234,7 @@ pub async fn refresh_session(
         // then keeps its full grace period, and the session still works.
         previous_token_id: crate::token::security::is_token_id(&session.token_id)
             .then(|| session.token_id.clone()),
+        ..TokenData::default()
     };
 
     let token = match issue_session_token(&session.username, expires_at, &new_id, &token_data) {

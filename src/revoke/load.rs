@@ -45,7 +45,89 @@ pub fn logout_record_until(token_expires_at: u64, now: u64) -> u64 {
 /// Whether `token_id` names a regular token rather than one of the
 /// store's internal keys.
 pub fn is_plain_token_id(token_id: &str) -> bool {
-    !token_id.trim().is_empty() && !token_id.starts_with(ROTATED_PREFIX)
+    !token_id.trim().is_empty()
+        && !token_id.starts_with(ROTATED_PREFIX)
+        && !token_id.starts_with(REFRESH_PREFIX)
+}
+
+// ───────────────────────── refresh generations ─────────────────────────
+//
+// An API session keeps one token id for its whole life: the access token
+// and the refresh token issued at login share it, and so does every pair
+// a refresh issues. Revoking that id therefore ends the session at once.
+//
+// What changes on each refresh is the *generation*. It is recorded under
+// `refresh:<token id>`, packed like a rotation — generation in the high
+// 32 bits, purge date in the low 32 — so it travels through memory, LMDB
+// and Redis exactly like any other entry. Tokens carrying an older
+// generation are refused.
+
+/// Key holding the current generation of an API session.
+pub fn refresh_key(token_id: &str) -> String {
+    format!("{REFRESH_PREFIX}{token_id}")
+}
+
+/// Current generation of the session `token_id` (0 before any refresh).
+pub fn current_generation(token_id: &str, revoked_tokens: &RevokedTokenMap) -> u32 {
+    revoked_tokens
+        .get(&refresh_key(token_id))
+        .map(|v| unpack_rotation(*v).0 as u32)
+        .unwrap_or(0)
+}
+
+/// Outcome of [`advance_generation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationStep {
+    /// The presented generation was current; the session is now at this
+    /// generation, and this is the value to persist.
+    Advanced { generation: u32, value: u64 },
+    /// The presented generation is not the current one: the refresh
+    /// token was already used.
+    Stale { current: u32 },
+}
+
+/// Checks that `presented` is the session's current generation and moves
+/// it forward, in one step under the map's shard lock — two concurrent
+/// refreshes with the same token cannot both succeed on one instance.
+/// `purge_at` is when the record may be forgotten: the end of the
+/// session's last refresh token.
+pub fn advance_generation(
+    token_id: &str,
+    presented: u32,
+    purge_at: u64,
+    revoked_tokens: &RevokedTokenMap,
+) -> GenerationStep {
+    use dashmap::mapref::entry::Entry;
+    match revoked_tokens.entry(refresh_key(token_id)) {
+        Entry::Occupied(mut entry) => {
+            let current = unpack_rotation(*entry.get()).0 as u32;
+            if current != presented {
+                return GenerationStep::Stale { current };
+            }
+            let generation = current.saturating_add(1);
+            let value = pack_rotation(generation as u64, purge_at.max(1));
+            entry.insert(value);
+            GenerationStep::Advanced { generation, value }
+        }
+        Entry::Vacant(entry) => {
+            if presented != 0 {
+                return GenerationStep::Stale { current: 0 };
+            }
+            let value = pack_rotation(1, purge_at.max(1));
+            entry.insert(value);
+            GenerationStep::Advanced { generation: 1, value }
+        }
+    }
+}
+
+/// Persists a generation written by [`advance_generation`] to LMDB and
+/// Redis.
+pub async fn publish_generation(
+    token_id: &str,
+    value: u64,
+    revoked_tokens: &RevokedTokenMap,
+) -> Result<()> {
+    revoke_token(&refresh_key(token_id), Some(value), revoked_tokens).await
 }
 
 // ───────────────────────── delayed revocation ─────────────────────────
@@ -63,6 +145,7 @@ pub fn is_plain_token_id(token_id: &str) -> bool {
 // sync loop, LMDB and Redis carry these entries without any change.
 
 const ROTATED_PREFIX: &str = "rotated:";
+const REFRESH_PREFIX: &str = "refresh:";
 
 /// Key under which a renewed token's delayed revocation is stored.
 pub fn rotated_key(token_id: &str) -> String {
@@ -91,7 +174,7 @@ fn is_rotated_out(token_id: &str, revoked_tokens: &RevokedTokenMap, now: u64) ->
 /// as the sync loop reads it. Used by the purge in the sync loop, which would otherwise read
 /// a packed rotation value as a date centuries away.
 pub fn revocation_purge_at(key: &str, value: u64) -> u64 {
-    if key.starts_with(ROTATED_PREFIX) {
+    if key.starts_with(ROTATED_PREFIX) || key.starts_with(REFRESH_PREFIX) {
         unpack_rotation(value).1
     } else {
         value

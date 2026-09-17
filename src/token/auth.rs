@@ -404,7 +404,7 @@ pub fn generate_random_string(len: usize) -> String {
 // clean 500 every time, forever, until the config is fixed. Falling back to
 // UTC (and logging loudly) keeps the service usable and makes the
 // misconfiguration visible in logs instead of as a silent total outage.
-fn resolve_timezone(config: &AppConfig) -> Tz {
+pub(crate) fn resolve_timezone(config: &AppConfig) -> Tz {
     config.timezone.parse().unwrap_or_else(|_| {
         error!(
             "Invalid timezone {:?} in config.json -- falling back to UTC. Fix the `timezone` field to a valid IANA name (e.g. Europe/Paris, UTC).",
@@ -989,6 +989,43 @@ pub async fn auth(
             }
         }
 
+        // API session: a refresh token next to the access token, when the
+        // vhost enables them. Same token id — revoking it ends both.
+        let refresh_lifetime = vhost_route
+            .map(|r| r.resolved_refresh_token_expiry(&data.config))
+            .unwrap_or(data.config.refresh_token_expiry_seconds);
+        if !session_cookie_enabled && refresh_lifetime > 0 {
+            let max_lifetime = vhost_route
+                .map(|r| r.resolved_session_refresh(&data.config).max_lifetime_secs)
+                .unwrap_or(data.config.session_max_lifetime_secs);
+            match crate::token::refresh_token::issue_login_refresh_token(
+                &auth.username,
+                index_user,
+                &id_token,
+                refresh_lifetime,
+                max_lifetime,
+            ) {
+                Ok((refresh_token, refresh_expires_at)) => {
+                    return resp
+                        .insert_header((header::CACHE_CONTROL, "no-store"))
+                        .json(serde_json::json!({
+                            "token": token_encrypt,
+                            "expires_at": expires_at_str,
+                            "refresh_token": refresh_token,
+                            "refresh_token_expires_at": crate::token::refresh_token::format_expiry(
+                                &data.config,
+                                refresh_expires_at,
+                            ),
+                        }));
+                }
+                Err(e) => {
+                    error!("[{}] failed to issue refresh token for {}: {}", ip, auth.username, e);
+                    return HttpResponse::InternalServerError().finish();
+                }
+            }
+        }
+
+        resp.insert_header((header::CACHE_CONTROL, "no-store"));
         resp.json(serde_json::json!({
             "token": token_encrypt,
             "expires_at": expires_at_str,

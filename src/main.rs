@@ -62,6 +62,7 @@ use std::net::TcpListener;
 use std::{fs, process, sync::Arc, time::Duration};
 use tls::bind_server;
 use token::auth::{auth_dispatch, auth_options};
+use token::refresh_token::refresh_token_dispatch;
 use token::logout::{logout_dispatch, logout_options};
 use token::reset_password::reset_password_route;
 use token::vault as token_vault;
@@ -338,6 +339,7 @@ macro_rules! auth_routes {
                 .route(web::post().to(auth_dispatch))
                 .route(web::method(Method::OPTIONS).to(auth_options)),
         )
+        .service(web::resource("/refresh_token").route(web::post().to(refresh_token_dispatch)))
         .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
         .service(
             web::resource("/adm/auth/totp/get")
@@ -616,7 +618,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    crate::revoke::db::set_token_lifetime(config.token_expiry_seconds);
+    crate::revoke::db::set_token_lifetime(
+        crate::config::config::max_token_lifetime(&config, &routes.routes) as i64,
+    );
     start_revoked_token_ttl(
         revoked_tokens.clone(),
         std::time::Duration::from_secs(15),
@@ -1072,6 +1076,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .route(web::method(Method::OPTIONS).to(auth_options)),
                             )
                             .service(
+                                web::resource("/refresh_token").route(
+                                    web::post()
+                                        .to(refresh_token_dispatch)
+                                        .wrap(Governor::new(&governor_auth_conf)),
+                                ),
+                            )
+                            .service(
                                 web::resource("/reset-password").route(
                                     web::post()
                                         .to(reset_password_route)
@@ -1121,6 +1132,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             .wrap(Governor::new(&governor_auth_conf)),
                                     )
                                     .route(web::method(Method::OPTIONS).to(auth_options)),
+                            )
+                            .service(
+                                web::resource("/refresh_token").route(
+                                    web::post()
+                                        .to(refresh_token_dispatch)
+                                        .wrap(Governor::new(&governor_auth_conf)),
+                                ),
                             )
                             .service(
                                 web::resource("/reset-password").route(

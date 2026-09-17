@@ -602,6 +602,10 @@ pub struct RouteRule {
     #[serde(default)]
     pub session_max_lifetime_secs: Option<u64>,
 
+    /// Per-vhost override of `AppConfig.refresh_token_expiry_seconds`.
+    #[serde(default)]
+    pub refresh_token_expiry_seconds: Option<u64>,
+
     /// Per-vhost override of `AppConfig.login_redirect_url` — where an
     /// already-authenticated visitor (a still-valid `session_token`
     /// cookie) gets sent instead of the login form, and where a fresh
@@ -987,6 +991,14 @@ impl RouteRule {
         }
     }
 
+    /// Lifetime of the refresh token `/auth` issues on this vhost in JSON
+    /// mode; `0` means no refresh token. See
+    /// `AppConfig::refresh_token_expiry_seconds`.
+    pub fn resolved_refresh_token_expiry(&self, global: &AppConfig) -> u64 {
+        self.refresh_token_expiry_seconds
+            .unwrap_or(global.refresh_token_expiry_seconds)
+    }
+
     pub fn resolved_max_age_session_cookie(&self, global: &AppConfig) -> i64 {
         self.max_age_session_cookie
             .unwrap_or(global.max_age_session_cookie)
@@ -1333,6 +1345,10 @@ pub struct VhostGroup {
     #[serde(default)]
     pub session_max_lifetime_secs: Option<u64>,
 
+    /// Per-vhost override of `AppConfig.refresh_token_expiry_seconds`.
+    #[serde(default)]
+    pub refresh_token_expiry_seconds: Option<u64>,
+
     /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::login_redirect_url`.
     #[serde(default)]
@@ -1560,6 +1576,9 @@ impl RouteConfig {
                 }
                 if route.session_max_lifetime_secs.is_none() {
                     route.session_max_lifetime_secs = group.session_max_lifetime_secs;
+                }
+                if route.refresh_token_expiry_seconds.is_none() {
+                    route.refresh_token_expiry_seconds = group.refresh_token_expiry_seconds;
                 }
                 if route.logout_redirect_url.is_none() {
                     route.logout_redirect_url = group.logout_redirect_url.clone();
@@ -2051,6 +2070,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub session_max_lifetime_secs: u64,
 
+    /// Lifetime of the refresh token returned by `/auth` in JSON mode
+    /// (`session_cookie: false`), in seconds. The refresh token shares
+    /// the access token's id — revoking that id ends both — and is
+    /// exchanged for a new pair at `POST /refresh_token`.
+    ///
+    /// `0` (the default) disables the feature: `/auth` returns no
+    /// `refresh_token`, and `/refresh_token` answers `400`.
+    #[serde(default)]
+    pub refresh_token_expiry_seconds: u64,
+
     #[serde(default)]
     pub login_redirect_url: Option<String>,
 
@@ -2259,6 +2288,10 @@ impl Serialize for AppConfig {
         )?;
         state.serialize_field("session_refresh_grace_secs", &self.session_refresh_grace_secs)?;
         state.serialize_field("session_max_lifetime_secs", &self.session_max_lifetime_secs)?;
+        state.serialize_field(
+            "refresh_token_expiry_seconds",
+            &self.refresh_token_expiry_seconds,
+        )?;
         state.end()
     }
 }
@@ -2275,6 +2308,18 @@ pub struct SessionRefreshPolicy {
     /// Longest a session may last from the original login, renewals
     /// included.
     pub max_lifetime_secs: u64,
+}
+
+/// The longest any token issued by this instance can live: access
+/// tokens, and refresh tokens wherever they are enabled. A revocation
+/// kept this long outlives every token it could refer to.
+pub fn max_token_lifetime(config: &AppConfig, routes: &[RouteRule]) -> u64 {
+    let access = config.token_expiry_seconds.max(0) as u64;
+    routes
+        .iter()
+        .map(|r| r.resolved_refresh_token_expiry(config))
+        .chain(std::iter::once(config.refresh_token_expiry_seconds))
+        .fold(access, u64::max)
 }
 
 impl SessionRefreshPolicy {

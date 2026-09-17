@@ -144,7 +144,7 @@ pub fn issue_token(
             index_user,
             issued_at: now,
             session_started_at: now,
-            previous_token_id: None,
+            ..TokenData::default()
         },
     )
 }
@@ -175,30 +175,51 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Which job a token does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenKind {
+    /// Presented on requests: cookie or `Authorization: Bearer`.
+    #[default]
+    Access,
+    /// Only accepted by `POST /refresh_token`, to obtain a new pair.
+    Refresh,
+}
+
 /// What ProxyAuth stores in a token's data field.
 ///
-/// Encoded as `index:issued_at:session_started_at[:previous_token_id]`.
-/// Tokens issued before session renewal existed hold only `index`; they
-/// still validate, and their two dates are unknown (`0`) until they are
-/// renewed. A token issued by a renewal names the token it replaces, so
-/// that one can be retired as soon as the new token is used.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// ```text
+/// index:issued_at:session_started_at[:previous_token_id][;r][;g=N]
+/// ```
+///
+/// - Tokens issued before session renewal existed hold only `index`;
+///   they still validate, their two dates unknown (`0`).
+/// - `previous_token_id` names the token a cookie renewal replaced.
+/// - `;r` marks a refresh token. Earlier versions cannot parse it, so they
+///   never accept one as an access token.
+/// - `;g=N` is the generation of a refreshed API session (absent = 0).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TokenData {
     /// Position of the account in `AppConfig::combined_users()`.
     pub index_user: usize,
     /// When this token was issued (Unix seconds).
     pub issued_at: u64,
     /// When the session began — the original login, kept across
-    /// renewals (Unix seconds).
+    /// renewals and refreshes (Unix seconds).
     pub session_started_at: u64,
     /// The id of the token this one replaced, for a token issued by a
-    /// session renewal.
+    /// cookie session renewal.
     pub previous_token_id: Option<String>,
+    /// Access or refresh token.
+    pub kind: TokenKind,
+    /// How many times the API session this token belongs to has been
+    /// refreshed when it was issued. Tokens of an older generation are
+    /// refused.
+    pub generation: u32,
 }
 
 /// Whether `value` can be carried as a token id in the data field.
 /// Token ids are hex digests; letters, digits, `-`, `_` and `.` are
-/// accepted, and nothing that could break the `:`-separated layout.
+/// accepted, and nothing that could break the layout.
 pub fn is_token_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -209,20 +230,28 @@ pub fn is_token_id(value: &str) -> bool {
 
 impl TokenData {
     pub fn encode(&self) -> String {
-        match &self.previous_token_id {
-            Some(prev) => format!(
-                "{}:{}:{}:{}",
-                self.index_user, self.issued_at, self.session_started_at, prev
-            ),
-            None => format!(
-                "{}:{}:{}",
-                self.index_user, self.issued_at, self.session_started_at
-            ),
+        let mut out = format!(
+            "{}:{}:{}",
+            self.index_user, self.issued_at, self.session_started_at
+        );
+        if let Some(prev) = &self.previous_token_id {
+            out.push(':');
+            out.push_str(prev);
         }
+        if self.kind == TokenKind::Refresh {
+            out.push_str(";r");
+        }
+        if self.generation > 0 {
+            out.push_str(&format!(";g={}", self.generation));
+        }
+        out
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        let mut parts = raw.split(':');
+        let mut sections = raw.split(';');
+        let base = sections.next()?;
+
+        let mut parts = base.split(':');
         let index_user = parts.next()?.parse().ok()?;
         let issued_at = match parts.next() {
             Some(v) => v.parse().ok()?,
@@ -240,11 +269,32 @@ impl TokenData {
         if parts.next().is_some() {
             return None;
         }
+
+        let mut kind = TokenKind::Access;
+        let mut generation = 0u32;
+        let mut seen_kind = false;
+        let mut seen_generation = false;
+        for extension in sections {
+            match extension {
+                "r" if !seen_kind => {
+                    kind = TokenKind::Refresh;
+                    seen_kind = true;
+                }
+                g if g.starts_with("g=") && !seen_generation => {
+                    generation = g[2..].parse().ok()?;
+                    seen_generation = true;
+                }
+                _ => return None,
+            }
+        }
+
         Some(Self {
             index_user,
             issued_at,
             session_started_at,
             previous_token_id,
+            kind,
+            generation,
         })
     }
 }
@@ -298,16 +348,58 @@ pub async fn validate_token(
 
 /// Same checks as [`validate_token`], returning the whole session —
 /// including its issue and login dates, which session renewal needs.
+/// A refresh token is refused here, and so is a token superseded by a
+/// refresh of its session.
 pub async fn validate_session(
     token: &str,
     data_app: &web::Data<AppState>,
     config: &AppConfig,
     ip: &str,
 ) -> Result<ValidSession, String> {
-    // One call covers what used to be decrypt + split + digest recompute
-    // + constant-time compare. `Expired` is separated from `Invalid`
-    // because the two deserve different log lines: one is routine, the
-    // other is worth noticing.
+    let session = verify_token(
+        token,
+        data_app,
+        config,
+        ip,
+        TokenKind::Access,
+        config.token_expiry_seconds.max(0) as u64,
+    )
+    .await?;
+
+    let current = crate::revoke::load::current_generation(&session.token_id, &data_app.revoked_tokens);
+    if session.data.generation < current {
+        warn!(
+            "[{}] token_id {} of user {} was superseded by a refresh (generation {} < {})",
+            ip, session.token_id, session.username, session.data.generation, current
+        );
+        return Err("superseded token".to_string());
+    }
+
+    Ok(session)
+}
+
+/// A refresh token, checked the same way as an access token except for
+/// its kind and its lifetime (`max_lifetime`, the refresh lifetime in
+/// force). The generation is left to the caller, which has to compare
+/// and advance it atomically.
+pub async fn validate_refresh_token(
+    token: &str,
+    data_app: &web::Data<AppState>,
+    config: &AppConfig,
+    ip: &str,
+    max_lifetime: u64,
+) -> Result<ValidSession, String> {
+    verify_token(token, data_app, config, ip, TokenKind::Refresh, max_lifetime).await
+}
+
+async fn verify_token(
+    token: &str,
+    data_app: &web::Data<AppState>,
+    config: &AppConfig,
+    ip: &str,
+    expected: TokenKind,
+    max_lifetime: u64,
+) -> Result<ValidSession, String> {
     let session = match vault().verify(token) {
         Ok(session) => session,
         Err(zerocrypt::Error::Expired) => {
@@ -322,6 +414,13 @@ pub async fn validate_session(
     // ── everything from here down reads live state, every request ──
     // Nothing below this line is cached. See the note on this function.
     let token_data = TokenData::parse(session.data()).ok_or("Index invalide")?;
+    if token_data.kind != expected {
+        warn!(
+            "[{}] {:?} token presented where a {:?} token is expected",
+            ip, token_data.kind, expected
+        );
+        return Err("no valid token".to_string());
+    }
     let index_user = token_data.index_user;
     let user = config.user_by_index(index_user).ok_or("User not found")?;
 
@@ -348,10 +447,10 @@ pub async fn validate_session(
     )
     .map_err(|_| "Your token is expired")?;
 
-    if time_expire > config.token_expiry_seconds.max(0) as u64 {
+    if time_expire > max_lifetime {
         error!(
             "[{}] username {} try to access token limit config {} value request {}",
-            ip, user.username, config.token_expiry_seconds, time_expire
+            ip, user.username, max_lifetime, time_expire
         );
         return Err("Bad time token".to_string());
     }
@@ -382,7 +481,6 @@ pub async fn validate_session(
             ip, user.username, time_expire
         );
     }
-
     Ok(ValidSession {
         username: user.username.to_string(),
         token_id: session.id().to_string(),

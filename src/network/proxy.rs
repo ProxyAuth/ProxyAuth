@@ -2047,26 +2047,73 @@ pub async fn global_proxy(
                     Err(e) => warn!("renewed session cookie could not be attached: {e}"),
                 }
             } else if crate::token::refresh::is_signed_in(&req) {
-                // A signed-in visitor's page: never in a shared cache, and
-                // revalidated by the browser, so the next visit reaches
-                // ProxyAuth and the session can be renewed on time. A
-                // stricter policy already set (`no-store`) is kept.
-                let headers = resp.headers_mut();
-                let already_strict = headers
-                    .get(header::CACHE_CONTROL)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| v.contains("no-store"));
-                if !already_strict {
-                    headers.insert(
-                        header::CACHE_CONTROL,
-                        header::HeaderValue::from_static("private, no-cache"),
-                    );
-                    headers.remove(header::EXPIRES);
-                }
+                signed_in_cache_policy(&mut resp);
             }
             Ok(resp)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// How a signed-in visitor's response may be cached.
+///
+/// A page has to be revalidated: served from the browser's cache it
+/// never reaches ProxyAuth, so the session could not be renewed on it —
+/// and a shared cache must not keep it at all. Everything else (scripts,
+/// stylesheets, images, fonts, API answers) keeps the route's own
+/// caching, downgraded from `public` to `private` so a CDN or a company
+/// proxy does not serve one signed-in visitor's file to the next.
+/// Applying `no-cache` to every asset, as this used to, emptied the
+/// browser cache of anyone signed in.
+fn signed_in_cache_policy(resp: &mut HttpResponse) {
+    let is_page = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let v = v.to_ascii_lowercase();
+            v.starts_with("text/html") || v.starts_with("application/xhtml+xml")
+        });
+
+    let current = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // A stricter policy already set by the route (`cache: false`) stands.
+    if current
+        .as_deref()
+        .is_some_and(|v| v.contains("no-store"))
+    {
+        return;
+    }
+
+    let headers = resp.headers_mut();
+
+    if is_page {
+        headers.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("private, no-cache"),
+        );
+        headers.remove(header::EXPIRES);
+        return;
+    }
+
+    let Some(current) = current else {
+        return;
+    };
+    if !current.contains("public") {
+        return;
+    }
+
+    let private = current.replacen("public", "private", 1);
+    match header::HeaderValue::from_str(&private) {
+        Ok(value) => {
+            headers.insert(header::CACHE_CONTROL, value);
+            headers.remove(header::EXPIRES);
+        }
+        Err(e) => warn!("could not mark a signed-in response private: {e}"),
     }
 }
 

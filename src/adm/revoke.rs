@@ -43,7 +43,9 @@ pub async fn revoke_route(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let lifetime = data.config.token_expiry_seconds.max(0) as u64;
+    // Refresh tokens can outlive access tokens: keep the record for the
+    // longest either can live.
+    let lifetime = crate::config::config::max_token_lifetime(&data.config, &data.routes.routes);
     let keep_until = revocation_record_until(now, lifetime);
 
     match revoke_token(token_id, Some(keep_until), &data.revoked_tokens).await {

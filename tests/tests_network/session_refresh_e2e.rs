@@ -190,6 +190,7 @@ vhosts:
                 issued_at,
                 session_started_at: now - session_age,
                 previous_token_id: None,
+                ..TokenData::default()
             },
         )
         .expect("issue token")
@@ -646,6 +647,7 @@ vhosts:
                 issued_at: now,
                 session_started_at: now - 100,
                 previous_token_id: Some(prev.to_string()),
+                ..TokenData::default()
             },
         )
         .unwrap();

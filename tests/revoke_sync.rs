@@ -302,3 +302,28 @@ async fn a_revocation_survives_every_tick_until_its_date() {
     assert!(is_token_revoked("r-keep", &m));
     assert!(lmdb_get("r-keep").is_some());
 }
+
+#[actix_web::test]
+#[serial]
+async fn refresh_generations_travel_between_instances() {
+    setup().await;
+    let _con = require_redis!();
+    use proxyauth::revoke::load::{
+        GenerationStep, advance_generation, current_generation, publish_generation,
+    };
+    let node_a = map();
+    let GenerationStep::Advanced { value, .. } =
+        advance_generation("api-session", 0, now() + 600, &node_a)
+    else {
+        panic!("first refresh must advance");
+    };
+    publish_generation("api-session", value, &node_a).await.unwrap();
+
+    // Another instance, starting from nothing, learns the generation
+    // on its next tick.
+    let node_b = map();
+    sync_tick(&node_b);
+    assert_eq!(current_generation("api-session", &node_b), 1);
+    assert!(lmdb_get("refresh:api-session").is_some());
+}
+

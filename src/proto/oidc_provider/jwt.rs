@@ -21,13 +21,13 @@
 //! [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071)
 //! (the "Marvin Attack" — an RSA timing side-channel), with no fixed
 //! version available. The practical exposure was already narrow —
-//! `jsonwebtoken`'s own actual *signing* operation goes through
-//! `ring`, not the `rsa` crate at all; `rsa` was only ever used here
-//! for one-time key generation and pulling the public modulus/exponent
-//! out for JWKS, never in a per-request, attacker-observable path —
-//! but "narrow exposure" isn't the same as "no dependency," and a
-//! `cargo audit` finding with no available fix is worth actually
-//! removing rather than only explaining away.
+//! `jsonwebtoken`'s signing operation uses its configured crypto
+//! provider; `rsa` was only ever used here for one-time key generation
+//! and pulling the public modulus/exponent out for JWKS, never in a
+//! per-request, attacker-observable path — but "narrow exposure" isn't
+//! the same as "no dependency," and a `cargo audit` finding with no
+//! available fix is worth actually removing rather than only explaining
+//! away.
 //!
 //! Key generation has moved **out of this binary entirely**. An
 //! operator generates the key once, externally, with a standard tool:
@@ -38,22 +38,25 @@
 //! chown <run_user> /etc/proxyauth/oidc/signing_key.pem
 //! ```
 //!
-//! This module only ever *reads* that file. Signing itself still goes
-//! through `jsonwebtoken::EncodingKey::from_rsa_pem` (→ `ring`,
-//! unaffected by the advisory). The one thing that genuinely needed
-//! `rsa` before — pulling the modulus/exponent out for JWKS — is now
-//! done by [`der`], a small, deliberately narrow DER reader that only
-//! knows how to walk a PKCS#1 `RSAPrivateKey` `SEQUENCE` far enough to
-//! read those two `INTEGER` fields, verified against real
-//! openssl-generated keys (2048-bit and 4096-bit) cross-checked
-//! byte-for-byte against `openssl rsa -noout -modulus`'s own report,
-//! plus a set of malformed/truncated inputs confirmed to fail cleanly
-//! rather than panic.
+//! This module only ever *reads* that file. The PEM is decoded locally
+//! and the resulting DER bytes are passed to
+//! `jsonwebtoken::EncodingKey::from_rsa_der`. With `jsonwebtoken 11`
+//! built using the `aws_lc_rs` feature, the actual signing operation is
+//! handled by the configured AWS-LC-RS crypto provider.
+//!
+//! The one thing that genuinely needed `rsa` before — pulling the
+//! modulus/exponent out for JWKS — is now done by [`der`], a small,
+//! deliberately narrow DER reader that only knows how to walk a PKCS#1
+//! `RSAPrivateKey` `SEQUENCE` far enough to read those two `INTEGER`
+//! fields, verified against real openssl-generated keys (2048-bit and
+//! 4096-bit) cross-checked byte-for-byte against `openssl rsa
+//! -noout -modulus`'s own report, plus a set of malformed/truncated
+//! inputs confirmed to fail cleanly rather than panic.
 //!
 //! # Key handling
 //!
-//! Loaded once at startup and cached — **never** regenerated or
-//! rewritten by ProxyAuth itself. Every previously-issued `id_token`
+//! Loaded once at startup and cached — **never regenerated or
+//! rewritten by ProxyAuth itself**. Every previously-issued `id_token`
 //! (and every relying party's cached copy of the old JWKS document)
 //! would stop validating the moment the key changed; rotation is a
 //! deliberate, external, explicit operation now, same as it always
@@ -61,7 +64,7 @@
 //!
 //! SECURITY: this key signs every `id_token` this instance issues —
 //! anyone who obtains it can forge a token asserting to be *any* user,
-//! for *any* relying party that trusts this provider. This is at
+//! *for any* relying party that trusts this provider. This is at
 //! least as sensitive as the TLS private key at
 //! `/etc/proxyauth/certs/key.pem`; ProxyAuth checks it's `0600` at
 //! load time and refuses to start with this feature enabled if it
@@ -130,10 +133,10 @@ impl OidcSigningKey {
     /// since it's only ever verified by ProxyAuth's own `/oidc/userinfo`
     /// endpoint, never an external relying party that would need to
     /// confirm it was the intended audience the way an `id_token`'s
-    /// recipient does. `validate_aud` set explicitly to `false` rather
-    /// than relying on whatever the library defaults to — verified
-    /// directly (not assumed) that a token genuinely carrying no `aud`
-    /// claim decodes cleanly with this configuration.
+    /// recipient does. `validate_aud` set explicitly to `false`
+    /// rather than relying on whatever the library defaults to —
+    /// verified directly (not assumed) that a token genuinely
+    /// carrying no `aud` claim decodes cleanly with this configuration.
     pub fn validation_no_audience(&self) -> Validation {
         let mut v = Validation::new(Algorithm::RS256);
         v.validate_exp = true;
@@ -158,16 +161,18 @@ pub fn init_signing_key() -> Result<(), String> {
         return Err(format!(
             "OIDC is enabled for at least one vhost, but no signing key was found at \
 {SIGNING_KEY_PATH}. Generate one once, externally, before starting ProxyAuth:\n\n\
-    openssl genrsa -traditional -out {SIGNING_KEY_PATH} 2048\n\
-    chmod 600 {SIGNING_KEY_PATH}\n\n\
+openssl genrsa -traditional -out {SIGNING_KEY_PATH} 2048\n\
+chmod 600 {SIGNING_KEY_PATH}\n\n\
 This only needs to happen once — every id_token issued after that point is tied \
 to this specific key, and it is never regenerated automatically."
         ));
     }
 
     let meta = fs::metadata(SIGNING_KEY_PATH)
-        .map_err(|e| format!("Failed to stat OIDC signing key at {SIGNING_KEY_PATH}: {e}"))?;
+    .map_err(|e| format!("Failed to stat OIDC signing key at {SIGNING_KEY_PATH}: {e}"))?;
+
     let mode = meta.permissions().mode() & 0o777;
+
     if mode != 0o600 {
         return Err(format!(
             "OIDC signing key at {SIGNING_KEY_PATH} has permissions {mode:o}, expected 600. \
@@ -176,13 +181,22 @@ Refusing to start with a signing key that isn't owner-only-readable — fix with
     }
 
     let pem_str = fs::read_to_string(SIGNING_KEY_PATH)
-        .map_err(|e| format!("Failed to read OIDC signing key at {SIGNING_KEY_PATH}: {e}"))?;
+    .map_err(|e| format!("Failed to read OIDC signing key at {SIGNING_KEY_PATH}: {e}"))?;
 
-    let encoding_key = EncodingKey::from_rsa_pem(pem_str.as_bytes())
-        .map_err(|e| format!("Failed to build JWT encoding key from {SIGNING_KEY_PATH}: {e}"))?;
-
+    // Decode the PEM first. `EncodingKey::from_rsa_der()` expects
+    // binary DER, not the ASCII PEM representation.
+    //
+    // The current implementation deliberately supports PKCS#1 RSA
+    // private keys generated with:
+    //
+    //     openssl genrsa -traditional ...
+    //
+    // PKCS#8 (`BEGIN PRIVATE KEY`) remains unsupported here because
+    // `der::extract_rsa_n_e()` currently expects a PKCS#1
+    // `RSAPrivateKey`.
     let pem_doc = pem::parse(&pem_str)
-        .map_err(|e| format!("Failed to parse PEM at {SIGNING_KEY_PATH}: {e}"))?;
+    .map_err(|e| format!("Failed to parse PEM at {SIGNING_KEY_PATH}: {e}"))?;
+
     let (n, e) = der::extract_rsa_n_e(pem_doc.contents()).ok_or_else(|| {
         format!(
             "Failed to extract modulus/exponent from {SIGNING_KEY_PATH} — is this a \
@@ -191,6 +205,15 @@ PKCS#1 RSA private key (\"-----BEGIN RSA PRIVATE KEY-----\")? PKCS#8 \
 `openssl rsa -traditional`."
         )
     })?;
+
+    // jsonwebtoken 11's `from_rsa_pem()` is not available with the
+    // aws_lc_rs provider configuration. The PEM has already been
+    // decoded above, so pass the actual DER bytes instead.
+    //
+    // IMPORTANT: never pass `pem_str.as_bytes()` here. Those are PEM
+    // text bytes, not DER.
+    let encoding_key = EncodingKey::from_rsa_der(pem_doc.contents());
+
     let decoding_key = DecodingKey::from_rsa_raw_components(&n, &e);
 
     // A single, stable key id for as long as this specific key file is
@@ -211,16 +234,56 @@ PKCS#1 RSA private key (\"-----BEGIN RSA PRIVATE KEY-----\")? PKCS#8 \
         e: b64url(&e),
     };
 
+    let signing_key = OidcSigningKey {
+        encoding_key,
+        decoding_key,
+        kid,
+        jwk,
+    };
+
+    // Test the complete signing path BEFORE publishing the key into the
+    // global OnceCell. If jsonwebtoken was compiled without a crypto
+    // provider, this fails here and leaves the OnceCell untouched.
+    sign_probe_with_key(&signing_key)?;
+
     SIGNING_KEY
-        .set(OidcSigningKey {
-            encoding_key,
-            decoding_key,
-            kid,
-            jwk,
-        })
-        .map_err(|_| "OIDC signing key already initialized".to_string())?;
+    .set(signing_key)
+    .map_err(|_| "OIDC signing key already initialized".to_string())?;
 
     Ok(())
+}
+
+/// Signs a throwaway token to prove the whole signing path works.
+///
+/// `jsonwebtoken 11` resolves its crypto provider lazily and can panic
+/// when the crate was built without exactly one provider. Catch that
+/// panic during startup so OIDC initialization returns an actionable
+/// error instead of allowing the first token request to trigger it.
+fn sign_probe_with_key(key: &OidcSigningKey) -> Result<(), String> {
+    let mut claims = std::collections::BTreeMap::new();
+    claims.insert("sub", "startup-probe");
+
+    let signed = std::panic::catch_unwind(|| {
+        jsonwebtoken::encode(&key.header(), &claims, &key.encoding_key)
+    });
+
+    match signed {
+        Ok(Ok(_)) => Ok(()),
+
+        Ok(Err(e)) => Err(format!(
+            "OIDC is enabled but this build cannot sign an id_token: {e}"
+        )),
+
+        Err(_) => Err(
+            "OIDC is enabled but this build of ProxyAuth cannot sign an id_token: the \
+`jsonwebtoken` crate was compiled without a crypto provider, and panics when asked to sign. \
+Build with exactly one of its providers enabled — in Cargo.toml:\n\n    \
+jsonwebtoken = { version = \"11\", features = [\"aws_lc_rs\"] }\n\n\
+(`aws_lc_rs` is preferred here; `rust_crypto` also works, but pulls in the `rsa` crate, \
+which carries RUSTSEC-2023-0071.)"
+.to_string(),
+        ),
+    }
 }
 
 /// Panics if `init_signing_key` hasn't run yet — this is a startup
@@ -230,13 +293,13 @@ PKCS#1 RSA private key (\"-----BEGIN RSA PRIVATE KEY-----\")? PKCS#8 \
 /// caller is expected to handle.
 pub fn signing_key() -> &'static OidcSigningKey {
     SIGNING_KEY
-        .get()
-        .expect("init_signing_key() must run before signing_key() is called")
+    .get()
+    .expect("init_signing_key() must run before signing_key() is called")
 }
 
-/// The JWKS document body for `/oidc/jwks.json` — currently always exactly
-/// one key. Structured as a `Vec` from the start (rather than a
-/// single `Jwk`) so real key rotation later — publishing both the
+/// The JWKS document body for `/oidc/jwks.json` — currently always
+/// exactly one key. Structured as a `Vec` from the start (rather than
+/// a single `Jwk`) so real key rotation later — publishing both the
 /// current and a recently-retired key simultaneously while in-flight
 /// tokens signed with the old one are still valid — is an additive
 /// change here, not a breaking one.
@@ -248,5 +311,6 @@ pub fn jwks_document() -> serde_json::Value {
 /// `n`/`e` fields.
 fn b64url(bytes: &[u8]) -> String {
     use base64::Engine;
+
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }

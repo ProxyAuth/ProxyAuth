@@ -41,6 +41,7 @@ mod tests {
                 issued_at,
                 session_started_at: NOW - session_age,
                 previous_token_id: None,
+                ..TokenData::default()
             },
         }
     }
@@ -126,6 +127,7 @@ mod tests {
                 issued_at,
                 session_started_at: issued_at,
                 previous_token_id: None,
+                ..TokenData::default()
             },
         };
         assert_eq!(decide(&p, &s, FIVE_DAYS, NOW), RenewalDecision::Renew);
@@ -174,6 +176,7 @@ mod tests {
             issued_at: 1_800_000_000,
             session_started_at: 1_790_000_000,
             previous_token_id: None,
+            ..TokenData::default()
         };
         assert_eq!(data.encode(), "7:1800000000:1790000000");
         assert_eq!(TokenData::parse(&data.encode()), Some(data));
@@ -188,6 +191,7 @@ mod tests {
                 issued_at: 0,
                 session_started_at: 0,
                 previous_token_id: None,
+                ..TokenData::default()
             })
         );
     }
@@ -352,6 +356,7 @@ routes:
             issued_at: 1_900_000_000,
             session_started_at: 1_899_990_000,
             previous_token_id: Some(PREV.to_string()),
+            ..TokenData::default()
         };
         assert_eq!(data.encode(), format!("2:1900000000:1899990000:{PREV}"));
         assert_eq!(TokenData::parse(&data.encode()), Some(data));
@@ -375,6 +380,7 @@ routes:
             issued_at: 1,
             session_started_at: 1,
             previous_token_id: None,
+            ..TokenData::default()
         };
         assert_eq!(data.encode(), "2:1:1");
     }
