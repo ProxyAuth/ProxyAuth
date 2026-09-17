@@ -5,3 +5,4 @@ mod loadbalancing;
 mod login_redirect;
 mod login_redirect_e2e;
 mod ratelimit_mode;
+mod session_refresh_e2e;

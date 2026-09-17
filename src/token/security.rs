@@ -135,15 +135,102 @@ pub fn issue_token(
         .parse::<u64>()
         .map_err(|_| "invalid expiry timestamp".to_string())?;
 
+    let now = now_secs();
+    issue_session_token(
+        username,
+        expires_at,
+        token_id,
+        &TokenData {
+            index_user,
+            issued_at: now,
+            session_started_at: now,
+        },
+    )
+}
+
+/// Issues a token carrying explicit [`TokenData`] — what a session
+/// renewal uses to keep the original login time.
+pub fn issue_session_token(
+    username: &str,
+    expires_at: u64,
+    token_id: &str,
+    data: &TokenData,
+) -> Result<String, String> {
     vault()
         .token(username)
         .expires_at(expires_at)
         .id(token_id)
-        // The user index rides in the token's data field: the library
-        // has no concept of an index, and does not need one.
-        .data(&index_user.to_string())
+        // The library has no concept of a user index or a session: both
+        // ride in the token's free-form data field.
+        .data(&data.encode())
         .issue()
         .map_err(|e| format!("token issue failed: {e}"))
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// What ProxyAuth stores in a token's data field.
+///
+/// Encoded as `index:issued_at:session_started_at`. Tokens issued
+/// before session renewal existed hold only `index`; they still
+/// validate, and their two dates are unknown (`0`) until they are
+/// renewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenData {
+    /// Position of the account in `AppConfig::combined_users()`.
+    pub index_user: usize,
+    /// When this token was issued (Unix seconds).
+    pub issued_at: u64,
+    /// When the session began — the original login, kept across
+    /// renewals (Unix seconds).
+    pub session_started_at: u64,
+}
+
+impl TokenData {
+    pub fn encode(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.index_user, self.issued_at, self.session_started_at
+        )
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        let mut parts = raw.split(':');
+        let index_user = parts.next()?.parse().ok()?;
+        let issued_at = match parts.next() {
+            Some(v) => v.parse().ok()?,
+            None => 0,
+        };
+        let session_started_at = match parts.next() {
+            Some(v) => v.parse().ok()?,
+            None => issued_at,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            index_user,
+            issued_at,
+            session_started_at,
+        })
+    }
+}
+
+/// Everything a successful validation knows about a session.
+#[derive(Debug, Clone)]
+pub struct ValidSession {
+    pub username: String,
+    pub token_id: String,
+    /// Seconds until the token expires.
+    pub remaining_secs: u64,
+    /// The token's own expiry (Unix seconds).
+    pub expires_at: u64,
+    pub data: TokenData,
 }
 
 /// Verifies a token and returns `(username, token_id, seconds_remaining)`.
@@ -176,6 +263,19 @@ pub async fn validate_token(
     config: &AppConfig,
     ip: &str,
 ) -> Result<(String, String, u64), String> {
+    validate_session(token, data_app, config, ip)
+        .await
+        .map(|s| (s.username, s.token_id, s.remaining_secs))
+}
+
+/// Same checks as [`validate_token`], returning the whole session —
+/// including its issue and login dates, which session renewal needs.
+pub async fn validate_session(
+    token: &str,
+    data_app: &web::Data<AppState>,
+    config: &AppConfig,
+    ip: &str,
+) -> Result<ValidSession, String> {
     // One call covers what used to be decrypt + split + digest recompute
     // + constant-time compare. `Expired` is separated from `Invalid`
     // because the two deserve different log lines: one is routine, the
@@ -193,10 +293,8 @@ pub async fn validate_token(
 
     // ── everything from here down reads live state, every request ──
     // Nothing below this line is cached. See the note on this function.
-    let index_user = session
-        .data()
-        .parse::<usize>()
-        .map_err(|_| "Index invalide")?;
+    let token_data = TokenData::parse(session.data()).ok_or("Index invalide")?;
+    let index_user = token_data.index_user;
     let user = config.user_by_index(index_user).ok_or("User not found")?;
 
     // The token carries the name it was issued to; the index must still
@@ -257,11 +355,13 @@ pub async fn validate_token(
         );
     }
 
-    Ok((
-        user.username.to_string(),
-        session.id().to_string(),
-        time_expire,
-    ))
+    Ok(ValidSession {
+        username: user.username.to_string(),
+        token_id: session.id().to_string(),
+        remaining_secs: time_expire,
+        expires_at: session.expires_at(),
+        data: token_data,
+    })
 }
 
 /// Resolves the username a token belongs to, without the full policy
@@ -283,9 +383,9 @@ pub fn extract_token_user(token: &str, config: &AppConfig, ip: String) -> Result
         }
     };
 
-    let index_user: usize = match session.data().parse() {
-        Ok(i) => i,
-        Err(_) => {
+    let index_user: usize = match TokenData::parse(session.data()) {
+        Some(d) => d.index_user,
+        None => {
             warn!("[{}] Failed to parse user index from token", ip);
             return Err("Invalid user index".into());
         }

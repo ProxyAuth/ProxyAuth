@@ -590,6 +590,18 @@ pub struct RouteRule {
     #[serde(default, alias = "login_page_url")]
     pub redirect_login_url: Option<String>,
 
+    /// Per-vhost override of `AppConfig.session_refresh_interval_secs`.
+    #[serde(default)]
+    pub session_refresh_interval_secs: Option<u64>,
+
+    /// Per-vhost override of `AppConfig.session_refresh_grace_secs`.
+    #[serde(default)]
+    pub session_refresh_grace_secs: Option<u64>,
+
+    /// Per-vhost override of `AppConfig.session_max_lifetime_secs`.
+    #[serde(default)]
+    pub session_max_lifetime_secs: Option<u64>,
+
     /// Per-vhost override of `AppConfig.login_redirect_url` — where an
     /// already-authenticated visitor (a still-valid `session_token`
     /// cookie) gets sent instead of the login form, and where a fresh
@@ -959,6 +971,22 @@ impl RouteRule {
 
     /// Resolves `AppConfig.max_age_session_cookie` for this vhost: its
     /// own value if set, otherwise the global default.
+    /// Resolved session-refresh policy for this vhost — see
+    /// `AppConfig::session_refresh_interval_secs`.
+    pub fn resolved_session_refresh(&self, global: &AppConfig) -> SessionRefreshPolicy {
+        SessionRefreshPolicy {
+            interval_secs: self
+                .session_refresh_interval_secs
+                .unwrap_or(global.session_refresh_interval_secs),
+            grace_secs: self
+                .session_refresh_grace_secs
+                .unwrap_or(global.session_refresh_grace_secs),
+            max_lifetime_secs: self
+                .session_max_lifetime_secs
+                .unwrap_or(global.session_max_lifetime_secs),
+        }
+    }
+
     pub fn resolved_max_age_session_cookie(&self, global: &AppConfig) -> i64 {
         self.max_age_session_cookie
             .unwrap_or(global.max_age_session_cookie)
@@ -1141,6 +1169,10 @@ pub struct BackendConfig {
     pub weight: i16,
 }
 
+fn default_session_refresh_grace_secs() -> u64 {
+    30
+}
+
 fn default_weight() -> i16 {
     1
 }
@@ -1288,6 +1320,18 @@ pub struct VhostGroup {
     /// see `RouteRule::redirect_login_url`.
     #[serde(default, alias = "login_page_url")]
     pub redirect_login_url: Option<String>,
+
+    /// Per-vhost override of `AppConfig.session_refresh_interval_secs`.
+    #[serde(default)]
+    pub session_refresh_interval_secs: Option<u64>,
+
+    /// Per-vhost override of `AppConfig.session_refresh_grace_secs`.
+    #[serde(default)]
+    pub session_refresh_grace_secs: Option<u64>,
+
+    /// Per-vhost override of `AppConfig.session_max_lifetime_secs`.
+    #[serde(default)]
+    pub session_max_lifetime_secs: Option<u64>,
 
     /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::login_redirect_url`.
@@ -1507,6 +1551,15 @@ impl RouteConfig {
                 }
                 if route.redirect_login_url.is_none() {
                     route.redirect_login_url = group.redirect_login_url.clone();
+                }
+                if route.session_refresh_interval_secs.is_none() {
+                    route.session_refresh_interval_secs = group.session_refresh_interval_secs;
+                }
+                if route.session_refresh_grace_secs.is_none() {
+                    route.session_refresh_grace_secs = group.session_refresh_grace_secs;
+                }
+                if route.session_max_lifetime_secs.is_none() {
+                    route.session_max_lifetime_secs = group.session_max_lifetime_secs;
                 }
                 if route.logout_redirect_url.is_none() {
                     route.logout_redirect_url = group.logout_redirect_url.clone();
@@ -1973,6 +2026,31 @@ pub struct AppConfig {
     #[serde(default = "default_max_age_session_cookie")]
     pub max_age_session_cookie: i64,
 
+    /// Renews a session token once it is older than this, without asking
+    /// the user to sign in again. The next request carrying the session
+    /// cookie gets a fresh token in a new `Set-Cookie` (full
+    /// `token_expiry_seconds` lifetime, new token id), and the replaced
+    /// token stops working `session_refresh_grace_secs` later.
+    ///
+    /// `0` (the default) disables renewal: a session ends when its token
+    /// expires, as before. Must be shorter than `token_expiry_seconds`
+    /// to have any effect.
+    #[serde(default)]
+    pub session_refresh_interval_secs: u64,
+
+    /// How long a token replaced by a renewal keeps being accepted.
+    /// Covers requests that were already in flight, and other tabs that
+    /// have not seen the new cookie yet. Default 30 seconds.
+    #[serde(default = "default_session_refresh_grace_secs")]
+    pub session_refresh_grace_secs: u64,
+
+    /// Absolute limit on a session, counted from the original login and
+    /// not reset by renewals: past it, the visitor has to sign in again.
+    /// `0` (the default) means no limit beyond renewals stopping when
+    /// the visitor stops using the site.
+    #[serde(default)]
+    pub session_max_lifetime_secs: u64,
+
     #[serde(default)]
     pub login_redirect_url: Option<String>,
 
@@ -2152,7 +2230,56 @@ impl Serialize for AppConfig {
         state.serialize_field("logout_redirect_url", &self.logout_redirect_url)?;
         state.serialize_field("users", &self.users)?;
         state.serialize_field("worker", &self.worker)?;
+        // Every setting has to be written back: `load_config` rewrites
+        // config.json (after hashing a plaintext password, sorting
+        // users, generating `token_admin`), and a field missing here was
+        // silently deleted from the file at that point.
+        state.serialize_field("backend_timeout", &self.backend_timeout)?;
+        state.serialize_field("cache_duration_secs", &self.cache_duration_secs)?;
+        state.serialize_field("csrf_token", &self.csrf_token)?;
+        state.serialize_field("ip_blocklists", &self.ip_blocklists)?;
+        state.serialize_field(
+            "ip_blocklist_refresh_interval_secs",
+            &self.ip_blocklist_refresh_interval_secs,
+        )?;
+        state.serialize_field("max_body_size", &self.max_body_size)?;
+        state.serialize_field("page_change_password", &self.page_change_password)?;
+        state.serialize_field(
+            "redirect_protect_refresh_interval_secs",
+            &self.redirect_protect_refresh_interval_secs,
+        )?;
+        state.serialize_field("run_group", &self.run_group)?;
+        state.serialize_field("run_user", &self.run_user)?;
+        state.serialize_field("smtp", &self.smtp)?;
+        state.serialize_field("strict_mtls", &self.strict_mtls)?;
+        state.serialize_field("trust_proxy_forward_for", &self.trust_proxy_forward_for)?;
+        state.serialize_field(
+            "session_refresh_interval_secs",
+            &self.session_refresh_interval_secs,
+        )?;
+        state.serialize_field("session_refresh_grace_secs", &self.session_refresh_grace_secs)?;
+        state.serialize_field("session_max_lifetime_secs", &self.session_max_lifetime_secs)?;
         state.end()
+    }
+}
+
+/// How a session is renewed while it is being used.
+///
+/// Every value is in seconds, and `0` disables that part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRefreshPolicy {
+    /// Age after which the next request gets a fresh token.
+    pub interval_secs: u64,
+    /// How long the replaced token keeps working after a renewal.
+    pub grace_secs: u64,
+    /// Longest a session may last from the original login, renewals
+    /// included.
+    pub max_lifetime_secs: u64,
+}
+
+impl SessionRefreshPolicy {
+    pub fn enabled(&self) -> bool {
+        self.interval_secs > 0
     }
 }
 

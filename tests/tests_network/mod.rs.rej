@@ -1,0 +1,10 @@
+--- tests/tests_network/mod.rs	2026-09-17 03:31:29.327291374 +0000
++++ tests/tests_network/mod.rs	2026-09-17 03:31:29.332369733 +0000
+@@ -2,4 +2,7 @@
+ #[path = "../common/mod.rs"]
+ mod common;
+ mod loadbalancing;
++mod login_redirect;
++mod login_redirect_e2e;
+ mod ratelimit_mode;
++mod session_refresh_e2e;

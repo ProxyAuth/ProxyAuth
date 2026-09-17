@@ -1,6 +1,6 @@
 use crate::AppState;
-use crate::revoke::load::revoke_token;
-use crate::token::security::validate_token;
+use crate::revoke::load::{logout_record_until, revoke_token};
+use crate::token::security::{now_secs, validate_session};
 use actix_web::{HttpRequest, HttpResponse, http::header, http::header::ContentType, web};
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 use tracing::warn;
@@ -88,12 +88,17 @@ pub async fn logout_session(req: HttpRequest, data: web::Data<AppState>) -> Http
             })
             .unwrap_or_else(|| "-".to_string());
 
-        match validate_token(cookie.value(), &data, &data.config, &ip).await {
-            Ok((username, token_id, _)) => {
-                if let Err(e) = revoke_token(&token_id, None, &data.revoked_tokens).await {
+        match validate_session(cookie.value(), &data, &data.config, &ip).await {
+            Ok(session) => {
+                // Kept until the token would have expired on its own —
+                // past that, the record serves no purpose.
+                let keep_until = logout_record_until(session.expires_at, now_secs());
+                if let Err(e) =
+                    revoke_token(&session.token_id, Some(keep_until), &data.revoked_tokens).await
+                {
                     warn!(
                         "[{}] Failed to revoke token {} for user {} on logout: {}",
-                        ip, token_id, username, e
+                        ip, session.token_id, session.username, e
                     );
                 }
             }

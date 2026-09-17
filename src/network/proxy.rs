@@ -10,7 +10,6 @@ use crate::network::shared_client::{
 };
 use crate::token::csrf::{fix_mime_actix, inject_csrf_token, validate_csrf_token};
 use crate::token::security::apply_filters_regex_allow_only;
-use crate::token::security::validate_token;
 use crate::{AppConfig, AppState};
 use actix_web::{
     Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
@@ -1893,7 +1892,7 @@ async fn check_static_auth(
             .body("401 Unauthorized"));
     };
 
-    let (username, token_id) = match validate_token(token_header, data, &data.config, ip).await {
+    let (username, token_id) = match validate_and_refresh(req, data, rule, token_header, ip).await {
         Ok((username, token_id, _expiry)) => (username, token_id),
         Err(_) => {
             if let Some(target) = login_page_redirect_target(req, rule, &data.config) {
@@ -1924,7 +1923,154 @@ async fn check_static_auth(
     Ok((username, token_id))
 }
 
+/// Validates a session token and applies the route's renewal policy
+/// (see `token::refresh`). A renewed cookie is queued on the request and
+/// added to the response by [`global_proxy`]; a session past
+/// `session_max_lifetime_secs` is reported as invalid, so callers treat
+/// it exactly like an expired token.
+async fn validate_and_refresh(
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+    rule: &RouteRule,
+    token: &str,
+    ip: &str,
+) -> Result<(String, String, u64), String> {
+    let session =
+        crate::token::security::validate_session(token, data, &data.config, ip).await?;
+
+    match crate::token::refresh::refresh_session(req, data, rule, &session).await {
+        crate::token::refresh::SessionRefresh::Keep => {
+            if crate::token::refresh::token_came_from_cookie(req) {
+                crate::token::refresh::mark_signed_in(req);
+            }
+        }
+        crate::token::refresh::SessionRefresh::Renewed(cookie) => {
+            crate::token::refresh::remember_renewal(req, cookie);
+        }
+        crate::token::refresh::SessionRefresh::TooOld => {
+            return Err("session reached session_max_lifetime_secs".to_string());
+        }
+    }
+
+    Ok((session.username, session.token_id, session.remaining_secs))
+}
+
+/// Session renewal on a route that does not require a login.
+///
+/// The page is always served, whatever happens here. When the request
+/// carries a session cookie:
+///
+/// - valid, and due for renewal → a new cookie is queued for the
+///   response and the old token is revoked after the grace period, as on
+///   a protected route;
+/// - no longer valid (expired, revoked, grace period over) → the cookie
+///   is cleared, so the browser stops sending it with every page and
+///   asset of the public site.
+///
+/// Nothing happens without a cookie, when renewal is off for the route,
+/// on a connection the session cookie is not accepted on, or for a
+/// `Bearer` client.
+async fn refresh_on_public_route(req: &HttpRequest, data: &web::Data<AppState>, rule: &RouteRule) {
+    if !rule.session_cookie_enabled(&data.config)
+        || !rule.resolved_session_refresh(&data.config).enabled()
+        || !crate::token::refresh::token_came_from_cookie(req)
+        || !is_secure_request(req, &data.config)
+    {
+        return;
+    }
+
+    let Some(cookie) = req.cookie("session_token") else {
+        return;
+    };
+    let token = cookie.value();
+    if token.is_empty() {
+        return;
+    }
+
+    let ip = client_ip(req, &data.config)
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    match crate::token::security::validate_session(token, data, &data.config, &ip).await {
+        Ok(session) => match crate::token::refresh::refresh_session(req, data, rule, &session).await {
+            crate::token::refresh::SessionRefresh::Keep => {
+                crate::token::refresh::mark_signed_in(req);
+            }
+            crate::token::refresh::SessionRefresh::Renewed(new_cookie) => {
+                crate::token::refresh::remember_renewal(req, new_cookie);
+            }
+            crate::token::refresh::SessionRefresh::TooOld => clear_session_cookie(req),
+        },
+        Err(_) => clear_session_cookie(req),
+    }
+}
+
+fn clear_session_cookie(req: &HttpRequest) {
+    crate::token::refresh::remember_renewal(
+        req,
+        "session_token=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict".to_string(),
+    );
+}
+
 pub async fn global_proxy(
+    req: HttpRequest,
+    body: web::Bytes,
+    data: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    let result = global_proxy_inner(req.clone(), body, data).await;
+
+    // A session renewed while handling this request: its new cookie
+    // goes on whatever response came out, error pages included — the
+    // session itself is valid, and dropping the cookie would leave the
+    // browser holding a token about to be refused.
+    match result {
+        Ok(mut resp) => {
+            if let Some(cookie) = crate::token::refresh::take_renewal_cookie(&req) {
+                match header::HeaderValue::from_str(&cookie) {
+                    Ok(value) => {
+                        let headers = resp.headers_mut();
+                        headers.append(header::SET_COOKIE, value);
+                        // A response carrying a session token must never
+                        // be stored: a shared cache (CDN, corporate
+                        // proxy) would hand this visitor's session to the
+                        // next one, and a browser cache would replay the
+                        // page without the cookie. Public pages are the
+                        // ones most likely to be cached, so this
+                        // overrides whatever the backend asked for.
+                        headers.insert(
+                            header::CACHE_CONTROL,
+                            header::HeaderValue::from_static("private, no-store, max-age=0"),
+                        );
+                        headers.remove(header::EXPIRES);
+                        headers.insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+                    }
+                    Err(e) => warn!("renewed session cookie could not be attached: {e}"),
+                }
+            } else if crate::token::refresh::is_signed_in(&req) {
+                // A signed-in visitor's page: never in a shared cache, and
+                // revalidated by the browser, so the next visit reaches
+                // ProxyAuth and the session can be renewed on time. A
+                // stricter policy already set (`no-store`) is kept.
+                let headers = resp.headers_mut();
+                let already_strict = headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("no-store"));
+                if !already_strict {
+                    headers.insert(
+                        header::CACHE_CONTROL,
+                        header::HeaderValue::from_static("private, no-cache"),
+                    );
+                    headers.remove(header::EXPIRES);
+                }
+            }
+            Ok(resp)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn global_proxy_inner(
     req: HttpRequest,
     body: web::Bytes,
     data: web::Data<AppState>,
@@ -2363,6 +2509,12 @@ pub async fn global_proxy(
             }
         }
 
+        // Public routes: a visitor who is signed in keeps their session
+        // renewed while browsing, exactly as on protected routes.
+        if !rule.required_login && rule.oidc.is_none() {
+            refresh_on_public_route(&req, &data, rule).await;
+        }
+
         let use_proxy = rule.proxy;
         if rule.static_path.is_some() {
             let ip_str = client_ip(&req, &data.config)
@@ -2654,7 +2806,7 @@ pub async fn proxy_with_proxy(
         };
 
         let (username, token_id, _expiry) =
-            match validate_token(token_header, &data, &data.config, &ip).await {
+            match validate_and_refresh(&req, &data, rule, token_header, &ip).await {
                 Ok(result) => result,
                 Err(_err) => {
                     warn!(
@@ -3443,7 +3595,7 @@ pub async fn proxy_without_proxy(
         };
 
         let (username, token_id, _expiry) =
-            match validate_token(token_header, &data, &data.config, &ip).await {
+            match validate_and_refresh(&req, &data, rule, token_header, &ip).await {
                 Ok(result) => result,
 
                 Err(_err) => {

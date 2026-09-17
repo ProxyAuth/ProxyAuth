@@ -176,7 +176,13 @@ mod tests {
         dec.read_to_string(&mut plain).unwrap();
 
         assert!(!plain.contains("{{ csrf_token }}"));
-        let tok = plain.trim_matches(|c| c == '<' || c == '>' || c == 'b' || c == '/' || c == ' ');
+        // Strip the exact tags: trimming the characters `<>b/` could also
+        // eat a `b` at either end of the random token, which made this
+        // test fail from time to time.
+        let tok = plain
+            .strip_prefix("<b>")
+            .and_then(|t| t.strip_suffix("</b>"))
+            .expect("the token sits between the tags");
         assert!(verify_csrf_token(secret, tok));
     }
 

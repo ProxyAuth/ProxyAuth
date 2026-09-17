@@ -398,6 +398,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
 
+    // Keys nothing reads are ignored by the parser; say so, instead of
+    // letting a misspelt setting silently do nothing.
+    if let Ok(raw) = fs::read_to_string("/etc/proxyauth/config/config.json") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            for unknown in config::unknown_keys::check_app_config(&value, &config) {
+                eprintln!("warning: {unknown}");
+                warn!("{unknown}");
+            }
+        }
+    }
+
     // Periodically re-scan `databases` (if configured) so users added or
     // edited directly in the database eventually take effect without a
     // restart. Two independent timers:
@@ -559,9 +570,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    for unknown in config::unknown_keys::check_routes(&routes_str) {
+        eprintln!("warning: {unknown}");
+        warn!("{unknown}");
+    }
+
     let routes_parsed: RouteConfig =
         serde_yaml::from_str(&routes_str).expect("Failed to parse routes.yml");
     let mut routes: RouteConfig = routes_parsed.expand_vhost_groups();
+
+    for line in crate::token::refresh::describe_policies(&config, &routes.routes) {
+        println!("{line}");
+        info!("{line}");
+    }
 
     let counter_token = Arc::new(CounterToken::new());
 
@@ -595,6 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    crate::revoke::db::set_token_lifetime(config.token_expiry_seconds);
     start_revoked_token_ttl(
         revoked_tokens.clone(),
         std::time::Duration::from_secs(15),

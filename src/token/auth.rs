@@ -919,12 +919,18 @@ pub async fn auth(
         resp.append_header(("server", "ProxyAuth"));
 
         if session_cookie_enabled {
-            let session_max_age = max_age_session_cookie.min(data.config.token_expiry_seconds);
+            let session_max_age = max_age_session_cookie
+                .min(data.config.token_expiry_seconds)
+                .max(0);
 
+            // Never longer than the token. This was `.clamp(60, max)`,
+            // which panics — and fails every login — as soon as the
+            // cookie or token lifetime is configured under 60 seconds.
             let seconds = expiry
                 .signed_duration_since(Utc::now())
                 .num_seconds()
-                .clamp(60, session_max_age);
+                .max(0)
+                .min(session_max_age);
 
             let cookie_expiry = Utc::now() + Duration::seconds(seconds);
             let cookie_expiry_time =
