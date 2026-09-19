@@ -51,15 +51,23 @@ mod tests {
                         }
                         let body = format!("backend:{path}");
                         // Pages under /cached are what a CDN would keep.
-                        let cache = if path.starts_with("/cached") {
+                        let cache = if path.starts_with("/cached") || path.starts_with("/asset") {
                             "Cache-Control: public, max-age=3600\r\nExpires: Thu, 01 Jan 2099 00:00:00 GMT\r\n"
+                        } else {
+                            ""
+                        };
+                        // Only this one says what it is: a script, the
+                        // kind of file a signed-in visitor should keep
+                        // in cache instead of revalidating every time.
+                        let content_type = if path.starts_with("/asset") {
+                            "Content-Type: text/javascript\r\n"
                         } else {
                             ""
                         };
                         let mut stream = reader.into_inner();
                         let _ = write!(
                             stream,
-                            "HTTP/1.1 200 OK\r\n{cache}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 200 OK\r\n{cache}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                             body.len(),
                             body
                         );
@@ -324,6 +332,61 @@ vhosts:
         assert!(cache.starts_with("public"), "{cache}");
         let _ = expires;
 
+    }
+
+    /// A script or a stylesheet fetched by a page, rather than a page
+    /// being opened: that is what `sec-fetch-mode` distinguishes.
+    fn subresource(host: &str, path: &str, cookie: &str) -> TestRequest {
+        TestRequest::get()
+            .uri(path)
+            .peer_addr("127.0.0.1:45001".parse().unwrap())
+            .insert_header((header::HOST, host))
+            .insert_header(("x-forwarded-proto", "https"))
+            .insert_header(("sec-fetch-mode", "no-cors"))
+            .insert_header((header::ACCEPT, "*/*"))
+            .insert_header((header::COOKIE, format!("session_token={cookie}")))
+    }
+
+    #[actix_web::test]
+    async fn a_signed_in_visitors_assets_stay_cached() {
+        let state = state();
+        // A script keeps the route's own duration — making every asset
+        // revalidate would empty the browser cache of anyone signed in —
+        // but never as `public`: a shared cache must not hand one
+        // signed-in visitor's file to the next.
+        let (cache, expires, cookie) =
+            cache_headers(&state, subresource(SITE, "/asset/app.js", &token("cached-asset", 30, 30)))
+                .await;
+        assert!(!cookie, "recent session: nothing sent back");
+        let cache = cache.expect("cache-control");
+        assert!(cache.starts_with("private"), "{cache}");
+        assert!(cache.contains("max-age="), "{cache}");
+        assert!(!cache.contains("no-cache"), "{cache}");
+        assert!(!cache.contains("no-store"), "{cache}");
+        assert_eq!(expires, None);
+    }
+
+    #[actix_web::test]
+    async fn an_asset_request_that_renews_is_still_never_stored() {
+        let state = state();
+        // The renewal cookie wins over everything: this response carries
+        // a session token, script or not.
+        let (cache, _, cookie) = cache_headers(
+            &state,
+            subresource(SITE, "/asset/app.js", &token("asset-renew", 1200, 1200)),
+        )
+        .await;
+        assert!(cookie, "the session was due for renewal");
+        assert!(cache.unwrap().contains("no-store"));
+    }
+
+    #[actix_web::test]
+    async fn a_navigation_is_revalidated_whatever_the_backend_labelled_it() {
+        let state = state();
+        // open() is a navigation: sec-fetch-mode: navigate.
+        let navigation = open(SITE, "/asset/app.js", &token("cached-nav", 30, 30));
+        let (cache, _, _) = cache_headers(&state, navigation).await;
+        assert_eq!(cache.as_deref(), Some("private, no-cache"));
     }
 
     #[actix_web::test]

@@ -2047,12 +2047,31 @@ pub async fn global_proxy(
                     Err(e) => warn!("renewed session cookie could not be attached: {e}"),
                 }
             } else if crate::token::refresh::is_signed_in(&req) {
-                signed_in_cache_policy(&mut resp);
+                signed_in_cache_policy(&req, &mut resp);
             }
             Ok(resp)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Whether the browser is opening a page, rather than fetching
+/// something for a page it already has. `Sec-Fetch-Mode` says so
+/// outright; without it, a request that accepts HTML is one.
+fn is_navigation(req: &HttpRequest) -> bool {
+    let header_value = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_ascii_lowercase())
+    };
+    if let Some(mode) = header_value("sec-fetch-mode") {
+        return mode == "navigate";
+    }
+    if header_value("x-requested-with").is_some() {
+        return false;
+    }
+    header_value("accept").is_some_and(|accept| accept.contains("text/html"))
 }
 
 /// How a signed-in visitor's response may be cached.
@@ -2065,15 +2084,23 @@ pub async fn global_proxy(
 /// proxy does not serve one signed-in visitor's file to the next.
 /// Applying `no-cache` to every asset, as this used to, emptied the
 /// browser cache of anyone signed in.
-fn signed_in_cache_policy(resp: &mut HttpResponse) {
-    let is_page = resp
+fn signed_in_cache_policy(req: &HttpRequest, resp: &mut HttpResponse) {
+    // What counts as a page: an HTML document, a response that does not
+    // say what it is — the browser will sniff it, so treat it as one —
+    // or a browser navigation, whatever the backend labelled it.
+    let content_type = resp
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            let v = v.to_ascii_lowercase();
-            v.starts_with("text/html") || v.starts_with("application/xhtml+xml")
-        });
+        .map(|v| v.to_ascii_lowercase());
+    let is_page = match content_type.as_deref() {
+        None => true,
+        Some(v) => {
+            v.starts_with("text/html")
+                || v.starts_with("application/xhtml+xml")
+                || is_navigation(req)
+        }
+    };
 
     let current = resp
         .headers()
