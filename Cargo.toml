@@ -67,7 +67,7 @@ hyper       = { version = "1", features = ["server", "http1", "http2", "client"]
 http-body-util = "^0.1"
 hyper-util  = { version = "^0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 hyper-http-proxy = "1.2.0"
-hyper-rustls = "0.27"
+hyper-rustls = { version = "0.27", feactures = ["rustls"] }
 rustls = { version = ">=0.23.45", features = ["ring"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.9"
@@ -108,7 +108,6 @@ notify = "6"
 arc-swap = "1.8.0"
 diesel = { version = "2.3", features = ["postgres", "mysql", "chrono"] }
 http = "1"
-hyper-tls = "0.5"
 hmac = "0.13"
 cookie = "0.18"
 lettre = { version = "0.11.22", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
