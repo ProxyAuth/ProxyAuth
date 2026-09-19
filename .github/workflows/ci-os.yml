@@ -101,7 +101,8 @@ jobs:
                 /var/cache/dnf
                 /var/cache/apt
                 /var/lib/apt/lists
-            key: proxyauth-os-${{ matrix.os }}-${{ github.sha }}
+                /tmp
+            key: proxyauth-os-${{ matrix.os }}-
             restore-keys: |
                     proxyauth-os-${{ matrix.os }}-
 
@@ -330,16 +331,32 @@ jobs:
             path: |
                 ~/.cargo/registry
                 ~/.cargo/git
-            key: proxyauth-cargo-${{ matrix.os }}-${{ github.sha }}
+                ~/.cargo/bin
+                ~/.cargo/env
+                target
+            key: proxyauth-cargo-${{ matrix.os }}-
+            restore-keys: |
+                proxyauth-cargo-${{ matrix.os }}-
 
       # ----------------------------------------------------------------------
       # AUDIT
       # ----------------------------------------------------------------------
 
       - name: Install cargo-audit
+        env:
+            CARGO_BUILD_JOBS: ${{ env.NPROC }}
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+            CARGO_PROFILE_RELEASE_LTO: "false"
+            CARGO_PROFILE_DEV_DEBUG: 0
+            CARGO_INCREMENTAL: 1
         run: |
-          . "$HOME/.cargo/env"
-          cargo install --locked cargo-audit
+            . "$HOME/.cargo/env"
+
+            if command -v cargo-audit >/dev/null 2>&1; then
+              echo "cargo-audit is already installed, skipping."
+            else
+              cargo install --locked cargo-audit
+            fi
 
       - name: Audit dependencies
         run: |
@@ -363,18 +380,35 @@ jobs:
       # ----------------------------------------------------------------------
 
       - name: Install cargo-tarpaulin
+        env:
+          CARGO_BUILD_JOBS: ${{ env.NPROC }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 1
         run: |
-          . "$HOME/.cargo/env"
-          cargo install --locked cargo-tarpaulin
+            . "$HOME/.cargo/env"
+
+            if command -v cargo-tarpaulin >/dev/null 2>&1; then
+              echo "cargo-tarpaulin is already installed, skipping."
+            else
+              cargo install --locked cargo-tarpaulin
+            fi
 
       - name: Coverage
         continue-on-error: true
         env:
           CARGO_BUILD_JOBS: ${{ env.NPROC }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 1
         run: |
           . "$HOME/.cargo/env"
 
-          cargo tarpaulin \
+          cargo tarpaulin -j "$(nproc)" \
+            --skip-clean \
+            --target-dir target \
             --all-features \
             --out Html \
             --timeout 300 \
@@ -387,13 +421,19 @@ jobs:
 
       - name: Install cargo-nextest
         run: |
-          . "$HOME/.cargo/env"
-          cargo install --locked cargo-nextest
+            . "$HOME/.cargo/env"
+            if command -v cargo-nextest >/dev/null 2>&1; then
+                echo "cargo-nextest is already installed, skipping."
+            else
+                cargo install --locked cargo-nextest
+            fi
 
       - name: Build ProxyAuth
         env:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
           CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 1
         run: |
           . "$HOME/.cargo/env"
 
@@ -435,6 +475,10 @@ jobs:
       # ----------------------------------------------------------------------
 
       - name: Run unit tests
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 1
         run: |
           . "$HOME/.cargo/env"
           cargo nextest run \
@@ -509,7 +553,6 @@ jobs:
         run: |
           sudo -u proxyauth ./target/release/proxyauth &
           echo $! > proxyauth.pid
-
           sleep 2
 
       # ----------------------------------------------------------------------
@@ -710,7 +753,8 @@ jobs:
             /var/cache/dnf
             /var/cache/apt
             /var/lib/apt/lists
-          key: proxyauth-os-${{ matrix.os }}-${{ github.sha }}
+            /tmp
+          key: proxyauth-os-${{ matrix.os }}-
 
       - name: Save Cargo cache
         if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
@@ -719,4 +763,7 @@ jobs:
             path: |
                 ~/.cargo/registry
                 ~/.cargo/git
-            key: proxyauth-cargo-${{ matrix.os }}-${{ github.sha }}
+                ~/.cargo/bin
+                ~/.cargo/env
+                target
+            key: proxyauth-cargo-${{ matrix.os }}-

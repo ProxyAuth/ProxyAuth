@@ -21,12 +21,7 @@ include = [
     "LICENSE"
 ]
 
-[profile.dev]
-debug = "line-tables-only"
-split-debuginfo = "unpacked"
-
 [build]
-jobs = 4 # number threads launch for build
 rustflags = ["-C", "target-cpu=native"]
 
 [env]
@@ -39,7 +34,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
 actix-web = { version = "4.12.1", features = ["rustls-0_23"] }
 mimalloc = { version = "0.1", default-features = false }
 actix-service = "2"
-reqwest = { version = "0.13", features = ["rustls", "json", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "blocking", "charset", "http2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.33"
 serde_json = { version = "1.0.140", features = ["preserve_order"] }
@@ -47,7 +42,7 @@ base64 = "0.22.1"
 sha2 = "0.11.0-rc.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-tracing-loki = "0.2.6"
+tracing-loki = { version = "0.2.6", default-features = false, features = ["rustls", "compat-0-2-1"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.3"
 tokio = { version = "1", features = ["full"] }
@@ -67,7 +62,7 @@ hyper       = { version = "1", features = ["server", "http1", "http2", "client"]
 http-body-util = "^0.1"
 hyper-util  = { version = "^0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 hyper-http-proxy = "1.2.0"
-hyper-rustls = { version = "0.27", feactures = ["rustls"] }
+hyper-rustls = "0.27"
 rustls = { version = ">=0.23.45", features = ["ring"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.9"
@@ -151,6 +146,16 @@ actix-web = "4"
 actix-http = "3.12.1"
 serde_json = "1"
 ctor = "0.2"
+
+# Iterating on a 31 000-line crate with 574 compilation units behind it:
+# what costs time is debug information, written for every dependency and
+# copied into a ~90 MB binary on every relink. Line tables keep readable
+# backtraces and panic locations — what a server actually needs — without
+# the full variable information a step debugger would use. Set
+# `debug = 2` temporarily when you do need gdb or lldb.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
 
 [profile.release]
 opt-level = 3
