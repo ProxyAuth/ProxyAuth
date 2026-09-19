@@ -30,7 +30,7 @@ mod tests {
 
     use argon2::{
         Argon2,
-        password_hash::{PasswordHasher, SaltString},
+        password_hash::PasswordHasher
     };
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -75,9 +75,8 @@ mod tests {
     }
 
     fn hash_pwd(plain: &str) -> String {
-        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
         Argon2::default()
-            .hash_password(plain.as_bytes(), &salt)
+            .hash_password(plain.as_bytes())
             .unwrap()
             .to_string()
     }

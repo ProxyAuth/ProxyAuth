@@ -14,7 +14,8 @@ use actix_web::{
     web::{self, Form, Json},
 };
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use argon2::password_hash::phc::PasswordHash;
 use blake3;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -122,9 +123,9 @@ pub fn verify_password(input: &str, stored_hash: &str) -> bool {
 pub fn dummy_password_hash() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
-        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+
         Argon2::default()
-            .hash_password(b"proxyauth-constant-time-placeholder", &salt)
+            .hash_password(b"proxyauth-constant-time-placeholder")
             .map(|h| h.to_string())
             // Fallback (should never trigger): a fixed, syntactically
             // valid Argon2id PHC hash, still forces real Argon2 work on

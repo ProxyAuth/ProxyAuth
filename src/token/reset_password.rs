@@ -19,8 +19,7 @@ use actix_web::{
     web::{self, Form, Json},
 };
 use argon2::Argon2;
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHasher, SaltString};
+use argon2::password_hash::PasswordHasher;
 use futures_util::FutureExt;
 use futures_util::future::{LocalBoxFuture, ready};
 use serde::Deserialize;
@@ -124,13 +123,12 @@ pub async fn reset_password_route(
         }
     };
 
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = match Argon2::default().hash_password(body.password.as_bytes(), &salt) {
+    let hash = match Argon2::default().hash_password(body.password.as_bytes()) {
         Ok(h) => h.to_string(),
         Err(_) => {
             return HttpResponse::InternalServerError()
-                .append_header(("server", "ProxyAuth"))
-                .body("Failed to hash password");
+            .append_header(("server", "ProxyAuth"))
+            .body("Failed to hash password");
         }
     };
 

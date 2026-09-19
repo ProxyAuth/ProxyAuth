@@ -5,7 +5,6 @@ use crate::smtp::smtp::SmtpConfig;
 use crate::stats::tokencount::CounterToken;
 use crate::token::auth::generate_random_string;
 use arc_swap::ArcSwap;
-use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
 use dashmap::DashMap;
 use ipnet::IpNet;
@@ -3257,14 +3256,13 @@ pub fn load_config(path: &str) -> Arc<AppConfig> {
 
     for user in &mut config.users {
         if !user.password.starts_with("$argon2") {
-            let salt = SaltString::generate(&mut OsRng);
-            let hash = Argon2::default()
-                .hash_password(user.password.as_bytes(), &salt)
-                .expect(&format!(
-                    "Password hashing failed for user {}",
-                    user.username
-                ))
-                .to_string();
+            let hash = match Argon2::default().hash_password(user.password.as_bytes()) {
+                Ok(h) => h.to_string(),
+                Err(_) => {
+                    panic!("Password hashing failed for user {}", user.username);
+                }
+            };
+
             user.password = hash;
             updated = true;
         }

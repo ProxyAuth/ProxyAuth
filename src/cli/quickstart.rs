@@ -792,12 +792,10 @@ pub fn run_users(config: &AppConfig) -> Result<(), String> {
     }
 
     // ---- hash once, used by either destination ---------------------
-    use argon2::password_hash::{SaltString, rand_core::OsRng};
     use argon2::{Argon2, PasswordHasher};
-    let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
-    .hash_password(password.as_bytes(), &salt)
-    .map_err(|e| format!("Failed to hash the password: {e}"))?
+    .hash_password(password.as_bytes())
+    .map_err(|e| format!("Failed to hash password: {e}"))?
     .to_string();
 
     let email_entries: Vec<crate::config::config::EmailEntry> = emails

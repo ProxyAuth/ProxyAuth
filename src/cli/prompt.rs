@@ -6,7 +6,6 @@ use crate::config::def_config::{
     setup_proxyauth_directory, setup_proxyauth_directory_for, switch_to_user,
 };
 use crate::keystore::export::export_as_file;
-use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
 use clap::Parser;
 use reqwest::{
@@ -266,11 +265,10 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
                 None => rpassword::prompt_password("password: ")?,
             };
 
-            let salt = SaltString::generate(&mut OsRng);
             let hash = Argon2::default()
-                .hash_password(password.as_bytes(), &salt)
-                .map_err(|e| e.to_string())?
-                .to_string();
+            .hash_password(password.as_bytes())
+            .map_err(|e| format!("Failed to hash password: {e}"))?
+            .to_string();
 
             // --primary-email must name one of the --email addresses
             // given, if provided at all — otherwise it's ambiguous
