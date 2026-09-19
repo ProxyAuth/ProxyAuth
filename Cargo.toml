@@ -21,6 +21,10 @@ include = [
     "LICENSE"
 ]
 
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
 [build]
 jobs = 4 # number threads launch for build
 rustflags = ["-C", "target-cpu=native"]
@@ -72,7 +76,7 @@ rustc-hash = "1"
 memchr = "2"
 futures-util = "0.3"
 bytes = "1.11.1"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 blake3 = ">=1.8.7"
 
 # Token construction: key derivation, sealing, signature and the
