@@ -107,12 +107,13 @@ hmac = "0.13"
 cookie = "0.18"
 lettre = { version = "0.11.22", default-features = false, features = [ "tokio1-rustls", "builder", "smtp-transport", "ring", "webpki-roots" ] }
 rpassword = "7.3"
-tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["connect", "rustls-tls-webpki-roots"] }
 instant-acme = "0.8"
 rcgen = "0.13"
 x509-parser = "0.16"
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 pem = "3"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Security-advisory floors, not exact pins — deliberately left as
 # ranges so the resolver can still pick up a future patched release
@@ -121,6 +122,7 @@ pem = "3"
 version = ">=0.103.13, <0.104.0-alpha.1"
 [dependencies.quinn-proto]
 version = ">=0.11.15"
+
 [dependencies.h2]
 version = ">=0.4.16, <0.5.0"
 
