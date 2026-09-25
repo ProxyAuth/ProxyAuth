@@ -30,6 +30,7 @@ mod tests {
             allow_roles: vec![],
             exclude_users: vec![],
             allow_totp_reenroll: None,
+            registry: None,
             allow_ips: vec![],
             deny_ips: vec![],
             allow_ips_compiled: vec![],

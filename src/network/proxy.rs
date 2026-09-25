@@ -889,7 +889,7 @@ pub fn vhost_matches(host: Option<&str>, vhosts: &[String]) -> bool {
 /// Whether any entry in `vhosts` names `host` literally, as opposed to
 /// covering it via a wildcard. Used to give an exact vhost precedence
 /// over a wildcard one — see `build_route_order`.
-fn vhost_matches_exactly(host: Option<&str>, vhosts: &[String]) -> bool {
+pub fn vhost_matches_exactly(host: Option<&str>, vhosts: &[String]) -> bool {
     let Some(host) = host else {
         return false;
     };

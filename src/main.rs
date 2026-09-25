@@ -63,6 +63,7 @@ use std::{fs, process, sync::Arc, time::Duration};
 use tls::bind_server;
 use token::auth::{auth_dispatch, auth_options};
 use token::refresh_token::refresh_token_dispatch;
+use token::registry::registry_route;
 use token::logout::{logout_dispatch, logout_options};
 use token::reset_password::reset_password_route;
 use token::vault as token_vault;
@@ -305,7 +306,7 @@ macro_rules! build_app {
             .wrap(AccessLogger {
                 state: state.clone(),
             })
-            // `/auth`, `/reset-password` et `/adm/auth/totp/get` ne sont
+            // `/auth`, `/reset-password`, `/auth/registry` et `/adm/auth/totp/get` ne sont
             // PAS enregistres ici: ce sont les trois seules ressources que
             // les branches de `mode_actix` enveloppent d'un rate limiter,
             // et actix retient la premiere route declaree pour un chemin
@@ -341,6 +342,11 @@ macro_rules! auth_routes {
         )
         .service(web::resource("/refresh_token").route(web::post().to(refresh_token_dispatch)))
         .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
+        .service(
+            web::resource("/auth/registry")
+                .route(web::post().to(registry_route))
+                .route(web::method(Method::OPTIONS).to(auth_options)),
+        )
         .service(
             web::resource("/adm/auth/totp/get")
                 .route(web::post().to(get_otpauth_uri))
@@ -582,6 +588,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut routes: RouteConfig = routes_parsed.expand_vhost_groups();
 
     for line in crate::token::refresh::describe_policies(&config, &routes.routes) {
+        println!("{line}");
+        info!("{line}");
+    }
+
+    for line in crate::token::registry::describe_registry(&config, &routes.routes) {
         println!("{line}");
         info!("{line}");
     }
@@ -1090,6 +1101,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ),
                             )
                             .service(
+                                web::resource("/auth/registry")
+                                    .route(
+                                        web::post()
+                                            .to(registry_route)
+                                            .wrap(Governor::new(&governor_auth_conf)),
+                                    )
+                                    .route(web::method(Method::OPTIONS).to(auth_options)),
+                            )
+                            .service(
                                 web::resource("/adm/auth/totp/get")
                                     .route(
                                         web::post()
@@ -1146,6 +1166,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .to(reset_password_route)
                                         .wrap(Governor::new(&governor_auth_conf)),
                                 ),
+                            )
+                            .service(
+                                web::resource("/auth/registry")
+                                    .route(
+                                        web::post()
+                                            .to(registry_route)
+                                            .wrap(Governor::new(&governor_auth_conf)),
+                                    )
+                                    .route(web::method(Method::OPTIONS).to(auth_options)),
                             )
                             .service(
                                 web::resource("/adm/auth/totp/get")

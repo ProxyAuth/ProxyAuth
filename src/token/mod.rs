@@ -18,6 +18,7 @@ pub mod csrf;
 pub mod logout;
 pub mod refresh;
 pub mod refresh_token;
+pub mod registry;
 pub mod reset_password;
 pub mod security;
 pub mod vault;

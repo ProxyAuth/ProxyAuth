@@ -818,6 +818,20 @@ pub struct RouteRule {
     #[serde(default)]
     pub allow_totp_reenroll: Option<bool>,
 
+    /// Self-service account creation via `POST /auth/registry` on this
+    /// vhost — see `token::registry::RegistryConfig` for every field
+    /// (`enabled`, `default_groups`, `default_roles`, `redirect_url`).
+    /// `None`/unset means registration is unavailable here (the
+    /// endpoint answers `404`), same as `enabled: false`.
+    ///
+    /// The groups/roles a new account receives come **only** from this
+    /// block — never from the request body — so a visitor can't grant
+    /// themselves anything beyond what the operator configured. Usually
+    /// set on the `vhosts:` group (propagated to every route under it,
+    /// like `allow_groups`); a route's own block wins over the group's.
+    #[serde(default)]
+    pub registry: Option<crate::token::registry::RegistryConfig>,
+
     /// Access logging for this route. `None` means "inherit from the
     /// `vhosts:` group this route belongs to (if any), otherwise the
     /// global `logging.enabled`" — same override rules as `need_csrf`.
@@ -1443,6 +1457,12 @@ pub struct VhostGroup {
     #[serde(default)]
     pub allow_totp_reenroll: Option<bool>,
 
+    /// Applied to every route in this group that doesn't set its own —
+    /// see `RouteRule::registry`. Whole-block replacement, not merged
+    /// field by field.
+    #[serde(default)]
+    pub registry: Option<crate::token::registry::RegistryConfig>,
+
     /// Access logging applied to every route in this group that doesn't
     /// set its own `log` — same override rules as `need_csrf`.
     #[serde(default)]
@@ -1626,6 +1646,9 @@ impl RouteConfig {
                 }
                 if route.allow_totp_reenroll.is_none() {
                     route.allow_totp_reenroll = group.allow_totp_reenroll;
+                }
+                if route.registry.is_none() {
+                    route.registry = group.registry.clone();
                 }
                 if route.log.is_none() {
                     route.log = group.log;

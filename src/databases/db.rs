@@ -1032,6 +1032,199 @@ pub fn upsert_user(conn: &mut DbConnection, user: &User) -> Result<(), String> {
     Ok(())
 }
 
+/// Outcome of `insert_new_user` — lets the self-service registration
+/// endpoint tell "created" apart from the two expected refusals
+/// without parsing an error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewUserOutcome {
+    Created,
+    /// A row with this username already exists — active *or*
+    /// soft-deleted (compared case-insensitively).
+    UsernameTaken,
+    /// One of the new account's email addresses is already on file for
+    /// another, non-deleted account (compared case-insensitively).
+    EmailTaken,
+}
+
+/// Runs a raw transaction-control statement (`BEGIN`/`COMMIT`/
+/// `ROLLBACK`) on whichever backend `conn` is.
+fn exec_simple(conn: &mut DbConnection, sql: &str) -> Result<(), String> {
+    match conn {
+        DbConnection::Postgres(c) => c
+            .batch_execute(sql)
+            .map_err(|e| format!("Failed to run `{sql}` (postgres): {e}")),
+        DbConnection::MySql(c) => c
+            .batch_execute(sql)
+            .map_err(|e| format!("Failed to run `{sql}` (mysql): {e}")),
+    }
+}
+
+#[derive(QueryableByName)]
+struct ExistsRow {
+    #[diesel(sql_type = BigInt)]
+    #[allow(dead_code)]
+    id: i64,
+}
+
+fn username_exists_any(conn: &mut DbConnection, username: &str) -> Result<bool, String> {
+    let row: Option<ExistsRow> = match conn {
+        DbConnection::Postgres(c) => sql_query(
+            "SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1",
+        )
+        .bind::<Text, _>(username)
+        .get_result(c)
+        .optional()
+        .map_err(|e| format!("Failed to look up username (postgres): {e}"))?,
+        DbConnection::MySql(c) => sql_query(
+            "SELECT id FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1",
+        )
+        .bind::<Text, _>(username)
+        .get_result(c)
+        .optional()
+        .map_err(|e| format!("Failed to look up username (mysql): {e}"))?,
+    };
+    Ok(row.is_some())
+}
+
+fn email_in_use(conn: &mut DbConnection, address: &str) -> Result<bool, String> {
+    let row: Option<ExistsRow> = match conn {
+        DbConnection::Postgres(c) => sql_query(
+            "SELECT u.id FROM user_email e JOIN users u ON u.id = e.user_id
+            WHERE LOWER(e.email) = LOWER($1) AND u.deleted = FALSE LIMIT 1",
+        )
+        .bind::<Text, _>(address)
+        .get_result(c)
+        .optional()
+        .map_err(|e| format!("Failed to look up email (postgres): {e}"))?,
+        DbConnection::MySql(c) => sql_query(
+            "SELECT u.id FROM user_email e JOIN users u ON u.id = e.user_id
+            WHERE LOWER(e.email) = LOWER(?) AND u.deleted = FALSE LIMIT 1",
+        )
+        .bind::<Text, _>(address)
+        .get_result(c)
+        .optional()
+        .map_err(|e| format!("Failed to look up email (mysql): {e}"))?,
+    };
+    Ok(row.is_some())
+}
+
+/// `Ok(None)` means the unique constraint on `users.username` fired —
+/// a concurrent registration (possibly on another instance sharing the
+/// database) won the race between our existence check and this insert.
+fn insert_user_row_strict(conn: &mut DbConnection, user: &User) -> Result<Option<i64>, String> {
+    use diesel::result::{DatabaseErrorKind, Error as DieselError};
+
+    let is_unique = |e: &DieselError| {
+        matches!(e, DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _))
+    };
+
+    match conn {
+        DbConnection::Postgres(c) => {
+            let res: Result<IdRow, DieselError> = sql_query(
+                "INSERT INTO users (username, password, otpkey, must_change_password)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id",
+            )
+            .bind::<Text, _>(&user.username)
+            .bind::<Text, _>(&user.password)
+            .bind::<Nullable<Text>, _>(&user.otpkey)
+            .bind::<diesel::sql_types::Bool, _>(user.must_change_password)
+            .get_result(c);
+            match res {
+                Ok(row) => Ok(Some(row.id)),
+                Err(e) if is_unique(&e) => Ok(None),
+                Err(e) => Err(format!("Failed to insert user (postgres): {e}")),
+            }
+        }
+        DbConnection::MySql(c) => {
+            let res = sql_query(
+                "INSERT INTO users (username, password, otpkey, must_change_password)
+                VALUES (?, ?, ?, ?)",
+            )
+            .bind::<Text, _>(&user.username)
+            .bind::<Text, _>(&user.password)
+            .bind::<Nullable<Text>, _>(&user.otpkey)
+            .bind::<diesel::sql_types::Bool, _>(user.must_change_password)
+            .execute(c);
+            match res {
+                Ok(_) => {}
+                Err(e) if is_unique(&e) => return Ok(None),
+                Err(e) => return Err(format!("Failed to insert user (mysql): {e}")),
+            }
+            let row: IdRow = sql_query("SELECT LAST_INSERT_ID() AS id")
+                .get_result(c)
+                .map_err(|e| format!("Failed to fetch inserted user id (mysql): {e}"))?;
+            Ok(Some(row.id))
+        }
+    }
+}
+
+fn insert_new_user_inner(conn: &mut DbConnection, user: &User) -> Result<NewUserOutcome, String> {
+    if username_exists_any(conn, &user.username)? {
+        return Ok(NewUserOutcome::UsernameTaken);
+    }
+    for entry in user.email.as_deref().unwrap_or_default() {
+        if email_in_use(conn, &entry.address)? {
+            return Ok(NewUserOutcome::EmailTaken);
+        }
+    }
+
+    let Some(user_id) = insert_user_row_strict(conn, user)? else {
+        return Ok(NewUserOutcome::UsernameTaken);
+    };
+
+    replace_user_allow(conn, user_id, user.allow.as_deref())?;
+    replace_user_roles(conn, user_id, user.roles.as_deref())?;
+    replace_user_groups(conn, user_id, user.groups.as_deref())?;
+    replace_user_email(conn, user_id, user.email.as_deref())?;
+    Ok(NewUserOutcome::Created)
+}
+
+/// Creates a brand-new account — the storage side of
+/// `POST /auth/registry`.
+///
+/// SECURITY: deliberately *not* `upsert_user`. That one is an admin
+/// tool: it overwrites an existing account's password and revives a
+/// soft-deleted one, which is exactly right for `db-add-user` and
+/// exactly wrong for an unauthenticated caller — reusing it here would
+/// let anyone "register" `alice` and take over her account. This
+/// function only ever inserts, and refuses (`UsernameTaken`) as soon as
+/// any row — even a soft-deleted one — holds the username.
+///
+/// The `users` row and its `user_allow`/`user_roles`/`user_groups`/
+/// `user_email` children are written inside one transaction, so a
+/// failure halfway through never leaves a half-configured account
+/// (e.g. created but without its default groups) behind. Any
+/// non-`Created` outcome rolls back too.
+///
+/// Email uniqueness is checked inside the same transaction but isn't
+/// backed by a database constraint (`user_email.email` has none, and
+/// adding one could fail on existing installs that already hold
+/// duplicates) — two registrations with the same address racing on two
+/// instances at the same millisecond could both succeed. Username
+/// uniqueness, the one that matters for account takeover, *is*
+/// enforced by the database itself.
+pub fn insert_new_user(conn: &mut DbConnection, user: &User) -> Result<NewUserOutcome, String> {
+    exec_simple(conn, "BEGIN")?;
+    match insert_new_user_inner(conn, user) {
+        Ok(NewUserOutcome::Created) => {
+            if let Err(e) = exec_simple(conn, "COMMIT") {
+                let _ = exec_simple(conn, "ROLLBACK");
+                return Err(e);
+            }
+            Ok(NewUserOutcome::Created)
+        }
+        Ok(refused) => {
+            exec_simple(conn, "ROLLBACK")?;
+            Ok(refused)
+        }
+        Err(e) => {
+            let _ = exec_simple(conn, "ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// Soft-deletes a user: sets `deleted = TRUE` (and bumps `modified_at`)
 /// instead of running `DELETE FROM users`. This is what makes deletion
 /// visible to the incremental scan — a hard `DELETE` leaves no row for a
