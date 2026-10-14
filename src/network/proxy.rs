@@ -32,6 +32,36 @@ use std::sync::RwLock;
 use tokio::time::{Duration, timeout};
 use tracing::warn;
 
+/// Valeur du cookie `name`, cherchée dans TOUTES les lignes `Cookie` de la
+/// requête. En HTTP/2, les navigateurs envoient une ligne par cookie
+/// (RFC 9113, § 8.2.3) : `headers().get(COOKIE)` ne lit que la première, et
+/// la session était perdue dès qu'un autre cookie (consentement d'une régie,
+/// statistiques…) arrivait avant `session_token`. Les autres cookies ne sont
+/// ni lus ni modifiés ici.
+pub(crate) fn request_cookie<'a>(req: &'a actix_web::HttpRequest, name: &str) -> Option<&'a str> {
+    req.headers()
+        .get_all(actix_web::http::header::COOKIE)
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|line| line.split(';'))
+        .find_map(|cookie| {
+            let (key, value) = cookie.trim().split_once('=')?;
+            (key.trim() == name).then(|| value.trim())
+        })
+}
+
+/// Toutes les lignes `Cookie` réunies en une seule (`a=1; b=2`), telle qu'il
+/// faut la recopier sur une requête sortante en HTTP/1.1. None sans cookie.
+pub(crate) fn joined_cookie_header(req: &actix_web::HttpRequest) -> Option<String> {
+    let parts: Vec<&str> = req
+        .headers()
+        .get_all(actix_web::http::header::COOKIE)
+        .filter_map(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock::new(None));
 
 fn to_actix_status(s: hyper::StatusCode) -> actix_web::http::StatusCode {
@@ -501,15 +531,7 @@ pub fn login_page_redirect_target<'a>(
 
     // Not a reason to refuse the redirect — the visitor still needs the
     // login page — but the likely reason they keep landing on it.
-    let has_session_cookie = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|cookies| {
-            cookies
-                .split(';')
-                .any(|c| c.trim_start().starts_with("session_token="))
-        });
+    let has_session_cookie = request_cookie(req, "session_token").is_some();
     if has_session_cookie && !is_secure_request(req, config) {
         warn!(
             "route \"{}\": a session cookie was sent but is ignored because the connection is not considered secure (enable tls, or list the TLS-terminating proxy in trust_proxy_forward_for); sending the visitor to the login page again",
@@ -648,20 +670,7 @@ pub async fn extract_username_for_tags(
             if !is_secure_request(req, &data.config) {
                 return None;
             }
-            req.headers()
-                .get(header::COOKIE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|cookie_str| {
-                    cookie_str.split(';').find_map(|cookie| {
-                        let cookie = cookie.trim();
-                        let (key, value) = cookie.split_once('=')?;
-                        if key.trim() == "session_token" {
-                            Some(value.trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                })
+            crate::network::proxy::request_cookie(&req, "session_token").map(str::to_string)
         })?;
 
     match crate::token::security::validate_token(&token, data, &data.config, ip).await {
@@ -1415,7 +1424,8 @@ async fn check_backend_session(
     };
 
     let mut request_builder = Request::builder().method(Method::GET).uri(&uri);
-    if let Some(cookie_header) = req.headers().get(header::COOKIE) {
+    // Toutes les lignes Cookie, réunies (HTTP/2 en envoie une par cookie).
+    if let Some(cookie_header) = joined_cookie_header(req) {
         // Same cross-crate `http` type mismatch as in
         // `proxy_to_redirect_protect_target` — actix_web's
         // `HeaderValue` doesn't convert directly into hyper's, so
@@ -1866,20 +1876,7 @@ async fn check_static_auth(
             if !is_secure_request(req, &data.config) {
                 return None;
             }
-            req.headers()
-                .get(header::COOKIE)
-                .and_then(|val| val.to_str().ok())
-                .and_then(|cookie_str| {
-                    cookie_str.split(';').find_map(|cookie| {
-                        let cookie = cookie.trim();
-                        let (key, value) = cookie.split_once('=')?;
-                        if key.trim() == "session_token" {
-                            Some(value.trim())
-                        } else {
-                            None
-                        }
-                    })
-                })
+            crate::network::proxy::request_cookie(&req, "session_token")
         });
 
     let Some(token_header) = token_header else {
@@ -2851,20 +2848,7 @@ pub async fn proxy_with_proxy(
                 if !is_secure_request(&req, &data.config) {
                     return None;
                 }
-                req.headers()
-                    .get(header::COOKIE)
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|cookie_str| {
-                        cookie_str.split(';').find_map(|cookie| {
-                            let cookie = cookie.trim();
-                            if let Some((key, value)) = cookie.split_once('=') {
-                                if key.trim() == "session_token" {
-                                    return Some(value.trim());
-                                }
-                            }
-                            None
-                        })
-                    })
+                crate::network::proxy::request_cookie(&req, "session_token")
             })
             ;
 
@@ -3634,22 +3618,7 @@ pub async fn proxy_without_proxy(
                     return None;
                 }
 
-                req.headers()
-                    .get(header::COOKIE)
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|cookie_str| {
-                        cookie_str.split(';').find_map(|cookie| {
-                            let cookie = cookie.trim();
-
-                            if let Some((key, value)) = cookie.split_once('=') {
-                                if key.trim() == "session_token" {
-                                    return Some(value.trim());
-                                }
-                            }
-
-                            None
-                        })
-                    })
+                crate::network::proxy::request_cookie(&req, "session_token")
             })
             ;
 
@@ -4225,3 +4194,39 @@ pub async fn proxy_without_proxy(
         .body(body_bytes))
 }
 
+
+#[cfg(test)]
+mod cookie_header_tests {
+    use super::{joined_cookie_header, request_cookie};
+    use actix_web::test::TestRequest;
+
+    /// Navigateur en HTTP/2 : une ligne `Cookie` par cookie, et un cookie de
+    /// consentement (régie publicitaire) envoyé avant `session_token`.
+    #[actix_web::test]
+    async fn session_cookie_found_in_any_cookie_line() {
+        let req = TestRequest::default()
+            .append_header(("cookie", "FCCDCF=%5Bnull%2Cnull%5D"))
+            .append_header(("cookie", "session_token=abc123"))
+            .to_http_request();
+        assert_eq!(request_cookie(&req, "session_token"), Some("abc123"));
+        assert_eq!(request_cookie(&req, "FCCDCF"), Some("%5Bnull%2Cnull%5D"));
+        assert_eq!(
+            joined_cookie_header(&req).as_deref(),
+            Some("FCCDCF=%5Bnull%2Cnull%5D; session_token=abc123")
+        );
+    }
+
+    #[actix_web::test]
+    async fn single_line_and_absent_cookie() {
+        let req = TestRequest::default()
+            .append_header(("cookie", "a=1; session_token=xyz; b=2"))
+            .to_http_request();
+        assert_eq!(request_cookie(&req, "session_token"), Some("xyz"));
+        let empty = TestRequest::default().to_http_request();
+        assert_eq!(request_cookie(&empty, "session_token"), None);
+        assert_eq!(joined_cookie_header(&empty), None);
+        // Un nom qui ne fait que commencer pareil n'est pas confondu.
+        let other = TestRequest::default().append_header(("cookie", "session_token_old=1")).to_http_request();
+        assert_eq!(request_cookie(&other, "session_token"), None);
+    }
+}

@@ -269,16 +269,7 @@ pub async fn authorize_handler(
                 if !is_secure_request(&req, &data.config) {
                     return None;
                 }
-                req.headers()
-                    .get(header::COOKIE)
-                    .and_then(|val| val.to_str().ok())
-                    .and_then(|cookie_str| {
-                        cookie_str.split(';').find_map(|cookie| {
-                            let cookie = cookie.trim();
-                            let (key, value) = cookie.split_once('=')?;
-                            (key.trim() == "session_token").then(|| value.trim().to_string())
-                        })
-                    })
+                crate::network::proxy::request_cookie(&req, "session_token").map(str::to_string)
             });
 
         match token_header {

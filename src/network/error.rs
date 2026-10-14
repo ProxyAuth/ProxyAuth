@@ -223,7 +223,8 @@ pub async fn render_error_page(
     {
         rb = rb.header(USER_AGENT, ua);
     }
-    if let Some(ck) = req.headers().get("cookie").and_then(|v| v.to_str().ok()) {
+    // Toutes les lignes Cookie, réunies (HTTP/2 en envoie une par cookie).
+    if let Some(ck) = crate::network::proxy::joined_cookie_header(req) {
         rb = rb.header(COOKIE, ck);
     }
     if let Some(al) = req
