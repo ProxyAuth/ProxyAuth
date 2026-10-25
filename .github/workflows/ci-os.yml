@@ -129,6 +129,8 @@ jobs:
                 git \
                 jq \
                 llvm \
+                clang-dev \
+                llvm-dev \
                 mariadb-connector-c-dev \
                 nettle-dev \
                 nodejs \
