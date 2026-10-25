@@ -63,10 +63,10 @@ http-body-util = "^0.1"
 hyper-util  = { version = "^0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 hyper-http-proxy = "1.2.0"
 hyper-rustls = "0.27"
-rustls = { version = ">=0.23.45", features = ["ring"] }
+rustls = { version = ">=0.23.46", features = ["ring"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.9"
-webpki-roots = "0.26"
+webpki-roots = ">=1.0.10"
 rustc-hash = "1"
 memchr = "2"
 futures-util = "0.3"
@@ -119,7 +119,11 @@ rand_core = "0.10.1"
 # ranges so the resolver can still pick up a future patched release
 # without needing this file edited again.
 [dependencies.rustls-webpki]
-version = ">=0.103.13, <0.104.0-alpha.1"
+version = ">=0.103.16, <0.104.0-alpha.1"
+
+[dependencies.webpki-root-certs]
+version = ">=1.0.10"
+
 [dependencies.quinn-proto]
 version = ">=0.11.18"
 
@@ -131,6 +135,9 @@ version = ">=0.10.80"
 
 [dependencies.cmov]
 version = ">=0.5.4"
+
+[dependencies.ctutils]
+version = ">=0.4.4"
 
 [build-dependencies]
 rand = { version = "0.10", features = ["chacha"] }
