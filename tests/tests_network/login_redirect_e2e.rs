@@ -8,11 +8,10 @@
 
 #[cfg(test)]
 mod tests {
-    use actix_web::body::MessageBody;
-    use actix_web::dev::{Service, ServiceResponse};
-    use actix_web::http::{StatusCode, header};
-    use actix_web::test::{self, TestRequest};
-    use actix_web::{App, web};
+    use proxyauth::hyper_web::dev::ServiceResponse;
+    use proxyauth::hyper_web::http::{StatusCode, header};
+    use proxyauth::hyper_web::test::{self, TestRequest};
+    use proxyauth::hyper_web::{App, web};
     use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
     use proxyauth::network::proxy::global_proxy;
     use proxyauth::network::stats::RequestStats;
@@ -241,7 +240,7 @@ vhosts:
     async fn call(
         state: AppState,
         req: TestRequest,
-    ) -> ServiceResponse<impl MessageBody> {
+    ) -> ServiceResponse {
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(state))
@@ -273,7 +272,7 @@ vhosts:
 
     // ── not signed in ────────────────────────────────────────
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn anonymous_visitor_reads_the_public_site() {
         let (status, location, _, body) = send(open(SITE, "/")).await;
         assert_eq!(status, StatusCode::OK);
@@ -289,7 +288,7 @@ vhosts:
         assert_eq!(body, "<urlset/>");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn anonymous_visitor_is_sent_from_admin_to_the_login_page() {
         for path in ["/admin", "/admin/", "/admin/stats?days=30"] {
             let (status, location, cookie, _) = send(open(SITE, path)).await;
@@ -299,7 +298,7 @@ vhosts:
         }
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_login_page_itself_is_public() {
         let (status, location, _, body) = send(open(SITE, "/login")).await;
         assert_eq!(status, StatusCode::OK);
@@ -308,7 +307,7 @@ vhosts:
         assert!(!body.contains("{{ csrf_token }}"), "tag_proxyauth must fill the CSRF token");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn api_calls_and_writes_keep_their_401() {
         let json = TestRequest::get()
             .uri("/admin/api/stats")
@@ -332,14 +331,14 @@ vhosts:
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_route_level_redirect_login_url_is_used() {
         let (status, location, _, _) = send(open(RESTRICTED, "/ops")).await;
         assert_eq!(status, StatusCode::FOUND);
         assert_eq!(location.as_deref(), Some("/sign-in"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn protected_static_routes_redirect_too() {
         let (status, location, _, _) = send(open(RESTRICTED, "/docs")).await;
         assert_eq!(status, StatusCode::FOUND);
@@ -348,7 +347,7 @@ vhosts:
 
     // ── invalid session ──────────────────────────────────────
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn an_invalid_cookie_on_admin_goes_to_the_login_page_and_is_cleared() {
         let (status, location, cookie, _) =
             send(with_cookie(open(SITE, "/admin"), "not-a-real-token")).await;
@@ -357,7 +356,7 @@ vhosts:
         assert_cleared(cookie);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_revoked_session_on_admin_goes_to_the_login_page() {
         let token = session(ADMIN, "admin", "e2e-revoked");
         let state = state();
@@ -368,7 +367,7 @@ vhosts:
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/login");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn an_invalid_cookie_does_not_block_the_public_site() {
         let (status, location, _, body) =
             send(with_cookie(open(SITE, "/"), "not-a-real-token")).await;
@@ -379,7 +378,7 @@ vhosts:
 
     // ── signed in ────────────────────────────────────────────
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn signed_in_visitor_can_browse_the_public_site() {
         let token = admin_session();
         for (path, expected) in [
@@ -395,7 +394,7 @@ vhosts:
         }
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn signed_in_visitor_reaches_admin() {
         let token = admin_session();
         let (status, location, cookie, body) =
@@ -406,7 +405,7 @@ vhosts:
         assert_eq!(body, "backend:/admin/stats");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn signed_in_visitor_on_the_login_page_goes_to_login_redirect_url() {
         let token = admin_session();
         let (status, location, _, _) = send(with_cookie(open(SITE, "/login"), &token)).await;
@@ -414,7 +413,7 @@ vhosts:
         assert_eq!(location.as_deref(), Some("/admin"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn signed_in_visitor_without_the_right_group_gets_a_403() {
         let token = session(BOB, "bob", "e2e-bob");
         let (status, location, cookie, _) =
@@ -431,7 +430,7 @@ vhosts:
 
     // ── historical layout: login form on "/" ─────────────────
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn legacy_layout_still_forwards_signed_in_visitors_from_the_root() {
         let token = admin_session();
         let (status, location, _, _) = send(with_cookie(open(LEGACY, "/"), &token)).await;
@@ -443,7 +442,7 @@ vhosts:
         assert!(body.contains("action=\"/auth\""));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn legacy_layout_without_a_login_page_keeps_the_401() {
         let (status, location, _, _) = send(open(LEGACY, "/app")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "no login page configured: the historical 401 is kept");

@@ -12,10 +12,10 @@ use crate::config::config::AppState;
 use crate::network::proxy::{find_vhost_route, request_host};
 use crate::proto::oidc_provider::jwt::signing_key;
 use crate::proto::oidc_provider::token::AccessTokenClaims;
-use actix_web::{HttpRequest, HttpResponse, web};
+use crate::hyper_web::{HttpRequest, HttpResponse, web};
 use serde_json::{Map, Value};
 
-fn userinfo_error(status: actix_web::http::StatusCode, error: &str) -> HttpResponse {
+fn userinfo_error(status: crate::hyper_web::http::StatusCode, error: &str) -> HttpResponse {
     HttpResponse::build(status)
         .append_header(("server", "ProxyAuth"))
         .append_header(("www-authenticate", format!(r#"Bearer error="{error}""#)))
@@ -30,7 +30,7 @@ pub async fn userinfo_handler(req: HttpRequest, data: web::Data<AppState>) -> Ht
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
     else {
-        return userinfo_error(actix_web::http::StatusCode::UNAUTHORIZED, "invalid_request");
+        return userinfo_error(crate::hyper_web::http::StatusCode::UNAUTHORIZED, "invalid_request");
     };
 
     let key = signing_key();
@@ -41,7 +41,7 @@ pub async fn userinfo_handler(req: HttpRequest, data: web::Data<AppState>) -> Ht
     ) {
         Ok(decoded) => decoded.claims,
         Err(_) => {
-            return userinfo_error(actix_web::http::StatusCode::UNAUTHORIZED, "invalid_token");
+            return userinfo_error(crate::hyper_web::http::StatusCode::UNAUTHORIZED, "invalid_token");
         }
     };
 
@@ -53,17 +53,17 @@ pub async fn userinfo_handler(req: HttpRequest, data: web::Data<AppState>) -> Ht
     // so the signature alone doesn't distinguish which vhost a token
     // was really meant for).
     let Some(host) = request_host(&req) else {
-        return userinfo_error(actix_web::http::StatusCode::BAD_REQUEST, "invalid_request");
+        return userinfo_error(crate::hyper_web::http::StatusCode::BAD_REQUEST, "invalid_request");
     };
     let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) else {
-        return userinfo_error(actix_web::http::StatusCode::BAD_REQUEST, "invalid_request");
+        return userinfo_error(crate::hyper_web::http::StatusCode::BAD_REQUEST, "invalid_request");
     };
     if rule.oidc.is_none() {
-        return userinfo_error(actix_web::http::StatusCode::BAD_REQUEST, "invalid_request");
+        return userinfo_error(crate::hyper_web::http::StatusCode::BAD_REQUEST, "invalid_request");
     }
     let expected_issuer = format!("https://{host}");
     if claims.iss != expected_issuer {
-        return userinfo_error(actix_web::http::StatusCode::UNAUTHORIZED, "invalid_token");
+        return userinfo_error(crate::hyper_web::http::StatusCode::UNAUTHORIZED, "invalid_token");
     }
 
     let scopes: Vec<&str> = claims.scope.split_whitespace().collect();

@@ -6,10 +6,9 @@
 
 #[cfg(test)]
 mod tests {
-    use actix_web::dev::Service;
-    use actix_web::http::header;
-    use actix_web::test::{self, TestRequest};
-    use actix_web::{App, web};
+        use proxyauth::hyper_web::http::header;
+    use proxyauth::hyper_web::test::{self, TestRequest};
+    use proxyauth::hyper_web::{App, web};
     use proxyauth::config::config::{AppState, RouteConfig, load_config};
     use proxyauth::network::stats::RequestStats;
     use proxyauth::stats::tokencount::CounterToken;
@@ -82,6 +81,7 @@ vhosts:
         let cookie = resp
             .headers()
             .get_all(header::SET_COOKIE)
+            .iter()
             .filter_map(|v| v.to_str().ok())
             .find(|c| c.starts_with("session_token=") && !c.starts_with("session_token=;"))
             .map(str::to_string);
@@ -101,7 +101,7 @@ vhosts:
             .expect("the cookie carries a lifetime")
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_token_shorter_than_a_minute_still_signs_in() {
         let (status, cookie) = login_cookie(30, 3600).await;
         assert!(status < 500, "login failed with {status}");
@@ -109,14 +109,14 @@ vhosts:
         assert!(max_age(&cookie) <= 30, "never outlives the token: {cookie}");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_cookie_shorter_than_a_minute_still_signs_in() {
         let (status, cookie) = login_cookie(3600, 20).await;
         assert!(status < 500, "login failed with {status}");
         assert!(max_age(&cookie.expect("a session cookie")) <= 20);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn usual_lifetimes_are_unchanged() {
         let (status, cookie) = login_cookie(3600, 1800).await;
         assert!(status < 500);

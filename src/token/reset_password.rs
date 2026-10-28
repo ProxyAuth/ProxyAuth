@@ -12,8 +12,8 @@ use crate::network::error::render_error_page;
 use crate::reset::db as reset_db;
 use crate::token::auth::verify_password;
 use crate::token::csrf::verify_csrf_token;
-use actix_web::{
-    Error as ActixError, FromRequest, HttpRequest, HttpResponse, Responder,
+use crate::hyper_web::{
+    Error as WebError, FromRequest, HttpRequest, HttpResponse, Responder,
     dev::Payload,
     error::ErrorBadRequest,
     web::{self, Form, Json},
@@ -38,7 +38,7 @@ pub enum EitherResetPassword {
 }
 
 impl FromRequest for EitherResetPassword {
-    type Error = ActixError;
+    type Error = WebError;
     type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
 
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {

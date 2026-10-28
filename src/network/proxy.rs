@@ -11,7 +11,7 @@ use crate::network::shared_client::{
 use crate::token::csrf::{fix_mime_actix, inject_csrf_token, validate_csrf_token};
 use crate::token::security::apply_filters_regex_allow_only;
 use crate::{AppConfig, AppState};
-use actix_web::{
+use crate::hyper_web::{
     Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
     web,
 };
@@ -28,7 +28,7 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::RwLock;
+use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tracing::warn;
 
@@ -38,9 +38,10 @@ use tracing::warn;
 /// la session était perdue dès qu'un autre cookie (consentement d'une régie,
 /// statistiques…) arrivait avant `session_token`. Les autres cookies ne sont
 /// ni lus ni modifiés ici.
-pub(crate) fn request_cookie<'a>(req: &'a actix_web::HttpRequest, name: &str) -> Option<&'a str> {
+pub(crate) fn request_cookie<'a>(req: &'a crate::hyper_web::HttpRequest, name: &str) -> Option<&'a str> {
     req.headers()
-        .get_all(actix_web::http::header::COOKIE)
+        .get_all(crate::hyper_web::http::header::COOKIE)
+        .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|line| line.split(';'))
         .find_map(|cookie| {
@@ -51,10 +52,11 @@ pub(crate) fn request_cookie<'a>(req: &'a actix_web::HttpRequest, name: &str) ->
 
 /// Toutes les lignes `Cookie` réunies en une seule (`a=1; b=2`), telle qu'il
 /// faut la recopier sur une requête sortante en HTTP/1.1. None sans cookie.
-pub(crate) fn joined_cookie_header(req: &actix_web::HttpRequest) -> Option<String> {
+pub(crate) fn joined_cookie_header(req: &crate::hyper_web::HttpRequest) -> Option<String> {
     let parts: Vec<&str> = req
         .headers()
-        .get_all(actix_web::http::header::COOKIE)
+        .get_all(crate::hyper_web::http::header::COOKIE)
+        .iter()
         .filter_map(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -62,11 +64,19 @@ pub(crate) fn joined_cookie_header(req: &actix_web::HttpRequest) -> Option<Strin
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
-static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock::new(None));
+/// Ordre de recherche des routes, calculé au chargement.
+///
+/// PERF : lu à chaque requête par tous les workers. Un `RwLock` fait,
+/// même en lecture seule, une opération atomique sur un compteur partagé
+/// : à des centaines de milliers de requêtes/s sur des dizaines de cœurs,
+/// cette ligne de cache fait la navette entre eux. `ArcSwapOption` se lit
+/// sans écriture partagée.
+static ORDERED_ROUTE_IDX: Lazy<arc_swap::ArcSwapOption<Vec<usize>>> =
+    Lazy::new(|| arc_swap::ArcSwapOption::from(None));
 
-fn to_actix_status(s: hyper::StatusCode) -> actix_web::http::StatusCode {
-    actix_web::http::StatusCode::from_u16(s.as_u16())
-        .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)
+fn to_actix_status(s: hyper::StatusCode) -> crate::hyper_web::http::StatusCode {
+    crate::hyper_web::http::StatusCode::from_u16(s.as_u16())
+        .unwrap_or(crate::hyper_web::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn norm_len(prefix: &str) -> usize {
@@ -202,7 +212,7 @@ fn ip_allowed(ip: Option<IpAddr>, rule: &RouteRule) -> bool {
 }
 
 pub fn init_routes_order(routes: &[RouteRule]) {
-    *ORDERED_ROUTE_IDX.write().unwrap() = Some(build_route_order(routes));
+    ORDERED_ROUTE_IDX.store(Some(Arc::new(build_route_order(routes))));
 }
 
 /// Validates every `log_file` in routes: must be a simple filename
@@ -439,7 +449,7 @@ pub fn normalize_host(host: &str) -> String {
 /// here always wins over anything the backend itself might have sent
 /// for the same header name (`insert_header` replaces rather than
 /// appending a duplicate).
-fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, rule: &RouteRule) {
+fn apply_custom_headers_builder(builder: &mut crate::hyper_web::HttpResponseBuilder, rule: &RouteRule) {
     for (name, value) in &rule.headers {
         // Validated explicitly rather than handed straight to
         // `insert_header`: actix doesn't panic on a malformed
@@ -450,8 +460,8 @@ fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, ru
         // skipped on its own with a warning logged, which is what
         // this achieves instead.
         if let (Ok(header_name), Ok(header_value)) = (
-            actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
-            actix_web::http::header::HeaderValue::from_str(value),
+            crate::hyper_web::http::header::HeaderName::from_bytes(name.as_bytes()),
+            crate::hyper_web::http::header::HeaderValue::from_str(value),
         ) {
             builder.insert_header((header_name, header_value));
         } else {
@@ -631,8 +641,8 @@ pub fn login_page_redirect(target: &str, clear_session: bool) -> HttpResponse {
 fn apply_custom_headers(resp: &mut HttpResponse, rule: &RouteRule) {
     for (name, value) in &rule.headers {
         if let (Ok(header_name), Ok(header_value)) = (
-            actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
-            actix_web::http::header::HeaderValue::from_str(value),
+            crate::hyper_web::http::header::HeaderName::from_bytes(name.as_bytes()),
+            crate::hyper_web::http::header::HeaderValue::from_str(value),
         ) {
             resp.headers_mut().insert(header_name, header_value);
         } else {
@@ -1034,8 +1044,8 @@ fn eligible_on_pass(host: Option<&str>, rule: &RouteRule, exact_pass: bool) -> b
 /// distinction only exists once the requested host is known.
 pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule]) -> Option<usize> {
     {
-        let guard = ORDERED_ROUTE_IDX.read().unwrap();
-        if let Some(order) = guard.as_ref() {
+        let guard = ORDERED_ROUTE_IDX.load();
+        if let Some(order) = guard.as_deref() {
             if order.iter().all(|&i| i < routes.len()) {
                 for exact_pass in [true, false] {
                     for &i in order {
@@ -1183,6 +1193,45 @@ pub fn client_ip(req: &HttpRequest, config: &AppConfig) -> Option<IpAddr> {
     peer_ip
 }
 
+/// Pourquoi le backend n'a pas fourni de réponse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamFailure {
+    /// Connexion refusée/réinitialisée, DNS, TLS, réponse invalide, ou
+    /// tous les backends d'un pool en échec.
+    Unreachable,
+    /// Aucune réponse dans `backend_timeout`.
+    Timeout,
+}
+
+/// Réponse quand le backend d'une route existante ne répond pas.
+///
+/// Mêmes statuts que nginx/Envoy (RFC 9110 § 15.6) :
+/// * `502 Bad Gateway` — ProxyAuth n'a pas obtenu de réponse valide du
+///   backend (service arrêté, connexion refusée…) ;
+/// * `504 Gateway Timeout` — le backend n'a pas répondu à temps.
+///
+/// `503 Service Unavailable` reste réservé à ce que ProxyAuth rend
+/// indisponible lui-même (maintenance `redirect_protect`, fonctionnalité
+/// non configurée), et `404` à une URL qu'aucune route ne couvre.
+///
+/// `cors` ajoute les en-têtes CORS de la route (closure locale du
+/// handler, qui connaît la route et la configuration).
+pub(crate) fn upstream_failure(
+    why: UpstreamFailure,
+    cors: impl FnOnce(&mut HttpResponseBuilder),
+) -> HttpResponse {
+    let mut resp = match why {
+        UpstreamFailure::Unreachable => HttpResponse::BadGateway(),
+        UpstreamFailure::Timeout => HttpResponse::GatewayTimeout(),
+    };
+    resp.append_header(("server", "ProxyAuth"));
+    cors(&mut resp);
+    resp.body(match why {
+        UpstreamFailure::Unreachable => "502 Bad Gateway",
+        UpstreamFailure::Timeout => "504 Gateway Timeout",
+    })
+}
+
 /// Response-side body type. Distinct from `BoxBody` (whose error type
 /// is `Infallible`, correct for the *request* bodies this proxy builds
 /// itself): a streamed upstream response can fail mid-body, so its
@@ -1209,11 +1258,10 @@ fn widen_boxbody(res: hyper::Response<BoxBody>) -> hyper::Response<ResponseBody>
 }
 
 /// Adapts an `http_body::Body` into the `Stream` that
-/// `HttpResponse::streaming` expects. Trailer frames are dropped —
-/// actix has no way to emit them to the client.
-fn body_to_actix_stream<B>(
+/// `HttpResponse::streaming` expects. Trailer frames are dropped.
+fn body_to_stream<B>(
     body: B,
-) -> impl futures_util::Stream<Item = Result<Bytes, Box<dyn std::error::Error + 'static>>>
+) -> impl futures_util::Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync + 'static>>>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -1221,7 +1269,7 @@ where
     BodyStream::new(body).filter_map(|frame| async move {
         match frame {
             Ok(f) => f.into_data().ok().map(Ok),
-            Err(e) => Some(Err(Box::new(e) as Box<dyn std::error::Error + 'static>)),
+            Err(e) => Some(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>)),
         }
     })
 }
@@ -1604,18 +1652,37 @@ fn guess_content_type(path: &Path) -> &'static str {
 /// looks identical to a 404 otherwise and is easy to mistake for a
 /// typo'd path instead of a permissions problem.
 fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> HttpResponse {
+    // EMFILE (24) / ENFILE (23) : plus de descripteurs de fichiers, côté
+    // processus ou côté système. Le fichier existe très probablement :
+    // c'est le serveur qui est saturé, pas le chemin qui est faux. Un 404
+    // ici serait faux, mis en cache par les navigateurs et les CDN, et
+    // invisible dans les logs.
+    const ENFILE: i32 = 23;
+    const EMFILE: i32 = 24;
+
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        warn!(
+            "static route \"{prefix}\": too many open files while reading {} — raise the open-files limit of the proxyauth service (ulimit -n / LimitNOFILE / rc_ulimit)",
+              path.display()
+        );
+        return HttpResponse::ServiceUnavailable()
+        .append_header(("server", "ProxyAuth"))
+        .append_header(("Retry-After", "1"))
+        .body("503 Service Unavailable");
+    }
+
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         warn!(
             "static route \"{prefix}\": permission denied reading {} — the \"proxyauth\" user needs read (and, for directories, execute/traverse) access to this path",
-            path.display()
+              path.display()
         );
         HttpResponse::InternalServerError()
-            .append_header(("server", "ProxyAuth"))
-            .body("500 Internal Server Error")
+        .append_header(("server", "ProxyAuth"))
+        .body("500 Internal Server Error")
     } else {
         HttpResponse::NotFound()
-            .append_header(("server", "ProxyAuth"))
-            .body("404 Not Found")
+        .append_header(("server", "ProxyAuth"))
+        .body("404 Not Found")
     }
 }
 
@@ -2170,7 +2237,7 @@ async fn global_proxy_inner(
     // something for this exact (vhost, token) pair — see
     // `acme::challenge`'s module doc comment for why this is a
     // separate overlay rather than a real routes.yml entry.
-    if req.method() == actix_web::http::Method::GET {
+    if req.method() == crate::hyper_web::http::Method::GET {
         if let Some(token) = crate::acme::challenge::extract_token(req.path()) {
             let host = req.connection_info().host().to_string();
             let vhost = normalize_host(&host);
@@ -2285,7 +2352,7 @@ async fn global_proxy_inner(
     // (server-to-server) further down, `/oidc/userinfo` alongside
     // discovery/jwks since it's also Bearer-token-only with no
     // session/browser involvement.
-    if req.method() == actix_web::http::Method::GET {
+    if req.method() == crate::hyper_web::http::Method::GET {
         let path = req.path();
         if path == "/.well-known/openid-configuration" || path == "/oidc/jwks.json" {
             if let Some(host) = request_host(&req) {
@@ -2357,8 +2424,8 @@ async fn global_proxy_inner(
     // back to this same URL — see `authorize::render_login_form`) —
     // it can't live inside the GET-only block above for that reason.
     if req.path() == "/oidc/authorize"
-        && (req.method() == actix_web::http::Method::GET
-            || req.method() == actix_web::http::Method::POST)
+        && (req.method() == crate::hyper_web::http::Method::GET
+            || req.method() == crate::hyper_web::http::Method::POST)
     {
         if let Some(host) = request_host(&req) {
             if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
@@ -2381,7 +2448,7 @@ async fn global_proxy_inner(
     // detour to consider here the way `/oidc/authorize` has. Same
     // oidc-configured-vhost gate as every other interception in this
     // block.
-    if req.method() == actix_web::http::Method::POST && req.path() == "/oidc/token" {
+    if req.method() == crate::hyper_web::http::Method::POST && req.path() == "/oidc/token" {
         if let Some(host) = request_host(&req) {
             if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
                 if rule.oidc.is_some() {
@@ -2398,7 +2465,7 @@ async fn global_proxy_inner(
         }
     }
 
-    if req.method() == actix_web::http::Method::OPTIONS {
+    if req.method() == crate::hyper_web::http::Method::OPTIONS {
         // The OIDC provider's own discovery/JWKS documents are meant
         // to be publicly, universally fetchable — see
         // `proto::oidc_provider::discovery`'s own reasoning for why
@@ -3152,7 +3219,7 @@ pub async fn proxy_with_proxy(
                 .await
                 .map_err(|e| {
                     warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
-                    error::ErrorServiceUnavailable("503 Service Unavailable")
+                    error::ErrorBadGateway("502 Bad Gateway")
                 })?,
         )
     } else {
@@ -3165,17 +3232,11 @@ pub async fn proxy_with_proxy(
             Ok(Ok(res)) => incoming_to_boxbody(res),
             Ok(Err(e)) => {
                 warn!(client_ip = %ip, target = %full_url, "Upstream error: {}", e);
-                let mut resp = HttpResponse::ServiceUnavailable();
-                resp.append_header(("server", "ProxyAuth"));
-                add_cors_headers(&mut resp, &req);
-                return Ok(resp.finish());
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| add_cors_headers(r, &req)));
             }
             Err(e) => {
                 warn!(client_ip = %ip, target = %full_url, "Timeout error: {}", e);
-                let mut resp = HttpResponse::ServiceUnavailable();
-                resp.append_header(("server", "ProxyAuth"));
-                add_cors_headers(&mut resp, &req);
-                return Ok(resp.finish());
+                return Ok(upstream_failure(UpstreamFailure::Timeout, |r| add_cors_headers(r, &req)));
             }
         }
     };
@@ -3260,7 +3321,7 @@ pub async fn proxy_with_proxy(
         apply_custom_headers_builder(&mut client_resp, rule);
         client_resp.append_header(("server", "ProxyAuth"));
 
-        return Ok(client_resp.streaming(body_to_actix_stream(resp_body)));
+        return Ok(client_resp.streaming(body_to_stream(resp_body)));
     }
 
     let mut body_bytes: Bytes = resp_body
@@ -3374,7 +3435,7 @@ pub async fn proxy_without_proxy(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
 
-    let is_head = req.method() == actix_web::http::Method::HEAD;
+    let is_head = req.method() == crate::hyper_web::http::Method::HEAD;
 
     let add_cors_headers = |resp: &mut HttpResponseBuilder, req: &HttpRequest| {
         if let Some(origin) = req
@@ -3944,13 +4005,7 @@ pub async fn proxy_without_proxy(
                     e
                 );
 
-                let mut builder = HttpResponse::ServiceUnavailable();
-
-                builder.append_header(("server", "ProxyAuth"));
-
-                add_cors_headers(&mut builder, &req);
-
-                return Ok(builder.finish());
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| add_cors_headers(r, &req)));
             }
         }
     } else {
@@ -3970,13 +4025,7 @@ pub async fn proxy_without_proxy(
                       e
                 );
 
-                let mut resp = HttpResponse::ServiceUnavailable();
-
-                resp.append_header(("server", "ProxyAuth"));
-
-                add_cors_headers(&mut resp, &req);
-
-                return Ok(resp.finish());
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| add_cors_headers(r, &req)));
             }
 
             Err(e) => {
@@ -3987,13 +4036,7 @@ pub async fn proxy_without_proxy(
                       e
                 );
 
-                let mut resp = HttpResponse::ServiceUnavailable();
-
-                resp.append_header(("server", "ProxyAuth"));
-
-                add_cors_headers(&mut resp, &req);
-
-                return Ok(resp.finish());
+                return Ok(upstream_failure(UpstreamFailure::Timeout, |r| add_cors_headers(r, &req)));
             }
         }
     };
@@ -4083,7 +4126,7 @@ pub async fn proxy_without_proxy(
         apply_custom_headers_builder(&mut client_resp, rule);
         client_resp.append_header(("server", "ProxyAuth"));
 
-        return Ok(client_resp.streaming(body_to_actix_stream(resp_body)));
+        return Ok(client_resp.streaming(body_to_stream(resp_body)));
     }
 
     // ── Response body ───────────────────────────────────────────────
@@ -4198,11 +4241,11 @@ pub async fn proxy_without_proxy(
 #[cfg(test)]
 mod cookie_header_tests {
     use super::{joined_cookie_header, request_cookie};
-    use actix_web::test::TestRequest;
+    use crate::hyper_web::test::TestRequest;
 
     /// Navigateur en HTTP/2 : une ligne `Cookie` par cookie, et un cookie de
     /// consentement (régie publicitaire) envoyé avant `session_token`.
-    #[actix_web::test]
+    #[tokio::test]
     async fn session_cookie_found_in_any_cookie_line() {
         let req = TestRequest::default()
             .append_header(("cookie", "FCCDCF=%5Bnull%2Cnull%5D"))
@@ -4216,7 +4259,7 @@ mod cookie_header_tests {
         );
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn single_line_and_absent_cookie() {
         let req = TestRequest::default()
             .append_header(("cookie", "a=1; session_token=xyz; b=2"))

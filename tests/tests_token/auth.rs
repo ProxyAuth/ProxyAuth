@@ -1,7 +1,7 @@
-use actix_web::FromRequest;
-use actix_web::Responder;
-use actix_web::cookie::Cookie;
-use actix_web::http::StatusCode;
+use proxyauth::hyper_web::FromRequest;
+use proxyauth::hyper_web::Responder;
+use proxyauth::hyper_web::cookie::Cookie;
+use proxyauth::hyper_web::http::StatusCode;
 use proxyauth::AppState;
 use proxyauth::CounterToken;
 use proxyauth::config::config::AuthRequest;
@@ -15,8 +15,8 @@ use totp_rs::TOTP;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::body::to_bytes as actix_to_bytes;
-    use actix_web::{http::header, test};
+    use proxyauth::hyper_web::body::to_bytes as actix_to_bytes;
+    use proxyauth::hyper_web::{http::header, test};
     use dashmap::DashMap;
     use proxyauth::config::config::{AppConfig, RouteConfig, RouteRule, User};
     use proxyauth::revoke::db::RevokedTokenMap;
@@ -91,8 +91,6 @@ mod tests {
             host: vec!["127.0.0.1".to_string()],
             port: 0,
             worker: 1,
-            ratelimit_proxy: Default::default(),
-            ratelimit_auth: Default::default(),
             log: Default::default(),
             stats: false,
             max_idle_per_host: 16,
@@ -117,7 +115,7 @@ mod tests {
         }
     }
 
-    fn mk_state(routes: Vec<RouteRule>, cfg: AppConfig) -> actix_web::web::Data<AppState> {
+    fn mk_state(routes: Vec<RouteRule>, cfg: AppConfig) -> proxyauth::hyper_web::web::Data<AppState> {
         let stats = RequestStats::new();
         spawn_stats_ticker(stats.clone());
 
@@ -136,7 +134,7 @@ mod tests {
             ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
             redirect_protect_url_ips: Arc::new(dashmap::DashMap::new()),
         };
-        actix_web::web::Data::new(state)
+        proxyauth::hyper_web::web::Data::new(state)
     }
 
     fn rr(prefix: &str, target: &str) -> RouteRule {
@@ -157,6 +155,9 @@ mod tests {
             compression: None,
             cache: Some(true),
             streaming: None,
+            ratelimit: None,
+            port: None,
+            protocol: None,
             if_vhost: Vec::new(),
             cache_duration_secs: None,
             secure_path: false,
@@ -261,7 +262,7 @@ mod tests {
         let secret = "s3cr3t";
 
         let req_get = test::TestRequest::default()
-            .method(actix_web::http::Method::GET)
+            .method(proxyauth::hyper_web::http::Method::GET)
             .to_http_request();
         let ok = proxyauth::token::auth::validate_csrf(
             &req_get,
@@ -276,7 +277,7 @@ mod tests {
         assert!(ok);
 
         let req_post = test::TestRequest::default()
-            .method(actix_web::http::Method::POST)
+            .method(proxyauth::hyper_web::http::Method::POST)
             .to_http_request();
         let bad = proxyauth::token::auth::validate_csrf(
             &req_post,
@@ -306,7 +307,7 @@ mod tests {
 
     // --------- is_ip_allowed -------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn is_ip_allowed_variants() {
         let base = || User {
             username: "u".into(),
@@ -362,7 +363,7 @@ mod tests {
 
     // --------- verify_password -----------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn verify_password_ok_bad() {
         let hashed = hash_pwd("hunter2");
         assert!(proxyauth::token::auth::verify_password("hunter2", &hashed));
@@ -371,7 +372,7 @@ mod tests {
 
     // --------- generate_random_string ----------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn generate_random_string_is_hex64() {
         let s = proxyauth::token::auth::generate_random_string(32);
         assert_eq!(s.len(), 64, "blake3 en hex → 64 chars");
@@ -380,7 +381,7 @@ mod tests {
 
     // --------- expiry helpers ------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn expiry_helpers_are_deterministic() {
         let mut cfg = base_config();
         cfg.token_expiry_seconds = 3600;
@@ -529,7 +530,7 @@ mod tests {
     }
 
     fn build_valid_session_cookie_for_user(
-        data: &actix_web::web::Data<AppState>,
+        data: &proxyauth::hyper_web::web::Data<AppState>,
         index_user: usize,
         token_id: &str,
         seconds_from_now: i64,
@@ -628,7 +629,7 @@ mod tests {
         let req = test::TestRequest::default()
             .insert_header((header::CONTENT_TYPE, "application/json"))
             .insert_header((header::ORIGIN, "https://app.example.com"))
-            .cookie(Cookie::build("session_token", token_enc).finish())
+            .cookie(Cookie::build(("session_token", token_enc)).build())
             .to_http_request();
 
         let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
@@ -826,7 +827,7 @@ mod tests {
 #[cfg(test)]
 mod render_error_page_tests {
     use super::*;
-    use actix_web::{http::header, test};
+    use proxyauth::hyper_web::{http::header, test};
     use bytes::Bytes as ActixBytes;
     use dashmap::DashMap;
     use std::net::TcpListener;
@@ -843,7 +844,7 @@ mod render_error_page_tests {
     use proxyauth::config::config::{AppConfig, RouteConfig, RouteRule};
     use proxyauth::revoke::db::RevokedTokenMap;
 
-    fn mk_state(routes: Vec<RouteRule>, mut cfg: AppConfig) -> actix_web::web::Data<AppState> {
+    fn mk_state(routes: Vec<RouteRule>, mut cfg: AppConfig) -> proxyauth::hyper_web::web::Data<AppState> {
         cfg.session_cookie = true;
         cfg.csrf_token = true;
 
@@ -865,7 +866,7 @@ mod render_error_page_tests {
             ip_blocklist: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
             redirect_protect_url_ips: Arc::new(dashmap::DashMap::new()),
         };
-        actix_web::web::Data::new(state)
+        proxyauth::hyper_web::web::Data::new(state)
     }
 
     fn base_cfg() -> AppConfig {
@@ -878,8 +879,6 @@ mod render_error_page_tests {
             host: vec!["127.0.0.1".to_string()],
             port: 0,
             worker: 1,
-            ratelimit_proxy: Default::default(),
-            ratelimit_auth: Default::default(),
             log: Default::default(),
             stats: false,
             max_idle_per_host: 16,
@@ -922,6 +921,9 @@ mod render_error_page_tests {
             compression: None,
             cache: Some(true),
             streaming: None,
+            ratelimit: None,
+            port: None,
+            protocol: None,
             if_vhost: Vec::new(),
             cache_duration_secs: None,
             secure_path: false,
@@ -1018,7 +1020,7 @@ mod render_error_page_tests {
         let resp = proxyauth::network::error::render_error_page(&req, data, "boom").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let body = actix_web::body::to_bytes(resp.into_body())
+        let body = proxyauth::hyper_web::body::to_bytes(resp.into_body())
             .await
             .unwrap_or_else(|_| ActixBytes::new());
         assert_eq!(&body[..], b"logout_redirect_url is not configured");
@@ -1034,7 +1036,7 @@ mod render_error_page_tests {
         let resp = proxyauth::network::error::render_error_page(&req, data, "x").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        let body = actix_web::body::to_bytes(resp.into_body())
+        let body = proxyauth::hyper_web::body::to_bytes(resp.into_body())
             .await
             .unwrap_or_else(|_| ActixBytes::new());
         assert_eq!(&body[..], b"No matching route for logout_redirect_url path");
@@ -1104,7 +1106,7 @@ mod render_error_page_tests {
             .to_ascii_lowercase();
         assert!(ct.contains("text/html"));
 
-        let body = actix_web::body::to_bytes(resp.into_body())
+        let body = proxyauth::hyper_web::body::to_bytes(resp.into_body())
             .await
             .unwrap_or_else(|_| ActixBytes::new());
         let s = String::from_utf8_lossy(&body);

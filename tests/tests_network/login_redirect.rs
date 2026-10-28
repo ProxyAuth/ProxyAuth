@@ -13,8 +13,8 @@
 
 #[cfg(test)]
 mod tests {
-    use actix_web::http::{StatusCode, header};
-    use actix_web::test::TestRequest;
+    use proxyauth::hyper_web::http::{StatusCode, header};
+    use proxyauth::hyper_web::test::TestRequest;
     use proxyauth::config::config::{AppConfig, RouteRule};
     use proxyauth::network::proxy::{
         is_login_page, login_page_path, login_page_redirect, login_page_redirect_target,
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn head_is_redirected_like_get() {
         let req = TestRequest::default()
-            .method(actix_web::http::Method::HEAD)
+            .method(proxyauth::hyper_web::http::Method::HEAD)
             .uri("/admin")
             .to_http_request();
         let rule = with_login_page("/admin", "/login");

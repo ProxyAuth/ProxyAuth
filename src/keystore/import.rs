@@ -27,6 +27,18 @@ fn resolve_config_path() -> String {
     std::env::var("PROXYAUTH_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string())
 }
 
+/// Default directory holding `key.asc` and `data.pgp`.
+const DEFAULT_IMPORT_DIR: &str = "/etc/proxyauth/import";
+
+/// The directory `decrypt_keystore` reads from: the one given, or
+/// [`DEFAULT_IMPORT_DIR`].
+fn resolve_import_dir(import_dir_opt: Option<&Path>) -> PathBuf {
+    match import_dir_opt {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(DEFAULT_IMPORT_DIR),
+    }
+}
+
 /// Reads `key.asc` and `data.pgp` from `import_dir` (or the default
 /// `/etc/proxyauth/import` directory), decrypts the payload using the
 /// certificate's secret key, and returns the decrypted text.
@@ -34,10 +46,7 @@ fn resolve_config_path() -> String {
 /// The passphrase protecting the secret key material in `key.asc` is
 /// loaded from the path returned by `resolve_config_path()`.
 pub fn decrypt_keystore(import_dir_opt: Option<&Path>) -> Result<Option<String>> {
-    let import_dir: PathBuf = match import_dir_opt {
-        Some(p) => p.to_path_buf(),
-        None => PathBuf::from("/etc/proxyauth/import"),
-    };
+    let import_dir = resolve_import_dir(import_dir_opt);
 
     let key_path = import_dir.join("key.asc");
     let data_path = import_dir.join("data.pgp");
@@ -240,15 +249,17 @@ mod tests {
 
     // --- default path (None) -----------------
 
+    // Checks the path resolution itself rather than calling
+    // `decrypt_keystore(None)`: that read the machine's real
+    // /etc/proxyauth/import, so the test failed on any host where
+    // ProxyAuth is installed with a keystore (a successful decryption
+    // returns `Some`). "No files → None" is covered, hermetically, by
+    // the two tests above.
     #[test]
-    fn passing_none_uses_default_path_and_returns_none_when_missing() {
-        // NOTE: this assumes /etc/proxyauth/import does not exist in
-        // the test environment. Adjust or skip if that assumption
-        // doesn't hold on CI.
-        let res = decrypt_keystore(None);
-        if let Ok(got) = res {
-            assert!(got.is_none());
-        }
+    fn passing_none_uses_default_path() {
+        assert_eq!(resolve_import_dir(None), PathBuf::from("/etc/proxyauth/import"));
+        let custom = Path::new("/tmp/somewhere-else");
+        assert_eq!(resolve_import_dir(Some(custom)), custom.to_path_buf());
     }
 
     // --- empty cert cases ----------------

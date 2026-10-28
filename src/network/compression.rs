@@ -56,18 +56,15 @@
 
 use crate::AppState;
 use crate::config::config::CompressionConfig;
-use actix_service::{Service, Transform};
-use actix_web::body::{BoxBody, MessageBody, to_bytes};
-use actix_web::dev::{ServiceRequest, ServiceResponse};
-use actix_web::http::header;
-use actix_web::{Error, HttpMessage, web};
+use crate::hyper_web::body::{BodySize, to_bytes};
+use crate::hyper_web::dev::{Middleware, Next, ServiceFuture, ServiceRequest, ServiceResponse};
+use crate::hyper_web::http::header;
+use crate::hyper_web::web;
 use brotli::CompressorWriter;
 use bytes::Bytes;
 use flate2::Compression as FlateLevel;
 use flate2::write::{DeflateEncoder, GzEncoder};
-use futures_util::future::{LocalBoxFuture, Ready, ok};
 use std::io::Write;
-use std::task::{Context, Poll};
 
 use crate::network::accesslog::LogContext;
 
@@ -289,54 +286,16 @@ pub struct Compress {
     pub state: web::Data<AppState>,
 }
 
-impl<S, B> Transform<S, ServiceRequest> for Compress
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: 'static,
-    B: MessageBody + 'static,
-{
-    type Response = ServiceResponse<BoxBody>;
-    type Error = Error;
-    type Transform = CompressMiddleware<S>;
-    type InitError = ();
-    type Future = Ready<Result<Self::Transform, Self::InitError>>;
-
-    fn new_transform(&self, service: S) -> Self::Future {
-        ok(CompressMiddleware {
-            service,
-            state: self.state.clone(),
-        })
-    }
-}
-
-pub struct CompressMiddleware<S> {
-    service: S,
-    state: web::Data<AppState>,
-}
-
-impl<S, B> Service<ServiceRequest> for CompressMiddleware<S>
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: 'static,
-    B: MessageBody + 'static,
-{
-    type Response = ServiceResponse<BoxBody>;
-    type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.service.poll_ready(cx)
-    }
-
-    fn call(&self, req: ServiceRequest) -> Self::Future {
+impl Middleware for Compress {
+    fn call(&self, req: ServiceRequest, next: Next) -> ServiceFuture {
         let state = self.state.clone();
 
         // Global off switch: one boolean, then straight through. No
         // header lookup, no body buffering, no body type change beyond
         // the (free) boxing every actix response ends up doing anyway.
         if !state.config.compression.is_enabled() {
-            let fut = self.service.call(req);
-            return Box::pin(async move { Ok(fut.await?.map_into_boxed_body()) });
+            let fut = next.call(req);
+            return fut;
         }
 
         let accept_encoding = req
@@ -349,9 +308,9 @@ where
         // A HEAD response has no body to compress, and rewriting its
         // Content-Length would misreport the size of the GET the client
         // is probing for.
-        let is_head = req.method() == actix_web::http::Method::HEAD;
+        let is_head = req.method() == crate::hyper_web::http::Method::HEAD;
 
-        let fut = self.service.call(req);
+        let fut = next.call(req);
 
         Box::pin(async move {
             let res = fut.await?;
@@ -430,7 +389,7 @@ where
             // since the whole point of a ceiling is usually to avoid
             // ever buffering a very large body just to decide not to
             // compress it.
-            if let actix_web::body::BodySize::Sized(n) = res.response().body().size() {
+            if let BodySize::Sized(n) = res.response().body().size() {
                 if n < cfg.min_size as u64 || cfg.exceeds_max_size(n as usize) {
                     let mut res = res.map_into_boxed_body();
                     append_vary(&mut res);
@@ -438,8 +397,8 @@ where
                 }
             }
 
-            let (http_req, http_res) = res.into_parts();
-            let (mut head, body) = http_res.into_parts();
+            let (http_req, mut head) = res.into_parts();
+            let body = head.take_body();
 
             // Determine if this is a static-file response *before*
             // decomposing the response, since we need the request URI.
@@ -451,14 +410,14 @@ where
                 // send either way. Surface it as a 500 rather than a
                 // silently truncated 200.
                 Err(_) => {
-                    return Err(actix_web::error::ErrorInternalServerError(
+                    return Err(crate::hyper_web::error::ErrorInternalServerError(
                         "500 Internal Server Error",
                     ));
                 }
             };
 
             if original.len() < cfg.min_size || cfg.exceeds_max_size(original.len()) {
-                let mut res = ServiceResponse::new(http_req, head.set_body(BoxBody::new(original)));
+                let mut res = ServiceResponse::new(http_req, head.set_body(original));
                 append_vary(&mut res);
                 return Ok(res);
             }
@@ -482,7 +441,7 @@ where
             // check), send the original — a larger "compressed" body
             // would be strictly worse for the client.
             let Some(compressed) = compressed.filter(|c| c.len() < original.len()) else {
-                let mut res = ServiceResponse::new(http_req, head.set_body(BoxBody::new(original)));
+                let mut res = ServiceResponse::new(http_req, head.set_body(original));
                 append_vary(&mut res);
                 return Ok(res);
             };
@@ -499,8 +458,7 @@ where
                 head.headers_mut().insert(header::CONTENT_LENGTH, v);
             }
 
-            let body = BoxBody::new(Bytes::from(compressed));
-            let mut res = ServiceResponse::new(http_req, head.set_body(body));
+            let mut res = ServiceResponse::new(http_req, head.set_body(Bytes::from(compressed)));
             append_vary(&mut res);
             Ok(res)
         })
@@ -509,7 +467,7 @@ where
 
 /// Adds `Accept-Encoding` to `Vary` without clobbering a `Vary` the
 /// backend already set (e.g. `Vary: Origin` from a CORS-aware upstream).
-fn append_vary(res: &mut ServiceResponse<BoxBody>) {
+fn append_vary(res: &mut ServiceResponse) {
     let headers = res.headers_mut();
     let existing = headers
         .get(header::VARY)

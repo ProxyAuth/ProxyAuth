@@ -424,10 +424,22 @@ pub const DEFAULT_ROUTES_YML: &str = concat!(
     "  - prefix: \"/login\"\n",
     "    target: \"http://127.0.0.1:8000/login\"\n",
     "    required_login: false\n",
+    "    ratelimit:\n",
+    "      limit_req_per_sec: 5\n",
+    "      burst: 10\n",
+    "      auth:\n",
+    "        limit_req_per_sec: 5\n",
+    "        burst: 100\n",
     "  - prefix: \"/private\"\n",
     "    target: \"http://127.0.0.1:8000/myapp/\"\n",
     "    required_login: true\n",
     "    username: [\"admin\"]\n",
+    "    ratelimit:\n",
+    "      limit_req_per_sec: 5\n",
+    "      burst: 10\n",
+    "      auth:\n",
+    "        limit_req_per_sec: 5\n",
+    "        burst: 100\n",
     "  # vhost is optional. Leave it out (as above) and the route\n",
     "  # matches any Host header, same as before this field existed.\n",
     "  # List one or more hostnames to scope a route to specific\n",
@@ -475,6 +487,22 @@ pub const DEFAULT_ROUTES_YML: &str = concat!(
     "  #     routes:\n",
     "  #       - prefix: \"/\"\n",
     "  #         target: \"http://127.0.0.1:9000\"\n",
+    "  # Per-vhost listen port, HTTP protocol and rate limit (see\n",
+    "  # network/vhost_listen.rs and network/ratelimit.rs):\n",
+    "  #   - vhost: [\"app.example.com\"]\n",
+    "  #     port: 8443          # default: \"port\" from config.json\n",
+    "  #     protocol: h2        # h1 | h2 | auto (default)\n",
+    "  #     ratelimit:\n",
+    "  #       limit_req_per_sec: 5   # or: limit_request: 100 + period: 60\n",
+    "  #       burst: 5\n",
+    "  #       timeout: 10            # seconds blocked after exceeding\n",
+    "  #       key: ip                # ip | user\n",
+    "  #       auth:                  # optional, for /auth, /refresh_token...\n",
+    "  #         limit_request: 10\n",
+    "  #         period: 60\n",
+    "  #     routes:\n",
+    "  #       - prefix: \"/\"\n",
+    "  #         target: \"http://127.0.0.1:3000\"\n",
 );
 
 /// Default `config.json` written on first run when the file is missing.
@@ -499,16 +527,6 @@ pub const DEFAULT_CONFIG_JSON: &str = concat!(
     "  },\n",
     "  \"stats\": false,\n",
     "  \"max_idle_per_host\": 500,\n",
-    "  \"ratelimit_auth\": {\n",
-    "    \"burst\": 100,\n",
-    "    \"block_delay\": 5000,\n",
-    "    \"requests_per_second\": 5\n",
-    "  },\n",
-    "  \"ratelimit_proxy\": {\n",
-    "    \"block_delay\": 5000,\n",
-    "    \"requests_per_second\": 5,\n",
-    "    \"burst\": 10\n",
-    "  },\n",
     "  \"users\": [\n",
     "    {\n",
     "      \"username\": \"admin\",\n",
@@ -552,7 +570,7 @@ mod tests {
     use std::{fs, net::SocketAddr, path::PathBuf};
     use tokio::task::JoinHandle;
 
-    use actix_web::{App, HttpResponse, HttpServer, web};
+    use crate::hyper_web::{App, HttpResponse, HttpServer, web};
 
     // --- Helpers -------------------------------------------------------------
 
@@ -564,7 +582,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             HttpServer::new(move || {
                 App::new().default_service(web::to(move || async move {
-                    HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap())
+                    HttpResponse::build(crate::hyper_web::http::StatusCode::from_u16(status).unwrap())
                         .body(body)
                 }))
             })

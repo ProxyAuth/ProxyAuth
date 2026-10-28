@@ -22,7 +22,7 @@ use tokio::time::timeout;
 
 #[derive(Debug, Error)]
 pub enum ForwardError {
-    #[error("503 Service Unavailable")]
+    #[error("all backends failed")]
     AllBackendsFailed,
 
     // hyper_util::client::legacy::Error au lieu de hyper::Error

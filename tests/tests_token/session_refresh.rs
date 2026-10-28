@@ -242,7 +242,7 @@ mod tests {
         assert!(is_token_revoked("forever", &map));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn revoke_token_after_records_both_instants() {
         let map = Arc::new(DashMap::new());
         // No Redis or LMDB in this test: the in-memory entry is still

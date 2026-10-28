@@ -6,10 +6,10 @@ use crate::config::config::RouteRule;
 use crate::network::canonical_url::canonicalize_path_for_match;
 use crate::revoke::load::is_token_revoked;
 use crate::token::vault::vault;
-use actix_web::HttpRequest;
-use actix_web::http::StatusCode;
-use actix_web::http::header::HeaderMap;
-use actix_web::web;
+use crate::hyper_web::HttpRequest;
+use crate::hyper_web::http::StatusCode;
+use crate::hyper_web::http::header::HeaderMap;
+use crate::hyper_web::web;
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
@@ -580,7 +580,7 @@ pub fn apply_filters_regex_allow_only(
 
     let ct = req
         .headers()
-        .get(actix_web::http::header::CONTENT_TYPE)
+        .get(crate::hyper_web::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -627,7 +627,7 @@ pub fn apply_filters_regex_allow_only(
 
 pub fn cond_matches_strict(
     cond: &RegexCond,
-    method: &actix_web::http::Method,
+    method: &crate::hyper_web::http::Method,
     path: &str,
     headers: HeaderMap,
     query: &std::collections::HashMap<String, Vec<String>>,

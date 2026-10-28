@@ -1,10 +1,7 @@
-use actix_service::{Service, Transform};
-use actix_web::dev::{ServiceRequest, ServiceResponse};
-use actix_web::http::header;
-use actix_web::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue, SERVER};
-use actix_web::{Error, web};
-use futures_util::future::{LocalBoxFuture, Ready, ok};
-use std::task::{Context, Poll};
+use crate::hyper_web::dev::{Middleware, Next, ServiceFuture, ServiceRequest};
+use crate::hyper_web::http::header;
+use crate::hyper_web::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue, SERVER};
+use crate::hyper_web::web;
 
 use crate::AppState;
 
@@ -12,46 +9,8 @@ pub struct CorsMiddleware {
     pub config: web::Data<AppState>,
 }
 
-impl<S, B> Transform<S, ServiceRequest> for CorsMiddleware
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<B>;
-    type Error = Error;
-    type Transform = CorsMiddlewareService<S>;
-    type InitError = ();
-    type Future = Ready<Result<Self::Transform, Self::InitError>>;
-
-    fn new_transform(&self, service: S) -> Self::Future {
-        ok(CorsMiddlewareService {
-            service,
-            config: self.config.clone(),
-        })
-    }
-}
-
-pub struct CorsMiddlewareService<S> {
-    service: S,
-    config: web::Data<AppState>,
-}
-
-impl<S, B> Service<ServiceRequest> for CorsMiddlewareService<S>
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: 'static,
-    B: 'static,
-{
-    type Response = ServiceResponse<B>;
-    type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.service.poll_ready(cx)
-    }
-
-    fn call(&self, req: ServiceRequest) -> Self::Future {
+impl Middleware for CorsMiddleware {
+    fn call(&self, req: ServiceRequest, next: Next) -> ServiceFuture {
         let config = self.config.clone();
         let origin = req
             .headers()
@@ -63,7 +22,7 @@ where
         // once the response is being awaited.
         let host = crate::network::proxy::request_host(req.request());
 
-        let fut = self.service.call(req);
+        let fut = next.call(req);
 
         Box::pin(async move {
             let mut res = fut.await?;

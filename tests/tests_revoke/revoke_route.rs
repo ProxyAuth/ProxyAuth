@@ -3,10 +3,9 @@
 
 #[cfg(test)]
 mod tests {
-    use actix_web::dev::Service;
-    use actix_web::http::{StatusCode, header};
-    use actix_web::test::{self, TestRequest};
-    use actix_web::{App, web};
+        use proxyauth::hyper_web::http::{StatusCode, header};
+    use proxyauth::hyper_web::test::{self, TestRequest};
+    use proxyauth::hyper_web::{App, web};
     use proxyauth::adm::revoke::revoke_route;
     use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
     use proxyauth::network::proxy::global_proxy;
@@ -164,7 +163,7 @@ vhosts:
         assert_eq!(code, StatusCode::FOUND, "a revoked session is sent to the login page");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_session_works_before_revocation() {
         let state = state();
         let (token, _) = token("before");
@@ -173,7 +172,7 @@ vhosts:
         assert_eq!(body, "private page");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn revoking_without_exp_lasts_as_long_as_the_token_could() {
         let state = state();
         let (token, expires_at) = token("no-exp");
@@ -188,7 +187,7 @@ vhosts:
         assert!(kept_until <= now_secs() + LIFETIME && kept_until >= before + LIFETIME);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn exp_zero_no_longer_means_forever() {
         let state = state();
         let (token, _) = token("zero");
@@ -205,7 +204,7 @@ vhosts:
         assert!(kept_until >= before + LIFETIME && kept_until <= now_secs() + LIFETIME);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_far_exp_does_not_keep_the_record_longer_than_needed() {
         let state = state();
         let before = now_secs();
@@ -218,7 +217,7 @@ vhosts:
         assert!(kept_until <= now_secs() + LIFETIME, "kept only while a token could live");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_record_notes_when_the_revocation_was_made() {
         let state = state();
         let before = now_secs();
@@ -228,7 +227,7 @@ vhosts:
         assert_eq!(record.value, *state.revoked_tokens.get("dated").unwrap());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn logout_also_ends_the_token_a_renewal_replaced() {
         let state = state();
         ensure_lmdb().await;
@@ -279,7 +278,7 @@ vhosts:
         assert_eq!(purge, now + LIFETIME);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn logout_revokes_until_the_token_would_have_expired() {
         let state = state();
         let (token, expires_at) = token("logout");
@@ -309,7 +308,7 @@ vhosts:
         assert_refused(&state, &token).await;
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn revoking_with_the_token_expiry_is_immediate() {
         // The case that used to do nothing at all.
         let state = state();
@@ -325,7 +324,7 @@ vhosts:
         assert!(*state.revoked_tokens.get("with-exp").unwrap() >= expires_at);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_past_exp_still_revokes_and_keeps_the_record_long_enough() {
         let state = state();
         let (token, expires_at) = token("past-exp");
@@ -344,7 +343,7 @@ vhosts:
         );
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn other_tokens_are_unaffected() {
         let state = state();
         let (other, _) = token("untouched");
@@ -353,7 +352,7 @@ vhosts:
         assert_eq!(code, StatusCode::OK);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_admin_token_is_required() {
         let state = state();
         let req = TestRequest::post()
@@ -371,7 +370,7 @@ vhosts:
         assert!(state.revoked_tokens.is_empty());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn internal_or_empty_ids_are_refused() {
         let state = state();
         for id in ["", "   ", "rotated:abc"] {

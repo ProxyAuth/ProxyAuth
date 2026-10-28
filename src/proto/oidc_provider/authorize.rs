@@ -25,7 +25,7 @@ use crate::network::proxy::{
     find_vhost_route, is_secure_request, request_host, resolve_tag_csrf_token,
 };
 use crate::proto::oidc_provider::authcode::{self, AUTHCODE_TTL_SECS, AuthCodeEntry};
-use actix_web::{HttpRequest, HttpResponse, http::header, web};
+use crate::hyper_web::{HttpRequest, HttpResponse, http::header, web};
 use serde::Deserialize;
 use std::fs;
 use time::OffsetDateTime;
@@ -179,7 +179,7 @@ pub async fn authorize_handler(
     // both see the new session.
     let mut set_cookie: Option<String> = None;
 
-    let username: Option<String> = if req.method() == actix_web::http::Method::POST {
+    let username: Option<String> = if req.method() == crate::hyper_web::http::Method::POST {
         let form: AuthRequest = match serde_urlencoded::from_bytes(&body) {
             Ok(f) => f,
             Err(_) => return render_login_form(&req, &data, rule, Some("Malformed login request")),

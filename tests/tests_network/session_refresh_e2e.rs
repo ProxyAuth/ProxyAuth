@@ -5,11 +5,10 @@
 
 #[cfg(test)]
 mod tests {
-    use actix_web::body::MessageBody;
-    use actix_web::dev::{Service, ServiceResponse};
-    use actix_web::http::{StatusCode, header};
-    use actix_web::test::{self, TestRequest};
-    use actix_web::{App, web};
+    use proxyauth::hyper_web::dev::ServiceResponse;
+    use proxyauth::hyper_web::http::{StatusCode, header};
+    use proxyauth::hyper_web::test::{self, TestRequest};
+    use proxyauth::hyper_web::{App, web};
     use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
     use proxyauth::network::proxy::global_proxy;
     use proxyauth::network::stats::RequestStats;
@@ -215,7 +214,7 @@ vhosts:
             .insert_header((header::COOKIE, format!("session_token={cookie}")))
     }
 
-    async fn call(state: &AppState, req: TestRequest) -> ServiceResponse<impl MessageBody> {
+    async fn call(state: &AppState, req: TestRequest) -> ServiceResponse {
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(state.clone()))
@@ -244,11 +243,13 @@ vhosts:
         let cookie = resp
             .headers()
             .get_all(header::SET_COOKIE)
+            .iter()
             .map(|v| v.to_str().unwrap().to_string())
             .find(|c| c.starts_with("session_token=") && !c.starts_with("session_token=;"));
         let cleared = resp
             .headers()
             .get_all(header::SET_COOKIE)
+            .iter()
             .filter_map(|v| v.to_str().ok())
             .any(|c| c.starts_with("session_token=;") && c.contains("Max-Age=0"));
         let new_token = cookie.as_ref().map(|c| {
@@ -271,7 +272,7 @@ vhosts:
 
     // ── no renewal ───────────────────────────────────────────
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_recent_session_is_served_without_a_new_cookie() {
         let state = state();
         let out = send(&state, open(SITE, "/admin", &token("fresh", 60, 60))).await;
@@ -293,11 +294,12 @@ vhosts:
         let has_session_cookie = resp
             .headers()
             .get_all(header::SET_COOKIE)
+            .iter()
             .any(|v| v.to_str().unwrap().starts_with("session_token="));
         (get(header::CACHE_CONTROL), get(header::EXPIRES), has_session_cookie)
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_response_carrying_a_new_session_is_never_cached() {
         let state = state();
         let (cache, expires, renewed) =
@@ -309,7 +311,7 @@ vhosts:
         assert_eq!(expires, None);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_response_clearing_the_session_is_never_cached() {
         let state = state();
         let (cache, _, cleared) = cache_headers(&state, open(SITE, "/cached/page", "garbage")).await;
@@ -317,7 +319,7 @@ vhosts:
         assert!(cache.unwrap().contains("no-store"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn caching_is_untouched_when_no_session_cookie_is_sent_back() {
         let state = state();
         let anonymous = TestRequest::get()
@@ -347,7 +349,7 @@ vhosts:
             .insert_header((header::COOKIE, format!("session_token={cookie}")))
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_signed_in_visitors_assets_stay_cached() {
         let state = state();
         // A script keeps the route's own duration — making every asset
@@ -366,7 +368,7 @@ vhosts:
         assert_eq!(expires, None);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn an_asset_request_that_renews_is_still_never_stored() {
         let state = state();
         // The renewal cookie wins over everything: this response carries
@@ -380,7 +382,7 @@ vhosts:
         assert!(cache.unwrap().contains("no-store"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_navigation_is_revalidated_whatever_the_backend_labelled_it() {
         let state = state();
         // open() is a navigation: sec-fetch-mode: navigate.
@@ -389,7 +391,7 @@ vhosts:
         assert_eq!(cache.as_deref(), Some("private, no-cache"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_signed_in_visitors_page_is_private_and_revalidated() {
         let state = state();
         // Public page, recent session: nothing to send back, but the
@@ -408,7 +410,7 @@ vhosts:
         assert_eq!(cache.as_deref(), Some("private, no-cache"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn renewal_off_leaves_public_caching_alone() {
         let state = state();
         let (cache, _, cookie) =
@@ -419,7 +421,7 @@ vhosts:
 
     // ── public pages ─────────────────────────────────────────
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_renews_a_stale_session() {
         let state = state();
         let out = send(&state, open(SITE, "/blog/article", &token("public", 1200, 1200))).await;
@@ -437,7 +439,7 @@ vhosts:
         assert_eq!(admin.cookie, None);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_static_page_renews_too() {
         let state = state();
         let out = send(&state, open(SITE, "/docs/", &token("public-static", 1200, 1200))).await;
@@ -446,7 +448,7 @@ vhosts:
         assert!(out.new_token.is_some());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_keeps_a_recent_session_as_is() {
         let state = state();
         let out = send(&state, open(SITE, "/", &token("public-fresh", 30, 30))).await;
@@ -456,7 +458,7 @@ vhosts:
         assert!(state.revoked_tokens.is_empty());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_without_a_cookie_is_untouched() {
         let state = state();
         let req = TestRequest::get()
@@ -469,7 +471,7 @@ vhosts:
         assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_clears_an_invalid_cookie_but_is_still_served() {
         let state = state();
         let out = send(&state, open(SITE, "/blog", "not-a-real-token")).await;
@@ -479,7 +481,7 @@ vhosts:
         assert_eq!(out.new_token, None);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_clears_a_token_past_its_grace_period() {
         let state = state();
         let old = token("public-after-grace", 1200, 1200);
@@ -494,7 +496,7 @@ vhosts:
         assert_eq!(out.new_token, None);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_shares_the_renewal_during_the_grace_period() {
         let state = state();
         let old = token("public-grace", 1200, 1200);
@@ -505,7 +507,7 @@ vhosts:
         assert_eq!(first.new_token, second.new_token, "one renewal for a page and its assets");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_clears_a_session_past_its_max_lifetime() {
         let state = state();
         let out = send(&state, open(SHORT, "/", &token("public-too-old", 100, 7300))).await;
@@ -513,7 +515,7 @@ vhosts:
         assert!(out.cleared);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_does_nothing_when_renewal_is_off() {
         let state = state();
         let out = send(&state, open(NO_REFRESH, "/", &token("public-off", 1200, 1200))).await;
@@ -522,7 +524,7 @@ vhosts:
         assert!(!out.cleared);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_ignores_the_cookie_on_an_insecure_connection() {
         let state = state();
         let req = TestRequest::get()
@@ -534,7 +536,7 @@ vhosts:
         assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_does_not_renew_bearer_clients() {
         let state = state();
         let t = token("public-bearer", 1200, 1200);
@@ -545,7 +547,7 @@ vhosts:
         assert!(!out.cleared);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn renewal_can_be_disabled_per_vhost() {
         let state = state();
         let out = send(&state, open(NO_REFRESH, "/admin", &token("vhost-off", 1200, 1200))).await;
@@ -553,7 +555,7 @@ vhosts:
         assert_eq!(out.cookie, None);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn bearer_clients_are_not_renewed() {
         let state = state();
         let bearer = token("bearer", 1200, 1200);
@@ -570,7 +572,7 @@ vhosts:
 
     // ── renewal ──────────────────────────────────────────────
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_stale_session_gets_a_new_cookie_and_stays_signed_in() {
         let state = state();
         let out = send(&state, open(SITE, "/admin/page", &token("stale", 1000, 1000))).await;
@@ -589,7 +591,7 @@ vhosts:
         assert_eq!(next.cookie, None, "and is not renewed again right away");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_new_token_keeps_the_original_login_time() {
         let state = state();
         let out = send(&state, open(SITE, "/admin", &token("keeps-login", 1000, 5000))).await;
@@ -604,7 +606,7 @@ vhosts:
         assert_ne!(session.id(), "keeps-login", "new token id");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_old_token_works_during_the_grace_period() {
         let state = state();
         let old = token("grace", 1000, 1000);
@@ -630,7 +632,7 @@ vhosts:
         );
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn using_the_new_token_retires_the_old_one_right_away() {
         let state = state();
         let old = token("5e1f00000000000000000000000000000000000000000000000000000000a001", 1000, 1000);
@@ -664,7 +666,7 @@ vhosts:
         assert_eq!(still, after, "a late request never postpones the refusal");
 
         // After the margin, the old token is refused.
-        actix_web::rt::time::sleep(std::time::Duration::from_millis(
+        proxyauth::hyper_web::rt::time::sleep(std::time::Duration::from_millis(
             proxyauth::token::refresh::IN_FLIGHT_SECS * 1000 + 1100,
         ))
         .await;
@@ -678,7 +680,7 @@ vhosts:
         assert_eq!(ok.status, StatusCode::OK);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_old_token_is_retired_once_not_on_every_request() {
         let state = state();
         let old_id = "5e1f00000000000000000000000000000000000000000000000000000000a002";
@@ -687,13 +689,13 @@ vhosts:
 
         let _ = send(&state, open(SITE, "/admin/1", &new_token)).await;
         let first = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
-        actix_web::rt::time::sleep(std::time::Duration::from_millis(1100)).await;
+        proxyauth::hyper_web::rt::time::sleep(std::time::Duration::from_millis(1100)).await;
         let _ = send(&state, open(SITE, "/admin/2", &new_token)).await;
         let second = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
         assert_eq!(first, second, "no second write for the same predecessor");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_predecessor_renewed_on_another_instance_is_retired_too() {
         let state = state();
         // A token issued by a renewal elsewhere: this instance has no
@@ -726,7 +728,7 @@ vhosts:
         assert!(purge >= now + LIFETIME, "kept as long as the predecessor could live");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_public_page_retires_the_old_token_too() {
         let state = state();
         let old_id = "5e1f00000000000000000000000000000000000000000000000000000000a004";
@@ -739,7 +741,7 @@ vhosts:
         assert!(refuse <= now_secs() + proxyauth::token::refresh::IN_FLIGHT_SECS);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_old_token_is_refused_after_the_grace_period() {
         let state = state();
         let old = token("expired-grace", 1000, 1000);
@@ -755,7 +757,7 @@ vhosts:
         assert_eq!(out.new_token, None);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn a_session_past_its_max_lifetime_must_sign_in_again() {
         let state = state();
         let out = send(&state, open(SHORT, "/admin", &token("too-old", 1000, 7300))).await;
@@ -764,7 +766,7 @@ vhosts:
         assert_eq!(out.new_token, None);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn renewal_stops_extending_near_the_max_lifetime() {
         let state = state();
         // Started 4200s ago with a 7200s limit: the session ends in 50
@@ -777,7 +779,7 @@ vhosts:
         assert!(session.expires_at() < now_secs() + LIFETIME);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn the_token_rotates_even_when_the_session_end_is_already_set() {
         let state = state();
         // Started 5000s ago with a 7200s limit: the session ends before
@@ -792,7 +794,7 @@ vhosts:
         assert!(state.revoked_tokens.contains_key(&rotated_key("at-limit")));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn legacy_tokens_are_renewed_into_the_new_format() {
         config();
         let now = now_secs();

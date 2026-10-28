@@ -39,8 +39,8 @@ use crate::revoke::load::{GenerationStep, advance_generation, publish_generation
 use crate::token::security::{
     TokenData, TokenKind, issue_session_token, now_secs, validate_refresh_token,
 };
-use actix_web::http::header;
-use actix_web::{Error as ActixError, HttpRequest, HttpResponse, web};
+use crate::hyper_web::http::header;
+use crate::hyper_web::{Error as WebError, HttpRequest, HttpResponse, web};
 use chrono::{TimeZone, Utc};
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -171,7 +171,7 @@ pub fn pair_json(config: &AppConfig, pair: &IssuedPair) -> serde_json::Value {
     })
 }
 
-fn error_response(status: actix_web::http::StatusCode, code: &str, description: &str) -> HttpResponse {
+fn error_response(status: crate::hyper_web::http::StatusCode, code: &str, description: &str) -> HttpResponse {
     HttpResponse::build(status)
         .append_header(("server", "ProxyAuth"))
         .insert_header((header::CACHE_CONTROL, "no-store"))
@@ -207,8 +207,8 @@ pub async fn refresh_token_dispatch(
     req: HttpRequest,
     body: web::Bytes,
     data: web::Data<AppState>,
-) -> Result<HttpResponse, ActixError> {
-    use actix_web::http::StatusCode;
+) -> Result<HttpResponse, WebError> {
+    use crate::hyper_web::http::StatusCode;
 
     let host = crate::network::proxy::request_host(&req);
     let vhost_route = crate::network::proxy::find_vhost_route(host.as_deref(), &data.routes.routes);

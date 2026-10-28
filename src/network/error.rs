@@ -6,8 +6,8 @@ use crate::network::shared_client::BoxBody;
 use crate::network::shared_client::ClientOptions;
 use crate::network::shared_client::get_or_build_client;
 use crate::token::csrf::inject_csrf_token;
-use actix_web::rt::time::timeout;
-use actix_web::{HttpRequest, HttpResponse, web};
+use crate::hyper_web::rt::time::timeout;
+use crate::hyper_web::{HttpRequest, HttpResponse, web};
 use brotli::{CompressorWriter, Decompressor};
 use flate2::{
     Compression,

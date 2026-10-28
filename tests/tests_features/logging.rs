@@ -1,4 +1,3 @@
-use actix_web::HttpMessage;
 use proxyauth::config::config::{RouteConfig, RouteRule};
 use proxyauth::config::logging::{DEFAULT_FORMAT, LOG_DIR, LoggingConfig, VhostLogging};
 use proxyauth::network::accesslog::{Field, LogContext, RequiredFields, Segment, compile_format};
@@ -55,6 +54,9 @@ fn minimal_rule(prefix: &str) -> RouteRule {
         compression: None,
         cache: Some(true),
         streaming: None,
+        ratelimit: None,
+        port: None,
+        protocol: None,
         if_vhost: Vec::new(),
         cache_duration_secs: None,
         secure_path: false,
@@ -272,7 +274,7 @@ fn log_context_default() {
 
 #[test]
 fn log_context_set_error_detail_creates_extension() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_error_detail(&req, "invalid csrf token");
     let ctx = req.extensions().get::<LogContext>().cloned().unwrap();
     assert_eq!(ctx.error_detail.as_deref(), Some("invalid csrf token"));
@@ -280,7 +282,7 @@ fn log_context_set_error_detail_creates_extension() {
 
 #[test]
 fn log_context_set_error_detail_merges() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_route(&req, 3);
     LogContext::set_error_detail(&req, "acl filter rejected");
     let ctx = req.extensions().get::<LogContext>().cloned().unwrap();
@@ -290,7 +292,7 @@ fn log_context_set_error_detail_merges() {
 
 #[test]
 fn log_context_set_error_detail_overwrites() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_error_detail(&req, "first error");
     LogContext::set_error_detail(&req, "second error");
     let ctx = req.extensions().get::<LogContext>().cloned().unwrap();
@@ -299,7 +301,7 @@ fn log_context_set_error_detail_overwrites() {
 
 #[test]
 fn log_context_set_route() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_route(&req, 7);
     let ctx = req.extensions().get::<LogContext>().cloned().unwrap();
     assert_eq!(ctx.route_idx, Some(7));
@@ -307,7 +309,7 @@ fn log_context_set_route() {
 
 #[test]
 fn log_context_set_user() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_user(&req, "alice", "tok_123");
     let ctx = req.extensions().get::<LogContext>().cloned().unwrap();
     assert_eq!(ctx.username.as_deref(), Some("alice"));
@@ -316,7 +318,7 @@ fn log_context_set_user() {
 
 #[test]
 fn log_context_set_user_empty_becomes_none() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_user(&req, "", "");
     let ctx = req.extensions().get::<LogContext>().cloned().unwrap();
     assert!(ctx.username.is_none());

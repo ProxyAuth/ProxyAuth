@@ -42,7 +42,7 @@ use crate::network::proxy::{find_vhost_route, request_host};
 use crate::proto::oidc_provider::authcode;
 use crate::proto::oidc_provider::jwt::signing_key;
 use crate::token::auth::verify_password;
-use actix_web::{HttpRequest, HttpResponse, web};
+use crate::hyper_web::{HttpRequest, HttpResponse, web};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -69,7 +69,7 @@ struct TokenErrorResponse {
 }
 
 fn token_error(
-    status: actix_web::http::StatusCode,
+    status: crate::hyper_web::http::StatusCode,
     error: &'static str,
     description: &str,
 ) -> HttpResponse {
@@ -141,7 +141,7 @@ pub async fn token_handler(
 ) -> HttpResponse {
     let Some(host) = request_host(&req) else {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_request",
             "could not determine the requested host",
         );
@@ -149,7 +149,7 @@ pub async fn token_handler(
 
     let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) else {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_request",
             "unknown vhost",
         );
@@ -157,7 +157,7 @@ pub async fn token_handler(
 
     let Some(oidc) = &rule.oidc else {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_request",
             "OIDC is not enabled for this vhost",
         );
@@ -167,7 +167,7 @@ pub async fn token_handler(
         Ok(p) => p,
         Err(_) => {
             return token_error(
-                actix_web::http::StatusCode::BAD_REQUEST,
+                crate::hyper_web::http::StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "malformed request body",
             );
@@ -176,7 +176,7 @@ pub async fn token_handler(
 
     if params.grant_type.as_deref() != Some("authorization_code") {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
             "only grant_type=authorization_code is supported",
         );
@@ -192,7 +192,7 @@ pub async fn token_handler(
 
     let (Some(client_id), Some(client_secret)) = (client_id, client_secret) else {
         return token_error(
-            actix_web::http::StatusCode::UNAUTHORIZED,
+            crate::hyper_web::http::StatusCode::UNAUTHORIZED,
             "invalid_client",
             "client authentication is required",
         );
@@ -203,7 +203,7 @@ pub async fn token_handler(
     // presented code was otherwise valid.
     if client_id != oidc.client_id || !verify_password(&client_secret, &oidc.client_secret_hash) {
         return token_error(
-            actix_web::http::StatusCode::UNAUTHORIZED,
+            crate::hyper_web::http::StatusCode::UNAUTHORIZED,
             "invalid_client",
             "client authentication failed",
         );
@@ -215,7 +215,7 @@ pub async fn token_handler(
     // even if this exact request ultimately fails a later check.
     let Some(code) = params.code.as_deref() else {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_request",
             "missing code",
         );
@@ -225,7 +225,7 @@ pub async fn token_handler(
         Ok(e) => e,
         Err(_) => {
             return token_error(
-                actix_web::http::StatusCode::BAD_REQUEST,
+                crate::hyper_web::http::StatusCode::BAD_REQUEST,
                 "invalid_grant",
                 "the authorization code is invalid, expired, or already used",
             );
@@ -235,7 +235,7 @@ pub async fn token_handler(
     // --- 3. client_id match (defense in depth — see module doc comment).
     if entry.client_id != client_id {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_grant",
             "this code was not issued to this client",
         );
@@ -245,14 +245,14 @@ pub async fn token_handler(
     // received for this exact code.
     let Some(redirect_uri) = params.redirect_uri.as_deref() else {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_request",
             "missing redirect_uri",
         );
     };
     if redirect_uri != entry.redirect_uri {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_grant",
             "redirect_uri does not match the one used to obtain this code",
         );
@@ -261,14 +261,14 @@ pub async fn token_handler(
     // --- 5. PKCE.
     let Some(code_verifier) = params.code_verifier.as_deref() else {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_request",
             "missing code_verifier",
         );
     };
     if !verify_pkce(code_verifier, &entry.code_challenge) {
         return token_error(
-            actix_web::http::StatusCode::BAD_REQUEST,
+            crate::hyper_web::http::StatusCode::BAD_REQUEST,
             "invalid_grant",
             "code_verifier does not match the code_challenge presented at /authorize",
         );
@@ -292,7 +292,7 @@ pub async fn token_handler(
         Err(e) => {
             tracing::error!("Failed to sign OIDC id_token: {e}");
             return token_error(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                crate::hyper_web::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "failed to sign id_token",
             );
@@ -312,7 +312,7 @@ pub async fn token_handler(
         Err(e) => {
             tracing::error!("Failed to sign OIDC access_token: {e}");
             return token_error(
-                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                crate::hyper_web::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "failed to sign access_token",
             );

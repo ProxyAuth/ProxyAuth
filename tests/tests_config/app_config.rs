@@ -405,13 +405,20 @@ mod tests {
     }
 
     #[test]
-    fn app_config_missing_ratelimit_sections_get_defaults() {
-        // A config that never mentions rate limiting must still produce
-        // usable maps, not something that panics when they're read.
-        let json = format!("{{{BASE}}}");
+    fn app_config_legacy_ratelimit_sections_are_ignored() {
+        // Rate limiting moved to routes.yml (per vhost). An existing
+        // config.json that still carries the old sections must keep
+        // loading — they are reported, not fatal.
+        let json = format!(
+            r#"{{{BASE},
+                "ratelimit_proxy": {{"requests_per_second": 5, "burst": 10}},
+                "ratelimit_auth": {{"requests_per_second": 5, "burst": 100}}
+            }}"#
+        );
         let cfg: AppConfig = serde_json::from_str(&json).unwrap();
-        assert!(cfg.ratelimit_proxy.contains_key("requests_per_second"));
-        assert!(cfg.ratelimit_auth.contains_key("requests_per_second"));
+        let back = serde_json::to_value(&cfg).unwrap();
+        assert!(back.get("ratelimit_proxy").is_none());
+        assert!(back.get("ratelimit_auth").is_none());
     }
 
     #[test]

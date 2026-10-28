@@ -1,4 +1,4 @@
-use actix_web::http::StatusCode;
+use proxyauth::hyper_web::http::StatusCode;
 use chrono::Utc;
 use proxyauth::AppConfig;
 use proxyauth::config::config::RegexCond;
@@ -21,7 +21,7 @@ use serde_json::Value as JsonValue;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{http::Method, http::header, test, test::TestRequest};
+    use proxyauth::hyper_web::{http::Method, http::header, test, test::TestRequest};
     use bytes::Bytes;
     use proxyauth::config::config::{AllowRegexCfg, RegexCondCfg, RouteRule};
     use regex::Regex;
@@ -29,7 +29,7 @@ mod tests {
 
     // ---------- parse_query_map ----------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn parse_query_map_multiple_values_and_missing_value() {
         let q = "a=1&a=2&b=&c";
         let m = parse_query_map(q);
@@ -92,6 +92,9 @@ mod tests {
             compression: None,
             cache: Some(true),
             streaming: None,
+            ratelimit: None,
+            port: None,
+            protocol: None,
             if_vhost: Vec::new(),
             cache_duration_secs: None,
             secure_path: false,
@@ -105,7 +108,7 @@ mod tests {
         }
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn acl_all_must_match_ok() {
         let filters = AllowRegexCfg {
             default_allow: false,
@@ -147,7 +150,7 @@ mod tests {
         assert!(status.is_none(), "should be allowed (all conditions match)");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn acl_mismatch_denied() {
         let filters = AllowRegexCfg {
             default_allow: false,
@@ -163,7 +166,7 @@ mod tests {
         assert_eq!(status, Some(StatusCode::FORBIDDEN));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn acl_default_allow_false_and_no_rules_denied() {
         let filters = AllowRegexCfg {
             default_allow: false,
@@ -175,7 +178,7 @@ mod tests {
         assert_eq!(status, Some(StatusCode::FORBIDDEN));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn acl_bodyraw_and_header_and_query() {
         let filters = AllowRegexCfg {
             default_allow: false,
@@ -210,7 +213,7 @@ mod tests {
 
     // ---------- all_values_match ---------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn all_values_match_ok_and_ko() {
         let re_ok = Regex::new("^[a-z]+$").unwrap();
         assert!(all_values_match(["abc", "xyz"], &re_ok));
@@ -221,7 +224,7 @@ mod tests {
 
     // ---------- canonicalize + Path ------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn cond_matches_path_with_canonicalization() {
         let raw_path = "/api%2Fadmin";
         let canon = canonicalize_path_for_match(raw_path);
@@ -233,7 +236,7 @@ mod tests {
             &cond,
             &Method::GET,
             &canon,
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &std::collections::HashMap::new(),
             None,
             None,
@@ -244,7 +247,7 @@ mod tests {
 
     // ---------- Method -------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn cond_matches_method_exact() {
         let cond = RegexCond::Method {
             re: Regex::new("^POST$").unwrap(),
@@ -253,7 +256,7 @@ mod tests {
             &cond,
             &Method::POST,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &std::collections::HashMap::new(),
             None,
             None,
@@ -263,7 +266,7 @@ mod tests {
             &cond,
             &Method::GET,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &std::collections::HashMap::new(),
             None,
             None,
@@ -273,7 +276,7 @@ mod tests {
 
     // ---------- Header -------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn cond_matches_header_name_and_values() {
         let req = TestRequest::default()
             .insert_header(("x-client", "abc_123"))
@@ -330,7 +333,7 @@ mod tests {
 
     // ---------- Query --------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn cond_matches_query_all_values_must_match() {
         let q = parse_query_map("foo=a&foo=ab&bar=zzz");
 
@@ -342,7 +345,7 @@ mod tests {
             &cond_ok,
             &Method::GET,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &q,
             None,
             None,
@@ -357,7 +360,7 @@ mod tests {
             &cond_bad,
             &Method::GET,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &q,
             None,
             None,
@@ -372,7 +375,7 @@ mod tests {
             &cond_missing,
             &Method::GET,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &q,
             None,
             None,
@@ -382,7 +385,7 @@ mod tests {
 
     // ---------- BodyRaw ------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn cond_matches_body_raw_utf8() {
         let cond = RegexCond::BodyRaw {
             re: Regex::new("^hello[ ]+world$").unwrap(),
@@ -391,7 +394,7 @@ mod tests {
             &cond,
             &Method::POST,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &std::collections::HashMap::new(),
             Some("hello world"),
             None,
@@ -401,7 +404,7 @@ mod tests {
             &cond,
             &Method::POST,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &std::collections::HashMap::new(),
             Some("hello  WORLD"),
             None,
@@ -411,7 +414,7 @@ mod tests {
 
     // ---------- BodyJson -----------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     async fn cond_matches_body_json_with_ct_guard() {
         let body = json!({"role":"admin","n":42,"active":true});
         let body_bytes = serde_json::to_vec(&body).unwrap();
@@ -436,7 +439,7 @@ mod tests {
                 cond,
                 &Method::POST,
                 "/",
-                actix_web::http::header::HeaderMap::new(),
+                proxyauth::hyper_web::http::header::HeaderMap::new(),
                 &std::collections::HashMap::new(),
                 body_utf8,
                 body_json.as_ref(),
@@ -448,7 +451,7 @@ mod tests {
             &c_role,
             &Method::POST,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &std::collections::HashMap::new(),
             body_utf8,
             body_json.as_ref(),
@@ -463,7 +466,7 @@ mod tests {
             &c_missing,
             &Method::POST,
             "/",
-            actix_web::http::header::HeaderMap::new(),
+            proxyauth::hyper_web::http::header::HeaderMap::new(),
             &std::collections::HashMap::new(),
             body_utf8,
             body_json.as_ref(),
@@ -485,7 +488,7 @@ mod tests {
 
     /// A token issued through the real path is opaque, URL-safe, and
     /// carries nothing readable.
-    #[test]
+    #[tokio::test]
     async fn issued_tokens_are_opaque_and_url_safe() {
         let expiry = (chrono::Utc::now() + chrono::Duration::seconds(600))
             .timestamp()
@@ -564,6 +567,9 @@ mod more_unit_tests {
             compression: None,
             cache: Some(true),
             streaming: None,
+            ratelimit: None,
+            port: None,
+            protocol: None,
             if_vhost: Vec::new(),
             cache_duration_secs: None,
             secure_path: false,
@@ -638,14 +644,14 @@ mod more_unit_tests {
 
     // ---------------- apply_filters_regex_allow_only ----------------
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn acl_default_allow_true_and_no_rules_allows() {
         let filters = AllowRegexCfg {
             default_allow: true,
             allow: vec![],
         };
         let rule = mk_rule(filters);
-        let req = actix_web::test::TestRequest::get()
+        let req = proxyauth::hyper_web::test::TestRequest::get()
             .uri("/api/anything")
             .to_http_request();
         let status = super::apply_filters_regex_allow_only(&rule, &req, &[]);
@@ -690,7 +696,7 @@ mod more_unit_tests {
 
 #[cfg(test)]
 mod validate_token_path_tests {
-    use actix_web::web;
+    use proxyauth::hyper_web::web;
     use chrono::Utc;
     use dashmap::DashMap;
     use std::sync::Arc;

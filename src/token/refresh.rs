@@ -42,8 +42,8 @@ use crate::config::config::{RouteRule, SessionRefreshPolicy};
 use crate::revoke::load::{revoke_token_after, rotated_key, unpack_rotation};
 use crate::token::auth::generate_random_string;
 use crate::token::security::{TokenData, ValidSession, issue_session_token, now_secs};
-use actix_web::cookie::{Cookie, SameSite};
-use actix_web::{HttpMessage, HttpRequest, web};
+use crate::hyper_web::cookie::{Cookie, SameSite};
+use crate::hyper_web::{HttpRequest, web};
 use dashmap::DashMap;
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
@@ -155,7 +155,7 @@ pub fn renewed_expiry(
 /// an `Authorization: Bearer` header.
 pub fn token_came_from_cookie(req: &HttpRequest) -> bool {
     !req.headers()
-        .get(actix_web::http::header::AUTHORIZATION)
+        .get(crate::hyper_web::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("Bearer "))
 }
@@ -383,13 +383,13 @@ pub fn session_cookie(
         .min(token_lifetime_secs.min(i64::MAX as u64) as i64) as u64;
     let max_age = token_remaining_secs.min(cap) as i64;
 
-    Cookie::build("session_token", token.to_string())
+    Cookie::build(("session_token", token.to_string()))
         .path("/")
-        .max_age(actix_web::cookie::time::Duration::seconds(max_age))
+        .max_age(crate::hyper_web::cookie::time::Duration::seconds(max_age))
         .http_only(true)
         .secure(true)
         .same_site(SameSite::Strict)
-        .finish()
+        .build()
         .to_string()
 }
 

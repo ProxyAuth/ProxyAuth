@@ -905,6 +905,22 @@ pub struct RouteRule {
     #[serde(default)]
     pub streaming: Option<bool>,
 
+    /// Limitation de débit de cette route (ou, posée sur un groupe
+    /// `vhosts:`, de tout le vhost — un seul compteur partagé). Voir
+    /// `network::ratelimit` pour le format. `None` : pas de limite.
+    #[serde(default)]
+    pub ratelimit: Option<crate::network::ratelimit::RateLimitConfig>,
+
+    /// Port d'écoute de ce vhost. `None` : le `port` de config.json.
+    /// Voir `network::vhost_listen`.
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Protocole HTTP servi pour ce vhost : `h1`, `h2` ou `auto`
+    /// (défaut). Voir `network::vhost_listen`.
+    #[serde(default)]
+    pub protocol: Option<crate::network::vhost_listen::HttpProtocol>,
+
     /// Narrows this route to a subset of the hosts its `vhosts:` group
     /// declares.
     ///
@@ -1417,6 +1433,18 @@ pub struct VhostGroup {
     #[serde(default)]
     pub streaming: Option<bool>,
 
+    /// Limitation de débit du vhost (voir `RouteRule::ratelimit`).
+    #[serde(default)]
+    pub ratelimit: Option<crate::network::ratelimit::RateLimitConfig>,
+
+    /// Port d'écoute du vhost (voir `RouteRule::port`).
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Protocole HTTP du vhost (voir `RouteRule::protocol`).
+    #[serde(default)]
+    pub protocol: Option<crate::network::vhost_listen::HttpProtocol>,
+
     /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::redirect_protect`. Setting this directly on a
     /// `vhosts:` group (rather than on each individual route) is the
@@ -1625,6 +1653,15 @@ impl RouteConfig {
                 }
                 if route.streaming.is_none() {
                     route.streaming = group.streaming;
+                }
+                if route.ratelimit.is_none() {
+                    route.ratelimit = group.ratelimit.clone();
+                }
+                if route.port.is_none() {
+                    route.port = group.port;
+                }
+                if route.protocol.is_none() {
+                    route.protocol = group.protocol;
                 }
                 if route.redirect_protect.is_none() {
                     route.redirect_protect = group.redirect_protect.clone();
@@ -1897,7 +1934,7 @@ pub struct AppConfig {
     /// supported) or an array (`"host": ["0.0.0.0", "::1"]`) to bind
     /// more than one at once, e.g. IPv4 + IPv6 together. Every entry
     /// is bound with its own listening socket, all served by the same
-    /// actix HttpServer instance — one shared worker pool, not a
+    /// HttpServer instance — one shared worker pool, not a
     /// separate server per address.
     #[serde(default = "default_hosts", deserialize_with = "deserialize_host")]
     pub host: Vec<String>,
@@ -1907,12 +1944,6 @@ pub struct AppConfig {
 
     #[serde(default = "default_worker")]
     pub worker: u8,
-
-    #[serde(default = "default_ratelimit_proxy")]
-    pub ratelimit_proxy: HashMap<String, u64>,
-
-    #[serde(default = "default_ratelimit_auth")]
-    pub ratelimit_auth: HashMap<String, u64>,
 
     #[serde(deserialize_with = "deserialize_log_map")]
     pub log: HashMap<String, String>,
@@ -2265,8 +2296,6 @@ impl Serialize for AppConfig {
         state.serialize_field("num_instances", &self.num_instances)?;
         state.serialize_field("pending_connections_limit", &self.pending_connections_limit)?;
         state.serialize_field("port", &self.port)?;
-        state.serialize_field("ratelimit_auth", &self.ratelimit_auth)?;
-        state.serialize_field("ratelimit_proxy", &self.ratelimit_proxy)?;
         state.serialize_field("redis", &self.redis)?;
         state.serialize_field("secret", &self.secret)?;
         state.serialize_field("session_cookie", &self.session_cookie)?;
@@ -2587,8 +2616,13 @@ fn default_pending_connections_limit() -> u32 {
     65535
 }
 
+/// File d'attente des connexions pas encore acceptées (`listen()`).
+/// 4096 = `net.core.somaxconn` par défaut depuis Linux 5.4 ; le noyau
+/// plafonne de toute façon à cette valeur. Avec 1024, un afflux de
+/// milliers de connexions débordait la file : le client renvoyait son
+/// SYN après 1 s, puis 3 s… d'où des « connect » de plusieurs secondes.
 fn default_socket_listen() -> u32 {
-    1024
+    4096
 }
 
 fn default_backends() -> Vec<BackendInput> {
@@ -2658,21 +2692,6 @@ fn default_log() -> HashMap<String, String> {
     log
 }
 
-fn default_ratelimit_proxy() -> HashMap<String, u64> {
-    let mut ratelimit = HashMap::new();
-    ratelimit.insert("requests_per_second".to_string(), 0);
-    ratelimit.insert("burst".to_string(), 1);
-    ratelimit.insert("block_delay".to_string(), 500);
-    ratelimit
-}
-
-fn default_ratelimit_auth() -> HashMap<String, u64> {
-    let mut ratelimit = HashMap::new();
-    ratelimit.insert("requests_per_second".to_string(), 0);
-    ratelimit.insert("burst".to_string(), 1);
-    ratelimit.insert("block_delay".to_string(), 500);
-    ratelimit
-}
 
 fn default_cert() -> HashMap<String, String> {
     let cert = HashMap::new();
@@ -2784,7 +2803,7 @@ impl AppConfig {
     /// A zero-length timeout is never what an operator means: it would
     /// abandon every proxied request the instant it is issued, turning
     /// the whole instance into a `503` generator. Elsewhere in this
-    /// config a `0` legitimately means "off" — `ratelimit_*`,
+    /// config a `0` legitimately means "off" — e.g.
     /// `ip_blocklist_refresh_interval_secs` — so the value has to stay
     /// accepted at parse time and be guarded here, at the point of use,
     /// instead.

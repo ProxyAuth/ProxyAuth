@@ -75,7 +75,7 @@ macro_rules! require_redis {
 
 // ── LMDB ─────────────────────────────────────────────────────
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn a_revocation_is_written_to_lmdb_immediately() {
     setup().await;
@@ -99,7 +99,7 @@ fn lmdb_put_raw(key: &str, bytes: &[u8]) {
     txn.commit().unwrap();
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn entries_kept_forever_by_older_versions_get_an_end_date() {
     setup().await;
@@ -121,7 +121,7 @@ async fn entries_kept_forever_by_older_versions_get_an_end_date() {
     assert!(is_token_revoked("legacy-dated", &m));
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn the_purge_cleans_memory_and_lmdb() {
     setup().await;
@@ -144,7 +144,7 @@ async fn the_purge_cleans_memory_and_lmdb() {
     assert!(lmdb_get("purge-future").is_some());
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn another_process_on_the_host_is_picked_up_from_lmdb() {
     setup().await;
@@ -154,7 +154,7 @@ async fn another_process_on_the_host_is_picked_up_from_lmdb() {
     assert!(is_token_revoked("other-process", &m));
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn the_loop_purges_without_redis_configured() {
     setup().await;
@@ -172,7 +172,7 @@ async fn the_loop_purges_without_redis_configured() {
 
 // ── Redis ────────────────────────────────────────────────────
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn all_redis_keys_expire_with_the_revocation() {
     setup().await;
@@ -191,7 +191,7 @@ async fn all_redis_keys_expire_with_the_revocation() {
 
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn a_forever_entry_from_an_older_node_is_bounded_on_the_bus() {
     setup().await;
@@ -212,7 +212,7 @@ async fn a_forever_entry_from_an_older_node_is_bounded_on_the_bus() {
     assert!(ttl > 0 && ttl <= LIFETIME as i64, "and an expiry: {ttl}");
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn a_revocation_from_another_node_is_applied_and_persisted() {
     setup().await;
@@ -230,7 +230,7 @@ async fn a_revocation_from_another_node_is_applied_and_persisted() {
     assert_eq!(lmdb_get("from-peer"), Some(exp));
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn an_orphan_action_key_is_dropped_not_made_permanent() {
     setup().await;
@@ -252,7 +252,7 @@ async fn an_orphan_action_key_is_dropped_not_made_permanent() {
     assert!(!exists);
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn an_expired_entry_left_in_redis_is_dropped() {
     setup().await;
@@ -269,7 +269,7 @@ async fn an_expired_entry_left_in_redis_is_dropped() {
     assert!(!exists);
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn the_purge_also_cleans_redis() {
     setup().await;
@@ -290,7 +290,7 @@ async fn the_purge_also_cleans_redis() {
     }
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn a_revocation_survives_every_tick_until_its_date() {
     setup().await;
@@ -303,7 +303,7 @@ async fn a_revocation_survives_every_tick_until_its_date() {
     assert!(lmdb_get("r-keep").is_some());
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn refresh_generations_travel_between_instances() {
     setup().await;

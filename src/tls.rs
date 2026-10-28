@@ -1,8 +1,6 @@
 use crate::AppConfig;
 use crate::config::config::RouteRule;
-use actix_web::body::BoxBody;
-use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
-use actix_web::{App, Error, HttpServer};
+use crate::hyper_web::{App, HttpServer};
 use arc_swap::ArcSwap;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
@@ -172,12 +170,47 @@ fn wildcard_covers(pattern: &str, host: &str) -> bool {
         .is_some_and(|label| !label.is_empty() && !label.contains('.'))
 }
 
+/// Reprise de session TLS partagée par tout le processus (toutes les
+/// instances, tous les workers, toutes les variantes d'ALPN).
+///
+/// Doc rustls : sans cela, chaque nouvelle connexion d'un client déjà
+/// venu refait une poignée de main complète (signature RSA/ECDSA, le
+/// poste le plus coûteux d'une connexion TLS). Avec un cache de sessions
+/// (TLS 1.2) et des tickets (TLS 1.3, sans état côté serveur), elle est
+/// reprise en un aller-retour, sans signature. Les clés de tickets sont
+/// renouvelées automatiquement par rustls.
+fn shared_resumption() -> (Arc<dyn rustls::server::StoresServerSessions>, Option<Arc<dyn rustls::server::ProducesTickets>>) {
+    static RESUMPTION: std::sync::OnceLock<(
+        Arc<dyn rustls::server::StoresServerSessions>,
+        Option<Arc<dyn rustls::server::ProducesTickets>>,
+    )> = std::sync::OnceLock::new();
+    RESUMPTION
+        .get_or_init(|| {
+            let cache: Arc<dyn rustls::server::StoresServerSessions> =
+                rustls::server::ServerSessionMemoryCache::new(32 * 1024);
+            let ticketer = match rustls::crypto::ring::Ticketer::new() {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warn!("TLS: session tickets disabled ({e}); falling back to the session cache only");
+                    None
+                }
+            };
+            (cache, ticketer)
+        })
+        .clone()
+}
+
 fn build_rustls_config_with_resolver(resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
     // rustls 0.23 : with_safe_defaults() supprimé — builder() configure automatiquement
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let (cache, ticketer) = shared_resumption();
+    cfg.session_storage = cache;
+    if let Some(t) = ticketer {
+        cfg.ticketer = t;
+    }
     cfg
 }
 
@@ -376,26 +409,22 @@ pub fn check_port(addr: &str) -> bool {
     TcpListener::bind(addr).is_ok()
 }
 
-pub fn bind_server<T, F>(
+pub fn bind_server<F>(
     app_factory: F,
-    listeners: Vec<TcpListener>,
+    listeners: Vec<(TcpListener, u16)>,
+    plan: &crate::network::vhost_listen::ListenPlan,
     config: &AppConfig,
     routes: &[RouteRule],
-) -> std::io::Result<actix_web::dev::Server>
+) -> std::io::Result<crate::hyper_web::dev::Server>
 where
-    T: ServiceFactory<
-            ServiceRequest,
-            Config = (),
-            Response = ServiceResponse<BoxBody>,
-            Error = Error,
-            InitError = (),
-        > + 'static,
-    F: Fn() -> App<T> + Clone + Send + 'static,
+    F: Fn() -> App + Clone + Send + 'static,
 {
+    use crate::network::vhost_listen::{HttpProtocol, protocol_for_sni};
+
     let mut builder = HttpServer::new(app_factory)
         .workers(config.worker as usize)
         .keep_alive(Duration::from_millis(config.keep_alive))
-        .backlog(config.pending_connections_limit)
+        .backlog(config.socket_listen)
         .max_connections(config.max_connections)
         .client_request_timeout(Duration::from_millis(config.client_timeout));
 
@@ -427,8 +456,7 @@ where
         // One certificate per vhost that declared its own `vhost_cert`
         // in routes.yml, selected via SNI at handshake time; every
         // other hostname (and any connection with no SNI) keeps using
-        // the default certificate above, unchanged from before vhosts
-        // existed.
+        // the default certificate above.
         let by_host = load_vhost_resolvers(routes);
         if !by_host.is_empty() {
             info!(
@@ -442,23 +470,31 @@ where
             default: default_resolver,
             by_host,
         });
-        let tls_cfg = build_rustls_config_with_resolver(resolver);
 
-        // actix-web 4 avec rustls 0.23 : listen_rustls_0_23
-        //
-        // Bound once per configured address (see AppConfig::bind_addresses)
-        // — every listener here is served by this SAME HttpServer
-        // instance (one shared worker pool), not a separate server per
-        // address.
-        for listener in listeners {
-            builder = builder.listen_rustls_0_23(listener, tls_cfg.clone())?;
+        // Une configuration rustls par protocole, toutes sur le même
+        // résolveur de certificats : seul l'ALPN annoncé change. Le nom
+        // SNI du ClientHello choisit la bonne (voir network::vhost_listen).
+        let mut by_proto: HashMap<HttpProtocol, Arc<ServerConfig>> = HashMap::new();
+        for proto in [HttpProtocol::Auto, HttpProtocol::H1, HttpProtocol::H2] {
+            let mut cfg = build_rustls_config_with_resolver(resolver.clone());
+            cfg.alpn_protocols = proto.alpn();
+            by_proto.insert(proto, Arc::new(cfg));
         }
-        let server = builder;
-        return Ok(server.run());
+        let routes_owned: Arc<Vec<RouteRule>> = Arc::new(routes.to_vec());
+        let selector: crate::hyper_web::server::TlsSelector = Arc::new(move |sni| {
+            let proto = protocol_for_sni(&routes_owned, sni);
+            by_proto[&proto].clone()
+        });
+
+        for (listener, _port) in listeners {
+            builder = builder.listen_rustls_sni(listener, selector.clone())?;
+        }
+        return Ok(builder.run());
     }
 
-    for listener in listeners {
-        builder = builder.listen(listener)?;
+    for (listener, port) in listeners {
+        let proto = plan.conn_protocol.get(&port).copied().unwrap_or_default();
+        builder = builder.listen_protocol(listener, proto)?;
     }
     Ok(builder.run())
 }

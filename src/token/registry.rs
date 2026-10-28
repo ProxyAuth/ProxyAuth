@@ -38,8 +38,8 @@ use crate::databases::db::NewUserOutcome;
 use crate::network::error::render_error_page;
 use crate::network::proxy::client_ip;
 use crate::token::csrf::verify_csrf_token;
-use actix_web::{
-    Error as ActixError, FromRequest, HttpRequest, HttpResponse, Responder,
+use crate::hyper_web::{
+    Error as WebError, FromRequest, HttpRequest, HttpResponse, Responder,
     dev::Payload,
     error::ErrorBadRequest,
     web::{self, Form, Json},
@@ -217,7 +217,7 @@ impl EitherRegistry {
 }
 
 impl FromRequest for EitherRegistry {
-    type Error = ActixError;
+    type Error = WebError;
     type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
 
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
@@ -366,7 +366,7 @@ fn collides_in_memory(config: &AppConfig, username: &str, email: &str) -> bool {
 
 // ── Handler ────────────────────────────────────────────────────
 
-fn plain(status: actix_web::http::StatusCode, body: impl Into<String>) -> HttpResponse {
+fn plain(status: crate::hyper_web::http::StatusCode, body: impl Into<String>) -> HttpResponse {
     HttpResponse::build(status)
         .append_header(("server", "ProxyAuth"))
         .body(body.into())
@@ -377,7 +377,7 @@ fn conflict() -> HttpResponse {
     // them apart would turn this endpoint into an email-enumeration
     // oracle for every address on file.
     plain(
-        actix_web::http::StatusCode::CONFLICT,
+        crate::hyper_web::http::StatusCode::CONFLICT,
         "Username or email already in use",
     )
 }
@@ -433,7 +433,7 @@ pub async fn registry_route(
     data: web::Data<AppState>,
     payload: EitherRegistry,
 ) -> impl Responder {
-    use actix_web::http::StatusCode;
+    use crate::hyper_web::http::StatusCode;
 
     let host = crate::network::proxy::request_host(&req);
     let Some(route) = find_registry_route(host.as_deref(), &data.routes.routes) else {

@@ -1,4 +1,4 @@
-use actix_web::{App, HttpResponse, test, web};
+use proxyauth::hyper_web::{App, HttpResponse, test, web};
 use dashmap::DashMap;
 use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 use proxyauth::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
@@ -94,7 +94,7 @@ macro_rules! build_app {
 }
 
 #[cfg(not(tarpaulin))]
-#[actix_web::test]
+#[tokio::test]
 async fn test_auth_route() {
     std::fs::create_dir_all("/tmp/proxyauth-test-db").unwrap();
     unsafe {
