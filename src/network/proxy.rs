@@ -1604,18 +1604,37 @@ fn guess_content_type(path: &Path) -> &'static str {
 /// looks identical to a 404 otherwise and is easy to mistake for a
 /// typo'd path instead of a permissions problem.
 fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> HttpResponse {
+    // EMFILE (24) / ENFILE (23) : plus de descripteurs de fichiers, côté
+    // processus ou côté système. Le fichier existe très probablement :
+    // c'est le serveur qui est saturé, pas le chemin qui est faux. Un 404
+    // ici serait faux, mis en cache par les navigateurs et les CDN, et
+    // invisible dans les logs.
+    const ENFILE: i32 = 23;
+    const EMFILE: i32 = 24;
+
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        warn!(
+            "static route \"{prefix}\": too many open files while reading {} — raise the open-files limit of the proxyauth service (ulimit -n / LimitNOFILE / rc_ulimit)",
+              path.display()
+        );
+        return HttpResponse::ServiceUnavailable()
+        .append_header(("server", "ProxyAuth"))
+        .append_header(("Retry-After", "1"))
+        .body("503 Service Unavailable");
+    }
+
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         warn!(
             "static route \"{prefix}\": permission denied reading {} — the \"proxyauth\" user needs read (and, for directories, execute/traverse) access to this path",
-            path.display()
+              path.display()
         );
         HttpResponse::InternalServerError()
-            .append_header(("server", "ProxyAuth"))
-            .body("500 Internal Server Error")
+        .append_header(("server", "ProxyAuth"))
+        .body("500 Internal Server Error")
     } else {
         HttpResponse::NotFound()
-            .append_header(("server", "ProxyAuth"))
-            .body("404 Not Found")
+        .append_header(("server", "ProxyAuth"))
+        .body("404 Not Found")
     }
 }
 
