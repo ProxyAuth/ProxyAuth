@@ -808,11 +808,13 @@ vhosts:
         // issue_token now writes the new format; rebuild a genuinely old
         // one with only the index in its data field.
         let legacy_old_format = proxyauth::token::vault::vault()
-            .token("admin")
-            .expires_at(now + LIFETIME - 1000)
-            .id("legacy-old")
-            .data("0")
-            .issue()
+            .with(|v| {
+                v.token("admin")
+                    .expires_at(now + LIFETIME - 1000)
+                    .id("legacy-old")
+                    .data("0")
+                    .issue()
+            })
             .unwrap();
         assert_ne!(legacy, legacy_old_format);
 

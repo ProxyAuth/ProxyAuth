@@ -157,14 +157,17 @@ pub fn issue_session_token(
     token_id: &str,
     data: &TokenData,
 ) -> Result<String, String> {
+    let encoded = data.encode();
     vault()
-        .token(username)
-        .expires_at(expires_at)
-        .id(token_id)
-        // The library has no concept of a user index or a session: both
-        // ride in the token's free-form data field.
-        .data(&data.encode())
-        .issue()
+        .with(|v| {
+            v.token(username)
+                .expires_at(expires_at)
+                .id(token_id)
+                // The library has no concept of a user index or a session:
+                // both ride in the token's free-form data field.
+                .data(&encoded)
+                .issue()
+        })
         .map_err(|e| format!("token issue failed: {e}"))
 }
 

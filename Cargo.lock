@@ -4603,17 +4603,18 @@ dependencies = [
 
 [[package]]
 name = "zerocrypt"
-version = "0.1.7"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf30ed5676b340ba46f1a8fda951b1c7931359aafaf780d5a0ef78b98af4f696"
+checksum = "492d67862498621040c93574c309b483476c121894226980313b6e830e351015"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
- "chacha20poly1305",
+ "chacha20",
  "getrandom 0.4.3",
  "hkdf",
  "itoa",
  "quick_cache",
+ "ring",
  "sha2 0.11.1",
  "subtle",
 ]
