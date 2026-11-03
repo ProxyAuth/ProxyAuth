@@ -90,6 +90,30 @@ impl FormatTime for LocalTime {
     }
 }
 
+/// `mi_option_purge_delay` (même position dans mimalloc v2 et v3).
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// Applique `purge_delay` (config.json, en secondes) à l'allocateur.
+///
+/// mimalloc garde la mémoire libérée un moment avant de la rendre au
+/// système, pour la réutiliser sans appel système (1 s par défaut, et
+/// davantage pour ses arènes). Sous une charge qui varie, la RSS reste
+/// donc plus haute que la mémoire réellement utilisée. `0` la rend
+/// aussitôt : mesuré à environ −20 % de RSS avec 2 000 connexions
+/// HTTP/2 ouvertes, pour un léger surcoût d'appels système.
+fn apply_purge_delay(seconds: Option<f64>) {
+    let Some(secs) = seconds else { return };
+    if !secs.is_finite() || secs < 0.0 {
+        eprintln!("warning: config.json: purge_delay must be a number of seconds >= 0 (ignored)");
+        return;
+    }
+    let ms = (secs * 1000.0).round().min(i32::MAX as f64) as std::os::raw::c_long;
+    // SAFETY: réglage d'une option de mimalloc, sans pointeur ; mimalloc
+    // le prend en compte aux prochaines purges.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, ms) };
+    info!("allocator purge delay set to {ms} ms");
+}
+
 fn print_launcher(ratelimits: &[String], version: &str, worker: u8, addr: &str, id: &str) {
     let msg = if ratelimits.is_empty() {
         "ratelimit Off (no `ratelimit:` block in routes.yml)".to_string()
@@ -242,6 +266,7 @@ async fn spawn_acme_http01_listener(
         let server = match crate::hyper_web::HttpServer::new(|| {
             App::new().default_service(web::to(acme_http01_responder))
         })
+        .shutdown_timeout(config.shutdown_timeout_duration())
         .listen(listener)
         {
             Ok(s) => s.run(),
@@ -309,6 +334,11 @@ macro_rules! build_app {
                 limiters: $limiters.clone(),
             })
             .wrap(VhostListenGuard {
+                state: state.clone(),
+            })
+            // En-têtes de sécurité automatiques (`discovery-csp`), sur les
+            // réponses HTTPS — y compris 421/429/505 produits plus bas.
+            .wrap(network::security_headers::SecurityHeaders {
                 state: state.clone(),
             })
             .wrap(CorsMiddleware {
@@ -402,6 +432,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
 
+    apply_purge_delay(config.purge_delay);
+
     // Limite de fichiers ouverts : 1024 par défaut sous Linux, soit un
     // plafond d'environ 1000 connexions simultanées. Relevée ici, tant
     // que le processus est encore root (la limite survit à l'abandon
@@ -421,6 +453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => eprintln!("warning: could not read/raise the open-files limit: {e}"),
     }
+
 
     // Le noyau plafonne silencieusement la file d'attente de `listen()`
     // à `net.core.somaxconn`.
@@ -671,6 +704,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_routes(&mut routes.routes);
     let routes = Arc::new(routes);
+
+    // Pools de connexions vers les backends : un par worker, d'où le
+    // partage de `max_idle_per_host` entre tous les workers.
+    network::shared_client::set_worker_threads(config.worker as usize * config.num_instances.max(1) as usize);
+
+    {
+        use network::security_headers::DiscoveryCsp;
+        let global = config.discovery_csp.unwrap_or_default();
+        let overrides = routes.routes.iter().filter(|r| r.discovery_csp.is_some_and(|m| m != global)).count();
+        if global == DiscoveryCsp::Auto || overrides > 0 {
+            info!(
+                "discovery-csp: {} on HTTPS responses{}",
+                if global == DiscoveryCsp::Auto { "baseline security headers" } else { "off by default" },
+                if overrides > 0 { format!(" ({overrides} route(s) override it)") } else { String::new() }
+            );
+        }
+        if global == DiscoveryCsp::Auto && !config.tls {
+            eprintln!(
+                "warning: config.json: \"discovery-csp\": \"auto\" only applies to HTTPS responses, and \"tls\" is false: no header will be added"
+            );
+        }
+    }
+
+    // Caches internes (désactivés par défaut) : globaux et par vhost.
+    network::fs_cache::init(&config.internal_cache, &routes.routes);
+    network::compression::init_compressed_caches(&config.internal_cache, &routes.routes);
 
     // Pushes the in-memory config/routes state to every configured
     // `blakegate` endpoint over WebSocket, near real-time — entirely
@@ -1081,6 +1140,22 @@ mod tests {
     use std::net::TcpStream;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn purge_delay_reaches_mimalloc() {
+        let before = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
+        if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+            // Bonne option visée : le défaut documenté de mimalloc v3.
+            assert_eq!(before, 1000, "index 15 must be mimalloc's purge_delay");
+        }
+        apply_purge_delay(Some(0.25));
+        assert_eq!(unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) }, 250);
+        apply_purge_delay(Some(0.0));
+        assert_eq!(unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) }, 0);
+        apply_purge_delay(Some(-1.0)); // refusé : valeur inchangée
+        assert_eq!(unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) }, 0);
+        unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, before) };
+    }
 
     #[test]
     fn print_launcher_variants_do_not_panic() {

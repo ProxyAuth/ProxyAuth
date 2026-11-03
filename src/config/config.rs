@@ -905,6 +905,22 @@ pub struct RouteRule {
     #[serde(default)]
     pub streaming: Option<bool>,
 
+    /// `discovery-csp` pour ce vhost : `auto` ou `off`, prioritaire sur
+    /// config.json. Hérité du groupe `vhosts:`.
+    #[serde(default, rename = "discovery-csp", alias = "discovery_csp")]
+    pub discovery_csp: Option<crate::network::security_headers::DiscoveryCsp>,
+
+    /// Réglages `internal_cache` propres à cette route (hérités du
+    /// groupe `vhosts:`, puis de config.json, champ par champ).
+    #[serde(default)]
+    pub internal_cache: Option<crate::config::internal_cache::InternalCacheConfig>,
+
+    /// Relaie les connexions WebSocket (`Upgrade: websocket`) vers
+    /// `target`, qui peut alors être en `ws://` ou `wss://`. Voir
+    /// `network::websocket`. Hérité du groupe `vhosts:` ; défaut : non.
+    #[serde(default)]
+    pub forward_websocket: Option<bool>,
+
     /// Limitation de débit de cette route (ou, posée sur un groupe
     /// `vhosts:`, de tout le vhost — un seul compteur partagé). Voir
     /// `network::ratelimit` pour le format. `None` : pas de limite.
@@ -1128,6 +1144,10 @@ impl RouteRule {
     /// group's (already propagated above), else `false`. Defaulting to
     /// `false` keeps every pre-existing route on the buffering path it
     /// has always used.
+    pub fn forward_websocket_enabled(&self) -> bool {
+        self.forward_websocket.unwrap_or(false)
+    }
+
     pub fn streaming_enabled(&self) -> bool {
         self.streaming.unwrap_or(false)
     }
@@ -1433,6 +1453,20 @@ pub struct VhostGroup {
     #[serde(default)]
     pub streaming: Option<bool>,
 
+    /// `discovery-csp` du vhost (voir `RouteRule::discovery_csp`).
+    #[serde(default, rename = "discovery-csp", alias = "discovery_csp")]
+    pub discovery_csp: Option<crate::network::security_headers::DiscoveryCsp>,
+
+    /// Réglages `internal_cache` du vhost (voir
+    /// `RouteRule::internal_cache`).
+    #[serde(default)]
+    pub internal_cache: Option<crate::config::internal_cache::InternalCacheConfig>,
+
+    /// Relais WebSocket pour les routes du vhost (voir
+    /// `RouteRule::forward_websocket`).
+    #[serde(default)]
+    pub forward_websocket: Option<bool>,
+
     /// Limitation de débit du vhost (voir `RouteRule::ratelimit`).
     #[serde(default)]
     pub ratelimit: Option<crate::network::ratelimit::RateLimitConfig>,
@@ -1656,6 +1690,15 @@ impl RouteConfig {
                 }
                 if route.ratelimit.is_none() {
                     route.ratelimit = group.ratelimit.clone();
+                }
+                if route.forward_websocket.is_none() {
+                    route.forward_websocket = group.forward_websocket;
+                }
+                if route.internal_cache.is_none() {
+                    route.internal_cache = group.internal_cache.clone();
+                }
+                if route.discovery_csp.is_none() {
+                    route.discovery_csp = group.discovery_csp;
                 }
                 if route.port.is_none() {
                     route.port = group.port;
@@ -1965,6 +2008,31 @@ pub struct AppConfig {
     /// per `vhosts:` group in `routes.yml`; see `CompressionConfig`.
     #[serde(default)]
     pub compression: CompressionConfig,
+
+    /// Cache mémoire des fichiers statiques, pages d'erreur et réponses
+    /// compressées. Voir `config::internal_cache`.
+    #[serde(default)]
+    pub internal_cache: crate::config::internal_cache::InternalCacheConfig,
+
+    /// Délai (en secondes, décimales acceptées : `0.5`) avant que
+    /// l'allocateur rende au système la mémoire libérée. `0` : tout de
+    /// suite (RSS plus bas, un peu plus d'appels système sous charge).
+    /// Absent : réglage de mimalloc (1 s). Voir `main::apply_purge_delay`.
+    #[serde(default)]
+    pub purge_delay: Option<f64>,
+
+    /// Délai (secondes, décimales acceptées) laissé aux requêtes en cours
+    /// quand ProxyAuth s'arrête ou redémarre ; les connexions encore
+    /// ouvertes ensuite (téléchargements, WebSocket, streaming) sont
+    /// coupées. `0` : coupure immédiate. Défaut : 2 s.
+    #[serde(default)]
+    pub shutdown_timeout: Option<f64>,
+
+    /// `"discovery-csp": "auto"` : en-têtes de sécurité de base (CSP
+    /// anti-clickjacking, nosniff, HSTS…) sur toutes les réponses HTTPS
+    /// de tous les vhosts. Voir `network::security_headers`.
+    #[serde(default, rename = "discovery-csp", alias = "discovery_csp")]
+    pub discovery_csp: Option<crate::network::security_headers::DiscoveryCsp>,
 
     /// Settings for automatic Let's Encrypt certificate renewal (see
     /// `RouteRule.certbot_renew`). Global — every ACME-managed vhost
@@ -2278,10 +2346,14 @@ impl Serialize for AppConfig {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("AppConfig", 7)?;
+        let mut state = serializer.serialize_struct("AppConfig", 8)?;
         state.serialize_field("blakegate", &self.blakegate)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
         state.serialize_field("compression", &self.compression)?;
+        state.serialize_field("internal_cache", &self.internal_cache)?;
+        state.serialize_field("purge_delay", &self.purge_delay)?;
+        state.serialize_field("shutdown_timeout", &self.shutdown_timeout)?;
+        state.serialize_field("discovery-csp", &self.discovery_csp)?;
         state.serialize_field("cors_origins", &self.cors_origins)?;
         state.serialize_field("databases", &self.databases)?;
         state.serialize_field("fast", &self.fast)?;
@@ -2807,6 +2879,15 @@ impl AppConfig {
     /// `ip_blocklist_refresh_interval_secs` — so the value has to stay
     /// accepted at parse time and be guarded here, at the point of use,
     /// instead.
+    /// `shutdown_timeout` effectif ; une valeur négative ou invalide
+    /// retombe sur le défaut.
+    pub fn shutdown_timeout_duration(&self) -> std::time::Duration {
+        match self.shutdown_timeout {
+            Some(s) if s.is_finite() && s >= 0.0 => std::time::Duration::from_secs_f64(s.min(3600.0)),
+            _ => crate::hyper_web::server::DEFAULT_SHUTDOWN_TIMEOUT,
+        }
+    }
+
     pub fn backend_timeout_duration(&self) -> std::time::Duration {
         let ms = if self.backend_timeout == 0 {
             default_backend_timeout()

@@ -808,6 +808,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cty"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
+
+[[package]]
 name = "darling"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2015,6 +2021,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
+ "cty",
 ]
 
 [[package]]
@@ -2665,6 +2672,7 @@ dependencies = [
  "itoa",
  "jsonwebtoken",
  "lettre",
+ "libmimalloc-sys",
  "lmdb-rkv",
  "lru",
  "memchr",
@@ -2676,6 +2684,7 @@ dependencies = [
  "openssl",
  "pem 3.0.6",
  "quanta",
+ "quick_cache",
  "quinn-proto",
  "rand",
  "rand_core 0.10.1",
@@ -2683,6 +2692,7 @@ dependencies = [
  "redis",
  "regex",
  "reqwest 0.13.5",
+ "ring",
  "rpassword",
  "rustc-hash 1.1.0",
  "rustls",
@@ -2703,7 +2713,9 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tokio-util",
  "totp-rs",
+ "tower-service",
  "tracing",
  "tracing-loki",
  "tracing-subscriber",

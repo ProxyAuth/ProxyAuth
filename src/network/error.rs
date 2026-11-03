@@ -106,11 +106,20 @@ pub async fn render_error_page(
     // build backend request" — the empty `target` doesn't parse into
     // anything a real HTTP request could be built against.
     if let Some(static_path) = &rule.static_path {
-        let file_path = match tokio::fs::metadata(static_path).await {
-            Ok(m) if m.is_file() => std::path::PathBuf::from(static_path),
+        let file_path = match crate::network::fs_cache::kind(std::path::Path::new(static_path)).await {
+            Ok((true, _)) => std::path::PathBuf::from(static_path),
             _ => std::path::Path::new(static_path).join(&rule.static_index),
         };
-        return match tokio::fs::read_to_string(&file_path).await {
+        let policy = crate::config::internal_cache::CachePolicy::new(
+            &data.config.internal_cache,
+            rule.internal_cache.as_ref(),
+        );
+        return match crate::network::fs_cache::read_to_string(
+            &file_path,
+            &policy,
+            crate::network::fs_cache::pool_for(Some(rule)).as_deref(),
+        )
+        .await {
             Ok(html) => {
                 let mut html = toggle_error_block(html, error_text);
                 if rule.tag_proxyauth_enabled() {

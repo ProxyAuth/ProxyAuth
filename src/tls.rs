@@ -426,7 +426,8 @@ where
         .keep_alive(Duration::from_millis(config.keep_alive))
         .backlog(config.socket_listen)
         .max_connections(config.max_connections)
-        .client_request_timeout(Duration::from_millis(config.client_timeout));
+        .client_request_timeout(Duration::from_millis(config.client_timeout))
+        .shutdown_timeout(config.shutdown_timeout_duration());
 
     if config.tls {
         let cert_path = PathBuf::from("/etc/proxyauth/certs/cert.pem");

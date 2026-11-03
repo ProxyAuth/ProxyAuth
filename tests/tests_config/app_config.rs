@@ -405,6 +405,23 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_timeout_defaults_to_two_seconds_and_accepts_decimals() {
+        use std::time::Duration;
+        let parse = |extra: &str| -> AppConfig {
+            serde_json::from_str(&format!("{{{BASE}{extra}}}")).unwrap()
+        };
+        assert_eq!(parse("").shutdown_timeout_duration(), Duration::from_secs(2));
+        assert_eq!(parse(r#", "shutdown_timeout": 0"#).shutdown_timeout_duration(), Duration::ZERO);
+        assert_eq!(parse(r#", "shutdown_timeout": 0.5"#).shutdown_timeout_duration(), Duration::from_millis(500));
+        assert_eq!(parse(r#", "shutdown_timeout": 30"#).shutdown_timeout_duration(), Duration::from_secs(30));
+        assert_eq!(
+            parse(r#", "shutdown_timeout": -1"#).shutdown_timeout_duration(),
+            Duration::from_secs(2),
+            "invalid value falls back to the default"
+        );
+    }
+
+    #[test]
     fn app_config_legacy_ratelimit_sections_are_ignored() {
         // Rate limiting moved to routes.yml (per vhost). An existing
         // config.json that still carries the old sections must keep

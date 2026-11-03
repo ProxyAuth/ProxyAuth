@@ -500,6 +500,8 @@ pub const DEFAULT_ROUTES_YML: &str = concat!(
     "  #       auth:                  # optional, for /auth, /refresh_token...\n",
     "  #         limit_request: 10\n",
     "  #         period: 60\n",
+    "  #     forward_websocket: true  # relay WebSocket over HTTP/1.1 and HTTP/2 (RFC 8441); target ws:// or wss://\n",
+    "  #     discovery-csp: auto      # baseline security headers on HTTPS (or off); default from config.json\n",
     "  #     routes:\n",
     "  #       - prefix: \"/\"\n",
     "  #         target: \"http://127.0.0.1:3000\"\n",

@@ -33,7 +33,8 @@ pub fn init_loadbalancer(cfg: &AppConfig) {
     let _ = LB_TUNING.set(LbTuning {
         request_timeout_ms: cfg.client_timeout,
         pool_max_idle_per_host: cfg.max_idle_per_host as usize,
-        keep_alive_secs: cfg.keep_alive,
+        // `keep_alive` est en millisecondes dans config.json.
+        keep_alive_secs: (cfg.keep_alive / 1000).max(1),
 
         backend_valid_duration_secs: 2,
         cooldown_base_secs: 2,

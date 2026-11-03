@@ -170,6 +170,26 @@ impl CompressionConfig {
         self.upstream_identity.unwrap_or(true)
     }
 
+    /// Whether a route should ask its backend for an uncompressed body:
+    /// what `route.merged_over(global)` would answer through
+    /// `is_enabled() && strips_upstream_accept_encoding()`, without
+    /// building (and allocating) the merged configuration — this runs on
+    /// every proxied request.
+    pub fn route_strips_upstream_accept_encoding(
+        route: Option<&CompressionConfig>,
+        global: &CompressionConfig,
+    ) -> bool {
+        let enabled = match route.and_then(|c| c.enabled) {
+            Some(v) => v,
+            None => global.is_enabled(),
+        };
+        let identity = match route.and_then(|c| c.upstream_identity) {
+            Some(v) => v,
+            None => global.strips_upstream_accept_encoding(),
+        };
+        enabled && identity
+    }
+
     /// Returns the compression level appropriate for the content type.
     /// When `is_static` is `true` and `level_static` is set, the
     /// static level is returned; otherwise the regular `level`.
@@ -366,6 +386,25 @@ mod tests {
         assert!(!cfg.exceeds_max_size(999_999));
         assert!(!cfg.exceeds_max_size(1_000_000));
         assert!(cfg.exceeds_max_size(1_000_001));
+    }
+
+    #[test]
+    fn route_strips_matches_the_merged_config() {
+        let on = CompressionConfig { enabled: Some(true), ..Default::default() };
+        let off = CompressionConfig { enabled: Some(false), ..Default::default() };
+        let keep = CompressionConfig { upstream_identity: Some(false), ..Default::default() };
+        for global in [&on, &off, &keep, &CompressionConfig::default()] {
+            for route in [None, Some(&on), Some(&off), Some(&keep)] {
+                let merged = match route {
+                    Some(r) => r.merged_over(global),
+                    None => global.clone(),
+                };
+                assert_eq!(
+                    CompressionConfig::route_strips_upstream_accept_encoding(route, global),
+                    merged.is_enabled() && merged.strips_upstream_accept_encoding(),
+                );
+            }
+        }
     }
 
     #[test]

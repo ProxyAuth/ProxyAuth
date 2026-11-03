@@ -338,11 +338,7 @@ fn build_regex_target(re: &Regex, template: &str, path: &str) -> String {
 /// the target-building code uses. `None` if `s` doesn't parse as a URI
 /// at all.
 fn authority_of(s: &str) -> Option<String> {
-    let normalized = if s.starts_with("http://") || s.starts_with("https://") {
-        s.to_string()
-    } else {
-        format!("http://{s}")
-    };
+    let normalized = crate::network::websocket::normalize_target_url(s.to_string());
     Uri::from_str(&normalized)
         .ok()
         .and_then(|u| u.authority().map(|a| a.to_string()))
@@ -1193,6 +1189,15 @@ pub fn client_ip(req: &HttpRequest, config: &AppConfig) -> Option<IpAddr> {
     peer_ip
 }
 
+/// Whether to ask the backend for an uncompressed body (`identity`), so
+/// ProxyAuth applies its own `compression` settings.
+fn strips_upstream_accept_encoding(rule: &RouteRule, config: &AppConfig) -> bool {
+    crate::config::compression::CompressionConfig::route_strips_upstream_accept_encoding(
+        rule.compression.as_ref(),
+        &config.compression,
+    )
+}
+
 /// Pourquoi le backend n'a pas fourni de réponse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpstreamFailure {
@@ -1370,7 +1375,7 @@ async fn proxy_to_redirect_protect_target(
     }
 
     let hyper_req = request_builder
-        .body(Full::new(Bytes::from(body.to_vec())).boxed())
+        .body(Full::new(body.clone()).boxed())
         .ok()?;
 
     let client_opts = ClientOptions {
@@ -1593,6 +1598,11 @@ fn json_value_as_flat_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Type MIME annoncé pour un fichier statique (d'après son extension).
+pub(crate) fn content_type_for(path: &Path) -> &'static str {
+    guess_content_type(path)
+}
+
 fn guess_content_type(path: &Path) -> &'static str {
     let ext = path
         .extension()
@@ -1700,7 +1710,7 @@ async fn serve_static_file(
             .body("500 Internal Server Error");
     };
 
-    let root = match tokio::fs::canonicalize(static_path).await {
+    let root = match crate::network::fs_cache::canonicalize(Path::new(static_path)).await {
         Ok(p) => p,
         Err(e) => {
             warn!(
@@ -1713,8 +1723,8 @@ async fn serve_static_file(
         }
     };
 
-    let root_is_file = match tokio::fs::metadata(&root).await {
-        Ok(m) => m.is_file(),
+    let root_is_file = match crate::network::fs_cache::kind(&root).await {
+        Ok((is_file, _)) => is_file,
         Err(e) => {
             return static_read_error_response(&rule.prefix, &root, &e);
         }
@@ -1726,62 +1736,18 @@ async fn serve_static_file(
     // `/robots.txt` or `/favicon.ico` route).
     let max_age = rule.cache_duration_secs.unwrap_or(cache_duration_secs);
     if root_is_file {
-        return match tokio::fs::read(&root).await {
-            Ok(bytes) => {
-                let content_type = guess_content_type(&root);
-                let bytes = if (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
-                    && content_type.starts_with("text/html")
-                {
-                    match String::from_utf8(bytes) {
-                        Ok(text) => {
-                            let username = extract_username_for_tags(req, data, ip).await;
-                            // Independent of `username` — a login page,
-                            // where nobody is authenticated yet, is
-                            // exactly the case that most needs a CSRF
-                            // token (for the login form's own POST).
-                            // But NOT independent of csrf_token itself —
-                            // injecting a token when CSRF protection is
-                            // deliberately off for this vhost would be a
-                            // pointless, confusing no-op at best (the
-                            // token gets generated and spliced in, but
-                            // /auth never actually checks it).
-                            let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                            let tagged = if rule.tag_proxyauth_enabled() {
-                                substitute_proxyauth_tags(
-                                    &text,
-                                    username.as_deref(),
-                                    csrf_token.as_deref(),
-                                )
-                            } else {
-                                text
-                            };
-                            apply_hidden_blocks(tagged, rule, req, data)
-                                .await
-                                .into_bytes()
-                        }
-                        Err(e) => e.into_bytes(),
-                    }
-                } else {
-                    bytes
-                };
-                let mut resp = HttpResponse::Ok();
-                resp.append_header(("server", "ProxyAuth"))
-                    .content_type(content_type);
-                if rule.cache_enabled() {
-                    resp.append_header((
-                        header::CACHE_CONTROL,
-                        format!("public, max-age={}", max_age),
-                    ));
-                } else {
-                    resp.append_header((
-                        header::CACHE_CONTROL,
-                        "no-store, no-cache, must-revalidate, max-age=0",
-                    ));
-                    resp.append_header(("Pragma", "no-cache"));
-                    resp.append_header(("Expires", "0"));
-                }
-                resp.body(bytes)
-            }
+        let policy = crate::config::internal_cache::CachePolicy::new(
+            &data.config.internal_cache,
+            rule.internal_cache.as_ref(),
+        );
+        return match crate::network::fs_cache::read(
+            &root,
+            guess_content_type(&root),
+            &policy,
+            crate::network::fs_cache::pool_for(Some(rule)).as_deref(),
+        )
+        .await {
+            Ok(file) => static_file_response(&root, file, rule, max_age, req, data, ip).await,
             Err(e) => static_read_error_response(&rule.prefix, &root, &e),
         };
     }
@@ -1823,15 +1789,15 @@ async fn serve_static_file(
 
     let mut candidate = root.join(remainder);
 
-    let is_dir = tokio::fs::metadata(&candidate)
+    let is_dir = crate::network::fs_cache::kind(&candidate)
         .await
-        .map(|m| m.is_dir())
+        .map(|(_, is_dir)| is_dir)
         .unwrap_or(false);
     if is_dir || remainder.is_empty() {
         candidate = candidate.join(&rule.static_index);
     }
 
-    let resolved = match tokio::fs::canonicalize(&candidate).await {
+    let resolved = match crate::network::fs_cache::canonicalize(&candidate).await {
         Ok(p) => p,
         Err(e) => {
             return static_read_error_response(&rule.prefix, &candidate, &e);
@@ -1850,55 +1816,109 @@ async fn serve_static_file(
             .body("403 Forbidden");
     }
 
-    match tokio::fs::read(&resolved).await {
-        Ok(bytes) => {
-            let content_type = guess_content_type(&resolved);
-            let bytes = if (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
-                && content_type.starts_with("text/html")
-            {
-                match String::from_utf8(bytes) {
-                    Ok(text) => {
-                        let username = extract_username_for_tags(req, data, ip).await;
-                        let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                        let tagged = if rule.tag_proxyauth_enabled() {
-                            substitute_proxyauth_tags(
-                                &text,
-                                username.as_deref(),
-                                csrf_token.as_deref(),
-                            )
-                        } else {
-                            text
-                        };
-                        apply_hidden_blocks(tagged, rule, req, data)
-                            .await
-                            .into_bytes()
-                    }
-                    Err(e) => e.into_bytes(),
-                }
-            } else {
-                bytes
-            };
-            let mut resp = HttpResponse::Ok();
-            resp.append_header(("server", "ProxyAuth"))
-                .content_type(content_type);
-            if rule.cache_enabled() {
-                resp.append_header((
-                    header::CACHE_CONTROL,
-                    format!("public, max-age={}", max_age),
-                ));
-            } else {
-                resp.append_header((
-                    header::CACHE_CONTROL,
-                    "no-store, no-cache, must-revalidate, max-age=0",
-                ));
-                resp.append_header(("Pragma", "no-cache"));
-                resp.append_header(("Expires", "0"));
-            }
-            resp.body(bytes)
-        }
+    let policy = crate::config::internal_cache::CachePolicy::new(
+        &data.config.internal_cache,
+        rule.internal_cache.as_ref(),
+    );
+    match crate::network::fs_cache::read(
+        &resolved,
+        guess_content_type(&resolved),
+        &policy,
+        crate::network::fs_cache::pool_for(Some(rule)).as_deref(),
+    )
+    .await {
+        Ok(file) => static_file_response(&resolved, file, rule, max_age, req, data, ip).await,
         Err(e) => static_read_error_response(&rule.prefix, &resolved, &e),
     }
 }
+
+/// Builds the response for a file read from `fs_cache`.
+///
+/// HTML with `tag_proxyauth` or hidden blocks is rendered per request
+/// (CSRF token, username): only the raw template comes from the cache.
+/// Anything else is sent straight from the cached `Bytes` (no copy) with
+/// a weak `ETag`, and a matching `If-None-Match` gets a `304` with no
+/// body — the browser keeps its copy and nothing is transferred.
+async fn static_file_response(
+    path: &Path,
+    file: crate::network::fs_cache::FileHandle,
+    rule: &RouteRule,
+    max_age: u64,
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+    ip: &str,
+) -> HttpResponse {
+    let content_type = guess_content_type(path);
+    let templated = (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
+        && content_type.starts_with("text/html");
+
+    let mut resp = HttpResponse::Ok();
+    resp.append_header(("server", "ProxyAuth"))
+        .content_type(content_type);
+    if rule.cache_enabled() {
+        resp.append_header((
+            header::CACHE_CONTROL,
+            format!("public, max-age={}", max_age),
+        ));
+    } else {
+        resp.append_header((
+            header::CACHE_CONTROL,
+            "no-store, no-cache, must-revalidate, max-age=0",
+        ));
+        resp.append_header(("Pragma", "no-cache"));
+        resp.append_header(("Expires", "0"));
+    }
+
+    if !templated {
+        let etag = file.etag();
+        let matches = req
+            .headers()
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
+        resp.append_header((header::ETAG, etag));
+        if matches {
+            resp.status(StatusCode::NOT_MODIFIED);
+            return resp.finish();
+        }
+        // Taille connue d'avance : `Content-Length` même quand le corps
+        // est un flux depuis le disque.
+        resp.append_header((header::CONTENT_LENGTH, file.len()));
+        return match file.into_body().await {
+            Ok(body) => resp.body(body),
+            Err(e) => static_read_error_response(&rule.prefix, path, &e),
+        };
+    }
+
+    // Modèle HTML réécrit à chaque requête : il faut son texte entier
+    // (au plus 16 Mo, jamais un gros fichier).
+    let raw = match file.into_bytes(16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return static_read_error_response(&rule.prefix, path, &e),
+    };
+    let rendered = match String::from_utf8(raw.to_vec()) {
+        Ok(text) => {
+            let username = extract_username_for_tags(req, data, ip).await;
+            // Independent of `username` — a login page, where nobody is
+            // authenticated yet, is exactly the case that most needs a
+            // CSRF token (for the login form's own POST). But NOT
+            // independent of csrf_token itself — injecting a token when
+            // CSRF protection is deliberately off for this vhost would be
+            // a pointless, confusing no-op at best.
+            let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+            let tagged = if rule.tag_proxyauth_enabled() {
+                substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+            } else {
+                text
+            };
+            apply_hidden_blocks(tagged, rule, req, data).await.into_bytes()
+        }
+        Err(e) => e.into_bytes(),
+    };
+    resp.body(rendered)
+}
+
+
 
 /// Minimal `required_login` gate for static routes: the same
 /// Bearer-token / session-cookie extraction and
@@ -2874,11 +2894,9 @@ pub async fn proxy_with_proxy(
         }
         target_url.push_str(q);
     }
-    let full_url = if target_url.starts_with("http://") || target_url.starts_with("https://") {
-        target_url
-    } else {
-        format!("http://{}", target_url)
-    };
+    // `ws://`/`wss://` targets (forward_websocket) map to http/https for
+    // ordinary requests on the same route.
+    let full_url = crate::network::websocket::normalize_target_url(target_url);
 
     let client = get_or_build_client_proxy(
         ClientOptions {
@@ -3028,12 +3046,7 @@ pub async fn proxy_with_proxy(
     // already carries a `Content-Encoding`. Asking upstream for
     // `identity` is what lets ProxyAuth apply the configured algorithm
     // and level itself — nginx's `proxy_set_header Accept-Encoding ""`.
-    let route_compression = match &rule.compression {
-        Some(c) => c.merged_over(&data.config.compression),
-        None => data.config.compression.clone(),
-    };
-    let strip_accept_encoding =
-        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+    let strip_accept_encoding = strips_upstream_accept_encoding(rule, &data.config);
 
     let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
     let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
@@ -3118,8 +3131,10 @@ pub async fn proxy_with_proxy(
             && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
         {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            // Same `http` 1.x types on both sides: the name and value move
+            // across as-is (a reference-count bump), with no re-parsing.
+            if let Some(h) = request_builder.headers_mut() {
+                h.append(key.clone(), value.clone());
             }
         }
     }
@@ -3181,7 +3196,7 @@ pub async fn proxy_with_proxy(
             }
         }
     } else {
-        match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
+        match request_builder.body(Full::new(body.clone()).boxed()) {
             Ok(req) => req,
             Err(e) => {
                 warn!(client_ip = %ip, target = %full_url, "Request build failed: {}", e);
@@ -3280,7 +3295,9 @@ pub async fn proxy_with_proxy(
         }
 
         if k != "user-agent" && k != "authorization" && k != "server" {
-            client_resp.append_header((k, value.as_bytes()));
+            if let Some(h) = client_resp.headers_mut() {
+                h.append(key.clone(), value.clone());
+            }
         }
     }
 
@@ -3624,11 +3641,9 @@ pub async fn proxy_without_proxy(
         target_url.push_str(q);
     }
 
-    let full_url = if target_url.starts_with("http://") || target_url.starts_with("https://") {
-        target_url
-    } else {
-        format!("http://{}", target_url)
-    };
+    // `ws://`/`wss://` targets (forward_websocket) map to http/https for
+    // ordinary requests on the same route.
+    let full_url = crate::network::websocket::normalize_target_url(target_url);
 
     // ── Client : cache global partagé ────────────────────────────────
     let client_opts = if !rule.cert.is_empty() {
@@ -3793,12 +3808,7 @@ pub async fn proxy_without_proxy(
     // already carries a `Content-Encoding`. Asking upstream for
     // `identity` is what lets ProxyAuth apply the configured algorithm
     // and level itself — nginx's `proxy_set_header Accept-Encoding ""`.
-    let route_compression = match &rule.compression {
-        Some(c) => c.merged_over(&data.config.compression),
-        None => data.config.compression.clone(),
-    };
-    let strip_accept_encoding =
-        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+    let strip_accept_encoding = strips_upstream_accept_encoding(rule, &data.config);
 
     // ── Build request Hyper ──────────────────────────────────────────
     //
@@ -3881,8 +3891,10 @@ pub async fn proxy_without_proxy(
             && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
         {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            // Same `http` 1.x types on both sides: the name and value move
+            // across as-is (a reference-count bump), with no re-parsing.
+            if let Some(h) = request_builder.headers_mut() {
+                h.append(key.clone(), value.clone());
             }
         }
     }
@@ -3930,6 +3942,26 @@ pub async fn proxy_without_proxy(
     request_builder = request_builder.header(USER_AGENT, user_agent);
     request_builder = inject_header(request_builder, &username, &data.config);
 
+    // ── WebSocket ────────────────────────────────────────────────────
+    //
+    // Same checks and same headers as any proxied request (all done
+    // above); only the transport changes. See `network::websocket`.
+    if let Some(mode) = rule
+        .forward_websocket_enabled()
+        .then(|| crate::network::websocket::websocket_request(&req))
+        .flatten()
+    {
+        return Ok(crate::network::websocket::tunnel(
+            &req,
+            mode,
+            request_builder,
+            &full_url,
+            data.config.backend_timeout_duration(),
+            &ip,
+        )
+        .await);
+    }
+
     // ── Build request body ───────────────────────────────────────────
     //
     // HEAD MUST NOT have a request body.
@@ -3956,7 +3988,7 @@ pub async fn proxy_without_proxy(
             }
         }
     } else {
-        match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
+        match request_builder.body(Full::new(body.clone()).boxed()) {
             Ok(req) => req,
 
             Err(e) => {
@@ -4088,7 +4120,9 @@ pub async fn proxy_without_proxy(
         }
 
         if k != "user-agent" && k != "authorization" && k != "server" {
-            client_resp.append_header((k, value.as_bytes()));
+            if let Some(h) = client_resp.headers_mut() {
+                h.append(key.clone(), value.clone());
+            }
         }
     }
 

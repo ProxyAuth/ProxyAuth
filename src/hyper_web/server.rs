@@ -11,9 +11,11 @@
 //!   (`SO_REUSEPORT`) et le noyau répartit les connexions entre eux ; si
 //!   ce n'est pas possible, un thread d'acceptation unique distribue
 //!   chaque connexion au worker qui en a le moins en cours ;
-//! * SIGINT/SIGTERM déclenchent un arrêt gracieux : plus d'`accept`, les
-//!   connexions en cours sont drainées pendant au plus
-//!   `shutdown_timeout` (30 s par défaut, comme actix).
+//! * SIGINT/SIGTERM déclenchent un arrêt rapide : plus d'`accept`, les
+//!   requêtes en cours ont au plus `shutdown_timeout` pour finir (2 s par
+//!   défaut, réglable dans config.json), puis les connexions restantes
+//!   (téléchargements, WebSocket…) sont coupées. Un second signal fait
+//!   sortir immédiatement.
 
 use super::app::{App, AppService, ServiceRequest};
 use super::body::Body;
@@ -36,6 +38,21 @@ use std::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
+
+/// Futur d'upgrade côté client (WebSocket), posé dans les extensions de
+/// la `HttpRequest` quand la requête demande un `Upgrade` sur une
+/// connexion HTTP/1.1. Un handler le retire pour ouvrir un tunnel après
+/// avoir répondu `101 Switching Protocols`.
+pub struct ClientUpgrade(pub hyper::upgrade::OnUpgrade);
+
+/// Valeur de `:protocol` d'un CONNECT étendu HTTP/2 (RFC 8441), par
+/// exemple `websocket`, posée dans les extensions de la `HttpRequest`.
+pub struct ConnectProtocol(pub String);
+
+/// Délai d'arrêt par défaut : de quoi finir une requête courte, sans
+/// faire attendre un redémarrage derrière un téléchargement ou une
+/// WebSocket (actix attendait 30 s).
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Délai maximal d'une poignée de main TLS, compté depuis la remise de
 /// la connexion au worker. actix utilisait 3 s ; lors d'un afflux de
@@ -80,6 +97,20 @@ fn install_signal_handlers() {
                 info!("Ctrl-C received, starting graceful shutdown");
             }
             trigger_shutdown();
+
+            // Second signal pendant l'arrêt : on n'attend plus rien.
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                if let Ok(mut term) = signal(SignalKind::terminate()) {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                    warn!("second signal received, exiting immediately");
+                    std::process::exit(1);
+                }
+            }
         };
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
@@ -142,20 +173,15 @@ struct Listener {
 }
 
 /// Les trois variantes de connexion, construites une fois par worker.
+///
+/// HTTP/1.1 seul passe par le builder `http1` de hyper plutôt que par
+/// `auto::Builder::http1_only()` : la variante « avec upgrades » d'auto
+/// (nécessaire aux WebSocket) ignore `http1_only`/`http2_only` et
+/// détecte le protocole elle-même — un port `h1` aurait accepté h2c.
 struct Builders {
     auto: auto::Builder<LocalExec>,
-    h1: auto::Builder<LocalExec>,
+    h1: hyper::server::conn::http1::Builder,
     h2: auto::Builder<LocalExec>,
-}
-
-impl Builders {
-    fn get(&self, p: ConnProtocol) -> &auto::Builder<LocalExec> {
-        match p {
-            ConnProtocol::Auto => &self.auto,
-            ConnProtocol::Http1 => &self.h1,
-            ConnProtocol::Http2 => &self.h2,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -189,7 +215,7 @@ where
                 keep_alive: Duration::from_secs(5),
                 max_connections: 25_000,
                 client_request_timeout: Duration::from_secs(5),
-                shutdown_timeout: Duration::from_secs(30),
+                shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             },
             listeners: Vec::new(),
         }
@@ -226,8 +252,10 @@ where
         self
     }
 
-    pub fn shutdown_timeout(mut self, secs: u64) -> Self {
-        self.opts.shutdown_timeout = Duration::from_secs(secs);
+    /// Délai laissé aux requêtes en cours à l'arrêt, avant de couper
+    /// les connexions restantes. `Duration::ZERO` : coupure immédiate.
+    pub fn shutdown_timeout(mut self, d: Duration) -> Self {
+        self.opts.shutdown_timeout = d;
         self
     }
 
@@ -624,7 +652,7 @@ where
         let app = factory().into_service();
         let builders = Rc::new(Builders {
             auto: make_builder(&opts),
-            h1: make_builder(&opts).http1_only(),
+            h1: make_h1_builder(&opts),
             h2: make_builder(&opts).http2_only(),
         });
         let mut shutdown = SHUTDOWN.subscribe();
@@ -737,6 +765,26 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Délai de lecture des en-têtes (voir `make_builder`).
+fn head_timeout(opts: &ServerOptions) -> Option<Duration> {
+    let t = if opts.keep_alive.is_zero() {
+        opts.client_request_timeout
+    } else {
+        opts.keep_alive.max(opts.client_request_timeout)
+    };
+    (!t.is_zero()).then_some(t)
+}
+
+/// Même réglage HTTP/1.1 que la partie `http1` de [`make_builder`].
+fn make_h1_builder(opts: &ServerOptions) -> hyper::server::conn::http1::Builder {
+    let mut h1 = hyper::server::conn::http1::Builder::new();
+    // Pas de `pipeline_flush` : voir `make_builder`.
+    h1.timer(TokioTimer::new())
+        .keep_alive(!opts.keep_alive.is_zero())
+        .header_read_timeout(head_timeout(opts));
+    h1
+}
+
 fn make_builder(opts: &ServerOptions) -> auto::Builder<LocalExec> {
     let mut b = auto::Builder::new(LocalExec);
     let keep_alive = !opts.keep_alive.is_zero();
@@ -752,12 +800,14 @@ fn make_builder(opts: &ServerOptions) -> auto::Builder<LocalExec> {
     };
     {
         let mut h1 = b.http1();
-        h1.timer(TokioTimer::new())
-            .keep_alive(keep_alive)
-            // Doc hyper : regroupe les écritures des réponses en pipeline
-            // en un seul flush (moins d'appels système quand un client
-            // envoie plusieurs requêtes d'affilée sur la connexion).
-            .pipeline_flush(true);
+        // Pas de `pipeline_flush(true)` : dans hyper, il désactive la
+        // limite du tampon d'écriture (`can_buffer()` toujours vrai). Un
+        // corps en flux (gros fichier statique, réponse de backend en
+        // streaming) était alors lu entièrement en mémoire, aussi vite que
+        // le disque ou le backend le fournissaient, en attendant un client
+        // plus lent : des centaines de Mo par téléchargement. Sans lui,
+        // hyper cesse de lire le corps dès que ~400 Ko attendent l'envoi.
+        h1.timer(TokioTimer::new()).keep_alive(keep_alive);
         if head_timeout.is_zero() {
             h1.header_read_timeout(None);
         } else {
@@ -772,6 +822,9 @@ fn make_builder(opts: &ServerOptions) -> auto::Builder<LocalExec> {
         // attendant d'avoir mesuré le débit × latence : moins bien pour
         // la plupart des clients.
         h2.timer(TokioTimer::new())
+            // CONNECT étendu (RFC 8441) : WebSocket sur HTTP/2. Annoncé au
+            // client par SETTINGS_ENABLE_CONNECT_PROTOCOL.
+            .enable_connect_protocol()
             // Protection « rapid reset » (CVE-2023-44487) : borne le
             // nombre de flux annulés par le client avant d'être servis.
             .max_pending_accept_reset_streams(Some(20));
@@ -793,8 +846,7 @@ async fn handle_connection(
     _guard: LoadGuard,
 ) {
     let Some(tls) = cfg.tls else {
-        let builder = builders.get(cfg.protocol);
-        serve(TokioIo::new(stream), peer, local_addr, false, app, builder).await;
+        serve(TokioIo::new(stream), peer, local_addr, false, app, &builders, cfg.protocol).await;
         return;
     };
 
@@ -830,8 +882,7 @@ async fn handle_connection(
         Some(b"http/1.1") => ConnProtocol::Http1,
         _ => cfg.protocol,
     };
-    let builder = builders.get(negotiated);
-    serve(TokioIo::new(tls_stream), peer, local_addr, true, app, builder).await;
+    serve(TokioIo::new(tls_stream), peer, local_addr, true, app, &builders, negotiated).await;
 }
 
 async fn serve<I>(
@@ -840,37 +891,62 @@ async fn serve<I>(
     local_addr: Option<SocketAddr>,
     secure: bool,
     app: AppService,
-    builder: &auto::Builder<LocalExec>,
+    builders: &Builders,
+    protocol: ConnProtocol,
 ) where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
         let app = app.clone();
         async move { Ok::<_, Infallible>(handle(app, req, peer, local_addr, secure).await) }
     });
-    let conn = builder.serve_connection(io, svc);
-    tokio::pin!(conn);
-    let mut rx = SHUTDOWN.subscribe();
-    let res = tokio::select! {
-        r = conn.as_mut() => r,
-        _ = wait_shutdown(&mut rx) => {
-            conn.as_mut().graceful_shutdown();
-            conn.await
-        }
-    };
-    if let Err(e) = res {
-        debug!("connection {peer} closed with error: {e}");
+
+    // Sert la connexion ; au signal d'arrêt, termine proprement la
+    // requête en cours puis ferme.
+    macro_rules! drive {
+        ($conn:expr) => {{
+            let conn = $conn;
+            tokio::pin!(conn);
+            let mut rx = SHUTDOWN.subscribe();
+            let res = tokio::select! {
+                r = conn.as_mut() => r.map_err(|e| e.to_string()),
+                _ = wait_shutdown(&mut rx) => {
+                    conn.as_mut().graceful_shutdown();
+                    conn.await.map_err(|e| e.to_string())
+                }
+            };
+            if let Err(e) = res {
+                debug!("connection {peer} closed with error: {e}");
+            }
+        }};
+    }
+
+    match protocol {
+        // Upgrades (WebSocket) acceptés : HTTP/1.1, ou détection auto.
+        ConnProtocol::Http1 => drive!(builders.h1.serve_connection(io, svc).with_upgrades()),
+        ConnProtocol::Auto => drive!(builders.auto.serve_connection_with_upgrades(io, svc)),
+        // HTTP/2 seul : pas d'upgrade HTTP/1.1 possible.
+        ConnProtocol::Http2 => drive!(builders.h2.serve_connection(io, svc)),
     }
 }
 
 /// Une requête hyper → `ServiceRequest` → application → réponse hyper.
 pub(crate) async fn handle(
     app: AppService,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     peer: SocketAddr,
     local_addr: Option<SocketAddr>,
     secure: bool,
 ) -> Response<Body> {
+    // Demande d'upgrade (WebSocket) : on garde de quoi reprendre la
+    // connexion brute si un handler accepte avec un `101`.
+    // HTTP/1.1 : en-tête `Upgrade`. HTTP/2 : CONNECT étendu (RFC 8441),
+    // dont hyper fournit `:protocol` et l'upgrade du flux.
+    let connect_protocol = (req.method() == http::Method::CONNECT)
+        .then(|| req.extensions().get::<hyper::ext::Protocol>().map(|p| p.as_str().to_string()))
+        .flatten();
+    let upgrade = (req.headers().contains_key(header::UPGRADE) || connect_protocol.is_some())
+        .then(|| hyper::upgrade::on(&mut req));
     let (parts, body) = req.into_parts();
     let is_head = parts.method == http::Method::HEAD;
     let mut headers = parts.headers;
@@ -889,6 +965,12 @@ pub(crate) async fn handle(
         local_addr,
         secure,
     );
+    if let Some(u) = upgrade {
+        http_req.extensions_mut().insert(ClientUpgrade(u));
+    }
+    if let Some(p) = connect_protocol {
+        http_req.extensions_mut().insert(ConnectProtocol(p));
+    }
     let payload = Payload::new(incoming_to_body(body));
     let res = app.call(ServiceRequest::new(http_req, payload)).await;
     let mut res = res.into_response();
