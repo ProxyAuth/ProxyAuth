@@ -22,7 +22,7 @@ use tokio::time::timeout;
 
 #[derive(Debug, Error)]
 pub enum ForwardError {
-    #[error("503 Service Unavailable")]
+    #[error("all backends failed")]
     AllBackendsFailed,
 
     // hyper_util::client::legacy::Error au lieu de hyper::Error
@@ -33,13 +33,17 @@ pub enum ForwardError {
 type AHasherDashMap<K, V> = DashMap<K, V, RandomState>;
 
 type ArcClient = Arc<Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody>>;
-type ClientPool = DashMap<String, ArcClient, RandomState>;
-static CLIENT_POOL: Lazy<ClientPool> = Lazy::new(ClientPool::default);
-
 type ProxyArcClient =
     Arc<Client<ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, BoxBody>>;
-type ProxyClientPool = DashMap<(String, String), ProxyArcClient, RandomState>;
-static PROXY_CLIENT_POOL: Lazy<ProxyClientPool> = Lazy::new(ProxyClientPool::default);
+
+// PERF — one client (and connection pool) per worker thread: see the
+// comment on `CLIENT_CACHE` in `shared_client.rs`.
+thread_local! {
+    static CLIENT_POOL: std::cell::RefCell<std::collections::HashMap<String, ArcClient, RandomState>> =
+        std::cell::RefCell::new(std::collections::HashMap::with_hasher(RandomState::default()));
+    static PROXY_CLIENT_POOL: std::cell::RefCell<std::collections::HashMap<(String, String), ProxyArcClient, RandomState>> =
+        std::cell::RefCell::new(std::collections::HashMap::with_hasher(RandomState::default()));
+}
 
 pub static LAST_GOOD_BACKEND: Lazy<AHasherDashMap<String, (String, Instant)>> =
     Lazy::new(Default::default);
@@ -187,8 +191,8 @@ pub fn build_swrr_order<'a>(cands: &[&'a BackendConfig]) -> Vec<&'a BackendConfi
 
 pub async fn get_or_build_client(backend: &str) -> ArcClient {
     let key = backend.trim().to_lowercase();
-    if let Some(client) = CLIENT_POOL.get(&key) {
-        return Arc::clone(&client);
+    if let Some(client) = CLIENT_POOL.with(|p| p.borrow().get(&key).cloned()) {
+        return client;
     }
 
     let mut connector = HttpConnector::new();
@@ -205,18 +209,22 @@ pub async fn get_or_build_client(backend: &str) -> ArcClient {
         .wrap_connector(connector);
 
     let client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(lb().pool_max_idle_per_host)
+        .pool_timer(crate::network::shared_client::pool_timer())
+        .pool_idle_timeout(Duration::from_secs(lb().keep_alive_secs))
+        .pool_max_idle_per_host(crate::network::shared_client::per_worker_idle(
+            lb().pool_max_idle_per_host,
+        ))
         .build::<_, BoxBody>(https);
 
     let arc_client = Arc::new(client);
-    CLIENT_POOL.insert(key, Arc::clone(&arc_client));
+    CLIENT_POOL.with(|p| p.borrow_mut().insert(key, Arc::clone(&arc_client)));
     arc_client
 }
 
 pub async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> ProxyArcClient {
     let key = (proxy_addr.to_string(), backend.to_string());
-    if let Some(client) = PROXY_CLIENT_POOL.get(&key) {
-        return Arc::clone(&client);
+    if let Some(client) = PROXY_CLIENT_POOL.with(|p| p.borrow().get(&key).cloned()) {
+        return client;
     }
 
     let proxy_uri: Uri = proxy_addr.parse().expect("Invalid proxy URI");
@@ -239,11 +247,15 @@ pub async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> 
         ProxyConnector::from_proxy(https, proxy).expect("Failed to create proxy connector");
 
     let client = Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(lb().pool_max_idle_per_host)
+        .pool_timer(crate::network::shared_client::pool_timer())
+        .pool_idle_timeout(Duration::from_secs(lb().keep_alive_secs))
+        .pool_max_idle_per_host(crate::network::shared_client::per_worker_idle(
+            lb().pool_max_idle_per_host,
+        ))
         .build(proxy_connector);
 
     let arc_client = Arc::new(client);
-    PROXY_CLIENT_POOL.insert(key, Arc::clone(&arc_client));
+    PROXY_CLIENT_POOL.with(|p| p.borrow_mut().insert(key, Arc::clone(&arc_client)));
     arc_client
 }
 

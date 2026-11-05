@@ -8,16 +8,16 @@
 
 use crate::AppState;
 use crate::config::config::{User, resolve_password_override, set_user_password};
-use crate::network::error::render_error_page;
-use crate::reset::db as reset_db;
-use crate::token::auth::verify_password;
-use crate::token::csrf::verify_csrf_token;
-use actix_web::{
-    Error as ActixError, FromRequest, HttpRequest, HttpResponse, Responder,
+use crate::hyper_web::{
+    Error as WebError, FromRequest, HttpRequest, HttpResponse, Responder,
     dev::Payload,
     error::ErrorBadRequest,
     web::{self, Form, Json},
 };
+use crate::network::error::render_error_page;
+use crate::reset::db as reset_db;
+use crate::token::auth::verify_password;
+use crate::token::csrf::verify_csrf_token;
 use argon2::Argon2;
 use argon2::password_hash::PasswordHasher;
 use futures_util::FutureExt;
@@ -38,7 +38,7 @@ pub enum EitherResetPassword {
 }
 
 impl FromRequest for EitherResetPassword {
-    type Error = ActixError;
+    type Error = WebError;
     type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
 
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
@@ -127,8 +127,8 @@ pub async fn reset_password_route(
         Ok(h) => h.to_string(),
         Err(_) => {
             return HttpResponse::InternalServerError()
-            .append_header(("server", "ProxyAuth"))
-            .body("Failed to hash password");
+                .append_header(("server", "ProxyAuth"))
+                .body("Failed to hash password");
         }
     };
 

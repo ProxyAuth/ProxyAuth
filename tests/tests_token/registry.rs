@@ -5,20 +5,19 @@
 
 #[cfg(test)]
 mod tests {
-    use actix_web::Responder;
-    use actix_web::http::StatusCode;
-    use actix_web::test;
     use dashmap::DashMap;
     use proxyauth::config::config::{
         AppConfig, BlakegateEndpoint, DatabaseConfig, EmailEntry, RouteConfig, RouteRule, User,
     };
+    use proxyauth::hyper_web::Responder;
+    use proxyauth::hyper_web::http::StatusCode;
+    use proxyauth::hyper_web::test;
     use proxyauth::network::stats::RequestStats;
     use proxyauth::revoke::db::RevokedTokenMap;
     use proxyauth::token::csrf::make_csrf_token;
     use proxyauth::token::registry::{
         EitherRegistry, RegistryConfig, RegistryRequest, build_new_user, describe_registry,
-        find_registry_route, registry_route, validate_email, validate_password,
-        validate_username,
+        find_registry_route, registry_route, validate_email, validate_password, validate_username,
     };
     use proxyauth::{AppState, CounterToken};
     use std::sync::Arc;
@@ -60,13 +59,17 @@ mod tests {
             secret: "registry-test-secret".into(),
             timezone: "UTC".into(),
             csrf_token: false,
-            databases: if with_db { Some(unreachable_db()) } else { None },
+            databases: if with_db {
+                Some(unreachable_db())
+            } else {
+                None
+            },
             ..Default::default()
         }
     }
 
-    fn state(routes: Vec<RouteRule>, cfg: AppConfig) -> actix_web::web::Data<AppState> {
-        actix_web::web::Data::new(AppState {
+    fn state(routes: Vec<RouteRule>, cfg: AppConfig) -> proxyauth::hyper_web::web::Data<AppState> {
+        proxyauth::hyper_web::web::Data::new(AppState {
             config: Arc::new(cfg),
             routes: Arc::new(RouteConfig {
                 routes,
@@ -94,7 +97,7 @@ mod tests {
     }
 
     async fn call(
-        data: actix_web::web::Data<AppState>,
+        data: proxyauth::hyper_web::web::Data<AppState>,
         host: &str,
         payload: EitherRegistry,
     ) -> (StatusCode, String) {
@@ -107,7 +110,7 @@ mod tests {
             .respond_to(&req)
             .map_into_boxed_body();
         let status = resp.status();
-        let bytes = actix_web::body::to_bytes(resp.into_body())
+        let bytes = proxyauth::hyper_web::body::to_bytes(resp.into_body())
             .await
             .unwrap_or_default();
         (status, String::from_utf8_lossy(&bytes).to_string())
@@ -117,7 +120,7 @@ mod tests {
 
     // ── configuration ──────────────────────────────────────────
 
-    #[test]
+    #[tokio::test]
     async fn registry_block_parses_from_routes_yml() {
         let yml = r#"
 routes:
@@ -137,19 +140,18 @@ routes:
         assert_eq!(reg.redirect_url.as_deref(), Some("/login?registered=1"));
     }
 
-    #[test]
+    #[tokio::test]
     async fn registry_is_off_unless_enabled_is_written() {
-        let reg: RegistryConfig =
-            serde_yaml::from_str("default_groups: [\"members\"]").unwrap();
+        let reg: RegistryConfig = serde_yaml::from_str("default_groups: [\"members\"]").unwrap();
         assert!(!reg.enabled);
     }
 
-    #[test]
+    #[tokio::test]
     async fn route_without_registry_has_none() {
         assert!(route(&[], None).registry.is_none());
     }
 
-    #[test]
+    #[tokio::test]
     async fn vhost_group_registry_propagates_and_route_override_wins() {
         let yml = r#"
 vhosts:
@@ -171,11 +173,17 @@ vhosts:
             .expand_vhost_groups();
         let root = rc.routes.iter().find(|r| r.prefix == "/").unwrap();
         let beta = rc.routes.iter().find(|r| r.prefix == "/beta").unwrap();
-        assert_eq!(root.registry.as_ref().unwrap().default_groups, vec!["members"]);
-        assert_eq!(beta.registry.as_ref().unwrap().default_groups, vec!["beta-testers"]);
+        assert_eq!(
+            root.registry.as_ref().unwrap().default_groups,
+            vec!["members"]
+        );
+        assert_eq!(
+            beta.registry.as_ref().unwrap().default_groups,
+            vec!["beta-testers"]
+        );
     }
 
-    #[test]
+    #[tokio::test]
     async fn registry_is_not_reported_as_an_unknown_key() {
         let yml = r#"
 routes:
@@ -193,20 +201,34 @@ routes:
 
     // ── validation ─────────────────────────────────────────────
 
-    #[test]
+    #[tokio::test]
     async fn usernames() {
         for ok in ["bob", "alice.smith", "user_42", "a-b", "X9z"] {
             assert!(validate_username(ok).is_ok(), "{ok} should be accepted");
         }
         let too_long = "a".repeat(65);
-        for bad in ["", "ab", ".bob", "-bob", "bob smith", "bob@x", "bób", "a/b", too_long.as_str()] {
+        for bad in [
+            "",
+            "ab",
+            ".bob",
+            "-bob",
+            "bob smith",
+            "bob@x",
+            "bób",
+            "a/b",
+            too_long.as_str(),
+        ] {
             assert!(validate_username(bad).is_err(), "{bad:?} should be refused");
         }
     }
 
-    #[test]
+    #[tokio::test]
     async fn emails() {
-        for ok in ["a@example.com", "first.last+tag@sub.example.org", "x@a-b.io"] {
+        for ok in [
+            "a@example.com",
+            "first.last+tag@sub.example.org",
+            "x@a-b.io",
+        ] {
             assert!(validate_email(ok).is_ok(), "{ok} should be accepted");
         }
         for bad in [
@@ -228,7 +250,7 @@ routes:
         }
     }
 
-    #[test]
+    #[tokio::test]
     async fn passwords() {
         assert!(validate_password(GOOD_PW, None).is_ok());
         assert!(validate_password(GOOD_PW, Some(GOOD_PW)).is_ok());
@@ -237,7 +259,7 @@ routes:
         assert!(validate_password(&"x".repeat(1025), None).is_err());
     }
 
-    #[test]
+    #[tokio::test]
     async fn new_user_takes_groups_and_roles_from_config_only() {
         let reg = enabled(&["members", " "], &["reader"]);
         let u = build_new_user("bob", "$argon2id$fake".into(), "bob@example.com", &reg);
@@ -245,7 +267,10 @@ routes:
         assert_eq!(u.roles, Some(vec!["reader".to_string()]));
         assert_eq!(
             u.email,
-            Some(vec![EmailEntry { address: "bob@example.com".into(), primary: true }])
+            Some(vec![EmailEntry {
+                address: "bob@example.com".into(),
+                primary: true
+            }])
         );
         assert!(u.otpkey.is_none());
         assert!(u.allow.is_none());
@@ -257,7 +282,7 @@ routes:
 
     // ── route resolution ───────────────────────────────────────
 
-    #[test]
+    #[tokio::test]
     async fn resolution_prefers_exact_then_wildcard_then_catch_all() {
         let routes = vec![
             route(&[], Some(enabled(&["catch-all"], &[]))),
@@ -275,7 +300,7 @@ routes:
         assert_eq!(pick("unrelated.org").as_deref(), Some("catch-all"));
     }
 
-    #[test]
+    #[tokio::test]
     async fn resolution_ignores_routes_without_a_registry_block() {
         let routes = vec![
             route(&["app.example.com"], None),
@@ -288,7 +313,7 @@ routes:
 
     // ── startup summary ────────────────────────────────────────
 
-    #[test]
+    #[tokio::test]
     async fn describe_warns_about_missing_db_and_login_mismatch() {
         let mut r = route(&["app.example.com"], Some(enabled(&["members"], &[])));
         r.allow_groups = vec!["staff".into()];
@@ -302,7 +327,7 @@ routes:
         assert!(!lines.contains("WARNING"), "{lines}");
     }
 
-    #[test]
+    #[tokio::test]
     async fn describe_reports_a_disabled_block() {
         let r = route(&["app.example.com"], Some(RegistryConfig::default()));
         let lines = describe_registry(&cfg(true), &[r]).join("\n");
@@ -311,59 +336,98 @@ routes:
 
     // ── handler ────────────────────────────────────────────────
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn not_found_when_no_route_has_registry() {
         let data = state(vec![route(&["app.example.com"], None)], cfg(true));
-        let (s, _) = call(data, "app.example.com", EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com"))).await;
+        let (s, _) = call(
+            data,
+            "app.example.com",
+            EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com")),
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn not_found_when_registry_disabled() {
         let data = state(
             vec![route(&["app.example.com"], Some(RegistryConfig::default()))],
             cfg(true),
         );
-        let (s, _) = call(data, "app.example.com", EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com"))).await;
+        let (s, _) = call(
+            data,
+            "app.example.com",
+            EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com")),
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn not_found_on_another_vhost() {
         let data = state(
-            vec![route(&["app.example.com"], Some(enabled(&["members"], &[])))],
+            vec![route(
+                &["app.example.com"],
+                Some(enabled(&["members"], &[])),
+            )],
             cfg(true),
         );
-        let (s, _) = call(data, "other.org", EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com"))).await;
+        let (s, _) = call(
+            data,
+            "other.org",
+            EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com")),
+        )
+        .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn unavailable_without_database() {
         let data = state(
-            vec![route(&["app.example.com"], Some(enabled(&["members"], &[])))],
+            vec![route(
+                &["app.example.com"],
+                Some(enabled(&["members"], &[])),
+            )],
             cfg(false),
         );
-        let (s, b) = call(data, "app.example.com", EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com"))).await;
+        let (s, b) = call(
+            data,
+            "app.example.com",
+            EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com")),
+        )
+        .await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
         assert!(b.contains("database"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn unavailable_in_blakegate_backup_mode() {
         let mut c = cfg(true);
-        c.blakegate = vec![BlakegateEndpoint::Simple("wss://blakegate.invalid/ws".into())];
+        c.blakegate = vec![BlakegateEndpoint::Simple(
+            "wss://blakegate.invalid/ws".into(),
+        )];
         let data = state(
-            vec![route(&["app.example.com"], Some(enabled(&["members"], &[])))],
+            vec![route(
+                &["app.example.com"],
+                Some(enabled(&["members"], &[])),
+            )],
             c,
         );
-        let (s, _) = call(data, "app.example.com", EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com"))).await;
+        let (s, _) = call(
+            data,
+            "app.example.com",
+            EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com")),
+        )
+        .await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn bad_input_is_rejected_before_touching_the_database() {
-        let routes = vec![route(&["app.example.com"], Some(enabled(&["members"], &[])))];
+        let routes = vec![route(
+            &["app.example.com"],
+            Some(enabled(&["members"], &[])),
+        )];
         for (u, p, e) in [
             ("x", GOOD_PW, "b@example.com"),
             ("bob", "short", "b@example.com"),
@@ -382,7 +446,7 @@ routes:
         assert!(b.contains("do not match"));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn cannot_register_over_a_config_json_user() {
         let mut c = cfg(true);
         c.users = vec![User {
@@ -392,30 +456,51 @@ routes:
             allow: None,
             roles: Some(vec!["admin".into()]),
             groups: None,
-            email: Some(vec![EmailEntry { address: "alice@example.com".into(), primary: true }]),
+            email: Some(vec![EmailEntry {
+                address: "alice@example.com".into(),
+                primary: true,
+            }]),
             must_change_password: false,
         }];
-        let routes = vec![route(&["app.example.com"], Some(enabled(&["members"], &[])))];
+        let routes = vec![route(
+            &["app.example.com"],
+            Some(enabled(&["members"], &[])),
+        )];
 
         // Same username, different case.
         let data = state(routes.clone(), c);
-        let (s, b) = call(data.clone(), "app.example.com", EitherRegistry::Json(body("alice", GOOD_PW, "new@example.com"))).await;
+        let (s, b) = call(
+            data.clone(),
+            "app.example.com",
+            EitherRegistry::Json(body("alice", GOOD_PW, "new@example.com")),
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert_eq!(b, "Username or email already in use");
 
         // Same email, different username — same (non-enumerating) answer.
-        let (s, b) = call(data, "app.example.com", EitherRegistry::Json(body("mallory", GOOD_PW, "ALICE@example.com"))).await;
+        let (s, b) = call(
+            data,
+            "app.example.com",
+            EitherRegistry::Json(body("mallory", GOOD_PW, "ALICE@example.com")),
+        )
+        .await;
         assert_eq!(s, StatusCode::CONFLICT);
         assert_eq!(b, "Username or email already in use");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn csrf_is_required_when_enabled_for_the_vhost() {
         let mut r = route(&["app.example.com"], Some(enabled(&["members"], &[])));
         r.tag_csrf_token = Some(true);
         let data = state(vec![r], cfg(false));
 
-        let (s, _) = call(data.clone(), "app.example.com", EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com"))).await;
+        let (s, _) = call(
+            data.clone(),
+            "app.example.com",
+            EitherRegistry::Json(body("bob", GOOD_PW, "b@example.com")),
+        )
+        .await;
         assert_eq!(s, StatusCode::FORBIDDEN);
 
         // With a valid token the request gets past CSRF — here it then
@@ -426,9 +511,9 @@ routes:
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn payload_accepts_json_and_form() {
-        use actix_web::FromRequest;
+        use proxyauth::hyper_web::FromRequest;
 
         let (req, mut pl) = test::TestRequest::post()
             .insert_header(("content-type", "application/json"))

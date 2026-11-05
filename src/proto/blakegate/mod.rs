@@ -317,7 +317,9 @@ async fn drive_connection(
     // Always push once immediately on a fresh connection, regardless
     // of generation — the peer has no prior state to diff against.
     stream
-        .send(Message::Text(build_snapshot(config, routes).to_string().into()))
+        .send(Message::Text(
+            build_snapshot(config, routes).to_string().into(),
+        ))
         .await?;
     let mut last_sent_generation = config.current_generation();
 

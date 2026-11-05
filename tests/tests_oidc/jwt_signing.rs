@@ -11,9 +11,7 @@
 
 #[cfg(test)]
 mod tests {
-    use jsonwebtoken::{
-        decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
-    };
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
     use openssl::rsa::Rsa;
     use std::collections::BTreeMap;
 
@@ -27,15 +25,14 @@ mod tests {
         let rsa = Rsa::generate(2048).expect("generate RSA test key");
 
         let private_der = rsa
-        .private_key_to_der()
-        .expect("encode RSA private key as DER");
+            .private_key_to_der()
+            .expect("encode RSA private key as DER");
 
         let public_der = rsa
-        .public_key_to_der()
-        .expect("encode RSA public key as DER");
+            .public_key_to_der()
+            .expect("encode RSA public key as DER");
 
-        let encoding_key =
-        EncodingKey::from_rsa_der(&private_der);
+        let encoding_key = EncodingKey::from_rsa_der(&private_der);
 
         let mut claims = BTreeMap::new();
         claims.insert("sub", "alice");
@@ -43,17 +40,15 @@ mod tests {
 
         let header = Header::new(Algorithm::RS256);
 
-        let token = encode(&header, &claims, &encoding_key)
-        .expect("signing an id_token");
+        let token = encode(&header, &claims, &encoding_key).expect("signing an id_token");
 
         assert_eq!(
             token.matches('.').count(),
-                   2,
-                   "a JWT must contain three parts"
+            2,
+            "a JWT must contain three parts"
         );
 
-        let decoding_key =
-        DecodingKey::from_rsa_der(&public_der);
+        let decoding_key = DecodingKey::from_rsa_der(&public_der);
 
         let mut validation = Validation::new(Algorithm::RS256);
 
@@ -64,22 +59,14 @@ mod tests {
         // not the presence of the standard JWT claims.
         validation.required_spec_claims.clear();
 
-        let decoded =
-        decode::<BTreeMap<String, String>>(
-            &token,
-            &decoding_key,
-            &validation,
-        )
-        .expect("the RS256 signature verifies");
+        let decoded = decode::<BTreeMap<String, String>>(&token, &decoding_key, &validation)
+            .expect("the RS256 signature verifies");
 
-        assert_eq!(
-            decoded.claims.get("sub"),
-                   Some(&"alice".to_string())
-        );
+        assert_eq!(decoded.claims.get("sub"), Some(&"alice".to_string()));
 
         assert_eq!(
             decoded.claims.get("iss"),
-                   Some(&"https://oidc.example.com".to_string())
+            Some(&"https://oidc.example.com".to_string())
         );
     }
 }

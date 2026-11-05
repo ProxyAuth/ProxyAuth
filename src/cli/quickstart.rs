@@ -125,12 +125,12 @@ fn show_block(label: &str, body: &str) {
 
 fn read_line() -> Result<String, String> {
     io::stdout()
-    .flush()
-    .map_err(|e| format!("Failed to flush stdout: {e}"))?;
+        .flush()
+        .map_err(|e| format!("Failed to flush stdout: {e}"))?;
     let mut buf = String::new();
     io::stdin()
-    .read_line(&mut buf)
-    .map_err(|e| format!("Failed to read from stdin: {e}"))?;
+        .read_line(&mut buf)
+        .map_err(|e| format!("Failed to read from stdin: {e}"))?;
     Ok(buf.trim().to_string())
 }
 
@@ -211,10 +211,10 @@ fn ask_choice(label: &str, options: &[(&str, &str)]) -> Result<usize, String> {
 fn ask_list(label: &str, default: &str) -> Result<Vec<String>, String> {
     let raw = ask(&format!("{label} (comma separated)"), default)?;
     Ok(raw
-    .split(',')
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-    .collect())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
 }
 
 fn confirm_write(paths: &[&str]) -> Result<bool, String> {
@@ -266,7 +266,7 @@ fn read_file(path: &str) -> Result<String, String> {
 fn write_routes_checked(path: &str, contents: &str) -> Result<String, String> {
     crate::config::config::check_deprecated_secure_key(contents)?;
     serde_yaml::from_str::<RouteConfig>(contents)
-    .map_err(|e| format!("The generated routes.yml does not parse ({e}) — nothing written."))?;
+        .map_err(|e| format!("The generated routes.yml does not parse ({e}) — nothing written."))?;
 
     let backup_path = backup(path)?;
     std::fs::write(path, contents).map_err(|e| format!("Failed to write {path}: {e}"))?;
@@ -284,14 +284,14 @@ fn write_routes_checked(path: &str, contents: &str) -> Result<String, String> {
 /// up stranded above the item this inserts.
 fn end_of_vhosts_block(lines: &[&str]) -> Option<usize> {
     let start = lines
-    .iter()
-    .position(|l| l.trim_start() == "vhosts:" && !l.starts_with([' ', '\t']))?;
+        .iter()
+        .position(|l| l.trim_start() == "vhosts:" && !l.starts_with([' ', '\t']))?;
 
     let mut end = lines.len();
     for (i, line) in lines.iter().enumerate().skip(start + 1) {
         let is_top_level = !line.is_empty()
-        && !line.starts_with([' ', '\t'])
-        && !line.trim_start().starts_with('#');
+            && !line.starts_with([' ', '\t'])
+            && !line.trim_start().starts_with('#');
         if is_top_level {
             end = i;
             break;
@@ -371,8 +371,8 @@ fn append_vhost_group(original: &str, item: &str) -> String {
 /// its own keys sit at.
 fn find_vhost_group(lines: &[&str], host: &str) -> Option<(usize, usize, usize)> {
     let start = lines
-    .iter()
-    .position(|l| l.trim_start() == "vhosts:" && !l.starts_with([' ', '\t']))?;
+        .iter()
+        .position(|l| l.trim_start() == "vhosts:" && !l.starts_with([' ', '\t']))?;
     let block_end = end_of_vhosts_block(lines)?;
 
     let mut items: Vec<usize> = Vec::new();
@@ -416,14 +416,20 @@ fn find_vhost_group(lines: &[&str], host: &str) -> Option<(usize, usize, usize)>
 fn declares_host(body: &str, host: &str) -> bool {
     let dedented = {
         let indent = body
-        .lines()
-        .next()
-        .map(|l| l.len() - l.trim_start().len())
-        .unwrap_or(0);
+            .lines()
+            .next()
+            .map(|l| l.len() - l.trim_start().len())
+            .unwrap_or(0);
         body.lines()
-        .map(|l| if l.len() > indent { &l[indent..] } else { l.trim_start() })
-        .collect::<Vec<_>>()
-        .join("\n")
+            .map(|l| {
+                if l.len() > indent {
+                    &l[indent..]
+                } else {
+                    l.trim_start()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&dedented) else {
@@ -438,9 +444,9 @@ fn declares_host(body: &str, host: &str) -> bool {
     };
     match vhosts {
         serde_yaml::Value::Sequence(seq) => seq
-        .iter()
-        .filter_map(|v| v.as_str())
-        .any(|v| v.eq_ignore_ascii_case(host)),
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|v| v.eq_ignore_ascii_case(host)),
         serde_yaml::Value::String(s) => s.eq_ignore_ascii_case(host),
         _ => false,
     }
@@ -453,7 +459,11 @@ fn declares_host(body: &str, host: &str) -> bool {
 /// `- value` rows behind — and the new keys are inserted just above
 /// `routes:` when the entry has one, keeping vhost-level settings
 /// together and above the route list rather than trailing after it.
-fn set_access_keys(original: &str, host: &str, keys: &[(String, String)]) -> Result<String, String> {
+fn set_access_keys(
+    original: &str,
+    host: &str,
+    keys: &[(String, String)],
+) -> Result<String, String> {
     let lines: Vec<&str> = original.lines().collect();
     let (first, end, key_indent) = find_vhost_group(&lines, host).ok_or_else(|| {
         format!(
@@ -463,7 +473,12 @@ declared in a `vhosts:` group — `proxyauth quickstart vhost` creates one."
         )
     })?;
 
-    const MANAGED: [&str; 4] = ["allow_users", "allow_groups", "allow_roles", "exclude_users"];
+    const MANAGED: [&str; 4] = [
+        "allow_users",
+        "allow_groups",
+        "allow_roles",
+        "exclude_users",
+    ];
 
     let mut kept: Vec<String> = Vec::new();
     let mut routes_at: Option<usize> = None;
@@ -482,9 +497,9 @@ declared in a `vhosts:` group — `proxyauth quickstart vhost` creates one."
         }
 
         let is_managed_key = indent == key_indent
-        && MANAGED
-        .iter()
-        .any(|k| trimmed.starts_with(&format!("{k}:")));
+            && MANAGED
+                .iter()
+                .any(|k| trimmed.starts_with(&format!("{k}:")));
         if is_managed_key {
             skipping = true;
             continue;
@@ -497,10 +512,7 @@ declared in a `vhosts:` group — `proxyauth quickstart vhost` creates one."
     }
 
     let pad = " ".repeat(key_indent);
-    let rendered: Vec<String> = keys
-    .iter()
-    .map(|(k, v)| format!("{pad}{k}: {v}"))
-    .collect();
+    let rendered: Vec<String> = keys.iter().map(|(k, v)| format!("{pad}{k}: {v}")).collect();
 
     let at = routes_at.unwrap_or(kept.len());
     let mut rebuilt = kept[..at].to_vec();
@@ -550,17 +562,17 @@ pub fn run_vhost() -> Result<(), String> {
         &[
             (
                 "Let's Encrypt",
-             "ProxyAuth issues and renews it, nothing else to install",
+                "ProxyAuth issues and renews it, nothing else to install",
             ),
             ("Own certificate", "you provide the cert and key paths"),
-                                ("None", "plain HTTP — local development only"),
+            ("None", "plain HTTP — local development only"),
         ],
     )?;
     let (cert_paths, certbot) = match tls_choice {
         0 => (
             Some((
                 format!("/etc/proxyauth/cert/{primary}/fullchain.pem"),
-                    format!("/etc/proxyauth/cert/{primary}/privkey.pem"),
+                format!("/etc/proxyauth/cert/{primary}/privkey.pem"),
             )),
             true,
         ),
@@ -584,12 +596,9 @@ pub fn run_vhost() -> Result<(), String> {
         &[
             (
                 "Browsers",
-             "session cookie + CSRF, the answer for a dashboard or a site",
+                "session cookie + CSRF, the answer for a dashboard or a site",
             ),
-            (
-                "Scripts and APIs",
-             "bearer token, no cookie, no CSRF",
-            ),
+            ("Scripts and APIs", "bearer token, no cookie, no CSRF"),
         ],
     )?;
     let browser = audience == 0;
@@ -612,10 +621,7 @@ pub fn run_vhost() -> Result<(), String> {
     let backend = ask("backend URL", "http://127.0.0.1:8000")?;
     let app_prefix = ask("path it is served at", if browser { "/app" } else { "/" })?;
     let required_login = ask_bool("Require a session to reach it?", true)?;
-    let forward = ask_bool(
-        "Send the visitor's real IP and Host to the backend?",
-        true,
-    )?;
+    let forward = ask_bool("Send the visitor's real IP and Host to the backend?", true)?;
 
     step(6, total, "The login page");
     let login_page = if browser {
@@ -730,7 +736,7 @@ pub fn run_users(config: &AppConfig) -> Result<(), String> {
             &[
                 (
                     "Database",
-                 "shared by every instance, the right answer past a handful of accounts",
+                    "shared by every instance, the right answer past a handful of accounts",
                 ),
                 ("config.json", "local to this instance, fine to start with"),
             ],
@@ -744,23 +750,20 @@ pub fn run_users(config: &AppConfig) -> Result<(), String> {
     let username = ask_required("username")?;
 
     step(3, total, "Password");
-    let temporary = ask_bool(
-        "Is this a temporary password you are handing over?",
-        true,
-    )?;
+    let temporary = ask_bool("Is this a temporary password you are handing over?", true)?;
     if temporary {
         note("The account will be marked must_change_password: the next login");
         note("lands on the reset page instead of issuing a session.");
     }
     let password = loop {
         let first = rpassword::prompt_password("      password: ")
-        .map_err(|e| format!("Failed to read the password: {e}"))?;
+            .map_err(|e| format!("Failed to read the password: {e}"))?;
         if first.is_empty() {
             warn("Empty password — try again.");
             continue;
         }
         let second = rpassword::prompt_password("      repeat: ")
-        .map_err(|e| format!("Failed to read the password: {e}"))?;
+            .map_err(|e| format!("Failed to read the password: {e}"))?;
         if first == second {
             break first;
         }
@@ -794,17 +797,17 @@ pub fn run_users(config: &AppConfig) -> Result<(), String> {
     // ---- hash once, used by either destination ---------------------
     use argon2::{Argon2, PasswordHasher};
     let hash = Argon2::default()
-    .hash_password(password.as_bytes())
-    .map_err(|e| format!("Failed to hash password: {e}"))?
-    .to_string();
+        .hash_password(password.as_bytes())
+        .map_err(|e| format!("Failed to hash password: {e}"))?
+        .to_string();
 
     let email_entries: Vec<crate::config::config::EmailEntry> = emails
-    .iter()
-    .map(|addr| crate::config::config::EmailEntry {
-        address: addr.clone(),
-         primary: *addr == primary_email,
-    })
-    .collect();
+        .iter()
+        .map(|addr| crate::config::config::EmailEntry {
+            address: addr.clone(),
+            primary: *addr == primary_email,
+        })
+        .collect();
 
     let user = crate::config::config::User {
         username: username.clone(),
@@ -849,7 +852,7 @@ pub fn run_users(config: &AppConfig) -> Result<(), String> {
             preview.push_str(&format!(
                 "    {{ \"address\": {}, \"primary\": {} }},\n",
                 yaml_str(&e.address),
-                                      e.primary
+                e.primary
             ));
         }
         preview.push_str("  ],\n");
@@ -876,9 +879,9 @@ pub fn run_users(config: &AppConfig) -> Result<(), String> {
 
     if to_db {
         let db_cfg = config
-        .databases
-        .as_ref()
-        .ok_or("No `databases` block in config.json.")?;
+            .databases
+            .as_ref()
+            .ok_or("No `databases` block in config.json.")?;
 
         // A live connection, never the LMDB fallback cache: that cache
         // exists for reads during an outage, and a write landing there
@@ -917,66 +920,64 @@ pub fn run_users(config: &AppConfig) -> Result<(), String> {
     } else {
         let original = read_file(CONFIG_PATH)?;
         let mut json: serde_json::Value = serde_json::from_str(&original)
-        .map_err(|e| format!("Failed to parse {CONFIG_PATH}: {e}"))?;
+            .map_err(|e| format!("Failed to parse {CONFIG_PATH}: {e}"))?;
 
         let users = json
-        .as_object_mut()
-        .ok_or("config.json is not a JSON object.")?
-        .entry("users")
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or("`users` in config.json is not an array.")?;
+            .as_object_mut()
+            .ok_or("config.json is not a JSON object.")?
+            .entry("users")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or("`users` in config.json is not an array.")?;
 
         if users
             .iter()
             .any(|u| u.get("username").and_then(|v| v.as_str()) == Some(username.as_str()))
-            {
-                return Err(format!(
-                    "'{username}' already exists in {CONFIG_PATH} — edit it there, or pick another name."
-                ));
-            }
+        {
+            return Err(format!(
+                "'{username}' already exists in {CONFIG_PATH} — edit it there, or pick another name."
+            ));
+        }
 
-            // Built by hand rather than serialized from `User`: that struct
-            // only derives `Deserialize`, and deriving `Serialize` on it
-            // would emit `"otpkey": null, "allow": null, …` for every field
-            // left unset — noise in a file people read and edit.
-            let mut entry = serde_json::Map::new();
-            entry.insert("username".into(), username.clone().into());
-            entry.insert("password".into(), hash.clone().into());
-            if !groups.is_empty() {
-                entry.insert("groups".into(), groups.clone().into());
-            }
-            if !roles.is_empty() {
-                entry.insert("roles".into(), roles.clone().into());
-            }
-            if !email_entries.is_empty() {
-                let addresses: Vec<serde_json::Value> = email_entries
+        // Built by hand rather than serialized from `User`: that struct
+        // only derives `Deserialize`, and deriving `Serialize` on it
+        // would emit `"otpkey": null, "allow": null, …` for every field
+        // left unset — noise in a file people read and edit.
+        let mut entry = serde_json::Map::new();
+        entry.insert("username".into(), username.clone().into());
+        entry.insert("password".into(), hash.clone().into());
+        if !groups.is_empty() {
+            entry.insert("groups".into(), groups.clone().into());
+        }
+        if !roles.is_empty() {
+            entry.insert("roles".into(), roles.clone().into());
+        }
+        if !email_entries.is_empty() {
+            let addresses: Vec<serde_json::Value> = email_entries
                 .iter()
-                .map(|e| {
-                    serde_json::json!({ "address": e.address, "primary": e.primary })
-                })
+                .map(|e| serde_json::json!({ "address": e.address, "primary": e.primary }))
                 .collect();
-                entry.insert("email".into(), addresses.into());
-            }
-            if temporary {
-                entry.insert("must_change_password".into(), true.into());
-            }
-            users.push(serde_json::Value::Object(entry));
+            entry.insert("email".into(), addresses.into());
+        }
+        if temporary {
+            entry.insert("must_change_password".into(), true.into());
+        }
+        users.push(serde_json::Value::Object(entry));
 
-            let rendered = serde_json::to_string_pretty(&json)
+        let rendered = serde_json::to_string_pretty(&json)
             .map_err(|e| format!("Failed to serialize {CONFIG_PATH}: {e}"))?;
-            let backup_path = backup(CONFIG_PATH)?;
-            std::fs::write(CONFIG_PATH, rendered)
+        let backup_path = backup(CONFIG_PATH)?;
+        std::fs::write(CONFIG_PATH, rendered)
             .map_err(|e| format!("Failed to write {CONFIG_PATH}: {e}"))?;
 
-            title("Done");
-            ok(&format!("'{username}' appended to {CONFIG_PATH}"));
-            note(&format!("previous version kept at {backup_path}"));
-            warn("config.json is read once at startup — restart to pick this up.");
+        title("Done");
+        ok(&format!("'{username}' appended to {CONFIG_PATH}"));
+        note(&format!("previous version kept at {backup_path}"));
+        warn("config.json is read once at startup — restart to pick this up.");
 
-            title("What was added, so you can write the next one yourself");
-            show_block(&format!("{CONFIG_PATH}  ·  inside \"users\""), &preview);
-            note("The hash above is shortened for display; the file holds it in full.");
+        title("What was added, so you can write the next one yourself");
+        show_block(&format!("{CONFIG_PATH}  ·  inside \"users\""), &preview);
+        note("The hash above is shortened for display; the file holds it in full.");
     }
 
     Ok(())
@@ -991,7 +992,7 @@ pub fn run_vhost_access() -> Result<(), String> {
 
     let original = read_file(ROUTES_PATH)?;
     let parsed: RouteConfig = serde_yaml::from_str(&original)
-    .map_err(|e| format!("Failed to parse {ROUTES_PATH}: {e}"))?;
+        .map_err(|e| format!("Failed to parse {ROUTES_PATH}: {e}"))?;
 
     // Only hosts declared in a `vhosts:` group can be edited here: these
     // keys are vhost-level, and a flat route carries no group to put
@@ -1015,9 +1016,9 @@ Run `proxyauth quickstart vhost` to create one first."
 
     step(1, total, "Which vhost?");
     let options: Vec<(&str, &str)> = host_list
-    .iter()
-    .map(|h| (h.as_str(), "declared in routes.yml"))
-    .collect();
+        .iter()
+        .map(|h| (h.as_str(), "declared in routes.yml"))
+        .collect();
     let chosen = ask_choice("Pick one.", &options)?;
     let host = host_list[chosen].clone();
 
@@ -1025,9 +1026,9 @@ Run `proxyauth quickstart vhost` to create one first."
     // resolves it, so the run starts from fact rather than from memory.
     let expanded = parsed.expand_vhost_groups();
     let current = expanded
-    .routes
-    .iter()
-    .find(|r| r.vhost.iter().any(|v| v.eq_ignore_ascii_case(&host)));
+        .routes
+        .iter()
+        .find(|r| r.vhost.iter().any(|v| v.eq_ignore_ascii_case(&host)));
 
     if let Some(rule) = current {
         title(&format!("Currently on {host}"));
@@ -1045,9 +1046,9 @@ Run `proxyauth quickstart vhost` to create one first."
         if rule.allow_users.is_empty()
             && rule.allow_groups.is_empty()
             && rule.allow_roles.is_empty()
-            {
-                warn("Nothing is allowed, so no login succeeds on this vhost today.");
-            }
+        {
+            warn("Nothing is allowed, so no login succeeds on this vhost today.");
+        }
     }
 
     step(2, total, "Who gets in?");
@@ -1086,9 +1087,9 @@ Run `proxyauth quickstart vhost` to create one first."
         "# every allow_*/exclude_users key removed from this vhost".to_string()
     } else {
         keys.iter()
-        .map(|(k, v)| format!("{k}: {v}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     title(&format!("What this sets on {host}"));
@@ -1126,7 +1127,10 @@ mod tests {
     #[test]
     fn appends_to_an_existing_vhosts_block() {
         let original = "vhosts:\n  - vhost: [\"a.example.com\"]\n    routes:\n      - prefix: \"/\"\n        target: \"http://127.0.0.1:1\"\n";
-        let out = append_vhost_group(original, "vhost: [\"b.example.com\"]\nroutes:\n  - prefix: \"/\"\n    target: \"http://127.0.0.1:2\"");
+        let out = append_vhost_group(
+            original,
+            "vhost: [\"b.example.com\"]\nroutes:\n  - prefix: \"/\"\n    target: \"http://127.0.0.1:2\"",
+        );
         assert_eq!(out.matches("- vhost:").count(), 2);
         let parsed: RouteConfig = serde_yaml::from_str(&out).expect("must still parse");
         assert_eq!(parsed.vhosts.len(), 2);
@@ -1135,7 +1139,10 @@ mod tests {
     #[test]
     fn creates_the_vhosts_key_when_missing() {
         let original = "routes:\n  - prefix: \"/\"\n    target: \"http://127.0.0.1:1\"\n";
-        let out = append_vhost_group(original, "vhost: [\"b.example.com\"]\nroutes:\n  - prefix: \"/\"\n    target: \"http://127.0.0.1:2\"");
+        let out = append_vhost_group(
+            original,
+            "vhost: [\"b.example.com\"]\nroutes:\n  - prefix: \"/\"\n    target: \"http://127.0.0.1:2\"",
+        );
         let parsed: RouteConfig = serde_yaml::from_str(&out).expect("must still parse");
         assert_eq!(parsed.routes.len(), 1);
         assert_eq!(parsed.vhosts.len(), 1);
@@ -1144,7 +1151,10 @@ mod tests {
     #[test]
     fn keeps_comments_around_the_insertion() {
         let original = "# top comment\nvhosts:\n  - vhost: [\"a.example.com\"]\n    routes:\n      - prefix: \"/\"\n        target: \"http://127.0.0.1:1\"\n\n# a note about what follows\nroutes:\n  - prefix: \"/legacy\"\n    target: \"http://127.0.0.1:9\"\n";
-        let out = append_vhost_group(original, "vhost: [\"b.example.com\"]\nroutes:\n  - prefix: \"/\"\n    target: \"http://127.0.0.1:2\"");
+        let out = append_vhost_group(
+            original,
+            "vhost: [\"b.example.com\"]\nroutes:\n  - prefix: \"/\"\n    target: \"http://127.0.0.1:2\"",
+        );
         assert!(out.contains("# top comment"));
         assert!(out.contains("# a note about what follows"));
         // The trailing comment still introduces `routes:`, not the new item.

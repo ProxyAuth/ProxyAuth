@@ -5,13 +5,14 @@
 //! What stays here is the mapping from `AppConfig` plus the build
 //! constants onto a `Vault`, done once at startup.
 //!
-//! The vault is immutable after construction and `Send + Sync`, so a
-//! single instance is shared by every worker with no lock and no cache
-//! on the request path.
+//! The vault is a `zerocrypt::ThreadVault`: one independent copy per
+//! worker thread, each with its own verification cache, so workers never
+//! contend on a shared cache. A client's keep-alive connection stays on
+//! one worker, so its token keeps hitting the same cache.
 
 use std::sync::OnceLock;
 
-use zerocrypt::{BuildKey, Factor, Vault};
+use zerocrypt::{BuildKey, Factor, ThreadVault, Vault};
 
 use crate::build::build_info::get;
 use crate::config::config::AppConfig;
@@ -19,7 +20,7 @@ use crate::token::security::{
     get_build_epochdate, get_build_hk, get_build_rand, get_build_seed2, get_build_time,
 };
 
-static VAULT: OnceLock<Vault> = OnceLock::new();
+static VAULT: OnceLock<ThreadVault> = OnceLock::new();
 
 /// How many verified tokens the vault keeps.
 ///
@@ -39,10 +40,20 @@ static VAULT: OnceLock<Vault> = OnceLock::new();
 /// an entry ages out. See the note on that function before moving any
 /// check around it.
 ///
-/// Note this is per process. With `num_instances: 4` the memory cost is
-/// four times the figure above, and a user's hit rate depends on which
-/// instance takes the request.
+/// This is the total across all worker threads: each thread's own cache
+/// gets an equal share (see [`per_thread_capacity`]), so memory stays
+/// at a few megabytes whatever `worker` and `num_instances` are.
 const CACHE_CAPACITY: usize = 50_000;
+
+/// Floor for one thread's cache, so a machine with very many workers
+/// still caches a useful number of sessions per thread.
+const MIN_PER_THREAD: usize = 1_000;
+
+/// One worker thread's share of [`CACHE_CAPACITY`].
+fn per_thread_capacity(config: &AppConfig) -> usize {
+    let threads = (config.worker.max(1) as usize) * (config.num_instances.max(1) as usize);
+    (CACHE_CAPACITY / threads).max(MIN_PER_THREAD)
+}
 
 /// Domain string for the build key derivation.
 ///
@@ -100,7 +111,7 @@ pub fn init(config: &AppConfig) -> Result<(), String> {
     let mut builder = Vault::builder(&config.secret)
         .key(build_key()?)
         .ttl(config.token_expiry_seconds.max(0) as u64)
-        .cache(CACHE_CAPACITY);
+        .cache(per_thread_capacity(config));
 
     // `fast: true` skips the obfuscation pass; `fast: false` (the
     // default) applies it, keyed by BUILD_SEED2. Same meaning the flag
@@ -116,7 +127,7 @@ pub fn init(config: &AppConfig) -> Result<(), String> {
 
     // A second call is deliberately not an error: `init` is idempotent so
     // a test harness or a reload path can call it defensively.
-    let _ = VAULT.set(builder.build());
+    let _ = VAULT.set(builder.build_per_thread());
     Ok(())
 }
 
@@ -127,7 +138,7 @@ pub fn init(config: &AppConfig) -> Result<(), String> {
 /// If [`init`] has not run. That is a startup-ordering bug, not a
 /// runtime condition — failing loudly at the first request beats serving
 /// traffic with a vault nobody configured.
-pub fn vault() -> &'static Vault {
+pub fn vault() -> &'static ThreadVault {
     VAULT
         .get()
         .expect("token vault used before init(); call token::vault::init at startup")

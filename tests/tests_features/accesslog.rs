@@ -1,4 +1,3 @@
-use actix_web::HttpMessage;
 use proxyauth::config::logging::LOG_DIR;
 use proxyauth::config::logging::LoggingConfig;
 use proxyauth::network::accesslog::{
@@ -306,7 +305,7 @@ fn writer_high_volume() {
 
 #[test]
 fn log_context_set_route_then_error_detail() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_route(&req, 5);
     LogContext::set_error_detail(&req, "acl filter rejected");
     let ctx = req.extensions().get::<LogContext>().cloned().unwrap();
@@ -316,7 +315,7 @@ fn log_context_set_route_then_error_detail() {
 
 #[test]
 fn log_context_set_user_then_error_detail() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_user(&req, "bob", "tok_99");
     LogContext::set_error_detail(&req, "invalid csrf token");
     let ctx = req.extensions().get::<LogContext>().cloned().unwrap();
@@ -327,7 +326,7 @@ fn log_context_set_user_then_error_detail() {
 
 #[test]
 fn log_context_full_lifecycle() {
-    let req = actix_web::test::TestRequest::default().to_http_request();
+    let req = proxyauth::hyper_web::test::TestRequest::default().to_http_request();
     LogContext::set_route(&req, 3);
     LogContext::set_user(&req, "charlie", "tok_42");
     LogContext::set_error_detail(&req, "method not allowed");

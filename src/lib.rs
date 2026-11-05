@@ -18,13 +18,13 @@ pub mod build;
 pub mod cli;
 pub mod config;
 pub mod databases;
+pub mod hyper_web;
 pub mod keystore;
 pub mod network;
 pub mod proto;
 pub mod reset;
 pub mod revoke;
 pub mod smtp;
-pub mod start_actix;
 pub mod stats;
 pub mod token;
 

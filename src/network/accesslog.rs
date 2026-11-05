@@ -62,13 +62,11 @@
 use crate::AppState;
 use crate::config::config::AppConfig;
 use crate::config::logging::LOG_DIR;
+use crate::hyper_web::body::BodySize;
+use crate::hyper_web::dev::{Middleware, Next, ServiceFuture, ServiceRequest, ServiceResponse};
+use crate::hyper_web::http::header;
+use crate::hyper_web::{HttpRequest, web};
 use crate::network::proxy::client_ip;
-use actix_service::{Service, Transform};
-use actix_web::body::{BodySize, MessageBody};
-use actix_web::dev::{ServiceRequest, ServiceResponse};
-use actix_web::http::header;
-use actix_web::{Error, HttpMessage, HttpRequest, web};
-use futures_util::future::{LocalBoxFuture, Ready, ok};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -76,7 +74,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
 use std::time::Instant;
 use tracing::info;
 
@@ -386,12 +383,111 @@ fn fmt_mem(out: &mut String) {
 // Per-vhost log-file writers
 // ─────────────────────────────────────────────────────────────────────
 
-/// Thread-safe, per-vhost file writer.  Each unique `log_file`
-/// filename gets its own `BufWriter<File>` behind a `Mutex`.
-/// Keys are the full path so writers are shared across vhosts/routes
-/// that resolve to the same file.
+/// Thread-safe, per-vhost file writer.
+///
+/// PERF — conçu pour plusieurs dizaines de workers qui journalisent
+/// chacun des dizaines de milliers de requêtes par seconde :
+///
+/// * chaque fichier a un tampon **par thread** (« shard »), avec son
+///   propre descripteur ouvert en `O_APPEND`. Avant, un unique
+///   `Mutex<BufWriter>` par fichier était partagé par tous les workers,
+///   et l'écriture disque (`write(2)`, toutes les ~8 Kio) se faisait en
+///   le tenant : toutes les requêtes du serveur se sérialisaient sur ce
+///   verrou, ce qui plafonnait le débit quel que soit le nombre de
+///   cœurs. Chaque verrou de shard n'est plus disputé que par le
+///   flusher périodique ;
+/// * on écrit des lignes entières (`\n` compris) en un seul appel : un
+///   `write(2)` en `O_APPEND` sur un fichier ordinaire ne s'entrelace
+///   pas avec celui d'un autre descripteur, donc les lignes de deux
+///   threads ne se mélangent jamais (l'ordre entre threads peut, lui,
+///   varier de quelques millisecondes — l'horodatage de chaque ligne
+///   fait foi) ;
+/// * chaque thread garde un cache local nom → fichier : ni `RwLock`
+///   global ni allocation de chemin à chaque requête.
 pub struct VhostLogWriter {
-    writers: std::sync::RwLock<HashMap<String, Mutex<BufWriter<File>>>>,
+    files: std::sync::RwLock<HashMap<String, std::sync::Arc<ShardedFile>>>,
+}
+
+/// Un fichier journal et ses tampons par thread, ouverts à la demande.
+struct ShardedFile {
+    path: PathBuf,
+    shards: Box<[Mutex<Option<BufWriter<File>>>]>,
+}
+
+/// Taille de chaque tampon : ~400 lignes, donc un `write(2)` toutes les
+/// ~400 requêtes par thread au lieu de toutes les ~50.
+const SHARD_BUF: usize = 64 * 1024;
+
+fn shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .clamp(4, 128)
+}
+
+/// Numéro de shard de ce thread, attribué une fois en tourniquet.
+fn shard_index(n: usize) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static MINE: usize = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    MINE.with(|i| *i) % n
+}
+
+impl ShardedFile {
+    fn new(path: PathBuf) -> Self {
+        let shards = (0..shard_count()).map(|_| Mutex::new(None)).collect();
+        ShardedFile { path, shards }
+    }
+
+    fn open(&self) -> std::io::Result<BufWriter<File>> {
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let file = File::options().create(true).append(true).open(&self.path)?;
+        Ok(BufWriter::with_capacity(SHARD_BUF, file))
+    }
+
+    /// `line` doit déjà se terminer par `\n`.
+    fn write_line(&self, line: &[u8]) {
+        let shard = &self.shards[shard_index(self.shards.len())];
+        let Ok(mut guard) = shard.lock() else { return };
+        if guard.is_none() {
+            match self.open() {
+                Ok(w) => *guard = Some(w),
+                Err(e) => {
+                    eprintln!(
+                        "[accesslog] failed to open log file {}: {e}",
+                        self.path.display()
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(w) = guard.as_mut() {
+            // Un seul `write_all` : si la ligne ne tient plus, BufWriter
+            // vide d'abord ce qu'il contient (qui finit sur une fin de
+            // ligne), puis la prend en entier.
+            let _ = w.write_all(line);
+        }
+    }
+
+    fn flush(&self) {
+        for shard in self.shards.iter() {
+            if let Ok(mut guard) = shard.lock() {
+                if let Some(w) = guard.as_mut() {
+                    let _ = w.flush();
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Cache par thread : `log_path` → fichier.
+    static LOCAL_FILES: std::cell::RefCell<HashMap<String, std::sync::Arc<ShardedFile>>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 impl VhostLogWriter {
@@ -400,80 +496,63 @@ impl VhostLogWriter {
     /// `routes.yml` don't all need to be known at startup.
     pub fn new() -> Self {
         Self {
-            writers: std::sync::RwLock::new(HashMap::new()),
+            files: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
+    fn file_for(&self, log_path: &str) -> std::sync::Arc<ShardedFile> {
+        if let Some(f) = LOCAL_FILES.with(|c| c.borrow().get(log_path).cloned()) {
+            return f;
+        }
+        let full = format!("{}/{}", LOG_DIR, log_path);
+        let shared = {
+            let found = self.files.read().ok().and_then(|m| m.get(&full).cloned());
+            match found {
+                Some(f) => f,
+                None => {
+                    let mut map = self.files.write().unwrap_or_else(|p| p.into_inner());
+                    map.entry(full.clone())
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(ShardedFile::new(PathBuf::from(&full)))
+                        })
+                        .clone()
+                }
+            }
+        };
+        LOCAL_FILES.with(|c| {
+            c.borrow_mut().insert(log_path.to_string(), shared.clone());
+        });
+        shared
+    }
+
     /// Writes a pre-rendered log line to the file for `log_path`.
-    /// Opens the file lazily on first use.  The trailing newline is
-    /// added here.
+    /// The trailing newline is added here.
     ///
     /// Deliberately does **not** flush on every call — that would turn
-    /// every log line into its own `write(2)` syscall, defeating the
-    /// point of the `BufWriter`. Lines are flushed periodically instead
-    /// (see `spawn_flush_ticker`) and on shutdown (see `flush_all`
-    /// called from `main`'s shutdown path) — bounding how long a line
-    /// can sit unwritten to a small, known window instead of "until the
-    /// buffer happens to fill up", which for a quiet vhost's log file
-    /// could otherwise be minutes, or forever if the process is
-    /// killed before the buffer ever fills.
+    /// every log line into its own `write(2)` syscall. Lines are flushed
+    /// periodically instead (see `flush_ticker`) and on shutdown (see
+    /// `flush_all` called from `main`'s shutdown path).
     pub fn write(&self, log_path: &str, line: &str) {
         if log_path.is_empty() {
             return;
         }
-        let full = format!("{}/{}", LOG_DIR, log_path);
-
-        // Fast path: file already opened.
-        {
-            if let Ok(map) = self.writers.read() {
-                if let Some(writer) = map.get(&full) {
-                    if let Ok(mut w) = writer.lock() {
-                        let _ = writeln!(w, "{}", line);
-                    }
-                    return;
-                }
-            }
-        }
-
-        // Slow path: open and insert.
-        if let Ok(mut map) = self.writers.write() {
-            if !map.contains_key(&full) {
-                let path = PathBuf::from(&full);
-                if let Some(parent) = path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                match File::options().create(true).append(true).open(&path) {
-                    Ok(file) => {
-                        map.insert(
-                            full.clone(),
-                            Mutex::new(BufWriter::with_capacity(8192, file)),
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[accesslog] failed to open log file {full}: {e}");
-                        return;
-                    }
-                }
-            }
-            if let Some(writer) = map.get(&full) {
-                if let Ok(mut w) = writer.lock() {
-                    let _ = writeln!(w, "{}", line);
-                }
-            }
-        }
+        let file = self.file_for(log_path);
+        let mut buf = Vec::with_capacity(line.len() + 1);
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+        file.write_line(&buf);
     }
 
     /// Flushes every open writer. Called periodically by
-    /// `spawn_flush_ticker`, and once more on shutdown so a line
+    /// `flush_ticker`, and once more on shutdown so a line
     /// written just before exit isn't silently dropped.
     pub fn flush_all(&self) {
-        let Ok(map) = self.writers.read() else {
-            return;
+        let files: Vec<_> = match self.files.read() {
+            Ok(m) => m.values().cloned().collect(),
+            Err(_) => return,
         };
-        for writer in map.values() {
-            if let Ok(mut w) = writer.lock() {
-                let _ = w.flush();
-            }
+        for f in files {
+            f.flush();
         }
     }
 }
@@ -576,31 +655,6 @@ pub struct AccessLogger {
     pub state: web::Data<AppState>,
 }
 
-impl<S, B> Transform<S, ServiceRequest> for AccessLogger
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: 'static,
-    B: MessageBody + 'static,
-{
-    type Response = ServiceResponse<B>;
-    type Error = Error;
-    type Transform = AccessLoggerMiddleware<S>;
-    type InitError = ();
-    type Future = Ready<Result<Self::Transform, Self::InitError>>;
-
-    fn new_transform(&self, service: S) -> Self::Future {
-        ok(AccessLoggerMiddleware {
-            service,
-            state: self.state.clone(),
-        })
-    }
-}
-
-pub struct AccessLoggerMiddleware<S> {
-    service: S,
-    state: web::Data<AppState>,
-}
-
 /// Everything the formatter needs that must be captured **before** the
 /// request is consumed by the inner service. Kept as owned `String`s
 /// because the request is moved into `service.call` and the response
@@ -630,28 +684,15 @@ fn header_str(req: &ServiceRequest, name: &str) -> String {
         .to_string()
 }
 
-impl<S, B> Service<ServiceRequest> for AccessLoggerMiddleware<S>
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    S::Future: 'static,
-    B: MessageBody + 'static,
-{
-    type Response = ServiceResponse<B>;
-    type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.service.poll_ready(cx)
-    }
-
-    fn call(&self, req: ServiceRequest) -> Self::Future {
+impl Middleware for AccessLogger {
+    fn call(&self, req: ServiceRequest, next: Next) -> ServiceFuture {
         let state = self.state.clone();
 
         // Global kill switch, checked first: when logging is off
         // proxy-wide this middleware costs one boolean load and a
         // pass-through future — no captures, no timer, no allocation.
         if !state.config.logging.enabled {
-            let fut = self.service.call(req);
+            let fut = next.call(req);
             return Box::pin(async move { fut.await });
         }
 
@@ -665,7 +706,7 @@ where
         // call, since the matched route isn't known until the handler
         // has run.
         if !state.config.logging.vhost_enabled(&vhost) {
-            let fut = self.service.call(req);
+            let fut = next.call(req);
             return Box::pin(async move { fut.await });
         }
 
@@ -717,7 +758,7 @@ where
         };
 
         let started = Instant::now();
-        let fut = self.service.call(req);
+        let fut = next.call(req);
 
         Box::pin(async move {
             // Deliberately not `fut.await?`: an `Err(actix::Error)` is
@@ -763,7 +804,7 @@ where
 /// Because this middleware sits **outside** the compression middleware,
 /// the value logged is the compressed, on-the-wire length — matching
 /// nginx's `$body_bytes_sent` rather than `$upstream_response_length`.
-fn body_len<B: MessageBody>(res: &ServiceResponse<B>) -> u64 {
+fn body_len(res: &ServiceResponse) -> u64 {
     match res.response().body().size() {
         BodySize::Sized(n) => n,
         BodySize::None => 0,
@@ -915,9 +956,7 @@ fn emit(
                 Field::ErrorDetail => {
                     line.push_str(ctx.and_then(|c| c.error_detail.as_deref()).unwrap_or("-"))
                 }
-                Field::Time => {
-                    line.push_str(&chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
-                }
+                Field::Time => push_local_time(&mut line),
             },
         }
     }
@@ -935,6 +974,29 @@ fn emit(
             writers.write(log_file, &line);
         }
     }
+}
+
+/// Appends the local time (`%Y-%m-%d %H:%M:%S`).
+///
+/// PERF: the text only changes once per second, so each thread renders
+/// it once per second and reuses it, instead of running chrono's
+/// formatter on every request.
+fn push_local_time(line: &mut String) {
+    thread_local! {
+        static CACHE: std::cell::RefCell<(i64, String)> = const { std::cell::RefCell::new((i64::MIN, String::new())) };
+    }
+    let now = chrono::Local::now();
+    let sec = now.timestamp();
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != sec {
+            c.1.clear();
+            use std::fmt::Write as _;
+            let _ = write!(c.1, "{}", now.format("%Y-%m-%d %H:%M:%S"));
+            c.0 = sec;
+        }
+        line.push_str(&c.1);
+    });
 }
 
 /// Tiny integer-to-string helper that avoids `format!`'s machinery for
@@ -1010,5 +1072,52 @@ mod tests {
         assert_eq!(normalize_vhost("Example.COM:8443"), "example.com");
         assert_eq!(normalize_vhost("[::1]:8080"), "[::1]");
         assert_eq!(normalize_vhost(""), "-");
+    }
+}
+
+#[cfg(test)]
+mod sharded_writer_tests {
+    use super::*;
+
+    /// 16 threads × 5 000 lines written concurrently: every line ends up
+    /// in the file exactly once, intact (no interleaving between
+    /// threads' writes).
+    #[test]
+    fn concurrent_lines_are_never_interleaved_or_lost() {
+        let dir = std::env::temp_dir().join(format!("proxyauth-shard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("access.log");
+        let file = std::sync::Arc::new(ShardedFile::new(path.clone()));
+
+        let threads: Vec<_> = (0..16)
+            .map(|t| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    for i in 0..5_000 {
+                        // Long enough lines that buffers fill and spill
+                        // many times during the test.
+                        let line = format!("thread={t:02} line={i:05} {}\n", "x".repeat(120));
+                        file.write_line(line.as_bytes());
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        file.flush();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 16 * 5_000);
+        let mut seen = std::collections::HashSet::new();
+        for l in &lines {
+            assert!(
+                l.starts_with("thread=") && l.ends_with(&"x".repeat(120)),
+                "corrupted line: {l:.80}"
+            );
+            assert!(seen.insert(&l[..23]), "duplicated line: {l:.30}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

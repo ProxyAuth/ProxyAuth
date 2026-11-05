@@ -1,28 +1,39 @@
 use crate::config::config::AppConfig;
 use ahash::RandomState;
-use dashmap::DashMap;
 use hyper::body::Bytes;
 use hyper_http_proxy::{Intercept, Proxy, ProxyConnector};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use once_cell::sync::Lazy;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::convert::Infallible;
 use std::{fs::File, io::BufReader, str::FromStr, sync::Arc, time::Duration};
 
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
-type AHashDashMap<K, V> = DashMap<K, V, RandomState>;
 type HttpsClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
 type ProxyClient = Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>;
 
-static CLIENT_CACHE: Lazy<AHashDashMap<ClientKey, HttpsClient>> =
-    Lazy::new(|| DashMap::with_hasher(RandomState::default()));
-
-static CLIENT_CACHE_PROXY: Lazy<AHashDashMap<ClientKey, ProxyClient>> =
-    Lazy::new(|| DashMap::with_hasher(RandomState::default()));
+// PERF — one client (hence one connection pool) per worker thread, like
+// nginx's per-worker upstream keepalive pools.
+//
+// A hyper connection is driven by a task on the runtime of the thread
+// that opened it. With a single process-wide client, a worker reusing a
+// connection opened by another worker sent every request through that
+// other thread and back — two cross-thread wake-ups per request, plus
+// waiting whenever that thread was busy — and all workers contended on
+// the pool's lock. Per-thread clients keep each request, and the
+// connection serving it, on the worker that received it.
+//
+// Cost: up to `workers × max_idle_per_host` idle connections per
+// backend instead of `max_idle_per_host`.
+thread_local! {
+    static CLIENT_CACHE: std::cell::RefCell<std::collections::HashMap<ClientKey, HttpsClient, RandomState>> =
+        std::cell::RefCell::new(std::collections::HashMap::with_hasher(RandomState::default()));
+    static CLIENT_CACHE_PROXY: std::cell::RefCell<std::collections::HashMap<ClientKey, ProxyClient, RandomState>> =
+        std::cell::RefCell::new(std::collections::HashMap::with_hasher(RandomState::default()));
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ClientOptions {
@@ -106,8 +117,8 @@ pub fn get_or_build_client(
 ) -> Result<HttpsClient, String> {
     let key = ClientKey::from_options(&opts);
 
-    if let Some(client) = CLIENT_CACHE.get(&key) {
-        return Ok(client.clone());
+    if let Some(client) = CLIENT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(client);
     }
 
     let client = if opts.use_cert {
@@ -116,20 +127,48 @@ pub fn get_or_build_client(
         build_hyper_client_normal(state)
     };
 
-    CLIENT_CACHE.insert(key, client.clone());
+    CLIENT_CACHE.with(|c| c.borrow_mut().insert(key, client.clone()));
     Ok(client)
 }
 
 pub fn get_or_build_client_proxy(opts: ClientOptions, state: &Arc<AppConfig>) -> ProxyClient {
     let key = ClientKey::from_options(&opts);
 
-    if let Some(client) = CLIENT_CACHE_PROXY.get(&key) {
-        return client.clone();
+    if let Some(client) = CLIENT_CACHE_PROXY.with(|c| c.borrow().get(&key).cloned()) {
+        return client;
     }
 
     let client = build_hyper_client_proxy(opts.clone(), state);
-    CLIENT_CACHE_PROXY.insert(key, client.clone());
+    CLIENT_CACHE_PROXY.with(|c| c.borrow_mut().insert(key, client.clone()));
     client
+}
+
+// ── Taille des pools par worker ──────────────────────────────────────────────
+
+/// Threads workers du processus (`worker × num_instances`), fixé au
+/// démarrage. Les pools de connexions vers les backends étant par worker,
+/// `max_idle_per_host` (un total) est réparti entre eux.
+static WORKER_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub fn set_worker_threads(n: usize) {
+    let _ = WORKER_THREADS.set(n.max(1));
+}
+
+/// Part d'un worker dans un nombre total de connexions inactives à garder
+/// par backend (au moins 2, pour que chaque worker réutilise ses
+/// connexions).
+pub fn per_worker_idle(total: usize) -> usize {
+    let threads = *WORKER_THREADS.get().unwrap_or(&1);
+    total.div_ceil(threads).max(2)
+}
+
+/// Minuteur du pool : sans lui, hyper-util ne ferme **jamais** de
+/// lui-même les connexions inactives (le « reaper » ne tourne pas) ;
+/// elles restaient ouvertes, avec leurs tampons, tant que personne ne
+/// les réutilisait — la mémoire et le nombre de connexions vers les
+/// backends ne faisaient que monter.
+pub fn pool_timer() -> hyper_util::rt::TokioTimer {
+    hyper_util::rt::TokioTimer::new()
 }
 
 // ── Builders ─────────────────────────────────────────────────────────────────
@@ -139,8 +178,9 @@ pub fn build_hyper_client_normal(state: &Arc<AppConfig>) -> HttpsClient {
     let https = build_https_connector_no_auth(keep);
 
     Client::builder(TokioExecutor::new())
+        .pool_timer(pool_timer())
         .pool_idle_timeout(keep)
-        .pool_max_idle_per_host(state.max_idle_per_host.into())
+        .pool_max_idle_per_host(per_worker_idle(state.max_idle_per_host.into()))
         .build::<_, BoxBody>(https)
 }
 
@@ -261,8 +301,9 @@ pub fn build_hyper_client_cert(
         .wrap_connector(build_http_connector(keep));
 
     Ok(Client::builder(TokioExecutor::new())
+        .pool_timer(pool_timer())
         .pool_idle_timeout(keep)
-        .pool_max_idle_per_host(state.max_idle_per_host.into())
+        .pool_max_idle_per_host(per_worker_idle(state.max_idle_per_host.into()))
         .build::<_, BoxBody>(https))
 }
 
@@ -281,7 +322,8 @@ pub fn build_hyper_client_proxy(opts: ClientOptions, state: &Arc<AppConfig>) -> 
         .expect("Failed to create proxy connector");
 
     Client::builder(TokioExecutor::new())
+        .pool_timer(pool_timer())
         .pool_idle_timeout(keep)
-        .pool_max_idle_per_host(state.max_idle_per_host.into())
+        .pool_max_idle_per_host(per_worker_idle(state.max_idle_per_host.into()))
         .build::<_, BoxBody>(proxy)
 }

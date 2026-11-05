@@ -52,28 +52,46 @@ mod tests {
     fn disabled_by_default() {
         let p = policy(0, 30, 0);
         assert!(!p.enabled());
-        assert_eq!(decide(&p, &session(3000, 3000), LIFETIME, NOW), RenewalDecision::Keep);
+        assert_eq!(
+            decide(&p, &session(3000, 3000), LIFETIME, NOW),
+            RenewalDecision::Keep
+        );
     }
 
     #[test]
     fn keeps_a_token_younger_than_the_interval() {
         let p = policy(900, 30, 0);
-        assert_eq!(decide(&p, &session(0, 0), LIFETIME, NOW), RenewalDecision::Keep);
-        assert_eq!(decide(&p, &session(899, 899), LIFETIME, NOW), RenewalDecision::Keep);
+        assert_eq!(
+            decide(&p, &session(0, 0), LIFETIME, NOW),
+            RenewalDecision::Keep
+        );
+        assert_eq!(
+            decide(&p, &session(899, 899), LIFETIME, NOW),
+            RenewalDecision::Keep
+        );
     }
 
     #[test]
     fn renews_once_the_interval_has_passed() {
         let p = policy(900, 30, 0);
-        assert_eq!(decide(&p, &session(900, 900), LIFETIME, NOW), RenewalDecision::Renew);
-        assert_eq!(decide(&p, &session(3500, 3500), LIFETIME, NOW), RenewalDecision::Renew);
+        assert_eq!(
+            decide(&p, &session(900, 900), LIFETIME, NOW),
+            RenewalDecision::Renew
+        );
+        assert_eq!(
+            decide(&p, &session(3500, 3500), LIFETIME, NOW),
+            RenewalDecision::Renew
+        );
     }
 
     #[test]
     fn the_interval_counts_from_the_last_renewal_not_the_login() {
         let p = policy(900, 30, 0);
         // Logged in 5 hours ago, token renewed 10 minutes ago.
-        assert_eq!(decide(&p, &session(600, 18_000), LIFETIME, NOW), RenewalDecision::Keep);
+        assert_eq!(
+            decide(&p, &session(600, 18_000), LIFETIME, NOW),
+            RenewalDecision::Keep
+        );
     }
 
     #[test]
@@ -92,7 +110,10 @@ mod tests {
     #[test]
     fn max_lifetime_applies_even_without_renewal() {
         let p = policy(0, 30, 600);
-        assert_eq!(decide(&p, &session(700, 700), LIFETIME, NOW), RenewalDecision::TooOld);
+        assert_eq!(
+            decide(&p, &session(700, 700), LIFETIME, NOW),
+            RenewalDecision::TooOld
+        );
     }
 
     #[test]
@@ -131,16 +152,25 @@ mod tests {
             },
         };
         assert_eq!(decide(&p, &s, FIVE_DAYS, NOW), RenewalDecision::Renew);
-        assert_eq!(renewed_expiry(&p, issued_at, FIVE_DAYS, NOW), issued_at + 3600);
+        assert_eq!(
+            renewed_expiry(&p, issued_at, FIVE_DAYS, NOW),
+            issued_at + 3600
+        );
 
         let young = ValidSession {
-            data: TokenData { issued_at: NOW - 30, ..s.data.clone() },
+            data: TokenData {
+                issued_at: NOW - 30,
+                ..s.data.clone()
+            },
             ..s.clone()
         };
         assert_eq!(decide(&p, &young, FIVE_DAYS, NOW), RenewalDecision::Keep);
 
         let over = ValidSession {
-            data: TokenData { session_started_at: NOW - 3600, ..s.data.clone() },
+            data: TokenData {
+                session_started_at: NOW - 3600,
+                ..s.data.clone()
+            },
             ..s
         };
         assert_eq!(decide(&p, &over, FIVE_DAYS, NOW), RenewalDecision::TooOld);
@@ -162,7 +192,10 @@ mod tests {
 
     #[test]
     fn renewed_tokens_get_a_full_lifetime_capped_by_the_hard_limit() {
-        assert_eq!(renewed_expiry(&policy(900, 30, 0), NOW - 5000, LIFETIME, NOW), NOW + LIFETIME);
+        assert_eq!(
+            renewed_expiry(&policy(900, 30, 0), NOW - 5000, LIFETIME, NOW),
+            NOW + LIFETIME
+        );
         let capped = renewed_expiry(&policy(900, 30, 6000), NOW - 5000, LIFETIME, NOW);
         assert_eq!(capped, NOW - 5000 + 6000);
     }
@@ -199,7 +232,18 @@ mod tests {
     #[test]
     fn malformed_token_data_is_refused() {
         let too_long = format!("1:2:3:{}", "a".repeat(129));
-        for raw in ["", "x", "1:y", "1:2:z", "1:2:3:", "1:2:3:has space", "1:2:3:a/b", "1:2:3:ab:cd", "-1:2:3", too_long.as_str()] {
+        for raw in [
+            "",
+            "x",
+            "1:y",
+            "1:2:z",
+            "1:2:3:",
+            "1:2:3:has space",
+            "1:2:3:a/b",
+            "1:2:3:ab:cd",
+            "-1:2:3",
+            too_long.as_str(),
+        ] {
             assert_eq!(TokenData::parse(raw), None, "{raw:?}");
         }
     }
@@ -229,7 +273,10 @@ mod tests {
         map.insert(rotated_key("in-grace"), pack_rotation(now + 30, now + 3600));
         assert!(!is_token_revoked("in-grace", &map));
 
-        map.insert(rotated_key("after-grace"), pack_rotation(now - 1, now + 3600));
+        map.insert(
+            rotated_key("after-grace"),
+            pack_rotation(now - 1, now + 3600),
+        );
         assert!(is_token_revoked("after-grace", &map));
 
         assert!(!is_token_revoked("unrelated", &map));
@@ -242,15 +289,20 @@ mod tests {
         assert!(is_token_revoked("forever", &map));
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn revoke_token_after_records_both_instants() {
         let map = Arc::new(DashMap::new());
         // No Redis or LMDB in this test: the in-memory entry is still
         // written before the backend error is reported.
         let _ = revoke_token_after("abc", 1_900_000_030, 1_900_003_600, &map).await;
-        let value = *map.get(&rotated_key("abc")).expect("entry written in memory");
+        let value = *map
+            .get(&rotated_key("abc"))
+            .expect("entry written in memory");
         assert_eq!(unpack_rotation(value), (1_900_000_030, 1_900_003_600));
-        assert!(map.get("abc").is_none(), "the token id itself is not revoked outright");
+        assert!(
+            map.get("abc").is_none(),
+            "the token id itself is not revoked outright"
+        );
     }
 
     // ── renewed cookie ───────────────────────────────────────
@@ -259,7 +311,13 @@ mod tests {
     fn renewed_cookie_has_the_login_cookie_attributes() {
         let cookie = session_cookie("NEWTOKEN", 1800, LIFETIME, 3600);
         assert!(cookie.starts_with("session_token=NEWTOKEN"));
-        for attr in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/", "Max-Age=1800"] {
+        for attr in [
+            "HttpOnly",
+            "Secure",
+            "SameSite=Strict",
+            "Path=/",
+            "Max-Age=1800",
+        ] {
             assert!(cookie.contains(attr), "{attr} missing in {cookie}");
         }
     }
@@ -323,9 +381,18 @@ routes:
 
         let find = |p: &str| routes.routes.iter().find(|r| r.prefix == p).unwrap();
 
-        assert_eq!(find("/admin").resolved_session_refresh(&cfg), policy(300, 20, 86400));
-        assert_eq!(find("/api").resolved_session_refresh(&cfg), policy(0, 5, 86400));
-        assert_eq!(find("/").resolved_session_refresh(&cfg), policy(900, 20, 86400));
+        assert_eq!(
+            find("/admin").resolved_session_refresh(&cfg),
+            policy(300, 20, 86400)
+        );
+        assert_eq!(
+            find("/api").resolved_session_refresh(&cfg),
+            policy(0, 5, 86400)
+        );
+        assert_eq!(
+            find("/").resolved_session_refresh(&cfg),
+            policy(900, 20, 86400)
+        );
     }
 
     #[test]
@@ -402,7 +469,10 @@ routes:
         let retired = pack_rotation(NOW + IN_FLIGHT_SECS, NOW + 3600);
         assert_eq!(predecessor_deadline(Some(retired), &p, LIFETIME, NOW), None);
         let long_gone = pack_rotation(NOW - 100, NOW + 3600);
-        assert_eq!(predecessor_deadline(Some(long_gone), &p, LIFETIME, NOW), None);
+        assert_eq!(
+            predecessor_deadline(Some(long_gone), &p, LIFETIME, NOW),
+            None
+        );
     }
 
     #[test]

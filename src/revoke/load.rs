@@ -115,7 +115,10 @@ pub fn advance_generation(
             }
             let value = pack_rotation(1, purge_at.max(1));
             entry.insert(value);
-            GenerationStep::Advanced { generation: 1, value }
+            GenerationStep::Advanced {
+                generation: 1,
+                value,
+            }
         }
     }
 }

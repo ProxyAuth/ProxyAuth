@@ -905,6 +905,38 @@ pub struct RouteRule {
     #[serde(default)]
     pub streaming: Option<bool>,
 
+    /// `discovery-csp` pour ce vhost : `auto` ou `off`, prioritaire sur
+    /// config.json. Hérité du groupe `vhosts:`.
+    #[serde(default, rename = "discovery-csp", alias = "discovery_csp")]
+    pub discovery_csp: Option<crate::network::security_headers::DiscoveryCsp>,
+
+    /// Réglages `internal_cache` propres à cette route (hérités du
+    /// groupe `vhosts:`, puis de config.json, champ par champ).
+    #[serde(default)]
+    pub internal_cache: Option<crate::config::internal_cache::InternalCacheConfig>,
+
+    /// Relaie les connexions WebSocket (`Upgrade: websocket`) vers
+    /// `target`, qui peut alors être en `ws://` ou `wss://`. Voir
+    /// `network::websocket`. Hérité du groupe `vhosts:` ; défaut : non.
+    #[serde(default)]
+    pub forward_websocket: Option<bool>,
+
+    /// Limitation de débit de cette route (ou, posée sur un groupe
+    /// `vhosts:`, de tout le vhost — un seul compteur partagé). Voir
+    /// `network::ratelimit` pour le format. `None` : pas de limite.
+    #[serde(default)]
+    pub ratelimit: Option<crate::network::ratelimit::RateLimitConfig>,
+
+    /// Port d'écoute de ce vhost. `None` : le `port` de config.json.
+    /// Voir `network::vhost_listen`.
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Protocole HTTP servi pour ce vhost : `h1`, `h2` ou `auto`
+    /// (défaut). Voir `network::vhost_listen`.
+    #[serde(default)]
+    pub protocol: Option<crate::network::vhost_listen::HttpProtocol>,
+
     /// Narrows this route to a subset of the hosts its `vhosts:` group
     /// declares.
     ///
@@ -1112,6 +1144,10 @@ impl RouteRule {
     /// group's (already propagated above), else `false`. Defaulting to
     /// `false` keeps every pre-existing route on the buffering path it
     /// has always used.
+    pub fn forward_websocket_enabled(&self) -> bool {
+        self.forward_websocket.unwrap_or(false)
+    }
+
     pub fn streaming_enabled(&self) -> bool {
         self.streaming.unwrap_or(false)
     }
@@ -1417,6 +1453,32 @@ pub struct VhostGroup {
     #[serde(default)]
     pub streaming: Option<bool>,
 
+    /// `discovery-csp` du vhost (voir `RouteRule::discovery_csp`).
+    #[serde(default, rename = "discovery-csp", alias = "discovery_csp")]
+    pub discovery_csp: Option<crate::network::security_headers::DiscoveryCsp>,
+
+    /// Réglages `internal_cache` du vhost (voir
+    /// `RouteRule::internal_cache`).
+    #[serde(default)]
+    pub internal_cache: Option<crate::config::internal_cache::InternalCacheConfig>,
+
+    /// Relais WebSocket pour les routes du vhost (voir
+    /// `RouteRule::forward_websocket`).
+    #[serde(default)]
+    pub forward_websocket: Option<bool>,
+
+    /// Limitation de débit du vhost (voir `RouteRule::ratelimit`).
+    #[serde(default)]
+    pub ratelimit: Option<crate::network::ratelimit::RateLimitConfig>,
+
+    /// Port d'écoute du vhost (voir `RouteRule::port`).
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Protocole HTTP du vhost (voir `RouteRule::protocol`).
+    #[serde(default)]
+    pub protocol: Option<crate::network::vhost_listen::HttpProtocol>,
+
     /// Applied to every route in this group that doesn't set its own —
     /// see `RouteRule::redirect_protect`. Setting this directly on a
     /// `vhosts:` group (rather than on each individual route) is the
@@ -1625,6 +1687,24 @@ impl RouteConfig {
                 }
                 if route.streaming.is_none() {
                     route.streaming = group.streaming;
+                }
+                if route.ratelimit.is_none() {
+                    route.ratelimit = group.ratelimit.clone();
+                }
+                if route.forward_websocket.is_none() {
+                    route.forward_websocket = group.forward_websocket;
+                }
+                if route.internal_cache.is_none() {
+                    route.internal_cache = group.internal_cache.clone();
+                }
+                if route.discovery_csp.is_none() {
+                    route.discovery_csp = group.discovery_csp;
+                }
+                if route.port.is_none() {
+                    route.port = group.port;
+                }
+                if route.protocol.is_none() {
+                    route.protocol = group.protocol;
                 }
                 if route.redirect_protect.is_none() {
                     route.redirect_protect = group.redirect_protect.clone();
@@ -1897,7 +1977,7 @@ pub struct AppConfig {
     /// supported) or an array (`"host": ["0.0.0.0", "::1"]`) to bind
     /// more than one at once, e.g. IPv4 + IPv6 together. Every entry
     /// is bound with its own listening socket, all served by the same
-    /// actix HttpServer instance — one shared worker pool, not a
+    /// HttpServer instance — one shared worker pool, not a
     /// separate server per address.
     #[serde(default = "default_hosts", deserialize_with = "deserialize_host")]
     pub host: Vec<String>,
@@ -1907,12 +1987,6 @@ pub struct AppConfig {
 
     #[serde(default = "default_worker")]
     pub worker: u8,
-
-    #[serde(default = "default_ratelimit_proxy")]
-    pub ratelimit_proxy: HashMap<String, u64>,
-
-    #[serde(default = "default_ratelimit_auth")]
-    pub ratelimit_auth: HashMap<String, u64>,
 
     #[serde(deserialize_with = "deserialize_log_map")]
     pub log: HashMap<String, String>,
@@ -1934,6 +2008,31 @@ pub struct AppConfig {
     /// per `vhosts:` group in `routes.yml`; see `CompressionConfig`.
     #[serde(default)]
     pub compression: CompressionConfig,
+
+    /// Cache mémoire des fichiers statiques, pages d'erreur et réponses
+    /// compressées. Voir `config::internal_cache`.
+    #[serde(default)]
+    pub internal_cache: crate::config::internal_cache::InternalCacheConfig,
+
+    /// Délai (en secondes, décimales acceptées : `0.5`) avant que
+    /// l'allocateur rende au système la mémoire libérée. `0` : tout de
+    /// suite (RSS plus bas, un peu plus d'appels système sous charge).
+    /// Absent : réglage de mimalloc (1 s). Voir `main::apply_purge_delay`.
+    #[serde(default)]
+    pub purge_delay: Option<f64>,
+
+    /// Délai (secondes, décimales acceptées) laissé aux requêtes en cours
+    /// quand ProxyAuth s'arrête ou redémarre ; les connexions encore
+    /// ouvertes ensuite (téléchargements, WebSocket, streaming) sont
+    /// coupées. `0` : coupure immédiate. Défaut : 2 s.
+    #[serde(default)]
+    pub shutdown_timeout: Option<f64>,
+
+    /// `"discovery-csp": "auto"` : en-têtes de sécurité de base (CSP
+    /// anti-clickjacking, nosniff, HSTS…) sur toutes les réponses HTTPS
+    /// de tous les vhosts. Voir `network::security_headers`.
+    #[serde(default, rename = "discovery-csp", alias = "discovery_csp")]
+    pub discovery_csp: Option<crate::network::security_headers::DiscoveryCsp>,
 
     /// Settings for automatic Let's Encrypt certificate renewal (see
     /// `RouteRule.certbot_renew`). Global — every ACME-managed vhost
@@ -2247,10 +2346,14 @@ impl Serialize for AppConfig {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("AppConfig", 7)?;
+        let mut state = serializer.serialize_struct("AppConfig", 8)?;
         state.serialize_field("blakegate", &self.blakegate)?;
         state.serialize_field("client_timeout", &self.client_timeout)?;
         state.serialize_field("compression", &self.compression)?;
+        state.serialize_field("internal_cache", &self.internal_cache)?;
+        state.serialize_field("purge_delay", &self.purge_delay)?;
+        state.serialize_field("shutdown_timeout", &self.shutdown_timeout)?;
+        state.serialize_field("discovery-csp", &self.discovery_csp)?;
         state.serialize_field("cors_origins", &self.cors_origins)?;
         state.serialize_field("databases", &self.databases)?;
         state.serialize_field("fast", &self.fast)?;
@@ -2265,8 +2368,6 @@ impl Serialize for AppConfig {
         state.serialize_field("num_instances", &self.num_instances)?;
         state.serialize_field("pending_connections_limit", &self.pending_connections_limit)?;
         state.serialize_field("port", &self.port)?;
-        state.serialize_field("ratelimit_auth", &self.ratelimit_auth)?;
-        state.serialize_field("ratelimit_proxy", &self.ratelimit_proxy)?;
         state.serialize_field("redis", &self.redis)?;
         state.serialize_field("secret", &self.secret)?;
         state.serialize_field("session_cookie", &self.session_cookie)?;
@@ -2308,7 +2409,10 @@ impl Serialize for AppConfig {
             "session_refresh_interval_secs",
             &self.session_refresh_interval_secs,
         )?;
-        state.serialize_field("session_refresh_grace_secs", &self.session_refresh_grace_secs)?;
+        state.serialize_field(
+            "session_refresh_grace_secs",
+            &self.session_refresh_grace_secs,
+        )?;
         state.serialize_field("session_max_lifetime_secs", &self.session_max_lifetime_secs)?;
         state.serialize_field(
             "refresh_token_expiry_seconds",
@@ -2587,8 +2691,13 @@ fn default_pending_connections_limit() -> u32 {
     65535
 }
 
+/// File d'attente des connexions pas encore acceptées (`listen()`).
+/// 4096 = `net.core.somaxconn` par défaut depuis Linux 5.4 ; le noyau
+/// plafonne de toute façon à cette valeur. Avec 1024, un afflux de
+/// milliers de connexions débordait la file : le client renvoyait son
+/// SYN après 1 s, puis 3 s… d'où des « connect » de plusieurs secondes.
 fn default_socket_listen() -> u32 {
-    1024
+    4096
 }
 
 fn default_backends() -> Vec<BackendInput> {
@@ -2656,22 +2765,6 @@ fn default_log() -> HashMap<String, String> {
     log.insert("type".to_string(), "local".to_string());
     log.insert("write_max_logs".to_string(), "1000".into());
     log
-}
-
-fn default_ratelimit_proxy() -> HashMap<String, u64> {
-    let mut ratelimit = HashMap::new();
-    ratelimit.insert("requests_per_second".to_string(), 0);
-    ratelimit.insert("burst".to_string(), 1);
-    ratelimit.insert("block_delay".to_string(), 500);
-    ratelimit
-}
-
-fn default_ratelimit_auth() -> HashMap<String, u64> {
-    let mut ratelimit = HashMap::new();
-    ratelimit.insert("requests_per_second".to_string(), 0);
-    ratelimit.insert("burst".to_string(), 1);
-    ratelimit.insert("block_delay".to_string(), 500);
-    ratelimit
 }
 
 fn default_cert() -> HashMap<String, String> {
@@ -2784,10 +2877,21 @@ impl AppConfig {
     /// A zero-length timeout is never what an operator means: it would
     /// abandon every proxied request the instant it is issued, turning
     /// the whole instance into a `503` generator. Elsewhere in this
-    /// config a `0` legitimately means "off" — `ratelimit_*`,
+    /// config a `0` legitimately means "off" — e.g.
     /// `ip_blocklist_refresh_interval_secs` — so the value has to stay
     /// accepted at parse time and be guarded here, at the point of use,
     /// instead.
+    /// `shutdown_timeout` effectif ; une valeur négative ou invalide
+    /// retombe sur le défaut.
+    pub fn shutdown_timeout_duration(&self) -> std::time::Duration {
+        match self.shutdown_timeout {
+            Some(s) if s.is_finite() && s >= 0.0 => {
+                std::time::Duration::from_secs_f64(s.min(3600.0))
+            }
+            _ => crate::hyper_web::server::DEFAULT_SHUTDOWN_TIMEOUT,
+        }
+    }
+
     pub fn backend_timeout_duration(&self) -> std::time::Duration {
         let ms = if self.backend_timeout == 0 {
             default_backend_timeout()
@@ -3548,4 +3652,3 @@ impl AllowRegexCfg {
         })
     }
 }
-

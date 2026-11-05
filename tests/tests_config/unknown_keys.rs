@@ -49,7 +49,11 @@ mod tests {
         assert!(check_app_config(&written, &cfg).is_empty());
 
         let mut renamed = written.clone();
-        let acme = renamed.as_object_mut().unwrap().remove("letsencrypt").unwrap();
+        let acme = renamed
+            .as_object_mut()
+            .unwrap()
+            .remove("letsencrypt")
+            .unwrap();
         renamed.as_object_mut().unwrap().insert("acme".into(), acme);
         assert!(check_app_config(&renamed, &cfg).is_empty());
     }
@@ -93,7 +97,12 @@ mod tests {
 
     #[test]
     fn misnamed_refresh_token_settings_point_to_the_real_one() {
-        for key in ["refresh_token", "token_refresh", "refresh_token_ttl", "refresh_token_expiry"] {
+        for key in [
+            "refresh_token",
+            "token_refresh",
+            "refresh_token_ttl",
+            "refresh_token_expiry",
+        ] {
             let json = with(serde_json::json!({ key: 86400 }));
             let found = check_app_config(&json, &app_config(&json));
             assert_eq!(found.len(), 1, "{key}");
@@ -198,7 +207,10 @@ vhosts:
     fn summary_says_when_renewal_is_off() {
         let cfg = app_config(&base());
         let lines = describe_policies(&cfg, &routes("routes: []").routes);
-        assert_eq!(lines, vec!["session renewal off (session_refresh_interval_secs = 0)"]);
+        assert_eq!(
+            lines,
+            vec!["session renewal off (session_refresh_interval_secs = 0)"]
+        );
     }
 
     #[test]
@@ -227,7 +239,8 @@ vhosts:
             describe_policies(&cfg, &r.routes),
             vec![
                 "session renewal every 900s, previous token accepted 30s more".to_string(),
-                "session renewal on api.example.com/admin: off (session_refresh_interval_secs = 0)".to_string(),
+                "session renewal on api.example.com/admin: off (session_refresh_interval_secs = 0)"
+                    .to_string(),
             ]
         );
     }
@@ -247,7 +260,9 @@ routes:
         );
         let lines = describe_policies(&cfg, &r.routes);
         assert!(
-            lines.iter().any(|l| l.starts_with("warning: session renewal on /admin never happens")),
+            lines
+                .iter()
+                .any(|l| l.starts_with("warning: session renewal on /admin never happens")),
             "{lines:?}"
         );
     }

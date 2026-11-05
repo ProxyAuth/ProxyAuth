@@ -11,19 +11,19 @@ use time::{Duration, OffsetDateTime};
 // Importer CONTENT_TYPE et CONTENT_ENCODING depuis hyper uniquement pour les HyperHeaderMap
 use hyper::header::{CONTENT_ENCODING, CONTENT_TYPE as HYPER_CONTENT_TYPE};
 // Importer CONTENT_TYPE depuis actix pour les TestRequest
-use actix_web::http::StatusCode;
-use actix_web::http::header::CONTENT_TYPE as CONTENT_TYPE_ACTIX;
+use proxyauth::hyper_web::http::StatusCode;
+use proxyauth::hyper_web::http::header::CONTENT_TYPE as CONTENT_TYPE_ACTIX;
 use proxyauth::token::csrf::fix_mime_actix;
 use std::io::Read;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::http::Method;
-    use actix_web::test::TestRequest;
     use bytes::Bytes;
     use flate2::{Compression, write::GzEncoder};
     use hyper::HeaderMap as HyperHeaderMap;
+    use proxyauth::hyper_web::http::Method;
+    use proxyauth::hyper_web::test::TestRequest;
     use serial_test::serial;
     use std::io::Write;
 
@@ -353,7 +353,7 @@ mod tests {
     // ------------ fix_mime_actix ------------
     #[test]
     fn fix_mime_sets_expected_types() {
-        use actix_web::HttpResponse;
+        use proxyauth::hyper_web::HttpResponse;
 
         // CSS
         let mut b1 = HttpResponse::Ok();

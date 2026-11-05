@@ -24,7 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const LIFETIME: u64 = 3600;
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn map() -> RevokedTokenMap {
@@ -32,7 +35,9 @@ fn map() -> RevokedTokenMap {
 }
 
 fn redis_url() -> Option<String> {
-    std::env::var("PROXYAUTH_TEST_REDIS").ok().filter(|u| !u.is_empty())
+    std::env::var("PROXYAUTH_TEST_REDIS")
+        .ok()
+        .filter(|u| !u.is_empty())
 }
 
 /// Opens a throwaway LMDB (and Redis, if configured) once for the binary.
@@ -50,7 +55,9 @@ async fn setup() {
     }
     if let Some(url) = redis_url() {
         let client = redis::Client::open(url.as_str()).unwrap();
-        let mut con = client.get_connection().expect("PROXYAUTH_TEST_REDIS is not reachable");
+        let mut con = client
+            .get_connection()
+            .expect("PROXYAUTH_TEST_REDIS is not reachable");
         let _: () = redis::cmd("FLUSHDB").query(&mut con).unwrap();
     }
     set_token_lifetime(LIFETIME as i64);
@@ -75,18 +82,23 @@ macro_rules! require_redis {
 
 // ── LMDB ─────────────────────────────────────────────────────
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn a_revocation_is_written_to_lmdb_immediately() {
     setup().await;
     let m = map();
-    revoke_token("lmdb-now", Some(now() + 600), &m).await.unwrap();
+    revoke_token("lmdb-now", Some(now() + 600), &m)
+        .await
+        .unwrap();
     assert!(is_token_revoked("lmdb-now", &m));
     assert_eq!(lmdb_get("lmdb-now"), Some(*m.get("lmdb-now").unwrap()));
 
     let record = lmdb_get_record("lmdb-now").unwrap();
     let t = now();
-    assert!(record.revoked_at <= t && record.revoked_at + 5 >= t, "recording date kept");
+    assert!(
+        record.revoked_at <= t && record.revoked_at + 5 >= t,
+        "recording date kept"
+    );
 }
 
 /// Writes raw bytes, the way an older version stored its entries.
@@ -95,11 +107,12 @@ fn lmdb_put_raw(key: &str, bytes: &[u8]) {
     let env = LMDB_ENV.get().unwrap();
     let db = env.open_db(Some("revoke")).unwrap();
     let mut txn = env.begin_rw_txn().unwrap();
-    txn.put(db, &key.as_bytes(), &bytes, lmdb::WriteFlags::empty()).unwrap();
+    txn.put(db, &key.as_bytes(), &bytes, lmdb::WriteFlags::empty())
+        .unwrap();
     txn.commit().unwrap();
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn entries_kept_forever_by_older_versions_get_an_end_date() {
     setup().await;
@@ -114,24 +127,33 @@ async fn entries_kept_forever_by_older_versions_get_an_end_date() {
     assert!(forever.value >= before + LIFETIME && forever.value <= now() + LIFETIME);
     assert!(forever.revoked_at >= before);
     assert_eq!(*m.get("legacy-forever").unwrap(), forever.value);
-    assert!(is_token_revoked("legacy-forever", &m), "still refused until then");
+    assert!(
+        is_token_revoked("legacy-forever", &m),
+        "still refused until then"
+    );
 
     let dated = lmdb_get_record("legacy-dated").unwrap();
     assert_eq!(dated.revoked_at, 0, "an old dated entry is read as-is");
     assert!(is_token_revoked("legacy-dated", &m));
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn the_purge_cleans_memory_and_lmdb() {
     setup().await;
     let m = map();
     let t = now();
     revoke_token("purge-old", Some(t - 10), &m).await.unwrap();
-    revoke_token("purge-future", Some(t + 600), &m).await.unwrap();
-    revoke_token(&rotated_key("purge-rot"), Some(pack_rotation(t - 20, t - 10)), &m)
+    revoke_token("purge-future", Some(t + 600), &m)
         .await
         .unwrap();
+    revoke_token(
+        &rotated_key("purge-rot"),
+        Some(pack_rotation(t - 20, t - 10)),
+        &m,
+    )
+    .await
+    .unwrap();
 
     sync_tick(&m);
 
@@ -144,7 +166,7 @@ async fn the_purge_cleans_memory_and_lmdb() {
     assert!(lmdb_get("purge-future").is_some());
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn another_process_on_the_host_is_picked_up_from_lmdb() {
     setup().await;
@@ -154,7 +176,7 @@ async fn another_process_on_the_host_is_picked_up_from_lmdb() {
     assert!(is_token_revoked("other-process", &m));
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn the_loop_purges_without_redis_configured() {
     setup().await;
@@ -167,12 +189,16 @@ async fn the_loop_purges_without_redis_configured() {
     lmdb_put("no-redis-expired", now() - 1).unwrap();
     start_revoked_token_ttl(m.clone(), Duration::from_millis(50), None).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(lmdb_get("no-redis-expired"), None, "purged by the running loop");
+    assert_eq!(
+        lmdb_get("no-redis-expired"),
+        None,
+        "purged by the running loop"
+    );
 }
 
 // ── Redis ────────────────────────────────────────────────────
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn all_redis_keys_expire_with_the_revocation() {
     setup().await;
@@ -187,11 +213,13 @@ async fn all_redis_keys_expire_with_the_revocation() {
 
     revoke_token("r-short", Some(now() + 5), &m).await.unwrap();
     let ttl: i64 = con.ttl("r-short_action").unwrap();
-    assert!(ttl >= REDIS_MIN_TTL_SECS as i64 - 2, "short entries still reach every node: {ttl}");
-
+    assert!(
+        ttl >= REDIS_MIN_TTL_SECS as i64 - 2,
+        "short entries still reach every node: {ttl}"
+    );
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn a_forever_entry_from_an_older_node_is_bounded_on_the_bus() {
     setup().await;
@@ -212,7 +240,7 @@ async fn a_forever_entry_from_an_older_node_is_bounded_on_the_bus() {
     assert!(ttl > 0 && ttl <= LIFETIME as i64, "and an expiry: {ttl}");
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn a_revocation_from_another_node_is_applied_and_persisted() {
     setup().await;
@@ -230,7 +258,7 @@ async fn a_revocation_from_another_node_is_applied_and_persisted() {
     assert_eq!(lmdb_get("from-peer"), Some(exp));
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn an_orphan_action_key_is_dropped_not_made_permanent() {
     setup().await;
@@ -252,7 +280,7 @@ async fn an_orphan_action_key_is_dropped_not_made_permanent() {
     assert!(!exists);
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn an_expired_entry_left_in_redis_is_dropped() {
     setup().await;
@@ -269,7 +297,7 @@ async fn an_expired_entry_left_in_redis_is_dropped() {
     assert!(!exists);
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn the_purge_also_cleans_redis() {
     setup().await;
@@ -290,7 +318,7 @@ async fn the_purge_also_cleans_redis() {
     }
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn a_revocation_survives_every_tick_until_its_date() {
     setup().await;
@@ -303,7 +331,7 @@ async fn a_revocation_survives_every_tick_until_its_date() {
     assert!(lmdb_get("r-keep").is_some());
 }
 
-#[actix_web::test]
+#[tokio::test]
 #[serial]
 async fn refresh_generations_travel_between_instances() {
     setup().await;
@@ -317,7 +345,9 @@ async fn refresh_generations_travel_between_instances() {
     else {
         panic!("first refresh must advance");
     };
-    publish_generation("api-session", value, &node_a).await.unwrap();
+    publish_generation("api-session", value, &node_a)
+        .await
+        .unwrap();
 
     // Another instance, starting from nothing, learns the generation
     // on its next tick.
@@ -326,4 +356,3 @@ async fn refresh_generations_travel_between_instances() {
     assert_eq!(current_generation("api-session", &node_b), 1);
     assert!(lmdb_get("refresh:api-session").is_some());
 }
-

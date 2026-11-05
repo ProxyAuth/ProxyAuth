@@ -1,13 +1,13 @@
 use crate::AppState;
 use crate::config::config::BackendConfig;
 use crate::config::config::BackendInput;
+use crate::hyper_web::rt::time::timeout;
+use crate::hyper_web::{HttpRequest, HttpResponse, web};
 use crate::network::loadbalancing::forward_failover;
 use crate::network::shared_client::BoxBody;
 use crate::network::shared_client::ClientOptions;
 use crate::network::shared_client::get_or_build_client;
 use crate::token::csrf::inject_csrf_token;
-use actix_web::rt::time::timeout;
-use actix_web::{HttpRequest, HttpResponse, web};
 use brotli::{CompressorWriter, Decompressor};
 use flate2::{
     Compression,
@@ -106,11 +106,22 @@ pub async fn render_error_page(
     // build backend request" — the empty `target` doesn't parse into
     // anything a real HTTP request could be built against.
     if let Some(static_path) = &rule.static_path {
-        let file_path = match tokio::fs::metadata(static_path).await {
-            Ok(m) if m.is_file() => std::path::PathBuf::from(static_path),
-            _ => std::path::Path::new(static_path).join(&rule.static_index),
-        };
-        return match tokio::fs::read_to_string(&file_path).await {
+        let file_path =
+            match crate::network::fs_cache::kind(std::path::Path::new(static_path)).await {
+                Ok((true, _)) => std::path::PathBuf::from(static_path),
+                _ => std::path::Path::new(static_path).join(&rule.static_index),
+            };
+        let policy = crate::config::internal_cache::CachePolicy::new(
+            &data.config.internal_cache,
+            rule.internal_cache.as_ref(),
+        );
+        return match crate::network::fs_cache::read_to_string(
+            &file_path,
+            &policy,
+            crate::network::fs_cache::pool_for(Some(rule)).as_deref(),
+        )
+        .await
+        {
             Ok(html) => {
                 let mut html = toggle_error_block(html, error_text);
                 if rule.tag_proxyauth_enabled() {

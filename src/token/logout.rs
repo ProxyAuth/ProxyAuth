@@ -1,14 +1,14 @@
 use crate::AppState;
+use crate::hyper_web::{HttpRequest, HttpResponse, http::header, http::header::ContentType, web};
 use crate::revoke::load::{logout_record_until, revoke_token};
 use crate::token::security::{now_secs, validate_session};
-use actix_web::{HttpRequest, HttpResponse, http::header, http::header::ContentType, web};
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 use tracing::warn;
 
 pub async fn logout_options(
     req: HttpRequest,
     data: web::Data<AppState>,
-) -> impl actix_web::Responder {
+) -> impl crate::hyper_web::Responder {
     let origin_header = req.headers().get(header::ORIGIN);
     let origin = origin_header.and_then(|v| v.to_str().ok());
 
@@ -54,7 +54,7 @@ pub async fn logout_dispatch(
     req: HttpRequest,
     body: web::Bytes,
     data: web::Data<AppState>,
-) -> Result<HttpResponse, actix_web::Error> {
+) -> Result<HttpResponse, crate::hyper_web::Error> {
     let vhost_route = crate::network::proxy::find_vhost_route(
         crate::network::proxy::request_host(&req).as_deref(),
         &data.routes.routes,

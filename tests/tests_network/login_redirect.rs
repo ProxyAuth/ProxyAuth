@@ -13,9 +13,9 @@
 
 #[cfg(test)]
 mod tests {
-    use actix_web::http::{StatusCode, header};
-    use actix_web::test::TestRequest;
     use proxyauth::config::config::{AppConfig, RouteRule};
+    use proxyauth::hyper_web::http::{StatusCode, header};
+    use proxyauth::hyper_web::test::TestRequest;
     use proxyauth::network::proxy::{
         is_login_page, login_page_path, login_page_redirect, login_page_redirect_target,
     };
@@ -65,7 +65,10 @@ mod tests {
         let mut rule = with_login_page("/admin", "/login");
         rule.logout_redirect_url = Some("/signout".into());
         let req = navigation("/admin").to_http_request();
-        assert_eq!(login_page_redirect_target(&req, &rule, &cfg), Some("/login"));
+        assert_eq!(
+            login_page_redirect_target(&req, &rule, &cfg),
+            Some("/login")
+        );
     }
 
     #[test]
@@ -74,7 +77,10 @@ mod tests {
         let mut rule = protected("/admin");
         rule.logout_redirect_url = Some("/login".into());
         let req = navigation("/admin").to_http_request();
-        assert_eq!(login_page_redirect_target(&req, &rule, &cfg), Some("/login"));
+        assert_eq!(
+            login_page_redirect_target(&req, &rule, &cfg),
+            Some("/login")
+        );
     }
 
     #[test]
@@ -91,7 +97,10 @@ mod tests {
     fn no_login_page_keeps_the_401() {
         let cfg = config(None);
         let req = navigation("/admin").to_http_request();
-        assert_eq!(login_page_redirect_target(&req, &protected("/admin"), &cfg), None);
+        assert_eq!(
+            login_page_redirect_target(&req, &protected("/admin"), &cfg),
+            None
+        );
     }
 
     #[test]
@@ -119,7 +128,10 @@ mod tests {
     fn a_browser_navigation_is_redirected() {
         let req = navigation("/admin/stats").to_http_request();
         let rule = with_login_page("/admin", "/login");
-        assert_eq!(login_page_redirect_target(&req, &rule, &config(None)), Some("/login"));
+        assert_eq!(
+            login_page_redirect_target(&req, &rule, &config(None)),
+            Some("/login")
+        );
     }
 
     #[test]
@@ -132,20 +144,29 @@ mod tests {
             .insert_header((header::ACCEPT, "*/*"))
             .insert_header((header::USER_AGENT, "curl/8.5.0"))
             .to_http_request();
-        assert_eq!(login_page_redirect_target(&curl, &rule, &cfg), Some("/login"));
+        assert_eq!(
+            login_page_redirect_target(&curl, &rule, &cfg),
+            Some("/login")
+        );
 
         let bare = TestRequest::get().uri("/admin").to_http_request();
-        assert_eq!(login_page_redirect_target(&bare, &rule, &cfg), Some("/login"));
+        assert_eq!(
+            login_page_redirect_target(&bare, &rule, &cfg),
+            Some("/login")
+        );
     }
 
     #[test]
     fn head_is_redirected_like_get() {
         let req = TestRequest::default()
-            .method(actix_web::http::Method::HEAD)
+            .method(proxyauth::hyper_web::http::Method::HEAD)
             .uri("/admin")
             .to_http_request();
         let rule = with_login_page("/admin", "/login");
-        assert_eq!(login_page_redirect_target(&req, &rule, &config(None)), Some("/login"));
+        assert_eq!(
+            login_page_redirect_target(&req, &rule, &config(None)),
+            Some("/login")
+        );
     }
 
     #[test]
@@ -154,7 +175,10 @@ mod tests {
             .insert_header((header::COOKIE, "theme=dark; session_token=abc"))
             .to_http_request();
         let rule = with_login_page("/admin", "/login");
-        assert_eq!(login_page_redirect_target(&req, &rule, &config(None)), Some("/login"));
+        assert_eq!(
+            login_page_redirect_target(&req, &rule, &config(None)),
+            Some("/login")
+        );
     }
 
     // ── which requests keep their 401 ────────────────────────
@@ -234,7 +258,10 @@ mod tests {
             .insert_header((header::ACCEPT, "text/html,application/json;q=0.9"))
             .to_http_request();
         let rule = with_login_page("/admin", "/login");
-        assert_eq!(login_page_redirect_target(&req, &rule, &config(None)), Some("/login"));
+        assert_eq!(
+            login_page_redirect_target(&req, &rule, &config(None)),
+            Some("/login")
+        );
     }
 
     // ── loop guard ───────────────────────────────────────────
@@ -260,7 +287,12 @@ mod tests {
         let resp = login_page_redirect("/login", false);
         assert_eq!(resp.status(), StatusCode::FOUND);
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/login");
-        let cache = resp.headers().get(header::CACHE_CONTROL).unwrap().to_str().unwrap();
+        let cache = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(cache.contains("no-store"));
         assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
@@ -269,7 +301,12 @@ mod tests {
     fn an_invalid_session_is_cleared_on_the_way() {
         let resp = login_page_redirect("/login", true);
         assert_eq!(resp.status(), StatusCode::FOUND);
-        let cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(cookie.starts_with("session_token=;"));
         assert!(cookie.contains("Max-Age=0"));
         assert!(cookie.contains("Secure") && cookie.contains("HttpOnly"));
@@ -301,7 +338,10 @@ mod tests {
 
         assert!(is_login_page("/login", Some(&rule), &cfg));
         assert!(is_login_page("/login/", Some(&rule), &cfg));
-        assert!(!is_login_page("/", Some(&rule), &cfg), "the public home page is not the login page");
+        assert!(
+            !is_login_page("/", Some(&rule), &cfg),
+            "the public home page is not the login page"
+        );
         assert!(!is_login_page("/admin", Some(&rule), &cfg));
         assert!(!is_login_page("/login-help", Some(&rule), &cfg));
     }

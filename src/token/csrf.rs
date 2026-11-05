@@ -1,8 +1,8 @@
-use actix_web::HttpRequest;
-use actix_web::HttpResponseBuilder;
-use actix_web::http::{
+use crate::hyper_web::HttpRequest;
+use crate::hyper_web::HttpResponseBuilder;
+use crate::hyper_web::http::{
     StatusCode,
-    header::{CONTENT_TYPE as CONTENT_TYPE_ACTIX, HeaderValue as HeaderValue_ACTIX},
+    header::{CONTENT_TYPE as CONTENT_TYPE_H, HeaderValue as HeaderValueH},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use blake3;
@@ -184,7 +184,7 @@ pub static CSRF_STORE: Lazy<CsrfNonceStore> = Lazy::new(|| {
 });
 
 pub fn validate_csrf_token(
-    method: &actix_web::http::Method,
+    method: &crate::hyper_web::http::Method,
     req: &HttpRequest,
     body: &Bytes,
     secret: &str,
@@ -196,9 +196,9 @@ pub fn validate_csrf_token(
 
     if matches!(
         method,
-        &actix_web::http::Method::GET
-            | &actix_web::http::Method::HEAD
-            | &actix_web::http::Method::OPTIONS
+        &crate::hyper_web::http::Method::GET
+            | &crate::hyper_web::http::Method::HEAD
+            | &crate::hyper_web::http::Method::OPTIONS
     ) {
         return true;
     }
@@ -215,7 +215,7 @@ pub fn validate_csrf_token(
         }
     }
 
-    // Utiliser &str pour accéder aux headers actix — évite le conflit http 0.2 vs 1.x
+    // Accès aux headers par &str (historique : évitait le conflit http 0.2 vs 1.x du temps d.actix)
     let content_type = req
         .headers()
         .get("content-type")
@@ -431,20 +431,20 @@ pub fn is_static_asset(path: &str) -> bool {
 pub fn fix_mime_actix(req_path: &str, resp: &mut HttpResponseBuilder, _status: StatusCode) {
     if req_path.ends_with(".css") {
         resp.insert_header((
-            CONTENT_TYPE_ACTIX,
-            HeaderValue_ACTIX::from_static("text/css; charset=utf-8"),
+            CONTENT_TYPE_H,
+            HeaderValueH::from_static("text/css; charset=utf-8"),
         ));
     }
     if req_path.ends_with(".js") {
         resp.insert_header((
-            CONTENT_TYPE_ACTIX,
-            HeaderValue_ACTIX::from_static("text/javascript; charset=utf-8"),
+            CONTENT_TYPE_H,
+            HeaderValueH::from_static("text/javascript; charset=utf-8"),
         ));
     }
     if req_path.ends_with(".html") {
         resp.insert_header((
-            CONTENT_TYPE_ACTIX,
-            HeaderValue_ACTIX::from_static("text/html; charset=utf-8"),
+            CONTENT_TYPE_H,
+            HeaderValueH::from_static("text/html; charset=utf-8"),
         ));
     }
 }

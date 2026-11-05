@@ -1,21 +1,21 @@
 use crate::AppConfig;
 use crate::AppState;
 use crate::config::config::{AuthRequest, RouteRule, User};
-use crate::network::error::render_error_page;
-use crate::network::proxy::client_ip;
-use crate::token::csrf::verify_csrf_token;
-use crate::token::security::{issue_token, validate_token};
-use actix_web::cookie::{Cookie, SameSite};
-use actix_web::{
-    Error as ActixError, FromRequest, HttpRequest, HttpResponse, Responder,
+use crate::hyper_web::cookie::{Cookie, SameSite};
+use crate::hyper_web::{
+    Error as WebError, FromRequest, HttpRequest, HttpResponse, Responder,
     dev::Payload,
     error::ErrorBadRequest,
     http::{StatusCode, header},
     web::{self, Form, Json},
 };
+use crate::network::error::render_error_page;
+use crate::network::proxy::client_ip;
+use crate::token::csrf::verify_csrf_token;
+use crate::token::security::{issue_token, validate_token};
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use blake3;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -38,7 +38,7 @@ pub enum EitherAuth {
 }
 
 impl FromRequest for EitherAuth {
-    type Error = ActixError;
+    type Error = WebError;
     type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
 
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
@@ -67,9 +67,9 @@ pub fn validate_csrf(req: &HttpRequest, payload: &EitherAuth, secret: &str) -> b
     let m = req.method();
     if matches!(
         m,
-        &actix_web::http::Method::GET
-            | &actix_web::http::Method::HEAD
-            | &actix_web::http::Method::OPTIONS
+        &crate::hyper_web::http::Method::GET
+            | &crate::hyper_web::http::Method::HEAD
+            | &crate::hyper_web::http::Method::OPTIONS
     ) {
         return true;
     }
@@ -123,7 +123,6 @@ pub fn verify_password(input: &str, stored_hash: &str) -> bool {
 pub fn dummy_password_hash() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
-
         Argon2::default()
             .hash_password(b"proxyauth-constant-time-placeholder")
             .map(|h| h.to_string())
@@ -353,16 +352,17 @@ pub fn establish_session(
         .signed_duration_since(Utc::now())
         .num_seconds()
         .max(0) as u64;
-    let max_age =
-        actix_web::cookie::time::Duration::seconds(seconds.min(session_max_age as u64) as i64);
+    let max_age = crate::hyper_web::cookie::time::Duration::seconds(
+        seconds.min(session_max_age as u64) as i64,
+    );
 
-    let cookie = Cookie::build("session_token", token_encrypt.clone())
+    let cookie = Cookie::build(("session_token", token_encrypt.clone()))
         .path("/")
         .max_age(max_age)
         .http_only(true)
         .secure(true)
         .same_site(SameSite::Strict)
-        .finish();
+        .build();
 
     (token_encrypt, cookie.to_string())
 }
@@ -938,23 +938,23 @@ pub async fn auth(
                 OffsetDateTime::from_unix_timestamp(cookie_expiry.timestamp()).unwrap();
 
             if req.cookie("session_token").is_some() {
-                let expired_cookie = Cookie::build("session_token", "")
+                let expired_cookie = Cookie::build(("session_token", ""))
                     .path("/")
                     .secure(true)
                     .http_only(true)
                     .same_site(SameSite::Strict)
                     .expires(OffsetDateTime::UNIX_EPOCH)
-                    .finish();
+                    .build();
                 resp.cookie(expired_cookie);
             }
 
-            let new_cookie = Cookie::build("session_token", token_encrypt.clone())
+            let new_cookie = Cookie::build(("session_token", token_encrypt.clone()))
                 .path("/")
                 .secure(true)
                 .http_only(true)
                 .same_site(SameSite::Strict)
                 .expires(cookie_expiry_time)
-                .finish();
+                .build();
 
             // check cors
             if let Some(origin_header) = req.headers().get(header::ORIGIN) {
@@ -1020,7 +1020,10 @@ pub async fn auth(
                         }));
                 }
                 Err(e) => {
-                    error!("[{}] failed to issue refresh token for {}: {}", ip, auth.username, e);
+                    error!(
+                        "[{}] failed to issue refresh token for {}: {}",
+                        ip, auth.username, e
+                    );
                     return HttpResponse::InternalServerError().finish();
                 }
             }
@@ -1093,7 +1096,7 @@ pub async fn auth_dispatch(
     req: HttpRequest,
     body: web::Bytes,
     data: web::Data<AppState>,
-) -> Result<HttpResponse, ActixError> {
+) -> Result<HttpResponse, WebError> {
     let vhost_route = crate::network::proxy::find_vhost_route(
         crate::network::proxy::request_host(&req).as_deref(),
         &data.routes.routes,

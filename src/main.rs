@@ -18,6 +18,8 @@ mod build;
 mod cli;
 mod config;
 mod databases;
+#[allow(dead_code, unused_imports)]
+mod hyper_web;
 mod keystore;
 mod logs;
 mod network;
@@ -25,7 +27,6 @@ mod proto;
 mod reset;
 mod revoke;
 mod smtp;
-mod start_actix;
 mod stats;
 mod tls;
 mod token;
@@ -35,6 +36,7 @@ use crate::adm::revoke::revoke_route;
 use crate::adm::stats::{get_proxy_sessions, get_proxy_stats};
 use crate::build::build_info::update_build_info;
 use crate::cli::prompt::prompt;
+use crate::hyper_web::{App, http::Method, web};
 use crate::keystore::import::decrypt_keystore;
 use crate::network::accesslog::{self, AccessLogger};
 use crate::network::compression::Compress;
@@ -45,8 +47,6 @@ use crate::network::stats::{RequestStats, spawn_stats_ticker};
 use crate::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use crate::smtp::smtp::SmtpClient;
 use crate::smtp::template::ensure_reset_template_exists;
-use actix_governor::{Governor, GovernorConfigBuilder};
-use actix_web::{App, http::Method, web};
 use chrono::Local;
 use config::config::{AppConfig, AppState, RouteConfig, load_config};
 use config::def_config;
@@ -54,17 +54,17 @@ use dashmap::DashMap;
 use futures_util::future::join_all;
 use logs::{ChannelLogWriter, get_logs, log_collector};
 use network::proxy::global_proxy;
-use network::ratelimit::{RateLimitLogger, UserToken};
+use network::ratelimit::{RateLimiters, VhostRateLimit};
+use network::vhost_listen::{ListenPlan, VhostListenGuard};
 use socket2::{Domain, Protocol, Socket, Type};
-use start_actix::mode_actix_web;
 pub use stats::tokencount::CounterToken;
 use std::net::TcpListener;
 use std::{fs, process, sync::Arc, time::Duration};
 use tls::bind_server;
 use token::auth::{auth_dispatch, auth_options};
+use token::logout::{logout_dispatch, logout_options};
 use token::refresh_token::refresh_token_dispatch;
 use token::registry::registry_route;
-use token::logout::{logout_dispatch, logout_options};
 use token::reset_password::reset_password_route;
 use token::vault as token_vault;
 use tokio::sync::mpsc::unbounded_channel;
@@ -90,13 +90,35 @@ impl FormatTime for LocalTime {
     }
 }
 
-fn print_launcher(mode: &str, version: &str, worker: u8, addr: &str, id: &str) {
-    let msg = match mode {
-        "NO_RATELIMIT_AUTH" => "ratelimit On (Proxy)",
-        "NO_RATELIMIT_PROXY" => "ratelimit On (Auth)",
-        "RATELIMIT_GLOBAL_ON" => "ratelimit On (Proxy, Auth)",
-        "RATELIMIT_GLOBAL_OFF" => "ratelimit Off",
-        _ => "ratelimit Off (No config)",
+/// `mi_option_purge_delay` (même position dans mimalloc v2 et v3).
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// Applique `purge_delay` (config.json, en secondes) à l'allocateur.
+///
+/// mimalloc garde la mémoire libérée un moment avant de la rendre au
+/// système, pour la réutiliser sans appel système (1 s par défaut, et
+/// davantage pour ses arènes). Sous une charge qui varie, la RSS reste
+/// donc plus haute que la mémoire réellement utilisée. `0` la rend
+/// aussitôt : mesuré à environ −20 % de RSS avec 2 000 connexions
+/// HTTP/2 ouvertes, pour un léger surcoût d'appels système.
+fn apply_purge_delay(seconds: Option<f64>) {
+    let Some(secs) = seconds else { return };
+    if !secs.is_finite() || secs < 0.0 {
+        eprintln!("warning: config.json: purge_delay must be a number of seconds >= 0 (ignored)");
+        return;
+    }
+    let ms = (secs * 1000.0).round().min(i32::MAX as f64) as std::os::raw::c_long;
+    // SAFETY: réglage d'une option de mimalloc, sans pointeur ; mimalloc
+    // le prend en compte aux prochaines purges.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, ms) };
+    info!("allocator purge delay set to {ms} ms");
+}
+
+fn print_launcher(ratelimits: &[String], version: &str, worker: u8, addr: &str, id: &str) {
+    let msg = if ratelimits.is_empty() {
+        "ratelimit Off (no `ratelimit:` block in routes.yml)".to_string()
+    } else {
+        ratelimits.join("\n")
     };
 
     println!(
@@ -138,8 +160,18 @@ async fn create_listener(
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
-    socket.set_send_buffer_size(send_buf_size)?;
-    socket.set_recv_buffer_size(recv_buf_size)?;
+    // Hérité par les connexions acceptées sous Linux.
+    socket.set_nodelay(true)?;
+    // 0 = laisser le noyau dimensionner les tampons. Fixer SO_SNDBUF /
+    // SO_RCVBUF désactive l'auto-dimensionnement TCP (tcp_moderate_rcvbuf)
+    // pour toutes les connexions acceptées : avec 64 Kio, une connexion
+    // vers un client à 50 ms plafonnait vers 1 Mo/s, quel que soit le lien.
+    if send_buf_size > 0 {
+        socket.set_send_buffer_size(send_buf_size)?;
+    }
+    if recv_buf_size > 0 {
+        socket.set_recv_buffer_size(recv_buf_size)?;
+    }
     socket.bind(&sock_addr.into())?;
     socket.listen(backlog)?;
 
@@ -156,13 +188,15 @@ async fn create_listener(
 /// a renewal without *something* answering there. Everything else
 /// gets redirected to HTTPS, matching what operators generally expect
 /// from port 80 anyway on an otherwise HTTPS-only site.
-async fn acme_http01_responder(req: actix_web::HttpRequest) -> actix_web::HttpResponse {
-    if req.method() == actix_web::http::Method::GET {
+async fn acme_http01_responder(
+    req: crate::hyper_web::HttpRequest,
+) -> crate::hyper_web::HttpResponse {
+    if req.method() == crate::hyper_web::http::Method::GET {
         if let Some(token) = crate::acme::challenge::extract_token(req.path()) {
             let host = req.connection_info().host().to_string();
             let vhost = crate::network::proxy::normalize_host(&host);
             return match crate::acme::challenge::lookup(&vhost, token) {
-                Some(key_authorization) => actix_web::HttpResponse::Ok()
+                Some(key_authorization) => crate::hyper_web::HttpResponse::Ok()
                     .append_header(("server", "ProxyAuth"))
                     .content_type("application/octet-stream")
                     .body(key_authorization),
@@ -176,7 +210,7 @@ async fn acme_http01_responder(req: actix_web::HttpRequest) -> actix_web::HttpRe
                 // comment is here specifically to prevent
                 // reintroducing: it once turned a should-be-404 into a
                 // confusing 403 from an `allow_ips`-restricted route.
-                None => actix_web::HttpResponse::NotFound()
+                None => crate::hyper_web::HttpResponse::NotFound()
                     .append_header(("server", "ProxyAuth"))
                     .finish(),
             };
@@ -185,7 +219,7 @@ async fn acme_http01_responder(req: actix_web::HttpRequest) -> actix_web::HttpRe
 
     let host = crate::network::proxy::normalize_host(&req.connection_info().host().to_string());
     let location = format!("https://{host}{}", req.uri());
-    actix_web::HttpResponse::MovedPermanently()
+    crate::hyper_web::HttpResponse::MovedPermanently()
         .append_header(("server", "ProxyAuth"))
         .append_header(("Location", location))
         .finish()
@@ -193,9 +227,9 @@ async fn acme_http01_responder(req: actix_web::HttpRequest) -> actix_web::HttpRe
 
 /// Spawns a minimal, plain-HTTP-only server bound to port 80, whose
 /// only job is `acme_http01_responder` above — entirely separate from
-/// the main server(s) (which may be TLS-only on 443), since actix
-/// doesn't support mixing TLS and plain-HTTP listeners within one
-/// `HttpServer` instance. Only spawned when at least one route has
+/// the main server(s) (which may be TLS-only on 443): it gets its own
+/// small `HttpServer` with a single route rather than the whole
+/// application. Only spawned when at least one route has
 /// `certbot_renew: true` and the main server runs with `tls: true` — a
 /// plain-HTTP main server already answers ACME challenges itself
 /// (see the same check wired into `global_proxy`), so a second
@@ -219,7 +253,7 @@ async fn spawn_acme_http01_listener(
 
     for host in config.bind_addresses() {
         let addr = socket_addr_string(&host, 80);
-        let listener = match create_listener(&addr, 4096, 4096, 128).await {
+        let listener = match create_listener(&addr, 0, 0, 128).await {
             Ok(l) => l,
             Err(e) => {
                 error!(
@@ -231,9 +265,10 @@ async fn spawn_acme_http01_listener(
 
         info!("ACME: HTTP-01 challenge listener bound on {addr}");
 
-        let server = match actix_web::HttpServer::new(|| {
+        let server = match crate::hyper_web::HttpServer::new(|| {
             App::new().default_service(web::to(acme_http01_responder))
         })
+        .shutdown_timeout(config.shutdown_timeout_duration())
         .listen(listener)
         {
             Ok(s) => s.run(),
@@ -255,7 +290,7 @@ async fn spawn_acme_http01_listener(
 
 async fn wait_for_port(addr: &str, max_retries: u32, delay: Duration) {
     for attempt in 1..=max_retries {
-        match create_listener(addr, 4096, 4096, 1).await {
+        match create_listener(addr, 0, 0, 1).await {
             Ok(_) => {
                 return;
             }
@@ -280,43 +315,43 @@ async fn wait_for_port(addr: &str, max_retries: u32, delay: Duration) {
 }
 
 macro_rules! build_app {
-    ($state:expr) => {{
+    ($state:expr, $limiters:expr) => {{
         let state = $state.clone();
         App::new()
             .app_data(state.clone())
             .app_data(web::PayloadConfig::new(state.config.max_body_size))
-            .wrap(RateLimitLogger)
+            // Ordre voulu : le dernier `wrap` enregistré est le plus
+            // extérieur. De l'intérieur vers l'extérieur :
+            // * VhostRateLimit — limite de débit du vhost/de la route
+            //   (`ratelimit:` dans routes.yml), avant tout handler, y
+            //   compris /auth ;
+            // * VhostListenGuard — le vhost est-il servi sur ce port et
+            //   dans ce protocole ? (421 / 505 sinon) ;
+            // * CORS, puis Compress ;
+            // * AccessLogger, le plus extérieur, pour journaliser le statut
+            //   final de *toute* requête, 421/429/505 compris, avec la
+            //   taille réellement envoyée (compressée).
+            .wrap(VhostRateLimit {
+                state: state.clone(),
+                limiters: $limiters.clone(),
+            })
+            .wrap(VhostListenGuard {
+                state: state.clone(),
+            })
+            // En-têtes de sécurité automatiques (`discovery-csp`), sur les
+            // réponses HTTPS — y compris 421/429/505 produits plus bas.
+            .wrap(network::security_headers::SecurityHeaders {
+                state: state.clone(),
+            })
             .wrap(CorsMiddleware {
                 config: state.clone(),
             })
-            // Ordering is deliberate. Actix runs `wrap`s in reverse
-            // registration order, so the last one registered is the
-            // outermost. AccessLogger must be outermost to observe the
-            // final status of *every* request — including 429s
-            // synthesized by actix-governor, responses produced by the
-            // CORS middleware, and errors converted by actix itself,
-            // none of which ever reach a handler. Compress sits just
-            // inside it, which means `[length]` logs the number of
-            // bytes actually put on the wire (compressed), matching
-            // nginx's `$body_bytes_sent` rather than the pre-encoding
-            // size.
             .wrap(Compress {
                 state: state.clone(),
             })
             .wrap(AccessLogger {
                 state: state.clone(),
             })
-            // `/auth`, `/reset-password`, `/auth/registry` et `/adm/auth/totp/get` ne sont
-            // PAS enregistres ici: ce sont les trois seules ressources que
-            // les branches de `mode_actix` enveloppent d'un rate limiter,
-            // et actix retient la premiere route declaree pour un chemin
-            // donne. Les declarer ici aussi faisait gagner la version sans
-            // limiteur, et celle des branches n'etait jamais atteinte —
-            // `/auth` acceptait donc autant de tentatives de mot de passe
-            // qu'on lui en envoyait, quelle que soit la configuration.
-            //
-            // Chaque branche les declare desormais exactement une fois,
-            // via `auth_routes!` pour la version non limitee.
             .service(web::resource("/adm/stats").route(web::get().to(get_proxy_stats)))
             .service(web::resource("/adm/stats/sessions").route(web::get().to(get_proxy_sessions)))
             .service(web::resource("/adm/logs").route(web::get().to(get_logs)))
@@ -327,31 +362,24 @@ macro_rules! build_app {
                     .route(web::get().to(logout_dispatch))
                     .route(web::method(Method::OPTIONS).to(logout_options)),
             )
-    }};
-}
-
-/// Les trois ressources sensibles, sans rate limiter — pour les modes ou
-/// `ratelimit_auth` est desactive. Les modes qui l'activent les declarent
-/// eux-memes avec `.wrap(Governor::new(...))` sur chaque route.
-macro_rules! auth_routes {
-    ($app:expr) => {{
-        $app.service(
-            web::resource("/auth")
-                .route(web::post().to(auth_dispatch))
-                .route(web::method(Method::OPTIONS).to(auth_options)),
-        )
-        .service(web::resource("/refresh_token").route(web::post().to(refresh_token_dispatch)))
-        .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
-        .service(
-            web::resource("/auth/registry")
-                .route(web::post().to(registry_route))
-                .route(web::method(Method::OPTIONS).to(auth_options)),
-        )
-        .service(
-            web::resource("/adm/auth/totp/get")
-                .route(web::post().to(get_otpauth_uri))
-                .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
-        )
+            .service(
+                web::resource("/auth")
+                    .route(web::post().to(auth_dispatch))
+                    .route(web::method(Method::OPTIONS).to(auth_options)),
+            )
+            .service(web::resource("/refresh_token").route(web::post().to(refresh_token_dispatch)))
+            .service(web::resource("/reset-password").route(web::post().to(reset_password_route)))
+            .service(
+                web::resource("/auth/registry")
+                    .route(web::post().to(registry_route))
+                    .route(web::method(Method::OPTIONS).to(auth_options)),
+            )
+            .service(
+                web::resource("/adm/auth/totp/get")
+                    .route(web::post().to(get_otpauth_uri))
+                    .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
+            )
+            .default_service(web::to(global_proxy))
     }};
 }
 
@@ -405,6 +433,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .expect("Could not create default config/routes.yml");
 
     let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+
+    apply_purge_delay(config.purge_delay);
+
+    // Limite de fichiers ouverts : 1024 par défaut sous Linux, soit un
+    // plafond d'environ 1000 connexions simultanées. Relevée ici, tant
+    // que le processus est encore root (la limite survit à l'abandon
+    // des droits) — voir network::fdlimit.
+    match network::fdlimit::raise() {
+        Ok(l) => {
+            if l.after < network::fdlimit::COMFORTABLE {
+                eprintln!(
+                    "warning: open-files limit is only {} (was {}): ProxyAuth can hold about {} simultaneous connections before new ones stall. Raise LimitNOFILE in the service unit (or `ulimit -n`)",
+                    l.after,
+                    l.before,
+                    network::fdlimit::max_connections_for(l.after)
+                );
+            } else if l.after != l.before {
+                info!("open-files limit raised from {} to {}", l.before, l.after);
+            }
+        }
+        Err(e) => eprintln!("warning: could not read/raise the open-files limit: {e}"),
+    }
+
+    // Le noyau plafonne silencieusement la file d'attente de `listen()`
+    // à `net.core.somaxconn`.
+    if let Some(somaxconn) = fs::read_to_string("/proc/sys/net/core/somaxconn")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        if somaxconn < config.socket_listen {
+            eprintln!(
+                "warning: socket_listen is {} but net.core.somaxconn is {somaxconn}: the kernel caps the accept queue at {somaxconn}; raise it with `sysctl -w net.core.somaxconn={}`",
+                config.socket_listen, config.socket_listen
+            );
+        }
+    }
 
     // Keys nothing reads are ignored by the parser; say so, instead of
     // letting a misspelt setting silently do nothing.
@@ -629,9 +693,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    crate::revoke::db::set_token_lifetime(
-        crate::config::config::max_token_lifetime(&config, &routes.routes) as i64,
-    );
+    crate::revoke::db::set_token_lifetime(crate::config::config::max_token_lifetime(
+        &config,
+        &routes.routes,
+    ) as i64);
     start_revoked_token_ttl(
         revoked_tokens.clone(),
         std::time::Duration::from_secs(15),
@@ -641,6 +706,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_routes(&mut routes.routes);
     let routes = Arc::new(routes);
+
+    // Pools de connexions vers les backends : un par worker, d'où le
+    // partage de `max_idle_per_host` entre tous les workers.
+    network::shared_client::set_worker_threads(
+        config.worker as usize * config.num_instances.max(1) as usize,
+    );
+
+    {
+        use network::security_headers::DiscoveryCsp;
+        let global = config.discovery_csp.unwrap_or_default();
+        let overrides = routes
+            .routes
+            .iter()
+            .filter(|r| r.discovery_csp.is_some_and(|m| m != global))
+            .count();
+        if global == DiscoveryCsp::Auto || overrides > 0 {
+            info!(
+                "discovery-csp: {} on HTTPS responses{}",
+                if global == DiscoveryCsp::Auto {
+                    "baseline security headers"
+                } else {
+                    "off by default"
+                },
+                if overrides > 0 {
+                    format!(" ({overrides} route(s) override it)")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        if global == DiscoveryCsp::Auto && !config.tls {
+            eprintln!(
+                "warning: config.json: \"discovery-csp\": \"auto\" only applies to HTTPS responses, and \"tls\" is false: no header will be added"
+            );
+        }
+    }
+
+    // Caches internes (désactivés par défaut) : globaux et par vhost.
+    network::fs_cache::init(&config.internal_cache, &routes.routes);
+    network::compression::init_compressed_caches(&config.internal_cache, &routes.routes);
 
     // Pushes the in-memory config/routes state to every configured
     // `blakegate` endpoint over WebSocket, near real-time — entirely
@@ -783,8 +888,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let env_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("proxyauth=trace"))
-            .add_directive("actix_web=warn".parse().unwrap())
-            .add_directive("actix_server=warn".parse().unwrap());
+            .add_directive("hyper=warn".parse().unwrap())
+            .add_directive("hyper_util=warn".parse().unwrap());
 
         let base_registry = Registry::default().with(env_filter);
 
@@ -915,295 +1020,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => warn!("Failed to decrypt keystore: {:?}", err),
     }
 
-    // configuration proxy ratelimit
-    let requests_per_second_proxy_config = config
-        .ratelimit_proxy
-        .get("requests_per_second")
-        .copied()
-        .unwrap_or(0);
+    // Ancien emplacement du rate limit : il vit désormais dans routes.yml,
+    // par vhost. Le signaler plutôt que de l'ignorer en silence.
+    if let Ok(raw) = fs::read_to_string("/etc/proxyauth/config/config.json") {
+        if raw.contains("\"ratelimit_auth\"") || raw.contains("\"ratelimit_proxy\"") {
+            eprintln!(
+                "warning: config.json: `ratelimit_auth`/`ratelimit_proxy` are no longer read — rate limiting is now configured per vhost with a `ratelimit:` block in routes.yml (see network/ratelimit.rs); remove them from config.json"
+            );
+        }
+    }
 
-    let burst_proxy_config = config
-        .ratelimit_proxy
-        .get("burst")
-        .copied()
-        .unwrap_or(0)
-        .try_into()
-        .expect("bad burst_proxy value");
+    // Limiteurs de débit, construits une seule fois et partagés par toutes
+    // les instances et tous leurs workers : un seul compteur par vhost,
+    // quel que soit `num_instances`.
+    let limiters = match RateLimiters::from_routes(&routes.routes) {
+        Ok(l) => Arc::new(l),
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+    limiters.spawn_purge(Duration::from_secs(60));
+    let ratelimit_summary = RateLimiters::describe(&routes.routes);
 
-    // configuration auth ratelimit
-    let requests_per_second_auth_config = config
-        .ratelimit_auth
-        .get("requests_per_second")
-        .copied()
-        .unwrap_or(0);
-
-    let burst_auth_config = config
-        .ratelimit_auth
-        .get("burst")
-        .copied()
-        .unwrap_or(0)
-        .try_into()
-        .expect("bad burst_auth value");
-
-    let mode_actix = mode_actix_web(
-        &requests_per_second_auth_config,
-        &requests_per_second_proxy_config,
-    );
-
-    // One or more bind addresses (e.g. IPv4 + IPv6 together via
-    // `host: [...]` in config.json) — see AppConfig::bind_addresses.
+    // Ports à ouvrir : celui de config.json + le `port` de chaque vhost,
+    // sur chacune des adresses `host` de config.json.
+    let plan = ListenPlan::build(&routes.routes, config.port);
     let bind_addrs = config.bind_addresses();
-    let addrs: Vec<String> = bind_addrs
+    let addrs: Vec<(String, u16)> = plan
+        .ports
         .iter()
-        .map(|h| socket_addr_string(h, config.port))
+        .flat_map(|&port| {
+            bind_addrs
+                .iter()
+                .map(move |h| (socket_addr_string(h, port), port))
+        })
         .collect();
 
-    for a in &addrs {
+    for (a, _) in &addrs {
         wait_for_port(a, 5, Duration::from_secs(2)).await;
     }
 
     let num_instances = config.num_instances;
-
-    // Les compteurs de rate limiting sont construits ici, une seule
-    // fois, et partages par toutes les instances ci-dessous.
-    //
-    // `num_instances` ne cree PAS de processus : ce sont N serveurs
-    // actix dans le meme espace d'adressage, chacun avec sa propre
-    // boucle d'accept via SO_REUSEPORT (voir le join_all en fin de
-    // fonction). Construire le GovernorConfig a l'interieur de la
-    // boucle donnait donc a chaque instance son propre seau, et le
-    // burst reellement applique valait `burst * num_instances` — avec
-    // le defaut de 2, exactement le double de ce que config.json
-    // annonce, ce qu'un test de charge mesurait comme "rate limit non
-    // applique".
-    //
-    // Passe par un Arc plutot qu'un clone: `Governor::new` prend une
-    // reference, et l'Arc garantit que les N fermetures partagent le
-    // meme etat sans dependre de l'implementation de Clone sur
-    // GovernorConfig.
-    //
-    // `requests_per_second: 0` desactive le limiteur concerne, et
-    // `None` est la facon de le representer ici: aucun compteur n'est
-    // construit, et le bras de `mode_actix` correspondant n'enveloppe
-    // rien. Une valeur de repli (0 ramene a 1) transformerait
-    // "desactive" en "la limite la plus stricte possible", ce qui est
-    // l'inverse de ce que la configuration demande.
-    //
-    // Un `burst` de 0 alors que le limiteur est actif est un cas
-    // different: `GovernorConfigBuilder::finish()` renvoie None pour un
-    // burst nul, donc la valeur est ramenee a 1 — la plus stricte
-    // representable — et signalee, plutot que de paniquer au demarrage.
-    fn build_governor_period(requests_per_second: u64) -> Duration {
-        Duration::from_secs_f64(1.0 / requests_per_second as f64)
-    }
-
-    fn usable_burst(burst: u32, which: &str) -> u32 {
-        if burst == 0 {
-            warn!(
-                "ratelimit_{which}: `burst` is 0 while `requests_per_second` is not — a burst of 0 is not representable, using 1. Set `requests_per_second` to 0 to disable this rate limit entirely."
-            );
-            1
-        } else {
-            burst
-        }
-    }
-
-    let governor_auth_conf = (requests_per_second_auth_config > 0).then(|| {
-        std::sync::Arc::new(
-            GovernorConfigBuilder::default()
-                .burst_size(usable_burst(burst_auth_config, "auth"))
-                .use_headers()
-                .period(build_governor_period(requests_per_second_auth_config))
-                .finish()
-                .unwrap(),
-        )
-    });
-
-    let governor_proxy_conf = (requests_per_second_proxy_config > 0).then(|| {
-        std::sync::Arc::new(
-            GovernorConfigBuilder::default()
-                .burst_size(usable_burst(burst_proxy_config, "proxy"))
-                .key_extractor(UserToken)
-                .period(build_governor_period(requests_per_second_proxy_config))
-                .finish()
-                .unwrap(),
-        )
-    });
-
     let mut server_futures = Vec::new();
 
-    print_launcher(mode_actix, VERSION, config.worker, &addrs.join(", "), ID);
+    print_launcher(
+        &ratelimit_summary,
+        VERSION,
+        config.worker,
+        &addrs
+            .iter()
+            .map(|(a, _)| a.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        ID,
+    );
 
     for _instance_id in 0..num_instances {
         let mut listener = Vec::with_capacity(addrs.len());
-        for a in &addrs {
-            listener.push(
-                create_listener(
-                    a,
-                    64 * 1024,
-                    64 * 1024,
-                    config.socket_listen.try_into().unwrap(),
-                )
-                .await?,
-            );
+        for (a, port) in &addrs {
+            listener.push((
+                create_listener(a, 0, 0, config.socket_listen.try_into().unwrap()).await?,
+                *port,
+            ));
         }
 
         let state_cloned = state.clone();
-
-        let server = match mode_actix.as_ref() {
-            "NO_RATELIMIT_AUTH" => {
-                // Clone d'Arc : meme compteur, pas un second seau.
-                let governor_proxy_conf = governor_proxy_conf
-                    .clone()
-                    .expect("NO_RATELIMIT_AUTH implies ratelimit_proxy is enabled");
-
-                bind_server(
-                    move || {
-                        auth_routes!(build_app!(state_cloned)).default_service(
-                            web::to(global_proxy).wrap(Governor::new(&governor_proxy_conf)),
-                        )
-                    },
-                    listener,
-                    &config,
-                    &routes.routes,
-                )?
-            }
-
-            "NO_RATELIMIT_PROXY" => {
-                let governor_auth_conf = governor_auth_conf
-                    .clone()
-                    .expect("NO_RATELIMIT_PROXY implies ratelimit_auth is enabled");
-
-                bind_server(
-                    move || {
-                        build_app!(state_cloned)
-                            .service(
-                                web::resource("/auth")
-                                    .route(
-                                        web::post()
-                                            .to(auth_dispatch)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(auth_options)),
-                            )
-                            .service(
-                                web::resource("/refresh_token").route(
-                                    web::post()
-                                        .to(refresh_token_dispatch)
-                                        .wrap(Governor::new(&governor_auth_conf)),
-                                ),
-                            )
-                            .service(
-                                web::resource("/reset-password").route(
-                                    web::post()
-                                        .to(reset_password_route)
-                                        .wrap(Governor::new(&governor_auth_conf)),
-                                ),
-                            )
-                            .service(
-                                web::resource("/auth/registry")
-                                    .route(
-                                        web::post()
-                                            .to(registry_route)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(auth_options)),
-                            )
-                            .service(
-                                web::resource("/adm/auth/totp/get")
-                                    .route(
-                                        web::post()
-                                            .to(get_otpauth_uri)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
-                            )
-                            .default_service(web::to(global_proxy))
-                    },
-                    listener,
-                    &config,
-                    &routes.routes,
-                )?
-            }
-
-            // RATELIMIT_GLOBAL_OFF ne figure volontairement plus ici:
-            // les deux limites sont a 0, donc rien ne doit etre
-            // enveloppe. Ce mode tombe sur le bras `_` plus bas, qui
-            // construit l'application sans aucun governor.
-            "RATELIMIT_GLOBAL_ON" => {
-                // `expect`: ce mode signifie exactement "les deux
-                // limites sont actives", donc les deux Option sont Some
-                // par construction (voir mode_actix_web).
-                let governor_auth_conf = governor_auth_conf
-                    .clone()
-                    .expect("RATELIMIT_GLOBAL_ON implies ratelimit_auth is enabled");
-                let governor_proxy_conf = governor_proxy_conf
-                    .clone()
-                    .expect("RATELIMIT_GLOBAL_ON implies ratelimit_proxy is enabled");
-
-                bind_server(
-                    move || {
-                        build_app!(state_cloned)
-                            .service(
-                                web::resource("/auth")
-                                    .route(
-                                        web::post()
-                                            .to(auth_dispatch)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(auth_options)),
-                            )
-                            .service(
-                                web::resource("/refresh_token").route(
-                                    web::post()
-                                        .to(refresh_token_dispatch)
-                                        .wrap(Governor::new(&governor_auth_conf)),
-                                ),
-                            )
-                            .service(
-                                web::resource("/reset-password").route(
-                                    web::post()
-                                        .to(reset_password_route)
-                                        .wrap(Governor::new(&governor_auth_conf)),
-                                ),
-                            )
-                            .service(
-                                web::resource("/auth/registry")
-                                    .route(
-                                        web::post()
-                                            .to(registry_route)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(auth_options)),
-                            )
-                            .service(
-                                web::resource("/adm/auth/totp/get")
-                                    .route(
-                                        web::post()
-                                            .to(get_otpauth_uri)
-                                            .wrap(Governor::new(&governor_auth_conf)),
-                                    )
-                                    .route(web::method(Method::OPTIONS).to(get_otpauth_uri_option)),
-                            )
-                            .default_service(
-                                web::to(global_proxy).wrap(Governor::new(&governor_proxy_conf)),
-                            )
-                    },
-                    listener,
-                    &config,
-                    &routes.routes,
-                )?
-            }
-
-            _ => bind_server(
-                move || {
-                    auth_routes!(build_app!(state_cloned)).default_service(web::to(global_proxy))
-                },
-                listener,
-                &config,
-                &routes.routes,
-            )?,
-        };
+        let limiters = limiters.clone();
+        let server = bind_server(
+            move || build_app!(state_cloned, limiters),
+            listener,
+            &plan,
+            &config,
+            &routes.routes,
+        )?;
 
         server_futures.push(tokio::spawn(async move {
             let result = server.await;
@@ -1250,7 +1140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Every server future above has resolved — actix's own graceful
+    // Every server future above has resolved — hyper_web's graceful
     // shutdown (built in, triggered by SIGTERM/SIGINT) already drained
     // in-flight requests by this point. One last flush so any
     // per-vhost/route log line written just before exit isn't left
@@ -1270,17 +1160,40 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn print_launcher_variants_do_not_panic() {
-        let modes = [
-            "NO_RATELIMIT_AUTH",
-            "NO_RATELIMIT_PROXY",
-            "RATELIMIT_GLOBAL_ON",
-            "RATELIMIT_GLOBAL_OFF",
-            "UNKNOWN_MODE",
-        ];
-        for m in modes {
-            print_launcher(m, "0.0.0-test", 4, "127.0.0.1:1234", ID);
+    fn purge_delay_reaches_mimalloc() {
+        let before = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
+        if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+            // Bonne option visée : le défaut documenté de mimalloc v3.
+            assert_eq!(before, 1000, "index 15 must be mimalloc's purge_delay");
         }
+        apply_purge_delay(Some(0.25));
+        assert_eq!(
+            unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) },
+            250
+        );
+        apply_purge_delay(Some(0.0));
+        assert_eq!(
+            unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) },
+            0
+        );
+        apply_purge_delay(Some(-1.0)); // refusé : valeur inchangée
+        assert_eq!(
+            unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) },
+            0
+        );
+        unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, before) };
+    }
+
+    #[test]
+    fn print_launcher_variants_do_not_panic() {
+        print_launcher(&[], "0.0.0-test", 4, "127.0.0.1:1234", ID);
+        print_launcher(
+            &["ratelimit app.example.com: 5/s burst 5".to_string()],
+            "0.0.0-test",
+            4,
+            "127.0.0.1:1234",
+            ID,
+        );
     }
 
     #[tokio::test]

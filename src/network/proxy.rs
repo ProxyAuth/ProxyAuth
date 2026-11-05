@@ -2,6 +2,10 @@ use crate::config::config::BackendConfig;
 use crate::config::config::BackendInput;
 use crate::config::config::CheckReturnType;
 use crate::config::config::RouteRule;
+use crate::hyper_web::{
+    Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
+    web,
+};
 use crate::network::accesslog::LogContext;
 use crate::network::canonical_url::canonicalize_path_for_match;
 use crate::network::loadbalancing::forward_failover;
@@ -11,10 +15,6 @@ use crate::network::shared_client::{
 use crate::token::csrf::{fix_mime_actix, inject_csrf_token, validate_csrf_token};
 use crate::token::security::apply_filters_regex_allow_only;
 use crate::{AppConfig, AppState};
-use actix_web::{
-    Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
-    web,
-};
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, Empty, Full};
 use hyper::body::{Bytes, Incoming};
@@ -28,7 +28,7 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::RwLock;
+use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tracing::warn;
 
@@ -38,9 +38,13 @@ use tracing::warn;
 /// la session était perdue dès qu'un autre cookie (consentement d'une régie,
 /// statistiques…) arrivait avant `session_token`. Les autres cookies ne sont
 /// ni lus ni modifiés ici.
-pub(crate) fn request_cookie<'a>(req: &'a actix_web::HttpRequest, name: &str) -> Option<&'a str> {
+pub(crate) fn request_cookie<'a>(
+    req: &'a crate::hyper_web::HttpRequest,
+    name: &str,
+) -> Option<&'a str> {
     req.headers()
-        .get_all(actix_web::http::header::COOKIE)
+        .get_all(crate::hyper_web::http::header::COOKIE)
+        .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|line| line.split(';'))
         .find_map(|cookie| {
@@ -51,10 +55,11 @@ pub(crate) fn request_cookie<'a>(req: &'a actix_web::HttpRequest, name: &str) ->
 
 /// Toutes les lignes `Cookie` réunies en une seule (`a=1; b=2`), telle qu'il
 /// faut la recopier sur une requête sortante en HTTP/1.1. None sans cookie.
-pub(crate) fn joined_cookie_header(req: &actix_web::HttpRequest) -> Option<String> {
+pub(crate) fn joined_cookie_header(req: &crate::hyper_web::HttpRequest) -> Option<String> {
     let parts: Vec<&str> = req
         .headers()
-        .get_all(actix_web::http::header::COOKIE)
+        .get_all(crate::hyper_web::http::header::COOKIE)
+        .iter()
         .filter_map(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -62,11 +67,19 @@ pub(crate) fn joined_cookie_header(req: &actix_web::HttpRequest) -> Option<Strin
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
-static ORDERED_ROUTE_IDX: Lazy<RwLock<Option<Vec<usize>>>> = Lazy::new(|| RwLock::new(None));
+/// Ordre de recherche des routes, calculé au chargement.
+///
+/// PERF : lu à chaque requête par tous les workers. Un `RwLock` fait,
+/// même en lecture seule, une opération atomique sur un compteur partagé
+/// : à des centaines de milliers de requêtes/s sur des dizaines de cœurs,
+/// cette ligne de cache fait la navette entre eux. `ArcSwapOption` se lit
+/// sans écriture partagée.
+static ORDERED_ROUTE_IDX: Lazy<arc_swap::ArcSwapOption<Vec<usize>>> =
+    Lazy::new(|| arc_swap::ArcSwapOption::from(None));
 
-fn to_actix_status(s: hyper::StatusCode) -> actix_web::http::StatusCode {
-    actix_web::http::StatusCode::from_u16(s.as_u16())
-        .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)
+fn to_actix_status(s: hyper::StatusCode) -> crate::hyper_web::http::StatusCode {
+    crate::hyper_web::http::StatusCode::from_u16(s.as_u16())
+        .unwrap_or(crate::hyper_web::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn norm_len(prefix: &str) -> usize {
@@ -202,7 +215,7 @@ fn ip_allowed(ip: Option<IpAddr>, rule: &RouteRule) -> bool {
 }
 
 pub fn init_routes_order(routes: &[RouteRule]) {
-    *ORDERED_ROUTE_IDX.write().unwrap() = Some(build_route_order(routes));
+    ORDERED_ROUTE_IDX.store(Some(Arc::new(build_route_order(routes))));
 }
 
 /// Validates every `log_file` in routes: must be a simple filename
@@ -328,11 +341,7 @@ fn build_regex_target(re: &Regex, template: &str, path: &str) -> String {
 /// the target-building code uses. `None` if `s` doesn't parse as a URI
 /// at all.
 fn authority_of(s: &str) -> Option<String> {
-    let normalized = if s.starts_with("http://") || s.starts_with("https://") {
-        s.to_string()
-    } else {
-        format!("http://{s}")
-    };
+    let normalized = crate::network::websocket::normalize_target_url(s.to_string());
     Uri::from_str(&normalized)
         .ok()
         .and_then(|u| u.authority().map(|a| a.to_string()))
@@ -439,7 +448,10 @@ pub fn normalize_host(host: &str) -> String {
 /// here always wins over anything the backend itself might have sent
 /// for the same header name (`insert_header` replaces rather than
 /// appending a duplicate).
-fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, rule: &RouteRule) {
+fn apply_custom_headers_builder(
+    builder: &mut crate::hyper_web::HttpResponseBuilder,
+    rule: &RouteRule,
+) {
     for (name, value) in &rule.headers {
         // Validated explicitly rather than handed straight to
         // `insert_header`: actix doesn't panic on a malformed
@@ -450,8 +462,8 @@ fn apply_custom_headers_builder(builder: &mut actix_web::HttpResponseBuilder, ru
         // skipped on its own with a warning logged, which is what
         // this achieves instead.
         if let (Ok(header_name), Ok(header_value)) = (
-            actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
-            actix_web::http::header::HeaderValue::from_str(value),
+            crate::hyper_web::http::header::HeaderName::from_bytes(name.as_bytes()),
+            crate::hyper_web::http::header::HeaderValue::from_str(value),
         ) {
             builder.insert_header((header_name, header_value));
         } else {
@@ -559,7 +571,9 @@ fn looks_like_api_call(req: &HttpRequest) -> bool {
     if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
         let accept = accept.to_ascii_lowercase();
         if !accept.contains("text/html")
-            && (accept.contains("json") || accept.contains("xml") || accept.contains("text/event-stream"))
+            && (accept.contains("json")
+                || accept.contains("xml")
+                || accept.contains("text/event-stream"))
         {
             return true;
         }
@@ -603,7 +617,11 @@ pub fn is_login_page(path: &str, route: Option<&RouteRule>, config: &AppConfig) 
     let login = login_page_path(route, config);
     let normalize = |p: &str| {
         let trimmed = p.trim_end_matches('/');
-        if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
+        }
     };
     normalize(path) == normalize(login)
 }
@@ -631,8 +649,8 @@ pub fn login_page_redirect(target: &str, clear_session: bool) -> HttpResponse {
 fn apply_custom_headers(resp: &mut HttpResponse, rule: &RouteRule) {
     for (name, value) in &rule.headers {
         if let (Ok(header_name), Ok(header_value)) = (
-            actix_web::http::header::HeaderName::from_bytes(name.as_bytes()),
-            actix_web::http::header::HeaderValue::from_str(value),
+            crate::hyper_web::http::header::HeaderName::from_bytes(name.as_bytes()),
+            crate::hyper_web::http::header::HeaderValue::from_str(value),
         ) {
             resp.headers_mut().insert(header_name, header_value);
         } else {
@@ -1034,8 +1052,8 @@ fn eligible_on_pass(host: Option<&str>, rule: &RouteRule, exact_pass: bool) -> b
 /// distinction only exists once the requested host is known.
 pub fn match_route_idx(raw_path: &str, host: Option<&str>, routes: &[RouteRule]) -> Option<usize> {
     {
-        let guard = ORDERED_ROUTE_IDX.read().unwrap();
-        if let Some(order) = guard.as_ref() {
+        let guard = ORDERED_ROUTE_IDX.load();
+        if let Some(order) = guard.as_deref() {
             if order.iter().all(|&i| i < routes.len()) {
                 for exact_pass in [true, false] {
                     for &i in order {
@@ -1183,6 +1201,54 @@ pub fn client_ip(req: &HttpRequest, config: &AppConfig) -> Option<IpAddr> {
     peer_ip
 }
 
+/// Whether to ask the backend for an uncompressed body (`identity`), so
+/// ProxyAuth applies its own `compression` settings.
+fn strips_upstream_accept_encoding(rule: &RouteRule, config: &AppConfig) -> bool {
+    crate::config::compression::CompressionConfig::route_strips_upstream_accept_encoding(
+        rule.compression.as_ref(),
+        &config.compression,
+    )
+}
+
+/// Pourquoi le backend n'a pas fourni de réponse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamFailure {
+    /// Connexion refusée/réinitialisée, DNS, TLS, réponse invalide, ou
+    /// tous les backends d'un pool en échec.
+    Unreachable,
+    /// Aucune réponse dans `backend_timeout`.
+    Timeout,
+}
+
+/// Réponse quand le backend d'une route existante ne répond pas.
+///
+/// Mêmes statuts que nginx/Envoy (RFC 9110 § 15.6) :
+/// * `502 Bad Gateway` — ProxyAuth n'a pas obtenu de réponse valide du
+///   backend (service arrêté, connexion refusée…) ;
+/// * `504 Gateway Timeout` — le backend n'a pas répondu à temps.
+///
+/// `503 Service Unavailable` reste réservé à ce que ProxyAuth rend
+/// indisponible lui-même (maintenance `redirect_protect`, fonctionnalité
+/// non configurée), et `404` à une URL qu'aucune route ne couvre.
+///
+/// `cors` ajoute les en-têtes CORS de la route (closure locale du
+/// handler, qui connaît la route et la configuration).
+pub(crate) fn upstream_failure(
+    why: UpstreamFailure,
+    cors: impl FnOnce(&mut HttpResponseBuilder),
+) -> HttpResponse {
+    let mut resp = match why {
+        UpstreamFailure::Unreachable => HttpResponse::BadGateway(),
+        UpstreamFailure::Timeout => HttpResponse::GatewayTimeout(),
+    };
+    resp.append_header(("server", "ProxyAuth"));
+    cors(&mut resp);
+    resp.body(match why {
+        UpstreamFailure::Unreachable => "502 Bad Gateway",
+        UpstreamFailure::Timeout => "504 Gateway Timeout",
+    })
+}
+
 /// Response-side body type. Distinct from `BoxBody` (whose error type
 /// is `Infallible`, correct for the *request* bodies this proxy builds
 /// itself): a streamed upstream response can fail mid-body, so its
@@ -1209,11 +1275,10 @@ fn widen_boxbody(res: hyper::Response<BoxBody>) -> hyper::Response<ResponseBody>
 }
 
 /// Adapts an `http_body::Body` into the `Stream` that
-/// `HttpResponse::streaming` expects. Trailer frames are dropped —
-/// actix has no way to emit them to the client.
-fn body_to_actix_stream<B>(
+/// `HttpResponse::streaming` expects. Trailer frames are dropped.
+fn body_to_stream<B>(
     body: B,
-) -> impl futures_util::Stream<Item = Result<Bytes, Box<dyn std::error::Error + 'static>>>
+) -> impl futures_util::Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync + 'static>>>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -1221,7 +1286,9 @@ where
     BodyStream::new(body).filter_map(|frame| async move {
         match frame {
             Ok(f) => f.into_data().ok().map(Ok),
-            Err(e) => Some(Err(Box::new(e) as Box<dyn std::error::Error + 'static>)),
+            Err(e) => Some(Err(
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>
+            )),
         }
     })
 }
@@ -1321,9 +1388,7 @@ async fn proxy_to_redirect_protect_target(
         }
     }
 
-    let hyper_req = request_builder
-        .body(Full::new(Bytes::from(body.to_vec())).boxed())
-        .ok()?;
+    let hyper_req = request_builder.body(Full::new(body.clone()).boxed()).ok()?;
 
     let client_opts = ClientOptions {
         use_proxy: false,
@@ -1545,6 +1610,11 @@ fn json_value_as_flat_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Type MIME annoncé pour un fichier statique (d'après son extension).
+pub(crate) fn content_type_for(path: &Path) -> &'static str {
+    guess_content_type(path)
+}
+
 fn guess_content_type(path: &Path) -> &'static str {
     let ext = path
         .extension()
@@ -1615,12 +1685,12 @@ fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> 
     if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
         warn!(
             "static route \"{prefix}\": too many open files while reading {} — raise the open-files limit of the proxyauth service (ulimit -n / LimitNOFILE / rc_ulimit)",
-              path.display()
+            path.display()
         );
         return HttpResponse::ServiceUnavailable()
-        .append_header(("server", "ProxyAuth"))
-        .append_header(("Retry-After", "1"))
-        .body("503 Service Unavailable");
+            .append_header(("server", "ProxyAuth"))
+            .append_header(("Retry-After", "1"))
+            .body("503 Service Unavailable");
     }
 
     if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -1652,7 +1722,7 @@ async fn serve_static_file(
             .body("500 Internal Server Error");
     };
 
-    let root = match tokio::fs::canonicalize(static_path).await {
+    let root = match crate::network::fs_cache::canonicalize(Path::new(static_path)).await {
         Ok(p) => p,
         Err(e) => {
             warn!(
@@ -1665,8 +1735,8 @@ async fn serve_static_file(
         }
     };
 
-    let root_is_file = match tokio::fs::metadata(&root).await {
-        Ok(m) => m.is_file(),
+    let root_is_file = match crate::network::fs_cache::kind(&root).await {
+        Ok((is_file, _)) => is_file,
         Err(e) => {
             return static_read_error_response(&rule.prefix, &root, &e);
         }
@@ -1678,62 +1748,19 @@ async fn serve_static_file(
     // `/robots.txt` or `/favicon.ico` route).
     let max_age = rule.cache_duration_secs.unwrap_or(cache_duration_secs);
     if root_is_file {
-        return match tokio::fs::read(&root).await {
-            Ok(bytes) => {
-                let content_type = guess_content_type(&root);
-                let bytes = if (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
-                    && content_type.starts_with("text/html")
-                {
-                    match String::from_utf8(bytes) {
-                        Ok(text) => {
-                            let username = extract_username_for_tags(req, data, ip).await;
-                            // Independent of `username` — a login page,
-                            // where nobody is authenticated yet, is
-                            // exactly the case that most needs a CSRF
-                            // token (for the login form's own POST).
-                            // But NOT independent of csrf_token itself —
-                            // injecting a token when CSRF protection is
-                            // deliberately off for this vhost would be a
-                            // pointless, confusing no-op at best (the
-                            // token gets generated and spliced in, but
-                            // /auth never actually checks it).
-                            let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                            let tagged = if rule.tag_proxyauth_enabled() {
-                                substitute_proxyauth_tags(
-                                    &text,
-                                    username.as_deref(),
-                                    csrf_token.as_deref(),
-                                )
-                            } else {
-                                text
-                            };
-                            apply_hidden_blocks(tagged, rule, req, data)
-                                .await
-                                .into_bytes()
-                        }
-                        Err(e) => e.into_bytes(),
-                    }
-                } else {
-                    bytes
-                };
-                let mut resp = HttpResponse::Ok();
-                resp.append_header(("server", "ProxyAuth"))
-                    .content_type(content_type);
-                if rule.cache_enabled() {
-                    resp.append_header((
-                        header::CACHE_CONTROL,
-                        format!("public, max-age={}", max_age),
-                    ));
-                } else {
-                    resp.append_header((
-                        header::CACHE_CONTROL,
-                        "no-store, no-cache, must-revalidate, max-age=0",
-                    ));
-                    resp.append_header(("Pragma", "no-cache"));
-                    resp.append_header(("Expires", "0"));
-                }
-                resp.body(bytes)
-            }
+        let policy = crate::config::internal_cache::CachePolicy::new(
+            &data.config.internal_cache,
+            rule.internal_cache.as_ref(),
+        );
+        return match crate::network::fs_cache::read(
+            &root,
+            guess_content_type(&root),
+            &policy,
+            crate::network::fs_cache::pool_for(Some(rule)).as_deref(),
+        )
+        .await
+        {
+            Ok(file) => static_file_response(&root, file, rule, max_age, req, data, ip).await,
             Err(e) => static_read_error_response(&rule.prefix, &root, &e),
         };
     }
@@ -1775,15 +1802,15 @@ async fn serve_static_file(
 
     let mut candidate = root.join(remainder);
 
-    let is_dir = tokio::fs::metadata(&candidate)
+    let is_dir = crate::network::fs_cache::kind(&candidate)
         .await
-        .map(|m| m.is_dir())
+        .map(|(_, is_dir)| is_dir)
         .unwrap_or(false);
     if is_dir || remainder.is_empty() {
         candidate = candidate.join(&rule.static_index);
     }
 
-    let resolved = match tokio::fs::canonicalize(&candidate).await {
+    let resolved = match crate::network::fs_cache::canonicalize(&candidate).await {
         Ok(p) => p,
         Err(e) => {
             return static_read_error_response(&rule.prefix, &candidate, &e);
@@ -1802,54 +1829,109 @@ async fn serve_static_file(
             .body("403 Forbidden");
     }
 
-    match tokio::fs::read(&resolved).await {
-        Ok(bytes) => {
-            let content_type = guess_content_type(&resolved);
-            let bytes = if (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
-                && content_type.starts_with("text/html")
-            {
-                match String::from_utf8(bytes) {
-                    Ok(text) => {
-                        let username = extract_username_for_tags(req, data, ip).await;
-                        let csrf_token = resolve_tag_csrf_token(rule, &data.config);
-                        let tagged = if rule.tag_proxyauth_enabled() {
-                            substitute_proxyauth_tags(
-                                &text,
-                                username.as_deref(),
-                                csrf_token.as_deref(),
-                            )
-                        } else {
-                            text
-                        };
-                        apply_hidden_blocks(tagged, rule, req, data)
-                            .await
-                            .into_bytes()
-                    }
-                    Err(e) => e.into_bytes(),
-                }
-            } else {
-                bytes
-            };
-            let mut resp = HttpResponse::Ok();
-            resp.append_header(("server", "ProxyAuth"))
-                .content_type(content_type);
-            if rule.cache_enabled() {
-                resp.append_header((
-                    header::CACHE_CONTROL,
-                    format!("public, max-age={}", max_age),
-                ));
-            } else {
-                resp.append_header((
-                    header::CACHE_CONTROL,
-                    "no-store, no-cache, must-revalidate, max-age=0",
-                ));
-                resp.append_header(("Pragma", "no-cache"));
-                resp.append_header(("Expires", "0"));
-            }
-            resp.body(bytes)
-        }
+    let policy = crate::config::internal_cache::CachePolicy::new(
+        &data.config.internal_cache,
+        rule.internal_cache.as_ref(),
+    );
+    match crate::network::fs_cache::read(
+        &resolved,
+        guess_content_type(&resolved),
+        &policy,
+        crate::network::fs_cache::pool_for(Some(rule)).as_deref(),
+    )
+    .await
+    {
+        Ok(file) => static_file_response(&resolved, file, rule, max_age, req, data, ip).await,
         Err(e) => static_read_error_response(&rule.prefix, &resolved, &e),
     }
+}
+
+/// Builds the response for a file read from `fs_cache`.
+///
+/// HTML with `tag_proxyauth` or hidden blocks is rendered per request
+/// (CSRF token, username): only the raw template comes from the cache.
+/// Anything else is sent straight from the cached `Bytes` (no copy) with
+/// a weak `ETag`, and a matching `If-None-Match` gets a `304` with no
+/// body — the browser keeps its copy and nothing is transferred.
+async fn static_file_response(
+    path: &Path,
+    file: crate::network::fs_cache::FileHandle,
+    rule: &RouteRule,
+    max_age: u64,
+    req: &HttpRequest,
+    data: &web::Data<AppState>,
+    ip: &str,
+) -> HttpResponse {
+    let content_type = guess_content_type(path);
+    let templated = (rule.tag_proxyauth_enabled() || rule.has_hidden_blocks())
+        && content_type.starts_with("text/html");
+
+    let mut resp = HttpResponse::Ok();
+    resp.append_header(("server", "ProxyAuth"))
+        .content_type(content_type);
+    if rule.cache_enabled() {
+        resp.append_header((
+            header::CACHE_CONTROL,
+            format!("public, max-age={}", max_age),
+        ));
+    } else {
+        resp.append_header((
+            header::CACHE_CONTROL,
+            "no-store, no-cache, must-revalidate, max-age=0",
+        ));
+        resp.append_header(("Pragma", "no-cache"));
+        resp.append_header(("Expires", "0"));
+    }
+
+    if !templated {
+        let etag = file.etag();
+        let matches = req
+            .headers()
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
+        resp.append_header((header::ETAG, etag));
+        if matches {
+            resp.status(StatusCode::NOT_MODIFIED);
+            return resp.finish();
+        }
+        // Taille connue d'avance : `Content-Length` même quand le corps
+        // est un flux depuis le disque.
+        resp.append_header((header::CONTENT_LENGTH, file.len()));
+        return match file.into_body().await {
+            Ok(body) => resp.body(body),
+            Err(e) => static_read_error_response(&rule.prefix, path, &e),
+        };
+    }
+
+    // Modèle HTML réécrit à chaque requête : il faut son texte entier
+    // (au plus 16 Mo, jamais un gros fichier).
+    let raw = match file.into_bytes(16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return static_read_error_response(&rule.prefix, path, &e),
+    };
+    let rendered = match String::from_utf8(raw.to_vec()) {
+        Ok(text) => {
+            let username = extract_username_for_tags(req, data, ip).await;
+            // Independent of `username` — a login page, where nobody is
+            // authenticated yet, is exactly the case that most needs a
+            // CSRF token (for the login form's own POST). But NOT
+            // independent of csrf_token itself — injecting a token when
+            // CSRF protection is deliberately off for this vhost would be
+            // a pointless, confusing no-op at best.
+            let csrf_token = resolve_tag_csrf_token(rule, &data.config);
+            let tagged = if rule.tag_proxyauth_enabled() {
+                substitute_proxyauth_tags(&text, username.as_deref(), csrf_token.as_deref())
+            } else {
+                text
+            };
+            apply_hidden_blocks(tagged, rule, req, data)
+                .await
+                .into_bytes()
+        }
+        Err(e) => e.into_bytes(),
+    };
+    resp.body(rendered)
 }
 
 /// Minimal `required_login` gate for static routes: the same
@@ -1912,7 +1994,10 @@ async fn check_static_auth(
         Ok((username, token_id, _expiry)) => (username, token_id),
         Err(_) => {
             if let Some(target) = login_page_redirect_target(req, rule, &data.config) {
-                LogContext::set_error_detail(req, "expired or invalid session, sent to redirect_login_url");
+                LogContext::set_error_detail(
+                    req,
+                    "expired or invalid session, sent to redirect_login_url",
+                );
                 return Err(login_page_redirect(target, true));
             }
             return Err(HttpResponse::Unauthorized()
@@ -1951,8 +2036,7 @@ async fn validate_and_refresh(
     token: &str,
     ip: &str,
 ) -> Result<(String, String, u64), String> {
-    let session =
-        crate::token::security::validate_session(token, data, &data.config, ip).await?;
+    let session = crate::token::security::validate_session(token, data, &data.config, ip).await?;
 
     match crate::token::refresh::refresh_session(req, data, rule, &session).await {
         crate::token::refresh::SessionRefresh::Keep => {
@@ -2008,15 +2092,17 @@ async fn refresh_on_public_route(req: &HttpRequest, data: &web::Data<AppState>, 
         .unwrap_or_else(|| "-".to_string());
 
     match crate::token::security::validate_session(token, data, &data.config, &ip).await {
-        Ok(session) => match crate::token::refresh::refresh_session(req, data, rule, &session).await {
-            crate::token::refresh::SessionRefresh::Keep => {
-                crate::token::refresh::mark_signed_in(req);
+        Ok(session) => {
+            match crate::token::refresh::refresh_session(req, data, rule, &session).await {
+                crate::token::refresh::SessionRefresh::Keep => {
+                    crate::token::refresh::mark_signed_in(req);
+                }
+                crate::token::refresh::SessionRefresh::Renewed(new_cookie) => {
+                    crate::token::refresh::remember_renewal(req, new_cookie);
+                }
+                crate::token::refresh::SessionRefresh::TooOld => clear_session_cookie(req),
             }
-            crate::token::refresh::SessionRefresh::Renewed(new_cookie) => {
-                crate::token::refresh::remember_renewal(req, new_cookie);
-            }
-            crate::token::refresh::SessionRefresh::TooOld => clear_session_cookie(req),
-        },
+        }
         Err(_) => clear_session_cookie(req),
     }
 }
@@ -2058,7 +2144,8 @@ pub async fn global_proxy(
                             header::HeaderValue::from_static("private, no-store, max-age=0"),
                         );
                         headers.remove(header::EXPIRES);
-                        headers.insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+                        headers
+                            .insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
                     }
                     Err(e) => warn!("renewed session cookie could not be attached: {e}"),
                 }
@@ -2125,10 +2212,7 @@ fn signed_in_cache_policy(req: &HttpRequest, resp: &mut HttpResponse) {
         .map(str::to_string);
 
     // A stricter policy already set by the route (`cache: false`) stands.
-    if current
-        .as_deref()
-        .is_some_and(|v| v.contains("no-store"))
-    {
+    if current.as_deref().is_some_and(|v| v.contains("no-store")) {
         return;
     }
 
@@ -2189,7 +2273,7 @@ async fn global_proxy_inner(
     // something for this exact (vhost, token) pair — see
     // `acme::challenge`'s module doc comment for why this is a
     // separate overlay rather than a real routes.yml entry.
-    if req.method() == actix_web::http::Method::GET {
+    if req.method() == crate::hyper_web::http::Method::GET {
         if let Some(token) = crate::acme::challenge::extract_token(req.path()) {
             let host = req.connection_info().host().to_string();
             let vhost = normalize_host(&host);
@@ -2304,7 +2388,7 @@ async fn global_proxy_inner(
     // (server-to-server) further down, `/oidc/userinfo` alongside
     // discovery/jwks since it's also Bearer-token-only with no
     // session/browser involvement.
-    if req.method() == actix_web::http::Method::GET {
+    if req.method() == crate::hyper_web::http::Method::GET {
         let path = req.path();
         if path == "/.well-known/openid-configuration" || path == "/oidc/jwks.json" {
             if let Some(host) = request_host(&req) {
@@ -2376,8 +2460,8 @@ async fn global_proxy_inner(
     // back to this same URL — see `authorize::render_login_form`) —
     // it can't live inside the GET-only block above for that reason.
     if req.path() == "/oidc/authorize"
-        && (req.method() == actix_web::http::Method::GET
-            || req.method() == actix_web::http::Method::POST)
+        && (req.method() == crate::hyper_web::http::Method::GET
+            || req.method() == crate::hyper_web::http::Method::POST)
     {
         if let Some(host) = request_host(&req) {
             if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
@@ -2400,7 +2484,7 @@ async fn global_proxy_inner(
     // detour to consider here the way `/oidc/authorize` has. Same
     // oidc-configured-vhost gate as every other interception in this
     // block.
-    if req.method() == actix_web::http::Method::POST && req.path() == "/oidc/token" {
+    if req.method() == crate::hyper_web::http::Method::POST && req.path() == "/oidc/token" {
         if let Some(host) = request_host(&req) {
             if let Some(rule) = find_vhost_route(Some(&host), &data.routes.routes) {
                 if rule.oidc.is_some() {
@@ -2417,7 +2501,7 @@ async fn global_proxy_inner(
         }
     }
 
-    if req.method() == actix_web::http::Method::OPTIONS {
+    if req.method() == crate::hyper_web::http::Method::OPTIONS {
         // The OIDC provider's own discovery/JWKS documents are meant
         // to be publicly, universally fetchable — see
         // `proto::oidc_provider::discovery`'s own reasoning for why
@@ -2826,11 +2910,9 @@ pub async fn proxy_with_proxy(
         }
         target_url.push_str(q);
     }
-    let full_url = if target_url.starts_with("http://") || target_url.starts_with("https://") {
-        target_url
-    } else {
-        format!("http://{}", target_url)
-    };
+    // `ws://`/`wss://` targets (forward_websocket) map to http/https for
+    // ordinary requests on the same route.
+    let full_url = crate::network::websocket::normalize_target_url(target_url);
 
     let client = get_or_build_client_proxy(
         ClientOptions {
@@ -2868,8 +2950,7 @@ pub async fn proxy_with_proxy(
                     return None;
                 }
                 crate::network::proxy::request_cookie(&req, "session_token")
-            })
-            ;
+            });
 
         let Some(token_header) = token_header else {
             if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
@@ -2891,7 +2972,10 @@ pub async fn proxy_with_proxy(
                         ip, path, method_str, user_agent, _err
                     );
                     if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
-                        LogContext::set_error_detail(&req, "expired or invalid session, sent to redirect_login_url");
+                        LogContext::set_error_detail(
+                            &req,
+                            "expired or invalid session, sent to redirect_login_url",
+                        );
                         return Ok(login_page_redirect(target, true));
                     }
                     let mut resp = HttpResponse::Unauthorized();
@@ -2980,12 +3064,7 @@ pub async fn proxy_with_proxy(
     // already carries a `Content-Encoding`. Asking upstream for
     // `identity` is what lets ProxyAuth apply the configured algorithm
     // and level itself — nginx's `proxy_set_header Accept-Encoding ""`.
-    let route_compression = match &rule.compression {
-        Some(c) => c.merged_over(&data.config.compression),
-        None => data.config.compression.clone(),
-    };
-    let strip_accept_encoding =
-        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+    let strip_accept_encoding = strips_upstream_accept_encoding(rule, &data.config);
 
     let hyper_method = Method::from_bytes(method_str.as_bytes()).unwrap_or(Method::GET);
     let mut request_builder = Request::builder().method(&hyper_method).uri(&uri);
@@ -3070,8 +3149,10 @@ pub async fn proxy_with_proxy(
             && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
         {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            // Same `http` 1.x types on both sides: the name and value move
+            // across as-is (a reference-count bump), with no re-parsing.
+            if let Some(h) = request_builder.headers_mut() {
+                h.append(key.clone(), value.clone());
             }
         }
     }
@@ -3133,7 +3214,7 @@ pub async fn proxy_with_proxy(
             }
         }
     } else {
-        match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
+        match request_builder.body(Full::new(body.clone()).boxed()) {
             Ok(req) => req,
             Err(e) => {
                 warn!(client_ip = %ip, target = %full_url, "Request build failed: {}", e);
@@ -3171,7 +3252,7 @@ pub async fn proxy_with_proxy(
                 .await
                 .map_err(|e| {
                     warn!(client_ip = %ip, target = %full_url, "Failover failed: {}", e);
-                    error::ErrorServiceUnavailable("503 Service Unavailable")
+                    error::ErrorBadGateway("502 Bad Gateway")
                 })?,
         )
     } else {
@@ -3184,17 +3265,15 @@ pub async fn proxy_with_proxy(
             Ok(Ok(res)) => incoming_to_boxbody(res),
             Ok(Err(e)) => {
                 warn!(client_ip = %ip, target = %full_url, "Upstream error: {}", e);
-                let mut resp = HttpResponse::ServiceUnavailable();
-                resp.append_header(("server", "ProxyAuth"));
-                add_cors_headers(&mut resp, &req);
-                return Ok(resp.finish());
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
             Err(e) => {
                 warn!(client_ip = %ip, target = %full_url, "Timeout error: {}", e);
-                let mut resp = HttpResponse::ServiceUnavailable();
-                resp.append_header(("server", "ProxyAuth"));
-                add_cors_headers(&mut resp, &req);
-                return Ok(resp.finish());
+                return Ok(upstream_failure(UpstreamFailure::Timeout, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
         }
     };
@@ -3238,7 +3317,9 @@ pub async fn proxy_with_proxy(
         }
 
         if k != "user-agent" && k != "authorization" && k != "server" {
-            client_resp.append_header((k, value.as_bytes()));
+            if let Some(h) = client_resp.headers_mut() {
+                h.append(key.clone(), value.clone());
+            }
         }
     }
 
@@ -3279,7 +3360,7 @@ pub async fn proxy_with_proxy(
         apply_custom_headers_builder(&mut client_resp, rule);
         client_resp.append_header(("server", "ProxyAuth"));
 
-        return Ok(client_resp.streaming(body_to_actix_stream(resp_body)));
+        return Ok(client_resp.streaming(body_to_stream(resp_body)));
     }
 
     let mut body_bytes: Bytes = resp_body
@@ -3393,7 +3474,7 @@ pub async fn proxy_without_proxy(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
 
-    let is_head = req.method() == actix_web::http::Method::HEAD;
+    let is_head = req.method() == crate::hyper_web::http::Method::HEAD;
 
     let add_cors_headers = |resp: &mut HttpResponseBuilder, req: &HttpRequest| {
         if let Some(origin) = req
@@ -3582,11 +3663,9 @@ pub async fn proxy_without_proxy(
         target_url.push_str(q);
     }
 
-    let full_url = if target_url.starts_with("http://") || target_url.starts_with("https://") {
-        target_url
-    } else {
-        format!("http://{}", target_url)
-    };
+    // `ws://`/`wss://` targets (forward_websocket) map to http/https for
+    // ordinary requests on the same route.
+    let full_url = crate::network::websocket::normalize_target_url(target_url);
 
     // ── Client : cache global partagé ────────────────────────────────
     let client_opts = if !rule.cert.is_empty() {
@@ -3638,8 +3717,7 @@ pub async fn proxy_without_proxy(
                 }
 
                 crate::network::proxy::request_cookie(&req, "session_token")
-            })
-            ;
+            });
 
         let Some(token_header) = token_header else {
             if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
@@ -3667,7 +3745,10 @@ pub async fn proxy_without_proxy(
                     );
 
                     if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
-                        LogContext::set_error_detail(&req, "expired or invalid session, sent to redirect_login_url");
+                        LogContext::set_error_detail(
+                            &req,
+                            "expired or invalid session, sent to redirect_login_url",
+                        );
                         return Ok(login_page_redirect(target, true));
                     }
 
@@ -3728,7 +3809,6 @@ pub async fn proxy_without_proxy(
             .unwrap_or("/");
         let on_login_page = req.uri() == "" || is_login_page(req.path(), Some(rule), &data.config);
         if on_login_page && req.path() == "/" && redirect_target_is_meaningful(redirect_target) {
-
             return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
                 .append_header(("location", redirect_target))
@@ -3751,12 +3831,7 @@ pub async fn proxy_without_proxy(
     // already carries a `Content-Encoding`. Asking upstream for
     // `identity` is what lets ProxyAuth apply the configured algorithm
     // and level itself — nginx's `proxy_set_header Accept-Encoding ""`.
-    let route_compression = match &rule.compression {
-        Some(c) => c.merged_over(&data.config.compression),
-        None => data.config.compression.clone(),
-    };
-    let strip_accept_encoding =
-        route_compression.is_enabled() && route_compression.strips_upstream_accept_encoding();
+    let strip_accept_encoding = strips_upstream_accept_encoding(rule, &data.config);
 
     // ── Build request Hyper ──────────────────────────────────────────
     //
@@ -3839,8 +3914,10 @@ pub async fn proxy_without_proxy(
             && !(rule.forward_proxy_headers_enabled() && key_str == "host")
             && !(strip_accept_encoding && key_str == "accept-encoding")
         {
-            if let Ok(hv) = hyper::header::HeaderValue::from_bytes(value.as_bytes()) {
-                request_builder = request_builder.header(key_str, hv);
+            // Same `http` 1.x types on both sides: the name and value move
+            // across as-is (a reference-count bump), with no re-parsing.
+            if let Some(h) = request_builder.headers_mut() {
+                h.append(key.clone(), value.clone());
             }
         }
     }
@@ -3888,6 +3965,26 @@ pub async fn proxy_without_proxy(
     request_builder = request_builder.header(USER_AGENT, user_agent);
     request_builder = inject_header(request_builder, &username, &data.config);
 
+    // ── WebSocket ────────────────────────────────────────────────────
+    //
+    // Same checks and same headers as any proxied request (all done
+    // above); only the transport changes. See `network::websocket`.
+    if let Some(mode) = rule
+        .forward_websocket_enabled()
+        .then(|| crate::network::websocket::websocket_request(&req))
+        .flatten()
+    {
+        return Ok(crate::network::websocket::tunnel(
+            &req,
+            mode,
+            request_builder,
+            &full_url,
+            data.config.backend_timeout_duration(),
+            &ip,
+        )
+        .await);
+    }
+
     // ── Build request body ───────────────────────────────────────────
     //
     // HEAD MUST NOT have a request body.
@@ -3914,7 +4011,7 @@ pub async fn proxy_without_proxy(
             }
         }
     } else {
-        match request_builder.body(Full::new(Bytes::from(body.to_vec())).boxed()) {
+        match request_builder.body(Full::new(body.clone()).boxed()) {
             Ok(req) => req,
 
             Err(e) => {
@@ -3963,13 +4060,9 @@ pub async fn proxy_without_proxy(
                     e
                 );
 
-                let mut builder = HttpResponse::ServiceUnavailable();
-
-                builder.append_header(("server", "ProxyAuth"));
-
-                add_cors_headers(&mut builder, &req);
-
-                return Ok(builder.finish());
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
         }
     } else {
@@ -3989,13 +4082,9 @@ pub async fn proxy_without_proxy(
                       e
                 );
 
-                let mut resp = HttpResponse::ServiceUnavailable();
-
-                resp.append_header(("server", "ProxyAuth"));
-
-                add_cors_headers(&mut resp, &req);
-
-                return Ok(resp.finish());
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
 
             Err(e) => {
@@ -4006,13 +4095,9 @@ pub async fn proxy_without_proxy(
                       e
                 );
 
-                let mut resp = HttpResponse::ServiceUnavailable();
-
-                resp.append_header(("server", "ProxyAuth"));
-
-                add_cors_headers(&mut resp, &req);
-
-                return Ok(resp.finish());
+                return Ok(upstream_failure(UpstreamFailure::Timeout, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
         }
     };
@@ -4064,7 +4149,9 @@ pub async fn proxy_without_proxy(
         }
 
         if k != "user-agent" && k != "authorization" && k != "server" {
-            client_resp.append_header((k, value.as_bytes()));
+            if let Some(h) = client_resp.headers_mut() {
+                h.append(key.clone(), value.clone());
+            }
         }
     }
 
@@ -4102,7 +4189,7 @@ pub async fn proxy_without_proxy(
         apply_custom_headers_builder(&mut client_resp, rule);
         client_resp.append_header(("server", "ProxyAuth"));
 
-        return Ok(client_resp.streaming(body_to_actix_stream(resp_body)));
+        return Ok(client_resp.streaming(body_to_stream(resp_body)));
     }
 
     // ── Response body ───────────────────────────────────────────────
@@ -4213,15 +4300,14 @@ pub async fn proxy_without_proxy(
         .body(body_bytes))
 }
 
-
 #[cfg(test)]
 mod cookie_header_tests {
     use super::{joined_cookie_header, request_cookie};
-    use actix_web::test::TestRequest;
+    use crate::hyper_web::test::TestRequest;
 
     /// Navigateur en HTTP/2 : une ligne `Cookie` par cookie, et un cookie de
     /// consentement (régie publicitaire) envoyé avant `session_token`.
-    #[actix_web::test]
+    #[tokio::test]
     async fn session_cookie_found_in_any_cookie_line() {
         let req = TestRequest::default()
             .append_header(("cookie", "FCCDCF=%5Bnull%2Cnull%5D"))
@@ -4235,7 +4321,7 @@ mod cookie_header_tests {
         );
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn single_line_and_absent_cookie() {
         let req = TestRequest::default()
             .append_header(("cookie", "a=1; session_token=xyz; b=2"))
@@ -4245,7 +4331,9 @@ mod cookie_header_tests {
         assert_eq!(request_cookie(&empty, "session_token"), None);
         assert_eq!(joined_cookie_header(&empty), None);
         // Un nom qui ne fait que commencer pareil n'est pas confondu.
-        let other = TestRequest::default().append_header(("cookie", "session_token_old=1")).to_http_request();
+        let other = TestRequest::default()
+            .append_header(("cookie", "session_token_old=1"))
+            .to_http_request();
         assert_eq!(request_cookie(&other, "session_token"), None);
     }
 }

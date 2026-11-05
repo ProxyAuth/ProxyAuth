@@ -15,8 +15,8 @@
 //! is the one exception, fixed at the root by the discovery spec
 //! itself (RFC 8414) — not something ProxyAuth gets to choose.
 
+use crate::hyper_web::{HttpResponse, http::header};
 use crate::proto::oidc_provider::jwt;
-use actix_web::{HttpResponse, http::header};
 
 /// Builds the discovery document for `issuer` — the vhost's own
 /// `https://{host}` identity, matching what `iss` in every id_token

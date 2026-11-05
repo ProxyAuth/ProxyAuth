@@ -18,8 +18,8 @@
 //! as `end_session_endpoint` in the discovery document.
 
 use crate::config::config::AppState;
+use crate::hyper_web::{HttpRequest, HttpResponse, http::header, web};
 use crate::network::proxy::{find_vhost_route, request_host};
-use actix_web::{HttpRequest, HttpResponse, http::header, web};
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 

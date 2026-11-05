@@ -35,15 +35,15 @@ use crate::AppConfig;
 use crate::AppState;
 use crate::config::config::{EmailEntry, RouteRule, User};
 use crate::databases::db::NewUserOutcome;
-use crate::network::error::render_error_page;
-use crate::network::proxy::client_ip;
-use crate::token::csrf::verify_csrf_token;
-use actix_web::{
-    Error as ActixError, FromRequest, HttpRequest, HttpResponse, Responder,
+use crate::hyper_web::{
+    Error as WebError, FromRequest, HttpRequest, HttpResponse, Responder,
     dev::Payload,
     error::ErrorBadRequest,
     web::{self, Form, Json},
 };
+use crate::network::error::render_error_page;
+use crate::network::proxy::client_ip;
+use crate::token::csrf::verify_csrf_token;
 use argon2::Argon2;
 use argon2::password_hash::PasswordHasher;
 use futures_util::FutureExt;
@@ -95,7 +95,11 @@ fn non_empty(list: &[String]) -> Option<Vec<String>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if cleaned.is_empty() { None } else { Some(cleaned) }
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
 }
 
 impl RegistryConfig {
@@ -116,7 +120,10 @@ impl RegistryConfig {
 ///
 /// Only routes that actually carry a `registry` block are considered,
 /// so the block can sit on any route of the vhost, not only the first.
-pub fn find_registry_route<'a>(host: Option<&str>, routes: &'a [RouteRule]) -> Option<&'a RouteRule> {
+pub fn find_registry_route<'a>(
+    host: Option<&str>,
+    routes: &'a [RouteRule],
+) -> Option<&'a RouteRule> {
     use crate::network::proxy::{vhost_matches, vhost_matches_exactly};
 
     let with_block = || routes.iter().filter(|r| r.registry.is_some());
@@ -173,7 +180,10 @@ pub fn describe_registry(config: &AppConfig, routes: &[RouteRule]) -> Vec<String
         // `RouteRule::login_authorized`), and one whose allow lists
         // don't include the defaults denies these accounts specifically.
         if !r.vhost.is_empty() {
-            let groups_ok = reg.default_groups.iter().any(|g| r.allow_groups.contains(g));
+            let groups_ok = reg
+                .default_groups
+                .iter()
+                .any(|g| r.allow_groups.contains(g));
             let roles_ok = reg.default_roles.iter().any(|x| r.allow_roles.contains(x));
             if !groups_ok && !roles_ok {
                 lines.push(format!(
@@ -217,7 +227,7 @@ impl EitherRegistry {
 }
 
 impl FromRequest for EitherRegistry {
-    type Error = ActixError;
+    type Error = WebError;
     type Future = LocalBoxFuture<'static, Result<Self, Self::Error>>;
 
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
@@ -366,7 +376,7 @@ fn collides_in_memory(config: &AppConfig, username: &str, email: &str) -> bool {
 
 // ── Handler ────────────────────────────────────────────────────
 
-fn plain(status: actix_web::http::StatusCode, body: impl Into<String>) -> HttpResponse {
+fn plain(status: crate::hyper_web::http::StatusCode, body: impl Into<String>) -> HttpResponse {
     HttpResponse::build(status)
         .append_header(("server", "ProxyAuth"))
         .body(body.into())
@@ -377,7 +387,7 @@ fn conflict() -> HttpResponse {
     // them apart would turn this endpoint into an email-enumeration
     // oracle for every address on file.
     plain(
-        actix_web::http::StatusCode::CONFLICT,
+        crate::hyper_web::http::StatusCode::CONFLICT,
         "Username or email already in use",
     )
 }
@@ -390,7 +400,13 @@ enum StoreOutcome {
 /// Hashing + database write + in-memory refresh. Entirely blocking
 /// (Argon2 and Diesel) — always run through `spawn_blocking`, same
 /// reasoning as `reset_password::persist_db_password_change`.
-fn store_new_user(data: &AppState, username: &str, password: &str, email: &str, reg: &RegistryConfig) -> StoreOutcome {
+fn store_new_user(
+    data: &AppState,
+    username: &str,
+    password: &str,
+    email: &str,
+    reg: &RegistryConfig,
+) -> StoreOutcome {
     let Some(db_cfg) = &data.config.databases else {
         return StoreOutcome::Error("no databases block".into());
     };
@@ -433,7 +449,7 @@ pub async fn registry_route(
     data: web::Data<AppState>,
     payload: EitherRegistry,
 ) -> impl Responder {
-    use actix_web::http::StatusCode;
+    use crate::hyper_web::http::StatusCode;
 
     let host = crate::network::proxy::request_host(&req);
     let Some(route) = find_registry_route(host.as_deref(), &data.routes.routes) else {
@@ -502,7 +518,12 @@ pub async fn registry_route(
         .unwrap_or_else(|| "-".to_string());
 
     let data_blocking = data.clone();
-    let (u, p, e, r) = (username.clone(), body.password.clone(), email.clone(), reg.clone());
+    let (u, p, e, r) = (
+        username.clone(),
+        body.password.clone(),
+        email.clone(),
+        reg.clone(),
+    );
     let outcome =
         tokio::task::spawn_blocking(move || store_new_user(&data_blocking, &u, &p, &e, &r)).await;
 
@@ -528,18 +549,27 @@ pub async fn registry_route(
                 }))
         }
         Ok(StoreOutcome::Stored(_)) => {
-            warn!("[{}] [registry] refused: username or email already in use", ip);
+            warn!(
+                "[{}] [registry] refused: username or email already in use",
+                ip
+            );
             conflict()
         }
         Ok(StoreOutcome::Error(e)) => {
             // SECURITY: never echo Diesel/connection errors to an
             // unauthenticated caller (hostnames, ports, schema names).
             error!("[registry] failed to create account: {e}");
-            plain(StatusCode::INTERNAL_SERVER_ERROR, "Internal error creating account")
+            plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error creating account",
+            )
         }
         Err(join_error) => {
             error!("[registry] blocking task failed: {join_error}");
-            plain(StatusCode::INTERNAL_SERVER_ERROR, "Internal error creating account")
+            plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error creating account",
+            )
         }
     }
 }

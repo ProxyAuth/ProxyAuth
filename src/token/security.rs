@@ -3,13 +3,13 @@ use crate::AppState;
 use crate::build::build_info::get;
 use crate::config::config::RegexCond;
 use crate::config::config::RouteRule;
+use crate::hyper_web::HttpRequest;
+use crate::hyper_web::http::StatusCode;
+use crate::hyper_web::http::header::HeaderMap;
+use crate::hyper_web::web;
 use crate::network::canonical_url::canonicalize_path_for_match;
 use crate::revoke::load::is_token_revoked;
 use crate::token::vault::vault;
-use actix_web::HttpRequest;
-use actix_web::http::StatusCode;
-use actix_web::http::header::HeaderMap;
-use actix_web::web;
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
@@ -157,14 +157,17 @@ pub fn issue_session_token(
     token_id: &str,
     data: &TokenData,
 ) -> Result<String, String> {
+    let encoded = data.encode();
     vault()
-        .token(username)
-        .expires_at(expires_at)
-        .id(token_id)
-        // The library has no concept of a user index or a session: both
-        // ride in the token's free-form data field.
-        .data(&data.encode())
-        .issue()
+        .with(|v| {
+            v.token(username)
+                .expires_at(expires_at)
+                .id(token_id)
+                // The library has no concept of a user index or a session:
+                // both ride in the token's free-form data field.
+                .data(&encoded)
+                .issue()
+        })
         .map_err(|e| format!("token issue failed: {e}"))
 }
 
@@ -366,7 +369,8 @@ pub async fn validate_session(
     )
     .await?;
 
-    let current = crate::revoke::load::current_generation(&session.token_id, &data_app.revoked_tokens);
+    let current =
+        crate::revoke::load::current_generation(&session.token_id, &data_app.revoked_tokens);
     if session.data.generation < current {
         warn!(
             "[{}] token_id {} of user {} was superseded by a refresh (generation {} < {})",
@@ -389,7 +393,15 @@ pub async fn validate_refresh_token(
     ip: &str,
     max_lifetime: u64,
 ) -> Result<ValidSession, String> {
-    verify_token(token, data_app, config, ip, TokenKind::Refresh, max_lifetime).await
+    verify_token(
+        token,
+        data_app,
+        config,
+        ip,
+        TokenKind::Refresh,
+        max_lifetime,
+    )
+    .await
 }
 
 async fn verify_token(
@@ -580,7 +592,7 @@ pub fn apply_filters_regex_allow_only(
 
     let ct = req
         .headers()
-        .get(actix_web::http::header::CONTENT_TYPE)
+        .get(crate::hyper_web::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -627,7 +639,7 @@ pub fn apply_filters_regex_allow_only(
 
 pub fn cond_matches_strict(
     cond: &RegexCond,
-    method: &actix_web::http::Method,
+    method: &crate::hyper_web::http::Method,
     path: &str,
     headers: HeaderMap,
     query: &std::collections::HashMap<String, Vec<String>>,
