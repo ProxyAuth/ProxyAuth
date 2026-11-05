@@ -115,7 +115,10 @@ pub async fn start_revoked_token_ttl(
     }
 
     lmdb_read_all_into(&revoked_tokens);
-    debug!("[RevokedSync] Loaded {} entries from LMDB at startup", revoked_tokens.len());
+    debug!(
+        "[RevokedSync] Loaded {} entries from LMDB at startup",
+        revoked_tokens.len()
+    );
 
     if let Some(url) = redis_url {
         if REDIS.get().is_none() {
@@ -137,7 +140,9 @@ pub async fn start_revoked_token_ttl(
                 }
             }
             if REDIS.get().is_none() {
-                error!("[RevokedSync] Failed to initialize Redis after retries; revocations stay local");
+                error!(
+                    "[RevokedSync] Failed to initialize Redis after retries; revocations stay local"
+                );
             }
         }
     }
@@ -151,7 +156,9 @@ pub async fn start_revoked_token_ttl(
             signal(SignalKind::terminate()),
             signal(SignalKind::interrupt()),
         ) else {
-            warn!("[RevokedSync] Cannot listen for shutdown signals; LMDB will not be flushed on exit");
+            warn!(
+                "[RevokedSync] Cannot listen for shutdown signals; LMDB will not be flushed on exit"
+            );
             return;
         };
         tokio::select! {
@@ -331,7 +338,9 @@ fn pull_from_redis(client: &Client, map: &RevokedTokenMap, now: u64) {
                         let value = match (value, migrated_purge_at(now)) {
                             (0, Some(bounded)) => {
                                 if let Err(e) = redis_publish(client, &token_id, bounded) {
-                                    warn!("[RevokedSync] Could not bound legacy Redis entry {token_id}: {e}");
+                                    warn!(
+                                        "[RevokedSync] Could not bound legacy Redis entry {token_id}: {e}"
+                                    );
                                 }
                                 bounded
                             }
@@ -364,7 +373,10 @@ fn pull_from_redis(client: &Client, map: &RevokedTokenMap, now: u64) {
         if let Err(e) = con.del::<_, ()>(keys) {
             warn!("[RevokedSync] Failed to drop stale Redis keys: {e}");
         } else {
-            debug!("[RevokedSync] Dropped {} stale Redis revocations", stale.len());
+            debug!(
+                "[RevokedSync] Dropped {} stale Redis revocations",
+                stale.len()
+            );
         }
     }
 }
@@ -380,12 +392,17 @@ pub fn encode_record(record: RevocationRecord) -> [u8; 16] {
 
 /// Reads every layout ever written (see the module notes).
 pub fn decode_record(bytes: &[u8]) -> Option<RevocationRecord> {
-    let u64_at = |range: std::ops::Range<usize>| {
-        bytes.get(range)?.try_into().ok().map(u64::from_be_bytes)
-    };
+    let u64_at =
+        |range: std::ops::Range<usize>| bytes.get(range)?.try_into().ok().map(u64::from_be_bytes);
     match bytes.len() {
-        0 => Some(RevocationRecord { revoked_at: 0, value: 0 }),
-        8 => Some(RevocationRecord { revoked_at: 0, value: u64_at(0..8)? }),
+        0 => Some(RevocationRecord {
+            revoked_at: 0,
+            value: 0,
+        }),
+        8 => Some(RevocationRecord {
+            revoked_at: 0,
+            value: u64_at(0..8)?,
+        }),
         16 => Some(RevocationRecord {
             revoked_at: u64_at(0..8)?,
             value: u64_at(8..16)?,
@@ -412,7 +429,12 @@ pub fn lmdb_put_record(token_id: &str, record: RevocationRecord) -> Result<(), E
         .ok_or_else(|| anyhow::anyhow!("LMDB is not initialized"))?;
     let db = env.open_db(Some("revoke"))?;
     let mut txn = env.begin_rw_txn()?;
-    txn.put(db, &token_id.as_bytes(), &encode_record(record), WriteFlags::empty())?;
+    txn.put(
+        db,
+        &token_id.as_bytes(),
+        &encode_record(record),
+        WriteFlags::empty(),
+    )?;
     txn.commit()?;
     Ok(())
 }
@@ -471,7 +493,13 @@ fn lmdb_read_all_into(map: &RevokedTokenMap) {
         let (key, mut value) = (entry.key().clone(), *entry.value());
         if value == 0 {
             if let Some(bounded) = migrated_purge_at(now) {
-                match lmdb_put_record(&key, RevocationRecord { revoked_at: now, value: bounded }) {
+                match lmdb_put_record(
+                    &key,
+                    RevocationRecord {
+                        revoked_at: now,
+                        value: bounded,
+                    },
+                ) {
                     Ok(()) => {
                         value = bounded;
                         migrated += 1;

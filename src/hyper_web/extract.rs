@@ -63,7 +63,9 @@ impl std::fmt::Display for PayloadError {
                 write!(f, "Unsupported content encoding: {e}")
             }
             PayloadError::Decode(e) => write!(f, "Can not decode content-encoding: {e}"),
-            PayloadError::Incomplete(e) => write!(f, "A payload reached EOF, but is not complete: {e}"),
+            PayloadError::Incomplete(e) => {
+                write!(f, "A payload reached EOF, but is not complete: {e}")
+            }
         }
     }
 }
@@ -361,9 +363,12 @@ impl<T: DeserializeOwned + 'static> FromRequest for Json<T> {
                 return Err(extract_err(StatusCode::BAD_REQUEST, "Content type error"));
             }
             let body = read_body(req, body, JSON_LIMIT).await?;
-            serde_json::from_slice::<T>(&body)
-                .map(Json)
-                .map_err(|e| extract_err(StatusCode::BAD_REQUEST, format!("Json deserialize error: {e}")))
+            serde_json::from_slice::<T>(&body).map(Json).map_err(|e| {
+                extract_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("Json deserialize error: {e}"),
+                )
+            })
         })
     }
 }
@@ -397,7 +402,12 @@ impl<T: DeserializeOwned + 'static> FromRequest for Query<T> {
     fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
         let res = serde_urlencoded::from_str::<T>(req.query_string())
             .map(Query)
-            .map_err(|e| extract_err(StatusCode::BAD_REQUEST, format!("Query deserialize error: {e}")));
+            .map_err(|e| {
+                extract_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("Query deserialize error: {e}"),
+                )
+            });
         Box::pin(async move { res })
     }
 }
@@ -406,7 +416,12 @@ impl<T: DeserializeOwned> Query<T> {
     pub fn from_query(query: &str) -> Result<Self, Error> {
         serde_urlencoded::from_str::<T>(query)
             .map(Query)
-            .map_err(|e| extract_err(StatusCode::BAD_REQUEST, format!("Query deserialize error: {e}")))
+            .map_err(|e| {
+                extract_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("Query deserialize error: {e}"),
+                )
+            })
     }
 }
 

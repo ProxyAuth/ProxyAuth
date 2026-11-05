@@ -2409,7 +2409,10 @@ impl Serialize for AppConfig {
             "session_refresh_interval_secs",
             &self.session_refresh_interval_secs,
         )?;
-        state.serialize_field("session_refresh_grace_secs", &self.session_refresh_grace_secs)?;
+        state.serialize_field(
+            "session_refresh_grace_secs",
+            &self.session_refresh_grace_secs,
+        )?;
         state.serialize_field("session_max_lifetime_secs", &self.session_max_lifetime_secs)?;
         state.serialize_field(
             "refresh_token_expiry_seconds",
@@ -2764,7 +2767,6 @@ fn default_log() -> HashMap<String, String> {
     log
 }
 
-
 fn default_cert() -> HashMap<String, String> {
     let cert = HashMap::new();
     cert
@@ -2883,7 +2885,9 @@ impl AppConfig {
     /// retombe sur le défaut.
     pub fn shutdown_timeout_duration(&self) -> std::time::Duration {
         match self.shutdown_timeout {
-            Some(s) if s.is_finite() && s >= 0.0 => std::time::Duration::from_secs_f64(s.min(3600.0)),
+            Some(s) if s.is_finite() && s >= 0.0 => {
+                std::time::Duration::from_secs_f64(s.min(3600.0))
+            }
             _ => crate::hyper_web::server::DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
@@ -3648,4 +3652,3 @@ impl AllowRegexCfg {
         })
     }
 }
-

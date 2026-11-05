@@ -11,7 +11,10 @@ mod tests {
             .expand_vhost_groups()
     }
 
-    fn route<'a>(routes: &'a RouteConfig, prefix: &str) -> &'a proxyauth::config::config::RouteRule {
+    fn route<'a>(
+        routes: &'a RouteConfig,
+        prefix: &str,
+    ) -> &'a proxyauth::config::config::RouteRule {
         routes
             .routes
             .iter()
@@ -35,8 +38,14 @@ vhosts:
         required_login: true
 "#,
         );
-        assert_eq!(route(&routes, "/admin").resolved_redirect_login_url(), Some("/login"));
-        assert_eq!(route(&routes, "/drafts").resolved_redirect_login_url(), Some("/login"));
+        assert_eq!(
+            route(&routes, "/admin").resolved_redirect_login_url(),
+            Some("/login")
+        );
+        assert_eq!(
+            route(&routes, "/drafts").resolved_redirect_login_url(),
+            Some("/login")
+        );
     }
 
     #[test]
@@ -56,7 +65,10 @@ vhosts:
         redirect_login_url: "https://auth.example.com/login"
 "#,
         );
-        assert_eq!(route(&routes, "/admin").resolved_redirect_login_url(), Some("/login"));
+        assert_eq!(
+            route(&routes, "/admin").resolved_redirect_login_url(),
+            Some("/login")
+        );
         assert_eq!(
             route(&routes, "/partners").resolved_redirect_login_url(),
             Some("https://auth.example.com/login")
@@ -74,7 +86,10 @@ routes:
     login_page_url: "/signin"
 "#,
         );
-        assert_eq!(route(&routes, "/admin").resolved_redirect_login_url(), Some("/signin"));
+        assert_eq!(
+            route(&routes, "/admin").resolved_redirect_login_url(),
+            Some("/signin")
+        );
     }
 
     #[test]
@@ -164,7 +179,10 @@ vhosts:
                 "routes:\n  - prefix: \"/admin\"\n    target: \"http://127.0.0.1:9005\"\n    redirect_login_url: \"{url}\"\n"
             );
             let routes = expand(&yaml);
-            assert_eq!(route(&routes, "/admin").resolved_redirect_login_url(), Some(url));
+            assert_eq!(
+                route(&routes, "/admin").resolved_redirect_login_url(),
+                Some(url)
+            );
         }
     }
 

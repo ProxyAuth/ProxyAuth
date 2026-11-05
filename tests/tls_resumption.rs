@@ -78,7 +78,11 @@ fn count_resumed(port: u16, version: &'static rustls::SupportedProtocolVersion, 
             .unwrap();
         let mut buf = Vec::new();
         let _ = tls.read_to_end(&mut buf);
-        assert!(buf.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&buf));
+        assert!(
+            buf.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&buf)
+        );
         if conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
             resumed += 1;
         }
@@ -112,10 +116,22 @@ async fn tls_sessions_resume_across_workers() {
 
     let results = tokio::task::spawn_blocking(move || {
         [
-            ("fixed tls1.2", count_resumed(fixed_port, &rustls::version::TLS12, 20)),
-            ("fixed tls1.3", count_resumed(fixed_port, &rustls::version::TLS13, 20)),
-            ("sni tls1.2", count_resumed(sni_port, &rustls::version::TLS12, 20)),
-            ("sni tls1.3", count_resumed(sni_port, &rustls::version::TLS13, 20)),
+            (
+                "fixed tls1.2",
+                count_resumed(fixed_port, &rustls::version::TLS12, 20),
+            ),
+            (
+                "fixed tls1.3",
+                count_resumed(fixed_port, &rustls::version::TLS13, 20),
+            ),
+            (
+                "sni tls1.2",
+                count_resumed(sni_port, &rustls::version::TLS12, 20),
+            ),
+            (
+                "sni tls1.3",
+                count_resumed(sni_port, &rustls::version::TLS13, 20),
+            ),
         ]
     })
     .await
@@ -128,4 +144,3 @@ async fn tls_sessions_resume_across_workers() {
         assert_eq!(resumed, 19, "{label}");
     }
 }
-

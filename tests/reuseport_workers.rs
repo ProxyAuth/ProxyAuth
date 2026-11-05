@@ -16,7 +16,8 @@ fn reuseport_listener() -> TcpListener {
     let s = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
     s.set_reuse_address(true).unwrap();
     s.set_reuse_port(true).unwrap();
-    s.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into()).unwrap();
+    s.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
     s.listen(1024).unwrap();
     s.into()
 }
@@ -38,7 +39,8 @@ async fn connections_are_spread_over_worker_sockets() {
         // noyau les répartit entre les sockets des workers.
         for _ in 0..400 {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
             let mut buf = String::new();
             s.read_to_string(&mut buf).unwrap();
             assert!(buf.starts_with("HTTP/1.1 200"), "{buf}");

@@ -36,7 +36,9 @@ async fn echo_backend() -> u16 {
                     path = req.uri().to_string();
                     Ok(resp)
                 };
-                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(s, cb).await else { return };
+                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(s, cb).await else {
+                    return;
+                };
                 let _ = ws.send(Message::text(format!("hello {path}"))).await;
                 while let Some(Ok(m)) = ws.next().await {
                     if m.is_text() || m.is_binary() {
@@ -103,7 +105,9 @@ async fn h2_websocket(
     port: u16,
     path: &str,
 ) -> Result<tokio_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>, String> {
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, Empty<Bytes>>(TokioIo::new(tcp))
         .await
@@ -128,8 +132,15 @@ async fn h2_websocket(
         resp.headers().get("content-length").is_none(),
         "a successful CONNECT response carries no Content-Length"
     );
-    let upgraded = hyper::upgrade::on(&mut resp).await.map_err(|e| e.to_string())?;
-    Ok(tokio_tungstenite::WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await)
+    let upgraded = hyper::upgrade::on(&mut resp)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(tokio_tungstenite::WebSocketStream::from_raw_socket(
+        TokioIo::new(upgraded),
+        Role::Client,
+        None,
+    )
+    .await)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -154,18 +165,27 @@ async fn websocket_over_http1_and_http2() {
     let server = tokio::spawn(server);
 
     // ── HTTP/1.1 ─────────────────────────────────────────────────
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws/room?x=1"))
-        .await
-        .expect("HTTP/1.1 websocket");
-    assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("hello /room?x=1"));
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws/room?x=1"))
+            .await
+            .expect("HTTP/1.1 websocket");
+    assert_eq!(
+        ws.next().await.unwrap().unwrap(),
+        Message::text("hello /room?x=1")
+    );
     ws.send(Message::text("h1 ping")).await.unwrap();
     assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("h1 ping"));
     ws.close(None).await.ok();
     drop(ws);
 
     // ── HTTP/2, RFC 8441 ─────────────────────────────────────────
-    let mut ws = h2_websocket(port, "/ws/chat").await.expect("HTTP/2 websocket");
-    assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("hello /chat"));
+    let mut ws = h2_websocket(port, "/ws/chat")
+        .await
+        .expect("HTTP/2 websocket");
+    assert_eq!(
+        ws.next().await.unwrap().unwrap(),
+        Message::text("hello /chat")
+    );
     ws.send(Message::text("h2 ping")).await.unwrap();
     assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("h2 ping"));
     let big: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
@@ -188,7 +208,10 @@ async fn websocket_over_http1_and_http2() {
     drop((a, b));
 
     // Route sans forward_websocket : pas de tunnel.
-    assert!(h2_websocket(port, "/nows").await.is_err(), "no tunnel without forward_websocket");
+    assert!(
+        h2_websocket(port, "/nows").await.is_err(),
+        "no tunnel without forward_websocket"
+    );
 
     // Toutes les WebSocket sont fermées : l'arrêt gracieux ne doit pas
     // attendre son délai maximal (30 s).
@@ -199,5 +222,9 @@ async fn websocket_over_http1_and_http2() {
         .expect("server must stop")
         .unwrap()
         .unwrap();
-    assert!(t0.elapsed() < Duration::from_secs(10), "shutdown took {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "shutdown took {:?}",
+        t0.elapsed()
+    );
 }

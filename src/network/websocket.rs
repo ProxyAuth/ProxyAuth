@@ -195,7 +195,10 @@ pub async fn tunnel(
                 h.insert(header::SEC_WEBSOCKET_KEY, v);
             }
             if !h.contains_key(header::SEC_WEBSOCKET_VERSION) {
-                h.insert(header::SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+                h.insert(
+                    header::SEC_WEBSOCKET_VERSION,
+                    HeaderValue::from_static("13"),
+                );
             }
         }
         if !h.contains_key(header::HOST) {
@@ -294,7 +297,10 @@ pub async fn tunnel(
                 return plain(StatusCode::BAD_GATEWAY, "502 Bad Gateway");
             }
             let mut res = HttpResponse::new(StatusCode::OK);
-            for name in [header::SEC_WEBSOCKET_PROTOCOL, header::SEC_WEBSOCKET_EXTENSIONS] {
+            for name in [
+                header::SEC_WEBSOCKET_PROTOCOL,
+                header::SEC_WEBSOCKET_EXTENSIONS,
+            ] {
                 for v in backend_resp.headers().get_all(&name) {
                     res.headers_mut().append(name.clone(), v.clone());
                 }
@@ -339,16 +345,31 @@ mod tests {
     #[test]
     fn accept_key_matches_rfc6455_example() {
         // RFC 6455 §1.3
-        assert_eq!(accept_for("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        assert_eq!(
+            accept_for("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
         assert_ne!(random_key(), random_key());
         assert_eq!(random_key().len(), 24);
     }
 
     #[test]
     fn target_schemes_are_normalized() {
-        assert_eq!(normalize_target_url("ws://10.0.0.1:3000/x".into()), "http://10.0.0.1:3000/x");
-        assert_eq!(normalize_target_url("wss://h.example/x".into()), "https://h.example/x");
-        assert_eq!(normalize_target_url("https://h.example".into()), "https://h.example");
-        assert_eq!(normalize_target_url("10.0.0.1:3000".into()), "http://10.0.0.1:3000");
+        assert_eq!(
+            normalize_target_url("ws://10.0.0.1:3000/x".into()),
+            "http://10.0.0.1:3000/x"
+        );
+        assert_eq!(
+            normalize_target_url("wss://h.example/x".into()),
+            "https://h.example/x"
+        );
+        assert_eq!(
+            normalize_target_url("https://h.example".into()),
+            "https://h.example"
+        );
+        assert_eq!(
+            normalize_target_url("10.0.0.1:3000".into()),
+            "http://10.0.0.1:3000"
+        );
     }
 }

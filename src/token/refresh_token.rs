@@ -35,12 +35,12 @@
 
 use crate::AppState;
 use crate::config::config::{AppConfig, RouteRule, max_token_lifetime};
+use crate::hyper_web::http::header;
+use crate::hyper_web::{Error as WebError, HttpRequest, HttpResponse, web};
 use crate::revoke::load::{GenerationStep, advance_generation, publish_generation, revoke_token};
 use crate::token::security::{
     TokenData, TokenKind, issue_session_token, now_secs, validate_refresh_token,
 };
-use crate::hyper_web::http::header;
-use crate::hyper_web::{Error as WebError, HttpRequest, HttpResponse, web};
 use chrono::{TimeZone, Utc};
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -157,7 +157,11 @@ pub fn format_expiry(config: &AppConfig, unix_secs: u64) -> String {
     let tz = crate::token::auth::resolve_timezone(config);
     Utc.timestamp_opt(unix_secs.min(i64::MAX as u64) as i64, 0)
         .single()
-        .map(|t| t.with_timezone(&tz).format("%Y-%m-%d %H:%M:%S %:z").to_string())
+        .map(|t| {
+            t.with_timezone(&tz)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -171,7 +175,11 @@ pub fn pair_json(config: &AppConfig, pair: &IssuedPair) -> serde_json::Value {
     })
 }
 
-fn error_response(status: crate::hyper_web::http::StatusCode, code: &str, description: &str) -> HttpResponse {
+fn error_response(
+    status: crate::hyper_web::http::StatusCode,
+    code: &str,
+    description: &str,
+) -> HttpResponse {
     HttpResponse::build(status)
         .append_header(("server", "ProxyAuth"))
         .insert_header((header::CACHE_CONTROL, "no-store"))
@@ -274,16 +282,34 @@ pub async fn refresh_token_dispatch(
 
     // The account may have changed since login.
     let Some(user) = data.config.user_by_index(session.data.index_user) else {
-        return Ok(error_response(StatusCode::UNAUTHORIZED, "invalid_grant", "unknown account"));
+        return Ok(error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_grant",
+            "unknown account",
+        ));
     };
     if !crate::token::auth::is_ip_allowed(&ip, &user) {
-        warn!("[{ip}] refresh denied for {}: address not allowed", user.username);
-        return Ok(error_response(StatusCode::FORBIDDEN, "access_denied", "access denied"));
+        warn!(
+            "[{ip}] refresh denied for {}: address not allowed",
+            user.username
+        );
+        return Ok(error_response(
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            "access denied",
+        ));
     }
     if let Some(rule) = vhost_route {
         if !rule.login_authorized(&user.username, &data.config) {
-            warn!("[{ip}] refresh denied for {}: not authorized on this vhost", user.username);
-            return Ok(error_response(StatusCode::FORBIDDEN, "access_denied", "access denied"));
+            warn!(
+                "[{ip}] refresh denied for {}: not authorized on this vhost",
+                user.username
+            );
+            return Ok(error_response(
+                StatusCode::FORBIDDEN,
+                "access_denied",
+                "access denied",
+            ));
         }
     }
 
@@ -294,7 +320,10 @@ pub async fn refresh_token_dispatch(
         session.data.issued_at
     };
     if max_lifetime > 0 && now >= started_at.saturating_add(max_lifetime) {
-        info!("[{ip}] session of {} reached session_max_lifetime_secs; sign-in required", user.username);
+        info!(
+            "[{ip}] session of {} reached session_max_lifetime_secs; sign-in required",
+            user.username
+        );
         return Ok(error_response(
             StatusCode::UNAUTHORIZED,
             "invalid_grant",
@@ -311,7 +340,8 @@ pub async fn refresh_token_dispatch(
         &data.revoked_tokens,
     ) {
         GenerationStep::Advanced { generation, value } => {
-            if let Err(e) = publish_generation(&session.token_id, value, &data.revoked_tokens).await {
+            if let Err(e) = publish_generation(&session.token_id, value, &data.revoked_tokens).await
+            {
                 warn!("[{ip}] refresh generation not persisted everywhere: {e}");
             }
             generation
@@ -323,8 +353,11 @@ pub async fn refresh_token_dispatch(
                 "[{ip}] refresh token reuse for {} (generation {} presented, {} current): session {} revoked",
                 user.username, session.data.generation, current, session.token_id
             );
-            let keep_until = now.saturating_add(max_token_lifetime(&data.config, &data.routes.routes));
-            if let Err(e) = revoke_token(&session.token_id, Some(keep_until), &data.revoked_tokens).await {
+            let keep_until =
+                now.saturating_add(max_token_lifetime(&data.config, &data.routes.routes));
+            if let Err(e) =
+                revoke_token(&session.token_id, Some(keep_until), &data.revoked_tokens).await
+            {
                 warn!("[{ip}] session revocation not persisted everywhere: {e}");
             }
             return Ok(error_response(
@@ -347,7 +380,10 @@ pub async fn refresh_token_dispatch(
     ) {
         Ok(pair) => pair,
         Err(e) => {
-            error!("[{ip}] failed to issue refreshed tokens for {}: {e}", user.username);
+            error!(
+                "[{ip}] failed to issue refreshed tokens for {}: {e}",
+                user.username
+            );
             return Ok(HttpResponse::InternalServerError().finish());
         }
     };

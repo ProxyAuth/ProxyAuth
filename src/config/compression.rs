@@ -390,9 +390,18 @@ mod tests {
 
     #[test]
     fn route_strips_matches_the_merged_config() {
-        let on = CompressionConfig { enabled: Some(true), ..Default::default() };
-        let off = CompressionConfig { enabled: Some(false), ..Default::default() };
-        let keep = CompressionConfig { upstream_identity: Some(false), ..Default::default() };
+        let on = CompressionConfig {
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let off = CompressionConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let keep = CompressionConfig {
+            upstream_identity: Some(false),
+            ..Default::default()
+        };
         for global in [&on, &off, &keep, &CompressionConfig::default()] {
             for route in [None, Some(&on), Some(&off), Some(&keep)] {
                 let merged = match route {

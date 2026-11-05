@@ -410,10 +410,22 @@ mod tests {
         let parse = |extra: &str| -> AppConfig {
             serde_json::from_str(&format!("{{{BASE}{extra}}}")).unwrap()
         };
-        assert_eq!(parse("").shutdown_timeout_duration(), Duration::from_secs(2));
-        assert_eq!(parse(r#", "shutdown_timeout": 0"#).shutdown_timeout_duration(), Duration::ZERO);
-        assert_eq!(parse(r#", "shutdown_timeout": 0.5"#).shutdown_timeout_duration(), Duration::from_millis(500));
-        assert_eq!(parse(r#", "shutdown_timeout": 30"#).shutdown_timeout_duration(), Duration::from_secs(30));
+        assert_eq!(
+            parse("").shutdown_timeout_duration(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            parse(r#", "shutdown_timeout": 0"#).shutdown_timeout_duration(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            parse(r#", "shutdown_timeout": 0.5"#).shutdown_timeout_duration(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse(r#", "shutdown_timeout": 30"#).shutdown_timeout_duration(),
+            Duration::from_secs(30)
+        );
         assert_eq!(
             parse(r#", "shutdown_timeout": -1"#).shutdown_timeout_duration(),
             Duration::from_secs(2),

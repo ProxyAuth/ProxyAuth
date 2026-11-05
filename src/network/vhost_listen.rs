@@ -34,7 +34,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use tracing::warn;
 
 /// Protocole HTTP servi pour un vhost.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum HttpProtocol {
     /// HTTP/1.1 et HTTP/2 (négocié).
@@ -167,9 +169,11 @@ pub fn protocol_for_sni(routes: &[RouteRule], sni: Option<&str>) -> HttpProtocol
         return HttpProtocol::Auto;
     };
     let host = normalize_host(sni);
-    let exact = routes
-        .iter()
-        .find(|r| r.vhost.iter().any(|v| !v.starts_with("*.") && vhost_entry_matches(v, &host)));
+    let exact = routes.iter().find(|r| {
+        r.vhost
+            .iter()
+            .any(|v| !v.starts_with("*.") && vhost_entry_matches(v, &host))
+    });
     let rule = exact.or_else(|| {
         routes
             .iter()
@@ -191,24 +195,32 @@ impl Middleware for VhostListenGuard {
         let route = find_vhost_route(host.as_deref(), &self.state.routes.routes);
 
         // Port attendu pour ce Host : celui de son vhost, sinon le défaut.
-        let expected = route.map(|r| route_port(r, default_port)).unwrap_or(default_port);
+        let expected = route
+            .map(|r| route_port(r, default_port))
+            .unwrap_or(default_port);
         // Le défi ACME HTTP-01 (port 80, écouteur séparé) n'est pas concerné ;
         // `local_port` absent = requête de test.
         if let Some(lp) = local_port {
             if lp != expected && !is_acme_challenge(req.path()) {
-                let res = HttpResponse::build(crate::hyper_web::http::StatusCode::MISDIRECTED_REQUEST)
-                    .body("421 Misdirected Request");
+                let res =
+                    HttpResponse::build(crate::hyper_web::http::StatusCode::MISDIRECTED_REQUEST)
+                        .body("421 Misdirected Request");
                 return Box::pin(async move { Ok(req.into_response(res)) });
             }
         }
 
         let proto = route.map(route_protocol).unwrap_or_default();
         if !proto.accepts(req.version()) {
-            let res = HttpResponse::build(crate::hyper_web::http::StatusCode::HTTP_VERSION_NOT_SUPPORTED)
-                .body(match proto {
-                    HttpProtocol::H2 => "505 HTTP Version Not Supported: this host is served over HTTP/2 only",
-                    _ => "505 HTTP Version Not Supported: this host is served over HTTP/1.1 only",
-                });
+            let res =
+                HttpResponse::build(crate::hyper_web::http::StatusCode::HTTP_VERSION_NOT_SUPPORTED)
+                    .body(match proto {
+                        HttpProtocol::H2 => {
+                            "505 HTTP Version Not Supported: this host is served over HTTP/2 only"
+                        }
+                        _ => {
+                            "505 HTTP Version Not Supported: this host is served over HTTP/1.1 only"
+                        }
+                    });
             return Box::pin(async move { Ok(req.into_response(res)) });
         }
 
@@ -253,9 +265,18 @@ mod tests {
             rule(&["*.example.com"], None, Some(HttpProtocol::H1)),
             rule(&["api.example.com"], None, Some(HttpProtocol::H2)),
         ];
-        assert_eq!(protocol_for_sni(&routes, Some("api.example.com")), HttpProtocol::H2);
-        assert_eq!(protocol_for_sni(&routes, Some("www.example.com")), HttpProtocol::H1);
-        assert_eq!(protocol_for_sni(&routes, Some("other.org")), HttpProtocol::Auto);
+        assert_eq!(
+            protocol_for_sni(&routes, Some("api.example.com")),
+            HttpProtocol::H2
+        );
+        assert_eq!(
+            protocol_for_sni(&routes, Some("www.example.com")),
+            HttpProtocol::H1
+        );
+        assert_eq!(
+            protocol_for_sni(&routes, Some("other.org")),
+            HttpProtocol::Auto
+        );
         assert_eq!(protocol_for_sni(&routes, None), HttpProtocol::Auto);
     }
 

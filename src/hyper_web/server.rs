@@ -33,9 +33,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
@@ -272,13 +272,21 @@ where
     }
 
     /// Écouteur en clair limité à un protocole.
-    pub fn listen_protocol(self, lst: std::net::TcpListener, protocol: ConnProtocol) -> io::Result<Self> {
+    pub fn listen_protocol(
+        self,
+        lst: std::net::TcpListener,
+        protocol: ConnProtocol,
+    ) -> io::Result<Self> {
         self.listen_with(lst, None, protocol)
     }
 
     /// Écouteur TLS dont la configuration est choisie par nom SNI. Le
     /// protocole de chaque connexion suit l'ALPN négocié.
-    pub fn listen_rustls_sni(self, lst: std::net::TcpListener, selector: TlsSelector) -> io::Result<Self> {
+    pub fn listen_rustls_sni(
+        self,
+        lst: std::net::TcpListener,
+        selector: TlsSelector,
+    ) -> io::Result<Self> {
         self.listen_with(lst, Some(Tls::BySni(selector)), ConnProtocol::Auto)
     }
 
@@ -370,7 +378,8 @@ where
                 let spawned = std::thread::Builder::new()
                     .name(format!("proxyauth-worker-{idx}"))
                     .spawn(move || {
-                        let res = run_worker(idx, factory, Source::Channel(conn_rx), cfg, load, opts);
+                        let res =
+                            run_worker(idx, factory, Source::Channel(conn_rx), cfg, load, opts);
                         let _ = tx.send(res);
                     });
                 if let Err(e) = spawned {
@@ -454,19 +463,26 @@ fn reuseport_siblings(
 ) -> io::Result<Vec<Vec<std::net::TcpListener>>> {
     use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-    let mut per_worker: Vec<Vec<std::net::TcpListener>> =
-        (1..workers).map(|_| Vec::with_capacity(originals.len())).collect();
+    let mut per_worker: Vec<Vec<std::net::TcpListener>> = (1..workers)
+        .map(|_| Vec::with_capacity(originals.len()))
+        .collect();
     if workers <= 1 {
         return Ok(per_worker);
     }
     for lst in originals {
         let sock = SockRef::from(lst);
         if !sock.reuse_port()? {
-            return Err(io::Error::other("listener was not created with SO_REUSEPORT"));
+            return Err(io::Error::other(
+                "listener was not created with SO_REUSEPORT",
+            ));
         }
         let addr = lst.local_addr()?;
         for set in per_worker.iter_mut() {
-            let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+            let domain = if addr.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
             let s = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
             if addr.is_ipv6() {
                 s.set_only_v6(sock.only_v6().unwrap_or(false))?;
@@ -846,7 +862,16 @@ async fn handle_connection(
     _guard: LoadGuard,
 ) {
     let Some(tls) = cfg.tls else {
-        serve(TokioIo::new(stream), peer, local_addr, false, app, &builders, cfg.protocol).await;
+        serve(
+            TokioIo::new(stream),
+            peer,
+            local_addr,
+            false,
+            app,
+            &builders,
+            cfg.protocol,
+        )
+        .await;
         return;
     };
 
@@ -882,7 +907,16 @@ async fn handle_connection(
         Some(b"http/1.1") => ConnProtocol::Http1,
         _ => cfg.protocol,
     };
-    serve(TokioIo::new(tls_stream), peer, local_addr, true, app, &builders, negotiated).await;
+    serve(
+        TokioIo::new(tls_stream),
+        peer,
+        local_addr,
+        true,
+        app,
+        &builders,
+        negotiated,
+    )
+    .await;
 }
 
 async fn serve<I>(
@@ -943,7 +977,11 @@ pub(crate) async fn handle(
     // HTTP/1.1 : en-tête `Upgrade`. HTTP/2 : CONNECT étendu (RFC 8441),
     // dont hyper fournit `:protocol` et l'upgrade du flux.
     let connect_protocol = (req.method() == http::Method::CONNECT)
-        .then(|| req.extensions().get::<hyper::ext::Protocol>().map(|p| p.as_str().to_string()))
+        .then(|| {
+            req.extensions()
+                .get::<hyper::ext::Protocol>()
+                .map(|p| p.as_str().to_string())
+        })
         .flatten();
     let upgrade = (req.headers().contains_key(header::UPGRADE) || connect_protocol.is_some())
         .then(|| hyper::upgrade::on(&mut req));
@@ -971,7 +1009,32 @@ pub(crate) async fn handle(
     if let Some(p) = connect_protocol {
         http_req.extensions_mut().insert(ConnectProtocol(p));
     }
-    let payload = Payload::new(incoming_to_body(body));
+    // Petit corps annoncé (≤ PREREAD_MAX) : lu avant de passer la main à
+    // l'application. Une réponse émise sans avoir lu le corps (un 429 du
+    // rate limit sur un POST /auth, un 401…) oblige hyper à fermer la
+    // connexion ; si le corps arrive après cette fermeture, le noyau répond
+    // par un RST qui peut détruire la réponse avant que le client ne l'ait
+    // lue (SSLEOFError / ECONNRESET côté client). Lire ces quelques octets
+    // d'abord évite la fermeture et garde la connexion réutilisable. Les
+    // gros corps restent en flux, lus par le handler s'il en a besoin.
+    let small_body = http_req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .is_some_and(|n| n > 0 && n <= PREREAD_MAX);
+    let body = if small_body {
+        use http_body_util::BodyExt;
+        match body.collect().await {
+            Ok(collected) => Body::from(collected.to_bytes()),
+            Err(e) => Body::from_stream(futures_util::stream::once(async move {
+                Err::<bytes::Bytes, super::body::BoxError>(Box::new(e))
+            })),
+        }
+    } else {
+        incoming_to_body(body)
+    };
+    let payload = Payload::new(body);
     let res = app.call(ServiceRequest::new(http_req, payload)).await;
     let mut res = res.into_response();
     if is_head {
@@ -995,7 +1058,8 @@ fn strip_body_for_head(res: &mut super::response::HttpResponse) {
     let may_have_length = !(status < 200 || status == 204 || status == 304);
     if may_have_length && !res.headers().contains_key(header::CONTENT_LENGTH) {
         if let super::body::BodySize::Sized(n) = body.size() {
-            res.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(n));
+            res.headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(n));
         }
     }
     // `body` (éventuellement un flux venant du backend) est abandonné ici.
@@ -1021,15 +1085,19 @@ fn normalize_uri(uri: Uri, version: Version, headers: &mut http::HeaderMap) -> U
     }
 }
 
+/// Taille maximale d'un corps de requête lu d'avance (voir `handle`).
+const PREREAD_MAX: u64 = 64 * 1024;
+
 pub(crate) fn incoming_to_body(body: Incoming) -> Body {
-    use http_body_util::BodyExt;
     use futures_util::StreamExt;
-    let stream = http_body_util::BodyStream::new(body.map_err(|e| Box::new(e) as super::body::BoxError))
-        .filter_map(|frame| async move {
-            match frame {
-                Ok(f) => f.into_data().ok().map(Ok::<_, super::body::BoxError>),
-                Err(e) => Some(Err(e)),
-            }
-        });
+    use http_body_util::BodyExt;
+    let stream =
+        http_body_util::BodyStream::new(body.map_err(|e| Box::new(e) as super::body::BoxError))
+            .filter_map(|frame| async move {
+                match frame {
+                    Ok(f) => f.into_data().ok().map(Ok::<_, super::body::BoxError>),
+                    Err(e) => Some(Err(e)),
+                }
+            });
     Body::from_stream(stream)
 }

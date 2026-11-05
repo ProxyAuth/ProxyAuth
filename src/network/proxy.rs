@@ -2,6 +2,10 @@ use crate::config::config::BackendConfig;
 use crate::config::config::BackendInput;
 use crate::config::config::CheckReturnType;
 use crate::config::config::RouteRule;
+use crate::hyper_web::{
+    Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
+    web,
+};
 use crate::network::accesslog::LogContext;
 use crate::network::canonical_url::canonicalize_path_for_match;
 use crate::network::loadbalancing::forward_failover;
@@ -11,10 +15,6 @@ use crate::network::shared_client::{
 use crate::token::csrf::{fix_mime_actix, inject_csrf_token, validate_csrf_token};
 use crate::token::security::apply_filters_regex_allow_only;
 use crate::{AppConfig, AppState};
-use crate::hyper_web::{
-    Error, HttpRequest, HttpResponse, HttpResponseBuilder, error, http::StatusCode, http::header,
-    web,
-};
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, Empty, Full};
 use hyper::body::{Bytes, Incoming};
@@ -38,7 +38,10 @@ use tracing::warn;
 /// la session était perdue dès qu'un autre cookie (consentement d'une régie,
 /// statistiques…) arrivait avant `session_token`. Les autres cookies ne sont
 /// ni lus ni modifiés ici.
-pub(crate) fn request_cookie<'a>(req: &'a crate::hyper_web::HttpRequest, name: &str) -> Option<&'a str> {
+pub(crate) fn request_cookie<'a>(
+    req: &'a crate::hyper_web::HttpRequest,
+    name: &str,
+) -> Option<&'a str> {
     req.headers()
         .get_all(crate::hyper_web::http::header::COOKIE)
         .iter()
@@ -445,7 +448,10 @@ pub fn normalize_host(host: &str) -> String {
 /// here always wins over anything the backend itself might have sent
 /// for the same header name (`insert_header` replaces rather than
 /// appending a duplicate).
-fn apply_custom_headers_builder(builder: &mut crate::hyper_web::HttpResponseBuilder, rule: &RouteRule) {
+fn apply_custom_headers_builder(
+    builder: &mut crate::hyper_web::HttpResponseBuilder,
+    rule: &RouteRule,
+) {
     for (name, value) in &rule.headers {
         // Validated explicitly rather than handed straight to
         // `insert_header`: actix doesn't panic on a malformed
@@ -565,7 +571,9 @@ fn looks_like_api_call(req: &HttpRequest) -> bool {
     if let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
         let accept = accept.to_ascii_lowercase();
         if !accept.contains("text/html")
-            && (accept.contains("json") || accept.contains("xml") || accept.contains("text/event-stream"))
+            && (accept.contains("json")
+                || accept.contains("xml")
+                || accept.contains("text/event-stream"))
         {
             return true;
         }
@@ -609,7 +617,11 @@ pub fn is_login_page(path: &str, route: Option<&RouteRule>, config: &AppConfig) 
     let login = login_page_path(route, config);
     let normalize = |p: &str| {
         let trimmed = p.trim_end_matches('/');
-        if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
+        }
     };
     normalize(path) == normalize(login)
 }
@@ -1274,7 +1286,9 @@ where
     BodyStream::new(body).filter_map(|frame| async move {
         match frame {
             Ok(f) => f.into_data().ok().map(Ok),
-            Err(e) => Some(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>)),
+            Err(e) => Some(Err(
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>
+            )),
         }
     })
 }
@@ -1374,9 +1388,7 @@ async fn proxy_to_redirect_protect_target(
         }
     }
 
-    let hyper_req = request_builder
-        .body(Full::new(body.clone()).boxed())
-        .ok()?;
+    let hyper_req = request_builder.body(Full::new(body.clone()).boxed()).ok()?;
 
     let client_opts = ClientOptions {
         use_proxy: false,
@@ -1673,26 +1685,26 @@ fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> 
     if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
         warn!(
             "static route \"{prefix}\": too many open files while reading {} — raise the open-files limit of the proxyauth service (ulimit -n / LimitNOFILE / rc_ulimit)",
-              path.display()
+            path.display()
         );
         return HttpResponse::ServiceUnavailable()
-        .append_header(("server", "ProxyAuth"))
-        .append_header(("Retry-After", "1"))
-        .body("503 Service Unavailable");
+            .append_header(("server", "ProxyAuth"))
+            .append_header(("Retry-After", "1"))
+            .body("503 Service Unavailable");
     }
 
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         warn!(
             "static route \"{prefix}\": permission denied reading {} — the \"proxyauth\" user needs read (and, for directories, execute/traverse) access to this path",
-              path.display()
+            path.display()
         );
         HttpResponse::InternalServerError()
-        .append_header(("server", "ProxyAuth"))
-        .body("500 Internal Server Error")
+            .append_header(("server", "ProxyAuth"))
+            .body("500 Internal Server Error")
     } else {
         HttpResponse::NotFound()
-        .append_header(("server", "ProxyAuth"))
-        .body("404 Not Found")
+            .append_header(("server", "ProxyAuth"))
+            .body("404 Not Found")
     }
 }
 
@@ -1746,7 +1758,8 @@ async fn serve_static_file(
             &policy,
             crate::network::fs_cache::pool_for(Some(rule)).as_deref(),
         )
-        .await {
+        .await
+        {
             Ok(file) => static_file_response(&root, file, rule, max_age, req, data, ip).await,
             Err(e) => static_read_error_response(&rule.prefix, &root, &e),
         };
@@ -1826,7 +1839,8 @@ async fn serve_static_file(
         &policy,
         crate::network::fs_cache::pool_for(Some(rule)).as_deref(),
     )
-    .await {
+    .await
+    {
         Ok(file) => static_file_response(&resolved, file, rule, max_age, req, data, ip).await,
         Err(e) => static_read_error_response(&rule.prefix, &resolved, &e),
     }
@@ -1911,14 +1925,14 @@ async fn static_file_response(
             } else {
                 text
             };
-            apply_hidden_blocks(tagged, rule, req, data).await.into_bytes()
+            apply_hidden_blocks(tagged, rule, req, data)
+                .await
+                .into_bytes()
         }
         Err(e) => e.into_bytes(),
     };
     resp.body(rendered)
 }
-
-
 
 /// Minimal `required_login` gate for static routes: the same
 /// Bearer-token / session-cookie extraction and
@@ -1980,7 +1994,10 @@ async fn check_static_auth(
         Ok((username, token_id, _expiry)) => (username, token_id),
         Err(_) => {
             if let Some(target) = login_page_redirect_target(req, rule, &data.config) {
-                LogContext::set_error_detail(req, "expired or invalid session, sent to redirect_login_url");
+                LogContext::set_error_detail(
+                    req,
+                    "expired or invalid session, sent to redirect_login_url",
+                );
                 return Err(login_page_redirect(target, true));
             }
             return Err(HttpResponse::Unauthorized()
@@ -2019,8 +2036,7 @@ async fn validate_and_refresh(
     token: &str,
     ip: &str,
 ) -> Result<(String, String, u64), String> {
-    let session =
-        crate::token::security::validate_session(token, data, &data.config, ip).await?;
+    let session = crate::token::security::validate_session(token, data, &data.config, ip).await?;
 
     match crate::token::refresh::refresh_session(req, data, rule, &session).await {
         crate::token::refresh::SessionRefresh::Keep => {
@@ -2076,15 +2092,17 @@ async fn refresh_on_public_route(req: &HttpRequest, data: &web::Data<AppState>, 
         .unwrap_or_else(|| "-".to_string());
 
     match crate::token::security::validate_session(token, data, &data.config, &ip).await {
-        Ok(session) => match crate::token::refresh::refresh_session(req, data, rule, &session).await {
-            crate::token::refresh::SessionRefresh::Keep => {
-                crate::token::refresh::mark_signed_in(req);
+        Ok(session) => {
+            match crate::token::refresh::refresh_session(req, data, rule, &session).await {
+                crate::token::refresh::SessionRefresh::Keep => {
+                    crate::token::refresh::mark_signed_in(req);
+                }
+                crate::token::refresh::SessionRefresh::Renewed(new_cookie) => {
+                    crate::token::refresh::remember_renewal(req, new_cookie);
+                }
+                crate::token::refresh::SessionRefresh::TooOld => clear_session_cookie(req),
             }
-            crate::token::refresh::SessionRefresh::Renewed(new_cookie) => {
-                crate::token::refresh::remember_renewal(req, new_cookie);
-            }
-            crate::token::refresh::SessionRefresh::TooOld => clear_session_cookie(req),
-        },
+        }
         Err(_) => clear_session_cookie(req),
     }
 }
@@ -2126,7 +2144,8 @@ pub async fn global_proxy(
                             header::HeaderValue::from_static("private, no-store, max-age=0"),
                         );
                         headers.remove(header::EXPIRES);
-                        headers.insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+                        headers
+                            .insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
                     }
                     Err(e) => warn!("renewed session cookie could not be attached: {e}"),
                 }
@@ -2193,10 +2212,7 @@ fn signed_in_cache_policy(req: &HttpRequest, resp: &mut HttpResponse) {
         .map(str::to_string);
 
     // A stricter policy already set by the route (`cache: false`) stands.
-    if current
-        .as_deref()
-        .is_some_and(|v| v.contains("no-store"))
-    {
+    if current.as_deref().is_some_and(|v| v.contains("no-store")) {
         return;
     }
 
@@ -2934,8 +2950,7 @@ pub async fn proxy_with_proxy(
                     return None;
                 }
                 crate::network::proxy::request_cookie(&req, "session_token")
-            })
-            ;
+            });
 
         let Some(token_header) = token_header else {
             if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
@@ -2957,7 +2972,10 @@ pub async fn proxy_with_proxy(
                         ip, path, method_str, user_agent, _err
                     );
                     if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
-                        LogContext::set_error_detail(&req, "expired or invalid session, sent to redirect_login_url");
+                        LogContext::set_error_detail(
+                            &req,
+                            "expired or invalid session, sent to redirect_login_url",
+                        );
                         return Ok(login_page_redirect(target, true));
                     }
                     let mut resp = HttpResponse::Unauthorized();
@@ -3247,11 +3265,15 @@ pub async fn proxy_with_proxy(
             Ok(Ok(res)) => incoming_to_boxbody(res),
             Ok(Err(e)) => {
                 warn!(client_ip = %ip, target = %full_url, "Upstream error: {}", e);
-                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| add_cors_headers(r, &req)));
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
             Err(e) => {
                 warn!(client_ip = %ip, target = %full_url, "Timeout error: {}", e);
-                return Ok(upstream_failure(UpstreamFailure::Timeout, |r| add_cors_headers(r, &req)));
+                return Ok(upstream_failure(UpstreamFailure::Timeout, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
         }
     };
@@ -3695,8 +3717,7 @@ pub async fn proxy_without_proxy(
                 }
 
                 crate::network::proxy::request_cookie(&req, "session_token")
-            })
-            ;
+            });
 
         let Some(token_header) = token_header else {
             if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
@@ -3724,7 +3745,10 @@ pub async fn proxy_without_proxy(
                     );
 
                     if let Some(target) = login_page_redirect_target(&req, rule, &data.config) {
-                        LogContext::set_error_detail(&req, "expired or invalid session, sent to redirect_login_url");
+                        LogContext::set_error_detail(
+                            &req,
+                            "expired or invalid session, sent to redirect_login_url",
+                        );
                         return Ok(login_page_redirect(target, true));
                     }
 
@@ -3785,7 +3809,6 @@ pub async fn proxy_without_proxy(
             .unwrap_or("/");
         let on_login_page = req.uri() == "" || is_login_page(req.path(), Some(rule), &data.config);
         if on_login_page && req.path() == "/" && redirect_target_is_meaningful(redirect_target) {
-
             return Ok(HttpResponse::SeeOther()
                 .append_header(("server", "ProxyAuth"))
                 .append_header(("location", redirect_target))
@@ -4037,7 +4060,9 @@ pub async fn proxy_without_proxy(
                     e
                 );
 
-                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| add_cors_headers(r, &req)));
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
         }
     } else {
@@ -4057,7 +4082,9 @@ pub async fn proxy_without_proxy(
                       e
                 );
 
-                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| add_cors_headers(r, &req)));
+                return Ok(upstream_failure(UpstreamFailure::Unreachable, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
 
             Err(e) => {
@@ -4068,7 +4095,9 @@ pub async fn proxy_without_proxy(
                       e
                 );
 
-                return Ok(upstream_failure(UpstreamFailure::Timeout, |r| add_cors_headers(r, &req)));
+                return Ok(upstream_failure(UpstreamFailure::Timeout, |r| {
+                    add_cors_headers(r, &req)
+                }));
             }
         }
     };
@@ -4271,7 +4300,6 @@ pub async fn proxy_without_proxy(
         .body(body_bytes))
 }
 
-
 #[cfg(test)]
 mod cookie_header_tests {
     use super::{joined_cookie_header, request_cookie};
@@ -4303,7 +4331,9 @@ mod cookie_header_tests {
         assert_eq!(request_cookie(&empty, "session_token"), None);
         assert_eq!(joined_cookie_header(&empty), None);
         // Un nom qui ne fait que commencer pareil n'est pas confondu.
-        let other = TestRequest::default().append_header(("cookie", "session_token_old=1")).to_http_request();
+        let other = TestRequest::default()
+            .append_header(("cookie", "session_token_old=1"))
+            .to_http_request();
         assert_eq!(request_cookie(&other, "session_token"), None);
     }
 }

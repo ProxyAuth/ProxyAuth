@@ -584,8 +584,10 @@ mod tests {
         let handle = tokio::spawn(async move {
             HttpServer::new(move || {
                 App::new().default_service(web::to(move || async move {
-                    HttpResponse::build(crate::hyper_web::http::StatusCode::from_u16(status).unwrap())
-                        .body(body)
+                    HttpResponse::build(
+                        crate::hyper_web::http::StatusCode::from_u16(status).unwrap(),
+                    )
+                    .body(body)
                 }))
             })
             .listen(listener)

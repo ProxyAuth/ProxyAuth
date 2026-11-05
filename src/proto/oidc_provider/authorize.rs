@@ -21,11 +21,11 @@
 //! instead of fail-directly.
 
 use crate::config::config::{AppState, AuthRequest};
+use crate::hyper_web::{HttpRequest, HttpResponse, http::header, web};
 use crate::network::proxy::{
     find_vhost_route, is_secure_request, request_host, resolve_tag_csrf_token,
 };
 use crate::proto::oidc_provider::authcode::{self, AUTHCODE_TTL_SECS, AuthCodeEntry};
-use crate::hyper_web::{HttpRequest, HttpResponse, http::header, web};
 use serde::Deserialize;
 use std::fs;
 use time::OffsetDateTime;

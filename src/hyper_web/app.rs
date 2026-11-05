@@ -182,7 +182,10 @@ where
         let handler = handler.clone();
         Box::pin(async move {
             let (req, mut payload) = sreq.into_parts();
-            let res = match Args::from_request(&req, &mut payload).await.map_err(Into::<Error>::into) {
+            let res = match Args::from_request(&req, &mut payload)
+                .await
+                .map_err(Into::<Error>::into)
+            {
                 Ok(args) => handler.call(args).await.respond_to(&req),
                 Err(e) => e.error_response(),
             };
@@ -226,9 +229,9 @@ impl Route {
     fn build(self) -> Next {
         let mut svc = self.service.unwrap_or_else(|| {
             Next::from_fn(|req: ServiceRequest| {
-                Box::pin(async move {
-                    Ok(req.into_response(HttpResponse::new(StatusCode::NOT_FOUND)))
-                })
+                Box::pin(
+                    async move { Ok(req.into_response(HttpResponse::new(StatusCode::NOT_FOUND))) },
+                )
             })
         });
         for mw in self.middlewares {
@@ -367,16 +370,13 @@ impl App {
                     .collect(),
             })
             .collect();
-        let default = self
-            .default
-            .map(Route::build)
-            .unwrap_or_else(|| {
-                Next::from_fn(|req: ServiceRequest| {
-                    Box::pin(async move {
-                        Ok(req.into_response(HttpResponse::new(StatusCode::NOT_FOUND)))
-                    })
-                })
-            });
+        let default = self.default.map(Route::build).unwrap_or_else(|| {
+            Next::from_fn(|req: ServiceRequest| {
+                Box::pin(
+                    async move { Ok(req.into_response(HttpResponse::new(StatusCode::NOT_FOUND))) },
+                )
+            })
+        });
 
         let router = Rc::new(Router { resources, default });
         let mut svc = Next::from_fn(move |req: ServiceRequest| router.dispatch(req));
@@ -402,7 +402,11 @@ impl Router {
         let path = requote_path(req.path());
         if let Some(res) = self.resources.iter().find(|r| r.path == path) {
             let method = req.method().clone();
-            return match res.routes.iter().find(|(m, _)| m.as_ref().is_none_or(|m| *m == method)) {
+            return match res
+                .routes
+                .iter()
+                .find(|(m, _)| m.as_ref().is_none_or(|m| *m == method))
+            {
                 Some((_, svc)) => svc.call(req),
                 None => Box::pin(async move {
                     Ok(req.into_response(HttpResponse::new(StatusCode::METHOD_NOT_ALLOWED)))

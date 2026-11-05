@@ -1,5 +1,5 @@
-use proxyauth::hyper_web::{App, HttpResponse, test, web};
 use dashmap::DashMap;
+use proxyauth::hyper_web::{App, HttpResponse, test, web};
 use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 use proxyauth::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use proxyauth::{AppConfig, AppState, CounterToken, RouteConfig, auth as auth_handler};

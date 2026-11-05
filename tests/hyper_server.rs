@@ -28,7 +28,11 @@ impl Middleware for Tag {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let v = if prev.is_empty() { name.to_string() } else { format!("{prev},{name}") };
+            let v = if prev.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prev},{name}")
+            };
             res.headers_mut().insert("x-order", v.parse().unwrap());
             Ok(res)
         })
@@ -136,11 +140,21 @@ async fn hyper_server_end_to_end() {
     assert_eq!(r.text().await.unwrap(), "bonjour");
 
     // Corps brut, limite, et décompression gzip à la volée.
-    let r = h1.post(format!("{base}/echo")).body("ping").send().await.unwrap();
+    let r = h1
+        .post(format!("{base}/echo"))
+        .body("ping")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.headers()["x-version"], "HTTP/1.1");
     assert_eq!(r.text().await.unwrap(), "ping");
 
-    let r = h1.post(format!("{base}/echo")).body(vec![b'a'; 2048]).send().await.unwrap();
+    let r = h1
+        .post(format!("{base}/echo"))
+        .body(vec![b'a'; 2048])
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 413);
 
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -175,16 +189,32 @@ async fn hyper_server_end_to_end() {
         .await
         .unwrap();
     assert_eq!(r.text().await.unwrap(), r#"{"double":42}"#);
-    let r = h1.post(format!("{base}/json")).body(r#"{"n":21}"#).send().await.unwrap();
+    let r = h1
+        .post(format!("{base}/json"))
+        .body(r#"{"n":21}"#)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 400, "missing content-type must be refused");
 
     // HTTP/2 en clair (prior knowledge) : Host reconstruit depuis :authority,
     // URI ramenée à la forme relative.
-    let h2c = reqwest::Client::builder().http2_prior_knowledge().build().unwrap();
-    let r = h2c.post(format!("{base}/echo?x=1")).body("h2").send().await.unwrap();
+    let h2c = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let r = h2c
+        .post(format!("{base}/echo?x=1"))
+        .body("h2")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.version(), reqwest::Version::HTTP_2);
     assert_eq!(r.headers()["x-version"], "HTTP/2.0");
-    assert_eq!(r.headers()["x-host"], format!("127.0.0.1:{plain_port}").as_str());
+    assert_eq!(
+        r.headers()["x-host"],
+        format!("127.0.0.1:{plain_port}").as_str()
+    );
     assert_eq!(r.headers()["x-path"], "/echo");
 
     // TLS + ALPN h2.
@@ -207,7 +237,11 @@ async fn hyper_server_end_to_end() {
     for (label, client, url) in [
         ("h1", &h1, format!("{base}/nowhere")),
         ("h2c", &h2c, format!("{base}/nowhere")),
-        ("h2+tls", &tls_client, format!("https://localhost:{tls_port}/nowhere")),
+        (
+            "h2+tls",
+            &tls_client,
+            format!("https://localhost:{tls_port}/nowhere"),
+        ),
     ] {
         let r = client
             .head(&url)
@@ -215,8 +249,16 @@ async fn hyper_server_end_to_end() {
             .await
             .unwrap_or_else(|e| panic!("HEAD over {label} failed: {e}"));
         assert_eq!(r.status(), 200, "{label}");
-        assert_eq!(r.headers()["content-length"], "16", "{label}: length of \"default:/nowhere\"");
-        assert_eq!(r.bytes().await.unwrap().len(), 0, "{label}: HEAD must have no body");
+        assert_eq!(
+            r.headers()["content-length"],
+            "16",
+            "{label}: length of \"default:/nowhere\""
+        );
+        assert_eq!(
+            r.bytes().await.unwrap().len(),
+            0,
+            "{label}: HEAD must have no body"
+        );
     }
 
     // Arrêt gracieux : la requête en cours se termine, le serveur s'arrête.

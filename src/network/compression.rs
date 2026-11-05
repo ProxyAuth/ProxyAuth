@@ -450,10 +450,13 @@ impl Middleware for Compress {
                 // slow compression can't hold a tokio worker (and every
                 // other connection scheduled on it) hostage.
                 let data = original.clone();
-                let out = match tokio::task::spawn_blocking(move || compress_sync(&data, algo, level)).await {
-                    Ok(v) => v,
-                    Err(_) => None,
-                };
+                let out =
+                    match tokio::task::spawn_blocking(move || compress_sync(&data, algo, level))
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(_) => None,
+                    };
                 CompressedCache::store_in(cache, cache_key, &original, out)
             } else {
                 let out = compress_sync(&original, algo, level);
@@ -527,7 +530,11 @@ impl CompressedCache {
 
     fn with_budget(budget: u64) -> Self {
         CompressedCache {
-            inner: quick_cache::sync::Cache::with_weighter(4_096, budget.max(1), CompressedWeighter),
+            inner: quick_cache::sync::Cache::with_weighter(
+                4_096,
+                budget.max(1),
+                CompressedWeighter,
+            ),
         }
     }
 
@@ -554,7 +561,12 @@ impl CompressedCache {
 
     /// Remembers `out` under `key` (when there is one) and returns it
     /// as the body to send.
-    fn store(&self, key: Option<CompressedKey>, original: &Bytes, out: Option<Vec<u8>>) -> Option<Bytes> {
+    fn store(
+        &self,
+        key: Option<CompressedKey>,
+        original: &Bytes,
+        out: Option<Vec<u8>>,
+    ) -> Option<Bytes> {
         // Only a result that actually shrinks the body is worth sending;
         // anything else is remembered as "send the original".
         let out = out.filter(|c| c.len() < original.len()).map(Bytes::from);
@@ -604,39 +616,43 @@ impl CompressedCaches {
         global: &crate::config::internal_cache::InternalCacheConfig,
         routes: &[crate::config::config::RouteRule],
     ) -> Self {
-    use std::collections::HashMap;
-    let global_budget = global.compressed_max_memory();
-    // internal_cache est désactivé par défaut : il faut `enabled: true`
-    // dans config.json, ou sur le vhost.
-    let global_enabled = global.enabled.unwrap_or(false);
-    let mut needs_global = global_enabled;
-    let mut shared: HashMap<(Vec<String>, u64), std::sync::Arc<CompressedCache>> = HashMap::new();
-    let by_route = routes
-        .iter()
-        .map(|r| {
-            let rc = r.internal_cache.as_ref();
-            if !rc.and_then(|c| c.enabled).unwrap_or(global_enabled) {
-                return Pool::Off;
-            }
-            match rc.and_then(|c| c.compressed_max_memory).map(|b| b.0) {
-                None => {
-                    needs_global = true;
-                    Pool::Global
+        use std::collections::HashMap;
+        let global_budget = global.compressed_max_memory();
+        // internal_cache est désactivé par défaut : il faut `enabled: true`
+        // dans config.json, ou sur le vhost.
+        let global_enabled = global.enabled.unwrap_or(false);
+        let mut needs_global = global_enabled;
+        let mut shared: HashMap<(Vec<String>, u64), std::sync::Arc<CompressedCache>> =
+            HashMap::new();
+        let by_route = routes
+            .iter()
+            .map(|r| {
+                let rc = r.internal_cache.as_ref();
+                if !rc.and_then(|c| c.enabled).unwrap_or(global_enabled) {
+                    return Pool::Off;
                 }
-                Some(0) => Pool::Off,
-                Some(budget) => Pool::Own(
-                    shared
-                        .entry((r.vhost.clone(), budget))
-                        .or_insert_with(|| std::sync::Arc::new(CompressedCache::with_budget(budget)))
-                        .clone(),
-                ),
-            }
-        })
-        .collect();
-    CompressedCaches {
-        global: (needs_global && global_budget > 0).then(|| CompressedCache::with_budget(global_budget)),
-        by_route,
-    }
+                match rc.and_then(|c| c.compressed_max_memory).map(|b| b.0) {
+                    None => {
+                        needs_global = true;
+                        Pool::Global
+                    }
+                    Some(0) => Pool::Off,
+                    Some(budget) => Pool::Own(
+                        shared
+                            .entry((r.vhost.clone(), budget))
+                            .or_insert_with(|| {
+                                std::sync::Arc::new(CompressedCache::with_budget(budget))
+                            })
+                            .clone(),
+                    ),
+                }
+            })
+            .collect();
+        CompressedCaches {
+            global: (needs_global && global_budget > 0)
+                .then(|| CompressedCache::with_budget(global_budget)),
+            by_route,
+        }
     }
 
     fn pick(&self, route_idx: Option<usize>) -> Option<&CompressedCache> {
@@ -794,11 +810,25 @@ vhosts:
         let c = CompressedCaches::build(&global, &routes);
         let ptr = |i| c.pick(Some(i)).map(|x| x as *const CompressedCache);
 
-        assert!(ptr(0).is_some() && ptr(0) == ptr(1), "one cache shared by the vhost's routes");
-        assert_ne!(ptr(0), c.global.as_ref().map(|x| x as *const _), "distinct from the global cache");
+        assert!(
+            ptr(0).is_some() && ptr(0) == ptr(1),
+            "one cache shared by the vhost's routes"
+        );
+        assert_ne!(
+            ptr(0),
+            c.global.as_ref().map(|x| x as *const _),
+            "distinct from the global cache"
+        );
         assert!(ptr(2).is_none(), "0 disables the cache for that vhost");
-        assert_eq!(ptr(3), c.global.as_ref().map(|x| x as *const _), "no setting: global cache");
-        assert_eq!(c.pick(None).map(|x| x as *const _), c.global.as_ref().map(|x| x as *const _));
+        assert_eq!(
+            ptr(3),
+            c.global.as_ref().map(|x| x as *const _),
+            "no setting: global cache"
+        );
+        assert_eq!(
+            c.pick(None).map(|x| x as *const _),
+            c.global.as_ref().map(|x| x as *const _)
+        );
 
         let none: InternalCacheConfig =
             serde_json::from_str(r#"{"enabled": true, "compressed_max_memory": 0}"#).unwrap();
@@ -815,16 +845,32 @@ vhosts:
         let ka = CompressedCache::key(&a, Algorithm::Gzip, 5);
         let kb = CompressedCache::key(&b, Algorithm::Gzip, 5);
         assert_ne!(ka, kb, "different content, different key");
-        assert_ne!(ka, CompressedCache::key(&a, Algorithm::Brotli, 5), "algorithm is part of the key");
-        assert_ne!(ka, CompressedCache::key(&a, Algorithm::Gzip, 6), "level is part of the key");
+        assert_ne!(
+            ka,
+            CompressedCache::key(&a, Algorithm::Brotli, 5),
+            "algorithm is part of the key"
+        );
+        assert_ne!(
+            ka,
+            CompressedCache::key(&a, Algorithm::Gzip, 6),
+            "level is part of the key"
+        );
 
         assert!(cache.get(&ka).is_none());
         let out = cache.store(Some(ka), &a, compress_sync(&a, Algorithm::Gzip, 5));
         let hit = cache.get(&ka).expect("cached");
         assert_eq!(hit, out);
         let mut dec = Vec::new();
-        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&hit.unwrap()[..]), &mut dec).unwrap();
-        assert_eq!(dec, a.to_vec(), "the cached body decompresses to the original");
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(&hit.unwrap()[..]),
+            &mut dec,
+        )
+        .unwrap();
+        assert_eq!(
+            dec,
+            a.to_vec(),
+            "the cached body decompresses to the original"
+        );
     }
 
     #[test]
@@ -834,8 +880,16 @@ vhosts:
         getrandom::fill(&mut noise).unwrap();
         let noise = Bytes::from(noise);
         let k = CompressedCache::key(&noise, Algorithm::Gzip, 5);
-        assert!(cache.store(Some(k), &noise, compress_sync(&noise, Algorithm::Gzip, 5)).is_none());
-        assert_eq!(cache.get(&k), Some(None), "\"send the original\" is cached too");
+        assert!(
+            cache
+                .store(Some(k), &noise, compress_sync(&noise, Algorithm::Gzip, 5))
+                .is_none()
+        );
+        assert_eq!(
+            cache.get(&k),
+            Some(None),
+            "\"send the original\" is cached too"
+        );
     }
 
     #[test]

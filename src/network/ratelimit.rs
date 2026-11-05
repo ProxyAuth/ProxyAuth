@@ -156,7 +156,10 @@ impl RateLimitConfig {
             }
         };
         if count == 0 {
-            return Err("the request count must be at least 1 (remove the block to disable rate limiting)".into());
+            return Err(
+                "the request count must be at least 1 (remove the block to disable rate limiting)"
+                    .into(),
+            );
         }
         if period.is_zero() {
             return Err("`period` must be at least 1 second".into());
@@ -251,13 +254,10 @@ impl Limiter {
 
     /// Cœur de l'algorithme, à horloge explicite (testable).
     pub fn check_at(&self, key: &str, now: u64) -> Decision {
-        let mut st = self
-            .states
-            .entry(key.to_owned())
-            .or_insert(KeyState {
-                tat: now,
-                blocked_until: 0,
-            });
+        let mut st = self.states.entry(key.to_owned()).or_insert(KeyState {
+            tat: now,
+            blocked_until: 0,
+        });
 
         if st.blocked_until > now {
             return Decision::Deny {
@@ -335,33 +335,31 @@ impl RateLimiters {
         let mut all = Vec::new();
         let mut by_route = Vec::with_capacity(routes.len());
 
-        let mut make = |rule: &RouteRule,
-                        cfg: &RateLimitConfig,
-                        what: &str|
-         -> Result<Entry, String> {
-            let quota = cfg.quota().map_err(|e| {
-                format!(
-                    "routes.yml: route `{}` (vhost {:?}): ratelimit{what}: {e}",
-                    rule.prefix, rule.vhost
-                )
-            })?;
-            let id = (
-                rule.vhost.clone(),
-                format!("{what}|{quota:?}|{:?}", cfg.key),
-            );
-            let limiter = shared
-                .entry(id)
-                .or_insert_with(|| {
-                    let l = Arc::new(Limiter::new(quota));
-                    all.push(l.clone());
-                    l
+        let mut make =
+            |rule: &RouteRule, cfg: &RateLimitConfig, what: &str| -> Result<Entry, String> {
+                let quota = cfg.quota().map_err(|e| {
+                    format!(
+                        "routes.yml: route `{}` (vhost {:?}): ratelimit{what}: {e}",
+                        rule.prefix, rule.vhost
+                    )
+                })?;
+                let id = (
+                    rule.vhost.clone(),
+                    format!("{what}|{quota:?}|{:?}", cfg.key),
+                );
+                let limiter = shared
+                    .entry(id)
+                    .or_insert_with(|| {
+                        let l = Arc::new(Limiter::new(quota));
+                        all.push(l.clone());
+                        l
+                    })
+                    .clone();
+                Ok(Entry {
+                    limiter,
+                    key: cfg.key,
                 })
-                .clone();
-            Ok(Entry {
-                limiter,
-                key: cfg.key,
-            })
-        };
+            };
 
         for rule in routes {
             let Some(cfg) = rule.ratelimit.as_ref() else {
@@ -441,8 +439,12 @@ impl RateLimiters {
                 let r = find_vhost_route(host, routes)?;
                 routes.iter().position(|x| std::ptr::eq(x, r))
             })
-            // Hôte sans vhost dédié : première route « catch-all » limitée.
+            // Hôte sans vhost dédié, chemin propre à ProxyAuth (`/auth`…) :
+            // première route « catch-all » limitée. Un autre chemin qu'aucune
+            // route ne sert (sonde sur `/`, 404) ne consomme le quota de
+            // personne — une route sans `vhost` ne limite que son préfixe.
             .or_else(|| {
+                AUTH_PATHS.contains(&path).then_some(())?;
                 routes
                     .iter()
                     .position(|r| r.vhost.is_empty() && r.ratelimit.is_some())
@@ -571,15 +573,56 @@ mod tests {
     const S: u64 = 1_000_000_000;
 
     #[test]
+    fn catch_all_route_limits_its_prefix_and_login_paths_only() {
+        let routes: crate::config::config::RouteConfig = serde_yaml::from_str(
+            r#"
+routes:
+  - prefix: "/app"
+    target: "http://127.0.0.1:1"
+    ratelimit:
+      limit_req_per_sec: 1
+      burst: 5
+      auth:
+        limit_req_per_sec: 1
+        burst: 3
+"#,
+        )
+        .unwrap();
+        let routes = routes.expand_vhost_groups().routes;
+        let rl = RateLimiters::from_routes(&routes).unwrap();
+        let general = rl
+            .resolve(&routes, "/app/x", Some("localhost"))
+            .map(|e| Arc::as_ptr(&e.limiter));
+        let auth = rl
+            .resolve(&routes, "/auth", Some("localhost"))
+            .map(|e| Arc::as_ptr(&e.limiter));
+        assert!(
+            general.is_some() && auth.is_some() && general != auth,
+            "route and auth limits are distinct"
+        );
+        assert!(
+            rl.resolve(&routes, "/", Some("localhost")).is_none(),
+            "a path no route serves must not consume the route's quota"
+        );
+        assert!(rl.resolve(&routes, "/other", None).is_none());
+    }
+
+    #[test]
     fn per_second_with_burst() {
         let q = cfg("limit_req_per_sec: 5\nburst: 5").quota().unwrap();
         let l = Limiter::new(q);
         for i in 0..5 {
-            assert!(matches!(l.check_at("a", 0), Decision::Allow { .. }), "req {i}");
+            assert!(
+                matches!(l.check_at("a", 0), Decision::Allow { .. }),
+                "req {i}"
+            );
         }
         assert!(matches!(l.check_at("a", 0), Decision::Deny { .. }));
         // Une autre clé a son propre compteur.
-        assert!(matches!(l.check_at("b", 0), Decision::Allow { remaining: 4 }));
+        assert!(matches!(
+            l.check_at("b", 0),
+            Decision::Allow { remaining: 4 }
+        ));
         // 200 ms plus tard : une place s'est libérée (T = 200 ms).
         assert!(matches!(l.check_at("a", S / 5), Decision::Allow { .. }));
         assert!(matches!(l.check_at("a", S / 5), Decision::Deny { .. }));
@@ -602,7 +645,9 @@ mod tests {
 
     #[test]
     fn timeout_blocks_after_exceeding() {
-        let q = cfg("limit_req_per_sec: 1\nburst: 1\ntimeout: 10").quota().unwrap();
+        let q = cfg("limit_req_per_sec: 1\nburst: 1\ntimeout: 10")
+            .quota()
+            .unwrap();
         let l = Limiter::new(q);
         assert!(matches!(l.check_at("a", 0), Decision::Allow { .. }));
         match l.check_at("a", 0) {
@@ -617,7 +662,11 @@ mod tests {
     #[test]
     fn invalid_configs_are_rejected() {
         assert!(cfg("burst: 5").quota().is_err());
-        assert!(cfg("limit_req_per_sec: 5\nlimit_request: 5").quota().is_err());
+        assert!(
+            cfg("limit_req_per_sec: 5\nlimit_request: 5")
+                .quota()
+                .is_err()
+        );
         assert!(cfg("limit_req_per_sec: 0").quota().is_err());
         assert!(cfg("limit_req_per_sec: 5\nperiod: 10").quota().is_err());
         assert!(serde_yaml::from_str::<RateLimitConfig>("limit_req_per_sc: 5").is_err());

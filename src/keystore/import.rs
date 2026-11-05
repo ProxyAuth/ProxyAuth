@@ -257,7 +257,10 @@ mod tests {
     // the two tests above.
     #[test]
     fn passing_none_uses_default_path() {
-        assert_eq!(resolve_import_dir(None), PathBuf::from("/etc/proxyauth/import"));
+        assert_eq!(
+            resolve_import_dir(None),
+            PathBuf::from("/etc/proxyauth/import")
+        );
         let custom = Path::new("/tmp/somewhere-else");
         assert_eq!(resolve_import_dir(Some(custom)), custom.to_path_buf());
     }

@@ -14,9 +14,9 @@
 
 pub mod acme;
 pub mod compression;
-pub mod internal_cache;
 pub mod config;
 pub mod def_config;
+pub mod internal_cache;
 pub mod logging;
 pub mod sorted;
 pub mod unknown_keys;

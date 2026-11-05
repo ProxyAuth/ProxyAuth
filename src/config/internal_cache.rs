@@ -147,7 +147,6 @@ impl InternalCacheConfig {
             .map(|b| b.0)
             .unwrap_or(DEFAULT_COMPRESSED_MAX_MEMORY)
     }
-
 }
 
 /// Réglages effectifs pour une route : la route d'abord, puis
@@ -167,7 +166,10 @@ impl<'a> CachePolicy<'a> {
         self.route.and_then(&f).or_else(|| f(self.global))
     }
 
-    fn pick_list(&self, f: impl Fn(&InternalCacheConfig) -> Option<&Vec<String>>) -> Option<&'a [String]> {
+    fn pick_list(
+        &self,
+        f: impl Fn(&InternalCacheConfig) -> Option<&Vec<String>>,
+    ) -> Option<&'a [String]> {
         let from = |c: &'a InternalCacheConfig| f(c).map(|v| v.as_slice());
         self.route.and_then(from).or_else(|| from(self.global))
     }
@@ -189,7 +191,10 @@ impl<'a> CachePolicy<'a> {
     }
 
     pub fn revalidate(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.pick(|c| c.revalidate_ms).unwrap_or(DEFAULT_REVALIDATE_MS))
+        std::time::Duration::from_millis(
+            self.pick(|c| c.revalidate_ms)
+                .unwrap_or(DEFAULT_REVALIDATE_MS),
+        )
     }
 
     /// Ce fichier (taille, extension, type MIME) doit-il être gardé en
@@ -262,10 +267,9 @@ mod tests {
 
     #[test]
     fn route_overrides_global_field_by_field() {
-        let global: InternalCacheConfig = serde_json::from_str(
-            r#"{"max_file_size": "1MB", "extensions": ["css", "js"]}"#,
-        )
-        .unwrap();
+        let global: InternalCacheConfig =
+            serde_json::from_str(r#"{"max_file_size": "1MB", "extensions": ["css", "js"]}"#)
+                .unwrap();
         let route: InternalCacheConfig =
             serde_json::from_str(r#"{"max_file_size": "10MB"}"#).unwrap();
         let p = CachePolicy::new(&global, Some(&route));
@@ -276,13 +280,20 @@ mod tests {
             serde_json::from_str(r#"{"enabled": true, "max_file_size": "10MB"}"#).unwrap();
         let p = CachePolicy::new(&global, Some(&on));
         assert!(p.accepts(Path::new("/a/app.js"), 5 * 1024 * 1024, "text/javascript"));
-        assert!(!p.accepts(Path::new("/a/photo.png"), 10, "image/png"), "extension inherited from global");
+        assert!(
+            !p.accepts(Path::new("/a/photo.png"), 10, "image/png"),
+            "extension inherited from global"
+        );
         // Global activé, vhost désactivé : le vhost gagne.
         let global_on: InternalCacheConfig =
             serde_json::from_str(r#"{"enabled": true, "extensions": ["css"]}"#).unwrap();
         assert!(CachePolicy::new(&global_on, None).accepts(Path::new("/a.css"), 10, "text/css"));
         let off: InternalCacheConfig = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
-        assert!(!CachePolicy::new(&global_on, Some(&off)).accepts(Path::new("/a.css"), 10, "text/css"));
+        assert!(!CachePolicy::new(&global_on, Some(&off)).accepts(
+            Path::new("/a.css"),
+            10,
+            "text/css"
+        ));
     }
 
     #[test]
@@ -296,7 +307,10 @@ mod tests {
         assert!(p.accepts(Path::new("x.svg"), 500, "image/svg+xml"));
         assert!(!p.accepts(Path::new("x.png"), 500, "image/png"));
         assert!(!p.accepts(Path::new("x.css"), 50, "text/css"), "too small");
-        assert!(!p.accepts(Path::new("x.css"), 5000, "text/css"), "too large");
+        assert!(
+            !p.accepts(Path::new("x.css"), 5000, "text/css"),
+            "too large"
+        );
     }
 
     #[test]

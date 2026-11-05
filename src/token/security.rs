@@ -3,13 +3,13 @@ use crate::AppState;
 use crate::build::build_info::get;
 use crate::config::config::RegexCond;
 use crate::config::config::RouteRule;
-use crate::network::canonical_url::canonicalize_path_for_match;
-use crate::revoke::load::is_token_revoked;
-use crate::token::vault::vault;
 use crate::hyper_web::HttpRequest;
 use crate::hyper_web::http::StatusCode;
 use crate::hyper_web::http::header::HeaderMap;
 use crate::hyper_web::web;
+use crate::network::canonical_url::canonicalize_path_for_match;
+use crate::revoke::load::is_token_revoked;
+use crate::token::vault::vault;
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
@@ -369,7 +369,8 @@ pub async fn validate_session(
     )
     .await?;
 
-    let current = crate::revoke::load::current_generation(&session.token_id, &data_app.revoked_tokens);
+    let current =
+        crate::revoke::load::current_generation(&session.token_id, &data_app.revoked_tokens);
     if session.data.generation < current {
         warn!(
             "[{}] token_id {} of user {} was superseded by a refresh (generation {} < {})",
@@ -392,7 +393,15 @@ pub async fn validate_refresh_token(
     ip: &str,
     max_lifetime: u64,
 ) -> Result<ValidSession, String> {
-    verify_token(token, data_app, config, ip, TokenKind::Refresh, max_lifetime).await
+    verify_token(
+        token,
+        data_app,
+        config,
+        ip,
+        TokenKind::Refresh,
+        max_lifetime,
+    )
+    .await
 }
 
 async fn verify_token(

@@ -1,10 +1,10 @@
+use proxyauth::AppState;
+use proxyauth::CounterToken;
+use proxyauth::config::config::AuthRequest;
 use proxyauth::hyper_web::FromRequest;
 use proxyauth::hyper_web::Responder;
 use proxyauth::hyper_web::cookie::Cookie;
 use proxyauth::hyper_web::http::StatusCode;
-use proxyauth::AppState;
-use proxyauth::CounterToken;
-use proxyauth::config::config::AuthRequest;
 use proxyauth::network::stats::{RequestStats, spawn_stats_ticker};
 use proxyauth::token::security::issue_token;
 use std::time::SystemTime;
@@ -15,10 +15,10 @@ use totp_rs::TOTP;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proxyauth::hyper_web::body::to_bytes as actix_to_bytes;
-    use proxyauth::hyper_web::{http::header, test};
     use dashmap::DashMap;
     use proxyauth::config::config::{AppConfig, RouteConfig, RouteRule, User};
+    use proxyauth::hyper_web::body::to_bytes as actix_to_bytes;
+    use proxyauth::hyper_web::{http::header, test};
     use proxyauth::revoke::db::RevokedTokenMap;
     use proxyauth::token::csrf::make_csrf_token;
 
@@ -28,10 +28,7 @@ mod tests {
     use hyper::body::Incoming;
     use hyper_util::rt::TokioIo;
 
-    use argon2::{
-        Argon2,
-        password_hash::PasswordHasher
-    };
+    use argon2::{Argon2, password_hash::PasswordHasher};
     use std::net::TcpListener;
     use std::sync::Arc;
     use tokio::net::TcpListener as TokioTcpListener;
@@ -115,7 +112,10 @@ mod tests {
         }
     }
 
-    fn mk_state(routes: Vec<RouteRule>, cfg: AppConfig) -> proxyauth::hyper_web::web::Data<AppState> {
+    fn mk_state(
+        routes: Vec<RouteRule>,
+        cfg: AppConfig,
+    ) -> proxyauth::hyper_web::web::Data<AppState> {
         let stats = RequestStats::new();
         spawn_stats_ticker(stats.clone());
 
@@ -830,9 +830,9 @@ mod tests {
 #[cfg(test)]
 mod render_error_page_tests {
     use super::*;
-    use proxyauth::hyper_web::{http::header, test};
     use bytes::Bytes as ActixBytes;
     use dashmap::DashMap;
+    use proxyauth::hyper_web::{http::header, test};
     use std::net::TcpListener;
     use std::sync::Arc;
     use tokio::net::TcpListener as TokioTcpListener;
@@ -847,7 +847,10 @@ mod render_error_page_tests {
     use proxyauth::config::config::{AppConfig, RouteConfig, RouteRule};
     use proxyauth::revoke::db::RevokedTokenMap;
 
-    fn mk_state(routes: Vec<RouteRule>, mut cfg: AppConfig) -> proxyauth::hyper_web::web::Data<AppState> {
+    fn mk_state(
+        routes: Vec<RouteRule>,
+        mut cfg: AppConfig,
+    ) -> proxyauth::hyper_web::web::Data<AppState> {
         cfg.session_cookie = true;
         cfg.csrf_token = true;
 

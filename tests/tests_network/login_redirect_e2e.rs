@@ -8,11 +8,11 @@
 
 #[cfg(test)]
 mod tests {
+    use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
     use proxyauth::hyper_web::dev::ServiceResponse;
     use proxyauth::hyper_web::http::{StatusCode, header};
     use proxyauth::hyper_web::test::{self, TestRequest};
     use proxyauth::hyper_web::{App, web};
-    use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
     use proxyauth::network::proxy::global_proxy;
     use proxyauth::network::stats::RequestStats;
     use proxyauth::stats::tokencount::CounterToken;
@@ -237,10 +237,7 @@ vhosts:
         req.insert_header((header::COOKIE, format!("session_token={token}")))
     }
 
-    async fn call(
-        state: AppState,
-        req: TestRequest,
-    ) -> ServiceResponse {
+    async fn call(state: AppState, req: TestRequest) -> ServiceResponse {
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(state))
@@ -262,12 +259,20 @@ vhosts:
         let location = header_value(header::LOCATION);
         let cookie = header_value(header::SET_COOKIE);
         let body = test::read_body(resp).await;
-        (status, location, cookie, String::from_utf8_lossy(&body).into_owned())
+        (
+            status,
+            location,
+            cookie,
+            String::from_utf8_lossy(&body).into_owned(),
+        )
     }
 
     fn assert_cleared(cookie: Option<String>) {
         let cookie = cookie.expect("the stale session cookie must be cleared");
-        assert!(cookie.starts_with("session_token=;") && cookie.contains("Max-Age=0"), "{cookie}");
+        assert!(
+            cookie.starts_with("session_token=;") && cookie.contains("Max-Age=0"),
+            "{cookie}"
+        );
     }
 
     // ── not signed in ────────────────────────────────────────
@@ -304,7 +309,10 @@ vhosts:
         assert_eq!(status, StatusCode::OK);
         assert_eq!(location, None);
         assert!(body.contains("action=\"/auth\""));
-        assert!(!body.contains("{{ csrf_token }}"), "tag_proxyauth must fill the CSRF token");
+        assert!(
+            !body.contains("{{ csrf_token }}"),
+            "tag_proxyauth must fill the CSRF token"
+        );
     }
 
     #[tokio::test]
@@ -371,7 +379,11 @@ vhosts:
     async fn an_invalid_cookie_does_not_block_the_public_site() {
         let (status, location, _, body) =
             send(with_cookie(open(SITE, "/"), "not-a-real-token")).await;
-        assert_eq!(status, StatusCode::OK, "the public home page must still load");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the public home page must still load"
+        );
         assert_eq!(location, None);
         assert_eq!(body, "backend:/");
     }
@@ -388,7 +400,11 @@ vhosts:
             ("/robots.txt", "User-agent: *"),
         ] {
             let (status, location, _, body) = send(with_cookie(open(SITE, path), &token)).await;
-            assert_eq!(status, StatusCode::OK, "{path} must be served, not redirected");
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path} must be served, not redirected"
+            );
             assert_eq!(location, None, "{path}");
             assert_eq!(body, expected, "{path}");
         }
@@ -419,7 +435,10 @@ vhosts:
         let (status, location, cookie, _) =
             send(with_cookie(open(RESTRICTED, "/ops"), &token)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(location, None, "signing in again would not help, so no redirect");
+        assert_eq!(
+            location, None,
+            "signing in again would not help, so no redirect"
+        );
         assert_eq!(cookie, None, "the session stays valid for other routes");
 
         let token = admin_session();
@@ -438,14 +457,22 @@ vhosts:
         assert_eq!(location.as_deref(), Some("/app"));
 
         let (status, _, _, body) = send(open(LEGACY, "/")).await;
-        assert_eq!(status, StatusCode::OK, "anonymous visitors get the login form");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "anonymous visitors get the login form"
+        );
         assert!(body.contains("action=\"/auth\""));
     }
 
     #[tokio::test]
     async fn legacy_layout_without_a_login_page_keeps_the_401() {
         let (status, location, _, _) = send(open(LEGACY, "/app")).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "no login page configured: the historical 401 is kept");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "no login page configured: the historical 401 is kept"
+        );
         assert_eq!(location, None);
     }
 }

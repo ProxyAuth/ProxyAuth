@@ -6,10 +6,10 @@
 
 #[cfg(test)]
 mod tests {
-        use proxyauth::hyper_web::http::header;
+    use proxyauth::config::config::{AppState, RouteConfig, load_config};
+    use proxyauth::hyper_web::http::header;
     use proxyauth::hyper_web::test::{self, TestRequest};
     use proxyauth::hyper_web::{App, web};
-    use proxyauth::config::config::{AppState, RouteConfig, load_config};
     use proxyauth::network::stats::RequestStats;
     use proxyauth::stats::tokencount::CounterToken;
     use std::sync::Arc;

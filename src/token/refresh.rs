@@ -39,11 +39,11 @@
 
 use crate::AppState;
 use crate::config::config::{RouteRule, SessionRefreshPolicy};
+use crate::hyper_web::cookie::{Cookie, SameSite};
+use crate::hyper_web::{HttpRequest, web};
 use crate::revoke::load::{revoke_token_after, rotated_key, unpack_rotation};
 use crate::token::auth::generate_random_string;
 use crate::token::security::{TokenData, ValidSession, issue_session_token, now_secs};
-use crate::hyper_web::cookie::{Cookie, SameSite};
-use crate::hyper_web::{HttpRequest, web};
 use dashmap::DashMap;
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
@@ -256,7 +256,9 @@ pub async fn refresh_session(
     // Never push a refusal later than one already recorded — for
     // instance by an earlier renewal whose successor has been used.
     let refuse_from = match data.revoked_tokens.get(&rotated_key(&session.token_id)) {
-        Some(value) => unpack_rotation(*value).0.min(now.saturating_add(policy.grace_secs)),
+        Some(value) => unpack_rotation(*value)
+            .0
+            .min(now.saturating_add(policy.grace_secs)),
         None => now.saturating_add(policy.grace_secs),
     };
     if let Err(e) = revoke_token_after(
@@ -342,7 +344,8 @@ async fn retire_predecessor(
     revoked: &crate::revoke::db::RevokedTokenMap,
 ) {
     let existing = revoked.get(&rotated_key(previous)).map(|v| *v);
-    let Some((refuse_from, purge_at)) = predecessor_deadline(existing, policy, lifetime, now) else {
+    let Some((refuse_from, purge_at)) = predecessor_deadline(existing, policy, lifetime, now)
+    else {
         return;
     };
     if let Err(e) = revoke_token_after(previous, refuse_from, purge_at, revoked).await {
@@ -431,7 +434,10 @@ pub fn describe_policies(
         if !p.enabled() {
             let mut text = "off (session_refresh_interval_secs = 0)".to_string();
             if p.max_lifetime_secs > 0 {
-                text.push_str(&format!(", sessions end {}s after login", p.max_lifetime_secs));
+                text.push_str(&format!(
+                    ", sessions end {}s after login",
+                    p.max_lifetime_secs
+                ));
             }
             return text;
         }
@@ -440,7 +446,10 @@ pub fn describe_policies(
             p.interval_secs, p.grace_secs
         );
         if p.max_lifetime_secs > 0 {
-            text.push_str(&format!(", sessions end {}s after login", p.max_lifetime_secs));
+            text.push_str(&format!(
+                ", sessions end {}s after login",
+                p.max_lifetime_secs
+            ));
         }
         text
     };
@@ -463,7 +472,10 @@ pub fn describe_policies(
         if policy != global && seen.insert(label.clone()) {
             lines.push(format!("session renewal on {label}: {}", describe(&policy)));
         }
-        if policy.enabled() && policy.interval_secs >= lifetime && seen.insert(format!("warn:{label}")) {
+        if policy.enabled()
+            && policy.interval_secs >= lifetime
+            && seen.insert(format!("warn:{label}"))
+        {
             lines.push(format!(
                 "warning: session renewal on {label} never happens: session_refresh_interval_secs ({}) is not shorter than token_expiry_seconds ({lifetime})",
                 policy.interval_secs

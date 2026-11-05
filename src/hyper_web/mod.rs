@@ -37,7 +37,9 @@ pub mod http {
 
 /// Équivalent de `actix_web::web`.
 pub mod web {
-    pub use super::app::{Resource, Route, delete, get, head, method, patch, post, put, resource, to};
+    pub use super::app::{
+        Resource, Route, delete, get, head, method, patch, post, put, resource, to,
+    };
     pub use super::extract::{Data, Form, Json, Payload, PayloadConfig, Query};
     pub use bytes::Bytes;
     pub use bytes::BytesMut;
@@ -45,7 +47,9 @@ pub mod web {
 
 /// Types « internes » utilisés par les middlewares.
 pub mod dev {
-    pub use super::app::{AppService, Middleware, Next, ServiceFuture, ServiceRequest, ServiceResponse};
+    pub use super::app::{
+        AppService, Middleware, Next, ServiceFuture, ServiceRequest, ServiceResponse,
+    };
     pub use super::body::BodySize;
     pub use super::extract::Payload;
     pub use super::server::Server;

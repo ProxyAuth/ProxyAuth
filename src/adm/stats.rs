@@ -1,6 +1,8 @@
 use crate::AppState;
+use crate::hyper_web::{
+    HttpRequest, HttpResponse, HttpResponseBuilder, Responder, http::header, web,
+};
 use crate::network::stats::build_stats_response;
-use crate::hyper_web::{HttpRequest, HttpResponse, HttpResponseBuilder, Responder, http::header, web};
 use chrono::Utc;
 use chrono_tz::Tz;
 use serde::Serialize;

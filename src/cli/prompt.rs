@@ -266,9 +266,9 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let hash = Argon2::default()
-            .hash_password(password.as_bytes())
-            .map_err(|e| format!("Failed to hash password: {e}"))?
-            .to_string();
+                .hash_password(password.as_bytes())
+                .map_err(|e| format!("Failed to hash password: {e}"))?
+                .to_string();
 
             // --primary-email must name one of the --email addresses
             // given, if provided at all — otherwise it's ambiguous

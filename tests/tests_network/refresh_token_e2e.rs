@@ -4,10 +4,10 @@
 
 #[cfg(test)]
 mod tests {
-        use proxyauth::hyper_web::http::{StatusCode, header};
+    use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
+    use proxyauth::hyper_web::http::{StatusCode, header};
     use proxyauth::hyper_web::test::{self, TestRequest};
     use proxyauth::hyper_web::{App, web};
-    use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
     use proxyauth::network::proxy::global_proxy;
     use proxyauth::network::stats::RequestStats;
     use proxyauth::stats::tokencount::CounterToken;
@@ -28,8 +28,10 @@ mod tests {
     fn dir() -> PathBuf {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
         DIR.get_or_init(|| {
-            let dir = std::env::temp_dir()
-                .join(format!("proxyauth-refresh-token-e2e-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "proxyauth-refresh-token-e2e-{}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(dir.join("www")).unwrap();
             std::fs::write(dir.join("www/index.html"), "private data").unwrap();
             dir
@@ -102,7 +104,9 @@ vhosts:
         required_login: true
 "#
         );
-        serde_yaml::from_str::<RouteConfig>(&yaml).unwrap().expand_vhost_groups()
+        serde_yaml::from_str::<RouteConfig>(&yaml)
+            .unwrap()
+            .expand_vhost_groups()
     }
 
     fn state_with(api_users: &str, revoked: proxyauth::revoke::db::RevokedTokenMap) -> AppState {
@@ -148,7 +152,12 @@ vhosts:
             .map(|v| v.to_str().unwrap().to_string());
         let body = String::from_utf8_lossy(&test::read_body(resp).await).into_owned();
         let json = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-        Reply { status, cache_control, json, body }
+        Reply {
+            status,
+            cache_control,
+            json,
+            body,
+        }
     }
 
     fn base(host: &str, req: TestRequest) -> TestRequest {
@@ -210,8 +219,17 @@ vhosts:
         let reply = login(&state, API, "alice", "wonderland").await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         assert_eq!(reply.cache_control.as_deref(), Some("no-store"));
-        for field in ["token", "expires_at", "refresh_token", "refresh_token_expires_at"] {
-            assert!(reply.json.get(field).is_some(), "{field} missing: {}", reply.body);
+        for field in [
+            "token",
+            "expires_at",
+            "refresh_token",
+            "refresh_token_expires_at",
+        ] {
+            assert!(
+                reply.json.get(field).is_some(),
+                "{field} missing: {}",
+                reply.body
+            );
         }
 
         let access = token_of(&reply, "token");
@@ -267,7 +285,11 @@ vhosts:
         );
 
         let wrong = refresh(&state, API, &access).await;
-        assert_eq!(wrong.status, StatusCode::UNAUTHORIZED, "an access token cannot refresh");
+        assert_eq!(
+            wrong.status,
+            StatusCode::UNAUTHORIZED,
+            "an access token cannot refresh"
+        );
         assert_eq!(wrong.json["error"], "invalid_grant");
     }
 
@@ -295,7 +317,10 @@ vhosts:
         assert_eq!(refresh_id, session_id);
         assert_eq!(access_data.generation, 1);
         assert_eq!(refresh_data.generation, 1);
-        assert_eq!(access_data.session_started_at, first_data.session_started_at, "login time kept");
+        assert_eq!(
+            access_data.session_started_at, first_data.session_started_at,
+            "login time kept"
+        );
 
         assert_eq!(api_call(&state, API, &new_access).await, StatusCode::OK);
         assert_eq!(
@@ -309,8 +334,14 @@ vhosts:
         assert_eq!(third.status, StatusCode::OK, "{}", third.body);
         let (_, third_data, _) = inspect(&token_of(&third, "token"));
         assert_eq!(third_data.generation, 2);
-        assert_eq!(api_call(&state, API, &new_access).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(api_call(&state, API, &token_of(&third, "token")).await, StatusCode::OK);
+        assert_eq!(
+            api_call(&state, API, &new_access).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            api_call(&state, API, &token_of(&third, "token")).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -328,11 +359,20 @@ vhosts:
         let replay = refresh(&state, API, &old_refresh).await;
         assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
         assert_eq!(replay.json["error"], "invalid_grant");
-        assert!(state.revoked_tokens.contains_key(&session_id), "the session id is revoked");
+        assert!(
+            state.revoked_tokens.contains_key(&session_id),
+            "the session id is revoked"
+        );
 
         // Both parties are out.
-        assert_eq!(api_call(&state, API, &new_access).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(refresh(&state, API, &new_refresh).await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            api_call(&state, API, &new_access).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            refresh(&state, API, &new_refresh).await.status,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
@@ -352,8 +392,14 @@ vhosts:
         )
         .await;
 
-        assert_eq!(api_call(&state, API, &access).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(refresh(&state, API, &refresh_tok).await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            api_call(&state, API, &access).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            refresh(&state, API, &refresh_tok).await.status,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     // ── refusals ─────────────────────────────────────────────
@@ -364,8 +410,7 @@ vhosts:
 
         let empty = call(
             &state,
-            base(API, TestRequest::post().uri("/refresh_token"))
-                .set_json(serde_json::json!({})),
+            base(API, TestRequest::post().uri("/refresh_token")).set_json(serde_json::json!({})),
         )
         .await;
         assert_eq!(empty.status, StatusCode::BAD_REQUEST);
@@ -430,7 +475,10 @@ vhosts:
             },
         )
         .unwrap();
-        assert_eq!(refresh(&state, API, &too_long).await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refresh(&state, API, &too_long).await.status,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
@@ -452,7 +500,10 @@ vhosts:
         )
         .unwrap();
         proxyauth::hyper_web::rt::time::sleep(std::time::Duration::from_millis(2100)).await;
-        assert_eq!(refresh(&state, API, &short).await.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refresh(&state, API, &short).await.status,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     // ── session lifetime cap ─────────────────────────────────
@@ -487,7 +538,10 @@ vhosts:
         let (_, data, access_exp) = inspect(&token_of(&reply, "token"));
         let (_, _, refresh_exp) = inspect(&token_of(&reply, "refresh_token"));
         let session_end = data.session_started_at + 7200;
-        assert_eq!(access_exp, session_end, "capped: 200 s left, not {ACCESS_LIFETIME}");
+        assert_eq!(
+            access_exp, session_end,
+            "capped: 200 s left, not {ACCESS_LIFETIME}"
+        );
         assert_eq!(refresh_exp, session_end);
     }
 
@@ -509,6 +563,9 @@ vhosts:
     async fn access_tokens_without_refresh_keep_working() {
         let state = state();
         let reply = login(&state, NO_REFRESH, "alice", "wonderland").await;
-        assert_eq!(api_call(&state, NO_REFRESH, &token_of(&reply, "token")).await, StatusCode::OK);
+        assert_eq!(
+            api_call(&state, NO_REFRESH, &token_of(&reply, "token")).await,
+            StatusCode::OK
+        );
     }
 }

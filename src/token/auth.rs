@@ -1,10 +1,6 @@
 use crate::AppConfig;
 use crate::AppState;
 use crate::config::config::{AuthRequest, RouteRule, User};
-use crate::network::error::render_error_page;
-use crate::network::proxy::client_ip;
-use crate::token::csrf::verify_csrf_token;
-use crate::token::security::{issue_token, validate_token};
 use crate::hyper_web::cookie::{Cookie, SameSite};
 use crate::hyper_web::{
     Error as WebError, FromRequest, HttpRequest, HttpResponse, Responder,
@@ -13,9 +9,13 @@ use crate::hyper_web::{
     http::{StatusCode, header},
     web::{self, Form, Json},
 };
+use crate::network::error::render_error_page;
+use crate::network::proxy::client_ip;
+use crate::token::csrf::verify_csrf_token;
+use crate::token::security::{issue_token, validate_token};
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use blake3;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -123,7 +123,6 @@ pub fn verify_password(input: &str, stored_hash: &str) -> bool {
 pub fn dummy_password_hash() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
-
         Argon2::default()
             .hash_password(b"proxyauth-constant-time-placeholder")
             .map(|h| h.to_string())
@@ -353,8 +352,9 @@ pub fn establish_session(
         .signed_duration_since(Utc::now())
         .num_seconds()
         .max(0) as u64;
-    let max_age =
-        crate::hyper_web::cookie::time::Duration::seconds(seconds.min(session_max_age as u64) as i64);
+    let max_age = crate::hyper_web::cookie::time::Duration::seconds(
+        seconds.min(session_max_age as u64) as i64,
+    );
 
     let cookie = Cookie::build(("session_token", token_encrypt.clone()))
         .path("/")
@@ -1020,7 +1020,10 @@ pub async fn auth(
                         }));
                 }
                 Err(e) => {
-                    error!("[{}] failed to issue refresh token for {}: {}", ip, auth.username, e);
+                    error!(
+                        "[{}] failed to issue refresh token for {}: {}",
+                        ip, auth.username, e
+                    );
                     return HttpResponse::InternalServerError().finish();
                 }
             }

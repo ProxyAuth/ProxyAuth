@@ -96,7 +96,10 @@ mod tests {
         // The purge keeps an entry while `purge_at > now`.
         let keep_until = revocation_record_until(NOW, LIFETIME);
         let purge_at = revocation_purge_at("tok", keep_until);
-        assert!(purge_at > NOW + LIFETIME - 1, "still kept while any token issued before NOW lives");
+        assert!(
+            purge_at > NOW + LIFETIME - 1,
+            "still kept while any token issued before NOW lives"
+        );
     }
 
     // ── LMDB record layout ───────────────────────────────────
@@ -105,7 +108,10 @@ mod tests {
 
     #[test]
     fn records_keep_both_instants() {
-        let record = RevocationRecord { revoked_at: NOW, value: NOW + LIFETIME };
+        let record = RevocationRecord {
+            revoked_at: NOW,
+            value: NOW + LIFETIME,
+        };
         let bytes = encode_record(record);
         assert_eq!(bytes.len(), 16);
         assert_eq!(decode_record(&bytes), Some(record));
@@ -115,12 +121,18 @@ mod tests {
     fn records_written_by_older_versions_still_read() {
         assert_eq!(
             decode_record(&[]),
-            Some(RevocationRecord { revoked_at: 0, value: 0 }),
+            Some(RevocationRecord {
+                revoked_at: 0,
+                value: 0
+            }),
             "old \"never\" entry"
         );
         assert_eq!(
             decode_record(&(NOW + 5).to_be_bytes()),
-            Some(RevocationRecord { revoked_at: 0, value: NOW + 5 })
+            Some(RevocationRecord {
+                revoked_at: 0,
+                value: NOW + 5
+            })
         );
         assert_eq!(decode_record(&[1, 2, 3]), None);
     }
@@ -152,7 +164,10 @@ mod tests {
         map.insert("expired".into(), NOW - 1);
         map.insert("due-now".into(), NOW);
         map.insert("later".into(), NOW + 60);
-        map.insert(rotated_key("rot-expired"), pack_rotation(NOW - 100, NOW - 1));
+        map.insert(
+            rotated_key("rot-expired"),
+            pack_rotation(NOW - 100, NOW - 1),
+        );
         map.insert(rotated_key("rot-later"), pack_rotation(NOW - 100, NOW + 60));
 
         let mut purged = purge_expired(&map, NOW);

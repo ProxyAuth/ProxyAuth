@@ -90,7 +90,10 @@ jobs:
 
     container:
       image: node:24-bookworm
-      options: --user root --cap-add=SYS_PTRACE
+      # --init: a real PID 1 (tini) reaps processes that exit. A server
+      # started with `setsid -f` is re-parented to PID 1; without an init
+      # it stays a zombie once stopped, and `pgrep` keeps matching it.
+      options: --user root --cap-add=SYS_PTRACE --init
 
     defaults:
       run:
@@ -261,6 +264,10 @@ jobs:
 
           class Handler(BaseHTTPRequestHandler):
               protocol_version = "HTTP/1.1"
+              # Headers and body leave in separate writes: without
+              # TCP_NODELAY, Nagle holds the body until ProxyAuth's delayed
+              # ACK (~40 ms) and every request takes at least that long.
+              disable_nagle_algorithm = True
 
               def log_message(self, *args):
                   pass
@@ -297,7 +304,16 @@ jobs:
                       remaining -= len(chunk)
                   self._reply(f"RECEIVED {received} {digest.hexdigest()}".encode())
 
-          ThreadingHTTPServer(("127.0.0.1", 8500), Handler).serve_forever()
+          class Server(ThreadingHTTPServer):
+              # Python's default listen backlog is 5. ProxyAuth keeps one
+              # connection pool per worker thread, so 32 clients arriving
+              # together open dozens of backend connections at once: with a
+              # backlog of 5 the kernel drops SYNs (1 s retransmit) or resets
+              # connections, which ProxyAuth correctly reports as 502.
+              request_queue_size = 1024
+              daemon_threads = True
+
+          Server(("127.0.0.1", 8500), Handler).serve_forever()
           PY
 
           python3 /tmp/backend.py >/tmp/backend.log 2>&1 &
@@ -580,6 +596,18 @@ jobs:
 
           # Same binary as the one built and started above.
           PROXYAUTH_BIN="$GITHUB_WORKSPACE/target/release/proxyauth"
+
+          # ProxyAuth processes that are really running: a stopped server
+          # whose parent does not reap it stays a zombie (state Z), still
+          # matched by pgrep, with no memory and nothing listening.
+          live_pids() {
+            local p state
+            for p in $(pgrep -u proxyauth -x proxyauth || true); do
+              state=$(awk '/^State:/ { print $2 }' "/proc/$p/status" 2>/dev/null || true)
+              [ -n "$state" ] && [ "$state" != "Z" ] && echo "$p"
+            done
+            return 0
+          }
           PID_FILE="$GITHUB_WORKSPACE/proxyauth.pid"
           PROXYAUTH_LOG=/tmp/proxyauth.log
 
@@ -602,10 +630,10 @@ jobs:
           # Fallback cleanup is restricted to the exact executable name/user.
           sudo pkill -TERM -u proxyauth -x proxyauth 2>/dev/null || true
           for _ in $(seq 1 20); do
-            pgrep -u proxyauth -x proxyauth >/dev/null || break
+            [ -z "$(live_pids)" ] && break
             sleep 0.25
           done
-          if pgrep -u proxyauth -x proxyauth >/dev/null; then
+          if [ -n "$(live_pids)" ]; then
             sudo pkill -KILL -u proxyauth -x proxyauth 2>/dev/null || true
           fi
           rm -f "$PID_FILE"
@@ -628,7 +656,7 @@ jobs:
             >> "$PROXYAUTH_LOG" 2>&1 </dev/null
 
           for _ in $(seq 1 60); do
-            server_pid="$(pgrep -u proxyauth -x proxyauth | head -n 1 || true)"
+            server_pid="$(live_pids | head -n 1)"
             if curl -k -sS -o /dev/null -m 2 https://localhost:8080 2>/dev/null; then
               if [ -z "$server_pid" ]; then
                 echo "::error::HTTPS answered but the ProxyAuth PID could not be identified"
@@ -716,7 +744,12 @@ jobs:
 
           token=$(/tmp/login.sh)
           pid=$(cat proxyauth.pid)
-          rss() { awk '/^VmRSS:/ { print int($2 / 1024) }' "/proc/$pid/status"; }
+          rss() {
+            local kb
+            kb=$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
+            [ -n "$kb" ] || { echo "::error::no VmRSS for PID $pid — not the running server" >&2; return 1; }
+            echo $(( kb / 1024 ))
+          }
           rss_before=$(rss)
 
           code=$(curl -k -s \
@@ -758,6 +791,10 @@ jobs:
       - name: "Rate limit: a burst on the proxy is capped at the configured size"
         run: |
           set -eu
+
+          # Start from a full bucket whatever ran before (burst 5 at 1 req/s
+          # refills in 5 s), so the burst measured is exactly the configured one.
+          sleep 6
 
           result=$(python3 /tmp/load.py --paths /app --requests 20 --concurrency 20 --token "$(cat /tmp/token)")
           echo "$result" | jq .
@@ -893,12 +930,23 @@ jobs:
           token=$(cat /tmp/token)
           pid=$(cat proxyauth.pid)
           kill -0 "$pid" || { echo "::error::ProxyAuth PID $pid is not running"; exit 1; }
-          echo "ProxyAuth pid: $pid"
+          state=$(awk '/^State:/ { print $2 }' "/proc/$pid/status")
+          echo "ProxyAuth pid: $pid (state $state)"
+          [ "$state" != "Z" ] || { echo "::error::PID $pid is a zombie, not the running server"; pgrep -a -u proxyauth || true; exit 1; }
 
-          rss() { awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status"; }
+          rss() {
+            local kb
+            kb=$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || true)
+            if [ -z "$kb" ]; then
+              echo "::error::no VmRSS for PID $pid (state: $(awk '/^State:/ { print $2 }' "/proc/$pid/status" 2>/dev/null || echo gone))" >&2
+              tail -n 20 /tmp/proxyauth.log >&2 || true
+              return 1
+            fi
+            echo "$kb"
+          }
 
           python3 /tmp/load.py --paths /app --requests 300 --concurrency 1 --token "$token" > /tmp/stress-before.json
-          echo "$(rss)" > /tmp/stress-rss-before
+          rss > /tmp/stress-rss-before
 
           python3 /tmp/load.py --paths /app /app/a /app/b /app/c --requests 5000 --concurrency 32 \
             --token "$token" > /tmp/stress-keepalive.json
@@ -911,7 +959,7 @@ jobs:
             > /tmp/stress-logins.json
 
           python3 /tmp/load.py --paths /app --requests 300 --concurrency 1 --token "$token" > /tmp/stress-after.json
-          echo "$(rss)" > /tmp/stress-rss-after
+          rss > /tmp/stress-rss-after
 
           kill -0 "$pid" || { echo "::error::ProxyAuth died during the stress test"; exit 1; }
 

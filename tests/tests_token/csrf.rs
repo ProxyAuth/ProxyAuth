@@ -19,11 +19,11 @@ use std::io::Read;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proxyauth::hyper_web::http::Method;
-    use proxyauth::hyper_web::test::TestRequest;
     use bytes::Bytes;
     use flate2::{Compression, write::GzEncoder};
     use hyper::HeaderMap as HyperHeaderMap;
+    use proxyauth::hyper_web::http::Method;
+    use proxyauth::hyper_web::test::TestRequest;
     use serial_test::serial;
     use std::io::Write;
 

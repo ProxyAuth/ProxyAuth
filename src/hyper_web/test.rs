@@ -106,7 +106,11 @@ impl TestRequest {
 
     pub fn cookie(mut self, cookie: Cookie<'_>) -> Self {
         let pair = format!("{}={}", cookie.name(), cookie.value());
-        let merged = match self.headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        let merged = match self
+            .headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+        {
             Some(existing) if !existing.is_empty() => format!("{existing}; {pair}"),
             _ => pair,
         };
@@ -124,7 +128,8 @@ impl TestRequest {
     pub fn set_payload(mut self, data: impl Into<Bytes>) -> Self {
         self.payload = data.into();
         let len = self.payload.len();
-        self.headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+        self.headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
         self
     }
 
@@ -204,7 +209,9 @@ pub async fn call_service(app: &TestService, req: TestHttpRequest) -> ServiceRes
 }
 
 pub async fn read_body(res: ServiceResponse) -> Bytes {
-    to_bytes(res.into_body()).await.expect("error reading test response body")
+    to_bytes(res.into_body())
+        .await
+        .expect("error reading test response body")
 }
 
 pub async fn call_and_read_body(app: &TestService, req: TestHttpRequest) -> Bytes {

@@ -1068,20 +1068,20 @@ struct ExistsRow {
 
 fn username_exists_any(conn: &mut DbConnection, username: &str) -> Result<bool, String> {
     let row: Option<ExistsRow> = match conn {
-        DbConnection::Postgres(c) => sql_query(
-            "SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1",
-        )
-        .bind::<Text, _>(username)
-        .get_result(c)
-        .optional()
-        .map_err(|e| format!("Failed to look up username (postgres): {e}"))?,
-        DbConnection::MySql(c) => sql_query(
-            "SELECT id FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1",
-        )
-        .bind::<Text, _>(username)
-        .get_result(c)
-        .optional()
-        .map_err(|e| format!("Failed to look up username (mysql): {e}"))?,
+        DbConnection::Postgres(c) => {
+            sql_query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1")
+                .bind::<Text, _>(username)
+                .get_result(c)
+                .optional()
+                .map_err(|e| format!("Failed to look up username (postgres): {e}"))?
+        }
+        DbConnection::MySql(c) => {
+            sql_query("SELECT id FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1")
+                .bind::<Text, _>(username)
+                .get_result(c)
+                .optional()
+                .map_err(|e| format!("Failed to look up username (mysql): {e}"))?
+        }
     };
     Ok(row.is_some())
 }
@@ -1115,7 +1115,10 @@ fn insert_user_row_strict(conn: &mut DbConnection, user: &User) -> Result<Option
     use diesel::result::{DatabaseErrorKind, Error as DieselError};
 
     let is_unique = |e: &DieselError| {
-        matches!(e, DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _))
+        matches!(
+            e,
+            DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)
+        )
     };
 
     match conn {

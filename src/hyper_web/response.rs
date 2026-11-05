@@ -293,7 +293,10 @@ impl HttpResponse {
     }
 
     /// Ajoute un `Set-Cookie`.
-    pub fn add_cookie(&mut self, cookie: &Cookie<'_>) -> Result<(), http::header::InvalidHeaderValue> {
+    pub fn add_cookie(
+        &mut self,
+        cookie: &Cookie<'_>,
+    ) -> Result<(), http::header::InvalidHeaderValue> {
         let v = HeaderValue::from_str(&cookie.to_string())?;
         self.headers.append(header::SET_COOKIE, v);
         Ok(())
@@ -489,13 +492,17 @@ impl Responder for HttpResponseBuilder {
 
 impl Responder for &'static str {
     fn respond_to(self, _req: &HttpRequest) -> HttpResponse {
-        HttpResponse::Ok().content_type(ContentType::plaintext()).body(self)
+        HttpResponse::Ok()
+            .content_type(ContentType::plaintext())
+            .body(self)
     }
 }
 
 impl Responder for String {
     fn respond_to(self, _req: &HttpRequest) -> HttpResponse {
-        HttpResponse::Ok().content_type(ContentType::plaintext()).body(self)
+        HttpResponse::Ok()
+            .content_type(ContentType::plaintext())
+            .body(self)
     }
 }
 

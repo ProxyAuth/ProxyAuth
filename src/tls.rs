@@ -179,7 +179,10 @@ fn wildcard_covers(pattern: &str, host: &str) -> bool {
 /// (TLS 1.2) et des tickets (TLS 1.3, sans état côté serveur), elle est
 /// reprise en un aller-retour, sans signature. Les clés de tickets sont
 /// renouvelées automatiquement par rustls.
-fn shared_resumption() -> (Arc<dyn rustls::server::StoresServerSessions>, Option<Arc<dyn rustls::server::ProducesTickets>>) {
+fn shared_resumption() -> (
+    Arc<dyn rustls::server::StoresServerSessions>,
+    Option<Arc<dyn rustls::server::ProducesTickets>>,
+) {
     static RESUMPTION: std::sync::OnceLock<(
         Arc<dyn rustls::server::StoresServerSessions>,
         Option<Arc<dyn rustls::server::ProducesTickets>>,

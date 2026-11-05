@@ -2,8 +2,10 @@ use crate::AppState;
 use crate::adm::method_otp::{generate_base32_secret, generate_otpauth_uri};
 use crate::adm::stats::is_valid_admin_token;
 use crate::config::config::{add_otpkey, clear_otpkey, resolve_otpkey};
+use crate::hyper_web::{
+    HttpRequest, HttpResponse, HttpResponseBuilder, Responder, http::header, web,
+};
 use crate::token::auth::{is_ip_allowed, verify_credentials_constant_time};
-use crate::hyper_web::{HttpRequest, HttpResponse, HttpResponseBuilder, Responder, http::header, web};
 use serde::{Deserialize, Serialize};
 use totp_rs::Algorithm;
 use tracing::warn;

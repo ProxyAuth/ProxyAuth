@@ -8,7 +8,9 @@ use proxyauth::hyper_web::server::{ConnProtocol, TlsSelector, trigger_shutdown};
 use proxyauth::hyper_web::{App, HttpRequest, HttpResponse, HttpServer, web};
 use proxyauth::network::ratelimit::{RateLimiters, VhostRateLimit};
 use proxyauth::network::stats::RequestStats;
-use proxyauth::network::vhost_listen::{HttpProtocol, ListenPlan, VhostListenGuard, protocol_for_sni};
+use proxyauth::network::vhost_listen::{
+    HttpProtocol, ListenPlan, VhostListenGuard, protocol_for_sni,
+};
 use proxyauth::stats::tokencount::CounterToken;
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
@@ -66,11 +68,8 @@ fn state(config: Arc<AppConfig>, yaml: &str) -> AppState {
 }
 
 fn tls_selector(routes: Vec<proxyauth::config::config::RouteRule>) -> TlsSelector {
-    let ck = rcgen::generate_simple_self_signed(vec![
-        "d.test".to_string(),
-        "e.test".to_string(),
-    ])
-    .unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["d.test".to_string(), "e.test".to_string()])
+        .unwrap();
     let cert = rustls_pki_types::CertificateDer::from(ck.cert.der().to_vec());
     let key_der = ck.key_pair.serialize_der();
     let mut by_proto = HashMap::new();
@@ -191,7 +190,11 @@ vhosts:
             .resolve("c.test", local(0))
             .resolve("d.test", local(0))
             .resolve("e.test", local(0));
-        b = if h2 { b.http2_prior_knowledge() } else { b.http1_only() };
+        b = if h2 {
+            b.http2_prior_knowledge()
+        } else {
+            b.http1_only()
+        };
         b.build().unwrap()
     };
     let h1 = client(false);
@@ -199,30 +202,64 @@ vhosts:
 
     // ── Port ──────────────────────────────────────────────────────
     // a.test n'a pas de port : servi sur le port par défaut seulement.
-    let r = h1.get(format!("http://a.test:{p0}/x")).send().await.unwrap();
+    let r = h1
+        .get(format!("http://a.test:{p0}/x"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
-    let r = h1.get(format!("http://a.test:{p2}/x")).send().await.unwrap();
-    assert_eq!(r.status(), 421, "a.test must not be served on c.test's port");
+    let r = h1
+        .get(format!("http://a.test:{p2}/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        421,
+        "a.test must not be served on c.test's port"
+    );
     // c.test est sur son port dédié, pas sur le port par défaut.
-    let r = h1.get(format!("http://c.test:{p2}/x")).send().await.unwrap();
+    let r = h1
+        .get(format!("http://c.test:{p2}/x"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
-    let r = h1.get(format!("http://c.test:{p0}/x")).send().await.unwrap();
+    let r = h1
+        .get(format!("http://c.test:{p0}/x"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 421);
 
     // ── Protocole en clair ───────────────────────────────────────
-    let r = h2c.get(format!("http://b.test:{p1}/x")).send().await.unwrap();
+    let r = h2c
+        .get(format!("http://b.test:{p1}/x"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.version(), reqwest::Version::HTTP_2);
     assert_eq!(r.status(), 200);
     assert!(
-        h1.get(format!("http://b.test:{p1}/x")).send().await.is_err(),
+        h1.get(format!("http://b.test:{p1}/x"))
+            .send()
+            .await
+            .is_err(),
         "an HTTP/2-only port must refuse HTTP/1.1"
     );
     assert!(
-        h2c.get(format!("http://c.test:{p2}/x")).send().await.is_err(),
+        h2c.get(format!("http://c.test:{p2}/x"))
+            .send()
+            .await
+            .is_err(),
         "an HTTP/1.1-only port must refuse HTTP/2"
     );
     // Port par défaut (auto) : HTTP/2 accepté pour un vhost `auto`.
-    let r = h2c.get(format!("http://a.test:{p0}/x")).send().await.unwrap();
+    let r = h2c
+        .get(format!("http://a.test:{p0}/x"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200, "a.test is auto: h2 accepted");
 
     // ── Protocole en TLS : ALPN choisi par SNI ───────────────────
@@ -232,34 +269,66 @@ vhosts:
         .resolve("e.test", local(p3))
         .build()
         .unwrap();
-    let r = tls.get(format!("https://d.test:{p3}/x")).send().await.unwrap();
+    let r = tls
+        .get(format!("https://d.test:{p3}/x"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.version(), reqwest::Version::HTTP_2, "d.test is h2");
-    let r = tls.get(format!("https://e.test:{p3}/x")).send().await.unwrap();
-    assert_eq!(r.version(), reqwest::Version::HTTP_11, "e.test is h1 even for an h2-capable client");
+    let r = tls
+        .get(format!("https://e.test:{p3}/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.version(),
+        reqwest::Version::HTTP_11,
+        "e.test is h1 even for an h2-capable client"
+    );
     assert_eq!(r.status(), 200);
 
     // ── Rate limit du vhost ──────────────────────────────────────
     for _ in 0..2 {
-        let r = h1.get(format!("http://r.test:{p0}/page")).send().await.unwrap();
+        let r = h1
+            .get(format!("http://r.test:{p0}/page"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 200);
         assert!(r.headers().contains_key("x-ratelimit-remaining"));
     }
-    let r = h1.get(format!("http://r.test:{p0}/page")).send().await.unwrap();
+    let r = h1
+        .get(format!("http://r.test:{p0}/page"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 429);
     assert_eq!(r.headers()["retry-after"], "5", "timeout: 5 blocks for 5 s");
     let body = r.text().await.unwrap();
     assert!(body.contains("TooManyRequests"), "{body}");
 
     // Le bloc `auth:` a son propre compteur (1 requête / 60 s).
-    let r = h1.post(format!("http://r.test:{p0}/auth")).send().await.unwrap();
+    let r = h1
+        .post(format!("http://r.test:{p0}/auth"))
+        .send()
+        .await
+        .unwrap();
     assert_ne!(r.status(), 429);
-    let r = h1.post(format!("http://r.test:{p0}/auth")).send().await.unwrap();
+    let r = h1
+        .post(format!("http://r.test:{p0}/auth"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 429);
     assert_eq!(r.headers()["retry-after"], "60");
 
     // Un vhost sans `ratelimit:` n'est pas limité.
     for _ in 0..20 {
-        let r = h1.get(format!("http://c.test:{p2}/x")).send().await.unwrap();
+        let r = h1
+            .get(format!("http://c.test:{p2}/x"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), 200);
     }
 

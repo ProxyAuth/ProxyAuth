@@ -41,7 +41,10 @@ mod tests {
         assert_eq!(access.encode(), format!("4:{NOW}:{};g=3", NOW - 60));
         assert_eq!(TokenData::parse(&access.encode()), Some(access.clone()));
 
-        let refresh = TokenData { kind: TokenKind::Refresh, ..access };
+        let refresh = TokenData {
+            kind: TokenKind::Refresh,
+            ..access
+        };
         assert_eq!(refresh.encode(), format!("4:{NOW}:{};r;g=3", NOW - 60));
         assert_eq!(TokenData::parse(&refresh.encode()), Some(refresh));
     }
@@ -90,13 +93,22 @@ mod tests {
         let step = advance_generation("abc", 0, NOW + 3600, &m);
         assert_eq!(
             step,
-            GenerationStep::Advanced { generation: 1, value: pack_rotation(1, NOW + 3600) }
+            GenerationStep::Advanced {
+                generation: 1,
+                value: pack_rotation(1, NOW + 3600)
+            }
         );
         assert_eq!(current_generation("abc", &m), 1);
 
         let step = advance_generation("abc", 1, NOW + 7200, &m);
-        assert!(matches!(step, GenerationStep::Advanced { generation: 2, .. }));
-        assert_eq!(unpack_rotation(*m.get(&refresh_key("abc")).unwrap()), (2, NOW + 7200));
+        assert!(matches!(
+            step,
+            GenerationStep::Advanced { generation: 2, .. }
+        ));
+        assert_eq!(
+            unpack_rotation(*m.get(&refresh_key("abc")).unwrap()),
+            (2, NOW + 7200)
+        );
     }
 
     #[test]
@@ -107,7 +119,11 @@ mod tests {
             advance_generation("abc", 0, NOW + 3600, &m),
             GenerationStep::Stale { current: 1 }
         );
-        assert_eq!(current_generation("abc", &m), 1, "a stale attempt changes nothing");
+        assert_eq!(
+            current_generation("abc", &m),
+            1,
+            "a stale attempt changes nothing"
+        );
     }
 
     #[test]
@@ -120,7 +136,10 @@ mod tests {
 
     #[test]
     fn generation_records_are_purged_with_their_last_refresh_token() {
-        assert_eq!(revocation_purge_at(&refresh_key("abc"), pack_rotation(5, NOW + 99)), NOW + 99);
+        assert_eq!(
+            revocation_purge_at(&refresh_key("abc"), pack_rotation(5, NOW + 99)),
+            NOW + 99
+        );
     }
 
     #[test]
@@ -133,7 +152,10 @@ mod tests {
 
     #[test]
     fn pair_expiries_follow_their_lifetimes() {
-        assert_eq!(pair_expiries(NOW, 600, 86400, NOW, 0), (NOW + 600, NOW + 86400));
+        assert_eq!(
+            pair_expiries(NOW, 600, 86400, NOW, 0),
+            (NOW + 600, NOW + 86400)
+        );
     }
 
     #[test]
@@ -160,12 +182,16 @@ mod tests {
             "log": { "type": "disabled" },
             "smtp": null
         });
-        json.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        json.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         serde_json::from_value(json).unwrap()
     }
 
     fn routes(yaml: &str) -> RouteConfig {
-        serde_yaml::from_str::<RouteConfig>(yaml).unwrap().expand_vhost_groups()
+        serde_yaml::from_str::<RouteConfig>(yaml)
+            .unwrap()
+            .expand_vhost_groups()
     }
 
     #[test]
@@ -198,7 +224,9 @@ routes:
         let lifetime = |host: &str| {
             r.routes
                 .iter()
-                .find(|x| x.vhost.iter().any(|v| v == host) || (host.is_empty() && x.vhost.is_empty()))
+                .find(|x| {
+                    x.vhost.iter().any(|v| v == host) || (host.is_empty() && x.vhost.is_empty())
+                })
                 .unwrap()
                 .resolved_refresh_token_expiry(&cfg)
         };
@@ -227,6 +255,9 @@ vhosts:
     #[test]
     fn the_setting_survives_a_config_rewrite() {
         let cfg = config(serde_json::json!({ "refresh_token_expiry_seconds": 86400 }));
-        assert_eq!(serde_json::to_value(&cfg).unwrap()["refresh_token_expiry_seconds"], 86400);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["refresh_token_expiry_seconds"],
+            86400
+        );
     }
 }

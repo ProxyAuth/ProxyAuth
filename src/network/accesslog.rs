@@ -62,11 +62,11 @@
 use crate::AppState;
 use crate::config::config::AppConfig;
 use crate::config::logging::LOG_DIR;
-use crate::network::proxy::client_ip;
 use crate::hyper_web::body::BodySize;
 use crate::hyper_web::dev::{Middleware, Next, ServiceFuture, ServiceRequest, ServiceResponse};
 use crate::hyper_web::http::header;
 use crate::hyper_web::{HttpRequest, web};
+use crate::network::proxy::client_ip;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -457,7 +457,10 @@ impl ShardedFile {
             match self.open() {
                 Ok(w) => *guard = Some(w),
                 Err(e) => {
-                    eprintln!("[accesslog] failed to open log file {}: {e}", self.path.display());
+                    eprintln!(
+                        "[accesslog] failed to open log file {}: {e}",
+                        self.path.display()
+                    );
                     return;
                 }
             }
@@ -509,7 +512,9 @@ impl VhostLogWriter {
                 None => {
                     let mut map = self.files.write().unwrap_or_else(|p| p.into_inner());
                     map.entry(full.clone())
-                        .or_insert_with(|| std::sync::Arc::new(ShardedFile::new(PathBuf::from(&full))))
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(ShardedFile::new(PathBuf::from(&full)))
+                        })
                         .clone()
                 }
             }
@@ -1107,7 +1112,10 @@ mod sharded_writer_tests {
         assert_eq!(lines.len(), 16 * 5_000);
         let mut seen = std::collections::HashSet::new();
         for l in &lines {
-            assert!(l.starts_with("thread=") && l.ends_with(&"x".repeat(120)), "corrupted line: {l:.80}");
+            assert!(
+                l.starts_with("thread=") && l.ends_with(&"x".repeat(120)),
+                "corrupted line: {l:.80}"
+            );
             assert!(seen.insert(&l[..23]), "duplicated line: {l:.30}");
         }
         let _ = fs::remove_dir_all(&dir);

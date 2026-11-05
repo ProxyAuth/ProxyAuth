@@ -3,11 +3,11 @@
 
 #[cfg(test)]
 mod tests {
-        use proxyauth::hyper_web::http::{StatusCode, header};
-    use proxyauth::hyper_web::test::{self, TestRequest};
-    use proxyauth::hyper_web::{App, web};
     use proxyauth::adm::revoke::revoke_route;
     use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
+    use proxyauth::hyper_web::http::{StatusCode, header};
+    use proxyauth::hyper_web::test::{self, TestRequest};
+    use proxyauth::hyper_web::{App, web};
     use proxyauth::network::proxy::global_proxy;
     use proxyauth::network::stats::RequestStats;
     use proxyauth::stats::tokencount::CounterToken;
@@ -21,7 +21,8 @@ mod tests {
     fn dir() -> PathBuf {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
         DIR.get_or_init(|| {
-            let dir = std::env::temp_dir().join(format!("proxyauth-revoke-e2e-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("proxyauth-revoke-e2e-{}", std::process::id()));
             std::fs::create_dir_all(dir.join("www")).unwrap();
             std::fs::write(dir.join("www/index.html"), "private page").unwrap();
             dir
@@ -160,7 +161,11 @@ vhosts:
 
     async fn assert_refused(state: &AppState, token: &str) {
         let (code, _) = status(state, open_private(token)).await;
-        assert_eq!(code, StatusCode::FOUND, "a revoked session is sent to the login page");
+        assert_eq!(
+            code,
+            StatusCode::FOUND,
+            "a revoked session is sent to the login page"
+        );
     }
 
     #[tokio::test]
@@ -177,7 +182,8 @@ vhosts:
         let state = state();
         let (token, expires_at) = token("no-exp");
         let before = now_secs();
-        let (code, body) = status(&state, revoke(serde_json::json!({ "token_id": "no-exp" }))).await;
+        let (code, body) =
+            status(&state, revoke(serde_json::json!({ "token_id": "no-exp" }))).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body, "Token revoked with expiration.");
         assert_refused(&state, &token).await;
@@ -214,7 +220,10 @@ vhosts:
         )
         .await;
         let kept_until = *state.revoked_tokens.get("far").unwrap();
-        assert!(kept_until <= now_secs() + LIFETIME, "kept only while a token could live");
+        assert!(
+            kept_until <= now_secs() + LIFETIME,
+            "kept only while a token could live"
+        );
     }
 
     #[tokio::test]
@@ -253,11 +262,10 @@ vhosts:
         )
         .unwrap();
 
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(state.clone()))
-                .route("/logout", web::get().to(proxyauth::token::logout::logout_dispatch)),
-        )
+        let app = test::init_service(App::new().app_data(web::Data::new(state.clone())).route(
+            "/logout",
+            web::get().to(proxyauth::token::logout::logout_dispatch),
+        ))
         .await;
         let req = TestRequest::get()
             .uri("/logout")
@@ -286,7 +294,10 @@ vhosts:
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(state.clone()))
-                .route("/logout", web::get().to(proxyauth::token::logout::logout_dispatch))
+                .route(
+                    "/logout",
+                    web::get().to(proxyauth::token::logout::logout_dispatch),
+                )
                 .default_service(web::to(global_proxy)),
         )
         .await;
@@ -301,7 +312,10 @@ vhosts:
         assert!(resp.status().is_redirection() || resp.status().is_success());
 
         assert_eq!(
-            *state.revoked_tokens.get("logout").expect("revoked on logout"),
+            *state
+                .revoked_tokens
+                .get("logout")
+                .expect("revoked on logout"),
             expires_at,
             "kept exactly until the token's own expiry, not forever"
         );
@@ -347,7 +361,11 @@ vhosts:
     async fn other_tokens_are_unaffected() {
         let state = state();
         let (other, _) = token("untouched");
-        let _ = status(&state, revoke(serde_json::json!({ "token_id": "someone-else" }))).await;
+        let _ = status(
+            &state,
+            revoke(serde_json::json!({ "token_id": "someone-else" })),
+        )
+        .await;
         let (code, _) = status(&state, open_private(&other)).await;
         assert_eq!(code, StatusCode::OK);
     }

@@ -127,7 +127,8 @@ struct FilePools {
 static POOLS: std::sync::OnceLock<FilePools> = std::sync::OnceLock::new();
 
 /// Sans `init` (tests) : un cache global au budget par défaut.
-static DEFAULT_POOL: Lazy<Arc<FileCache>> = Lazy::new(|| Arc::new(FileCache::with_budget(BYTES_BUDGET)));
+static DEFAULT_POOL: Lazy<Arc<FileCache>> =
+    Lazy::new(|| Arc::new(FileCache::with_budget(BYTES_BUDGET)));
 
 /// Crée les caches de fichiers. À appeler une fois au démarrage, après
 /// le chargement des routes.
@@ -365,7 +366,10 @@ pub async fn read(
     let Some(pool) = pool else {
         let meta = tokio::fs::metadata(path).await?;
         if !meta.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
         }
         return Ok(FileHandle::Disk {
             path: path.to_path_buf(),
@@ -384,7 +388,10 @@ pub async fn read(
 
     let meta = tokio::fs::metadata(path).await?;
     if !meta.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     let (len, modified) = (meta.len(), meta.modified().ok());
 
@@ -443,7 +450,10 @@ pub async fn read_to_string(
     pool: Option<&FileCache>,
 ) -> io::Result<String> {
     let mime = crate::network::proxy::content_type_for(path);
-    let bytes = read(path, mime, policy, pool).await?.into_bytes(16 * 1024 * 1024).await?;
+    let bytes = read(path, mime, policy, pool)
+        .await?
+        .into_bytes(16 * 1024 * 1024)
+        .await?;
     String::from_utf8(bytes.to_vec()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -452,7 +462,8 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("proxyauth-fscache-{}-{name}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("proxyauth-fscache-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -472,7 +483,14 @@ mod tests {
     static TEST_POOL: Lazy<Arc<FileCache>> = Lazy::new(pool);
 
     async fn content(f: &Path, cfg: &InternalCacheConfig) -> (bool, Vec<u8>) {
-        let h = read(f, "text/plain", &CachePolicy::new(cfg, None), Some(&TEST_POOL)).await.unwrap();
+        let h = read(
+            f,
+            "text/plain",
+            &CachePolicy::new(cfg, None),
+            Some(&TEST_POOL),
+        )
+        .await
+        .unwrap();
         let in_memory = matches!(h, FileHandle::Memory(_));
         let body = h.into_bytes(u64::MAX).await.unwrap().to_vec();
         (in_memory, body)
@@ -526,10 +544,22 @@ mod tests {
         let size = (crate::config::internal_cache::DEFAULT_MAX_FILE_SIZE + 1) as usize;
         std::fs::write(&f, vec![7u8; size]).unwrap();
         let cfg = defaults();
-        let h = read(&f, "application/octet-stream", &CachePolicy::new(&cfg, None), Some(&TEST_POOL)).await.unwrap();
+        let h = read(
+            &f,
+            "application/octet-stream",
+            &CachePolicy::new(&cfg, None),
+            Some(&TEST_POOL),
+        )
+        .await
+        .unwrap();
         assert!(matches!(h, FileHandle::Disk { .. }), "streamed from disk");
-        assert!(TEST_POOL.contents.get(f.as_path()).is_none(), "never kept in memory");
-        let body = crate::hyper_web::body::to_bytes(h.into_body().await.unwrap()).await.unwrap();
+        assert!(
+            TEST_POOL.contents.get(f.as_path()).is_none(),
+            "never kept in memory"
+        );
+        let body = crate::hyper_web::body::to_bytes(h.into_body().await.unwrap())
+            .await
+            .unwrap();
         assert_eq!(body.len(), size);
     }
 
@@ -543,15 +573,28 @@ mod tests {
         let only_css: InternalCacheConfig =
             serde_json::from_str(r#"{"enabled": true, "extensions": ["css"]}"#).unwrap();
         let p = CachePolicy::new(&only_css, None);
-        assert!(matches!(read(&css, "text/css", &p, Some(&TEST_POOL)).await.unwrap(), FileHandle::Memory(_)));
-        assert!(matches!(read(&png, "image/png", &p, Some(&TEST_POOL)).await.unwrap(), FileHandle::Disk { .. }));
+        assert!(matches!(
+            read(&css, "text/css", &p, Some(&TEST_POOL)).await.unwrap(),
+            FileHandle::Memory(_)
+        ));
+        assert!(matches!(
+            read(&png, "image/png", &p, Some(&TEST_POOL)).await.unwrap(),
+            FileHandle::Disk { .. }
+        ));
 
         // Désactivé par défaut : rien en mémoire.
         let default = InternalCacheConfig::default();
         let other = d.join("c.css");
         std::fs::write(&other, "x").unwrap();
         assert!(matches!(
-            read(&other, "text/css", &CachePolicy::new(&default, None), Some(&TEST_POOL)).await.unwrap(),
+            read(
+                &other,
+                "text/css",
+                &CachePolicy::new(&default, None),
+                Some(&TEST_POOL)
+            )
+            .await
+            .unwrap(),
             FileHandle::Disk { .. }
         ));
         assert!(TEST_POOL.contents.get(other.as_path()).is_none());
@@ -564,8 +607,10 @@ mod tests {
         std::fs::write(&f, vec![b'x'; 200_000]).unwrap();
         let cfg = defaults();
         let p = CachePolicy::new(&cfg, None);
-        let handles =
-            futures_util::future::join_all((0..20).map(|_| read(&f, "text/javascript", &p, Some(&TEST_POOL)))).await;
+        let handles = futures_util::future::join_all(
+            (0..20).map(|_| read(&f, "text/javascript", &p, Some(&TEST_POOL))),
+        )
+        .await;
         let ptrs: std::collections::HashSet<usize> = handles
             .into_iter()
             .map(|h| match h.unwrap() {
@@ -573,7 +618,11 @@ mod tests {
                 FileHandle::Disk { .. } => panic!("should be cached"),
             })
             .collect();
-        assert_eq!(ptrs.len(), 1, "one copy in memory for all concurrent readers");
+        assert_eq!(
+            ptrs.len(),
+            1,
+            "one copy in memory for all concurrent readers"
+        );
     }
 
     #[tokio::test]
@@ -610,17 +659,34 @@ vhosts:
         // Global désactivé (défaut) : seuls les vhosts qui l'activent ont un cache.
         let p = FilePools::build(&InternalCacheConfig::default(), &routes);
         let ptr = |i: usize| p.pick(Some(&routes[i])).map(|c| Arc::as_ptr(&c));
-        assert!(ptr(0).is_some() && ptr(0) == ptr(1), "one cache for the vhost's routes");
-        assert!(ptr(2).is_some() && ptr(2) != ptr(0), "enabled without max_memory: global budget");
-        assert!(p.global.is_some(), "global cache created for the vhost that needs it");
+        assert!(
+            ptr(0).is_some() && ptr(0) == ptr(1),
+            "one cache for the vhost's routes"
+        );
+        assert!(
+            ptr(2).is_some() && ptr(2) != ptr(0),
+            "enabled without max_memory: global budget"
+        );
+        assert!(
+            p.global.is_some(),
+            "global cache created for the vhost that needs it"
+        );
         let none = FilePools::build(&InternalCacheConfig::default(), &routes[3..]);
         assert!(none.global.is_none(), "nothing enabled: no cache at all");
     }
 
     #[test]
     fn etag_changes_with_content() {
-        let a = CachedFile { bytes: Bytes::from_static(b"a"), len: 1, modified: Some(SystemTime::UNIX_EPOCH) };
-        let b = CachedFile { bytes: Bytes::from_static(b"ab"), len: 2, modified: Some(SystemTime::UNIX_EPOCH) };
+        let a = CachedFile {
+            bytes: Bytes::from_static(b"a"),
+            len: 1,
+            modified: Some(SystemTime::UNIX_EPOCH),
+        };
+        let b = CachedFile {
+            bytes: Bytes::from_static(b"ab"),
+            len: 2,
+            modified: Some(SystemTime::UNIX_EPOCH),
+        };
         assert_ne!(a.etag(), b.etag());
     }
 }

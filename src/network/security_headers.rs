@@ -54,16 +54,30 @@ pub enum DiscoveryCsp {
 }
 
 /// Le socle appliqué par `auto`.
-pub const BASELINE_CSP: &str =
-    "frame-ancestors 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; upgrade-insecure-requests";
+pub const BASELINE_CSP: &str = "frame-ancestors 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; upgrade-insecure-requests";
 
 fn baseline() -> [(HeaderName, HeaderValue); 7] {
     [
-        (header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(BASELINE_CSP)),
-        (header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN")),
-        (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
-        (header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin")),
-        (header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000")),
+        (
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(BASELINE_CSP),
+        ),
+        (
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("SAMEORIGIN"),
+        ),
+        (
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ),
+        (
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ),
+        (
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        ),
         (
             HeaderName::from_static("cross-origin-opener-policy"),
             HeaderValue::from_static("same-origin-allow-popups"),
@@ -81,7 +95,11 @@ pub fn apply_baseline(headers: &mut HeaderMap) -> usize {
     let app_sets_framing = headers
         .get_all(header::CONTENT_SECURITY_POLICY)
         .iter()
-        .chain(headers.get_all(header::CONTENT_SECURITY_POLICY_REPORT_ONLY).iter())
+        .chain(
+            headers
+                .get_all(header::CONTENT_SECURITY_POLICY_REPORT_ONLY)
+                .iter(),
+        )
         .filter_map(|v| v.to_str().ok())
         .any(|v| v.to_ascii_lowercase().contains("frame-ancestors"));
     let mut added = 0;
@@ -149,35 +167,65 @@ mod tests {
         assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
         assert_eq!(h[header::STRICT_TRANSPORT_SECURITY], "max-age=31536000");
         assert!(BASELINE_CSP.contains("frame-ancestors 'self'"));
-        assert!(!BASELINE_CSP.contains("script-src"), "scripts are never restricted");
+        assert!(
+            !BASELINE_CSP.contains("script-src"),
+            "scripts are never restricted"
+        );
     }
 
     #[test]
     fn never_overrides_what_the_backend_sent() {
         let mut h = HeaderMap::new();
-        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors https://partner.example"));
-        h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("ALLOW-FROM https://partner.example"));
-        h.insert(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=63072000; includeSubDomains"));
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors https://partner.example"),
+        );
+        h.insert(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("ALLOW-FROM https://partner.example"),
+        );
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+        );
         assert_eq!(apply_baseline(&mut h), 4);
         assert_eq!(h.get_all(header::CONTENT_SECURITY_POLICY).iter().count(), 1);
-        assert_eq!(h[header::X_FRAME_OPTIONS], "ALLOW-FROM https://partner.example");
-        assert_eq!(h[header::CONTENT_SECURITY_POLICY], "frame-ancestors https://partner.example");
-        assert_eq!(h[header::STRICT_TRANSPORT_SECURITY], "max-age=63072000; includeSubDomains");
+        assert_eq!(
+            h[header::X_FRAME_OPTIONS],
+            "ALLOW-FROM https://partner.example"
+        );
+        assert_eq!(
+            h[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors https://partner.example"
+        );
+        assert_eq!(
+            h[header::STRICT_TRANSPORT_SECURITY],
+            "max-age=63072000; includeSubDomains"
+        );
     }
 
     #[test]
     fn no_x_frame_options_when_the_app_sets_frame_ancestors() {
         let mut h = HeaderMap::new();
-        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors https://partner.example"));
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors https://partner.example"),
+        );
         apply_baseline(&mut h);
-        assert!(!h.contains_key(header::X_FRAME_OPTIONS), "would contradict the app's own framing rule");
+        assert!(
+            !h.contains_key(header::X_FRAME_OPTIONS),
+            "would contradict the app's own framing rule"
+        );
         assert!(h.contains_key(header::X_CONTENT_TYPE_OPTIONS));
     }
 
     #[test]
     fn report_only_policy_is_respected() {
         let mut h = HeaderMap::new();
-        h.insert(header::CONTENT_SECURITY_POLICY_REPORT_ONLY, HeaderValue::from_static("default-src 'self'"));
+        h.insert(
+            header::CONTENT_SECURITY_POLICY_REPORT_ONLY,
+            HeaderValue::from_static("default-src 'self'"),
+        );
         apply_baseline(&mut h);
         assert!(!h.contains_key(header::CONTENT_SECURITY_POLICY));
         assert!(h.contains_key(header::X_FRAME_OPTIONS));
@@ -185,8 +233,14 @@ mod tests {
 
     #[test]
     fn parses_config_values() {
-        assert_eq!(serde_json::from_str::<DiscoveryCsp>(r#""auto""#).unwrap(), DiscoveryCsp::Auto);
-        assert_eq!(serde_json::from_str::<DiscoveryCsp>(r#""off""#).unwrap(), DiscoveryCsp::Off);
+        assert_eq!(
+            serde_json::from_str::<DiscoveryCsp>(r#""auto""#).unwrap(),
+            DiscoveryCsp::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<DiscoveryCsp>(r#""off""#).unwrap(),
+            DiscoveryCsp::Off
+        );
         assert!(serde_json::from_str::<DiscoveryCsp>(r#""strict""#).is_err());
     }
 }

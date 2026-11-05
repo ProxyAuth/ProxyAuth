@@ -211,7 +211,9 @@ pub async fn get_or_build_client(backend: &str) -> ArcClient {
     let client = Client::builder(TokioExecutor::new())
         .pool_timer(crate::network::shared_client::pool_timer())
         .pool_idle_timeout(Duration::from_secs(lb().keep_alive_secs))
-        .pool_max_idle_per_host(crate::network::shared_client::per_worker_idle(lb().pool_max_idle_per_host))
+        .pool_max_idle_per_host(crate::network::shared_client::per_worker_idle(
+            lb().pool_max_idle_per_host,
+        ))
         .build::<_, BoxBody>(https);
 
     let arc_client = Arc::new(client);
@@ -247,7 +249,9 @@ pub async fn get_or_build_client_with_proxy(proxy_addr: &str, backend: &str) -> 
     let client = Client::builder(TokioExecutor::new())
         .pool_timer(crate::network::shared_client::pool_timer())
         .pool_idle_timeout(Duration::from_secs(lb().keep_alive_secs))
-        .pool_max_idle_per_host(crate::network::shared_client::per_worker_idle(lb().pool_max_idle_per_host))
+        .pool_max_idle_per_host(crate::network::shared_client::per_worker_idle(
+            lb().pool_max_idle_per_host,
+        ))
         .build(proxy_connector);
 
     let arc_client = Arc::new(client);

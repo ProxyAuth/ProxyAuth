@@ -1,7 +1,7 @@
-use proxyauth::hyper_web::http::StatusCode;
 use chrono::Utc;
 use proxyauth::AppConfig;
 use proxyauth::config::config::RegexCond;
+use proxyauth::hyper_web::http::StatusCode;
 use proxyauth::network::canonical_url::canonicalize_path_for_match;
 use proxyauth::token::security::all_values_match;
 use proxyauth::token::security::apply_filters_regex_allow_only;
@@ -21,9 +21,9 @@ use serde_json::Value as JsonValue;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proxyauth::hyper_web::{http::Method, http::header, test, test::TestRequest};
     use bytes::Bytes;
     use proxyauth::config::config::{AllowRegexCfg, RegexCondCfg, RouteRule};
+    use proxyauth::hyper_web::{http::Method, http::header, test, test::TestRequest};
     use regex::Regex;
     use serde_json::json;
 
@@ -702,9 +702,9 @@ mod more_unit_tests {
 
 #[cfg(test)]
 mod validate_token_path_tests {
-    use proxyauth::hyper_web::web;
     use chrono::Utc;
     use dashmap::DashMap;
+    use proxyauth::hyper_web::web;
     use std::sync::Arc;
 
     use proxyauth::AppConfig;

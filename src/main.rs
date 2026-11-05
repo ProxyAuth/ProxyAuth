@@ -36,6 +36,7 @@ use crate::adm::revoke::revoke_route;
 use crate::adm::stats::{get_proxy_sessions, get_proxy_stats};
 use crate::build::build_info::update_build_info;
 use crate::cli::prompt::prompt;
+use crate::hyper_web::{App, http::Method, web};
 use crate::keystore::import::decrypt_keystore;
 use crate::network::accesslog::{self, AccessLogger};
 use crate::network::compression::Compress;
@@ -46,7 +47,6 @@ use crate::network::stats::{RequestStats, spawn_stats_ticker};
 use crate::revoke::db::{load_revoked_tokens, start_revoked_token_ttl};
 use crate::smtp::smtp::SmtpClient;
 use crate::smtp::template::ensure_reset_template_exists;
-use crate::hyper_web::{App, http::Method, web};
 use chrono::Local;
 use config::config::{AppConfig, AppState, RouteConfig, load_config};
 use config::def_config;
@@ -62,9 +62,9 @@ use std::net::TcpListener;
 use std::{fs, process, sync::Arc, time::Duration};
 use tls::bind_server;
 use token::auth::{auth_dispatch, auth_options};
+use token::logout::{logout_dispatch, logout_options};
 use token::refresh_token::refresh_token_dispatch;
 use token::registry::registry_route;
-use token::logout::{logout_dispatch, logout_options};
 use token::reset_password::reset_password_route;
 use token::vault as token_vault;
 use tokio::sync::mpsc::unbounded_channel;
@@ -188,7 +188,9 @@ async fn create_listener(
 /// a renewal without *something* answering there. Everything else
 /// gets redirected to HTTPS, matching what operators generally expect
 /// from port 80 anyway on an otherwise HTTPS-only site.
-async fn acme_http01_responder(req: crate::hyper_web::HttpRequest) -> crate::hyper_web::HttpResponse {
+async fn acme_http01_responder(
+    req: crate::hyper_web::HttpRequest,
+) -> crate::hyper_web::HttpResponse {
     if req.method() == crate::hyper_web::http::Method::GET {
         if let Some(token) = crate::acme::challenge::extract_token(req.path()) {
             let host = req.connection_info().host().to_string();
@@ -454,7 +456,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("warning: could not read/raise the open-files limit: {e}"),
     }
 
-
     // Le noyau plafonne silencieusement la file d'attente de `listen()`
     // à `net.core.somaxconn`.
     if let Some(somaxconn) = fs::read_to_string("/proc/sys/net/core/somaxconn")
@@ -692,9 +693,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    crate::revoke::db::set_token_lifetime(
-        crate::config::config::max_token_lifetime(&config, &routes.routes) as i64,
-    );
+    crate::revoke::db::set_token_lifetime(crate::config::config::max_token_lifetime(
+        &config,
+        &routes.routes,
+    ) as i64);
     start_revoked_token_ttl(
         revoked_tokens.clone(),
         std::time::Duration::from_secs(15),
@@ -707,17 +709,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pools de connexions vers les backends : un par worker, d'où le
     // partage de `max_idle_per_host` entre tous les workers.
-    network::shared_client::set_worker_threads(config.worker as usize * config.num_instances.max(1) as usize);
+    network::shared_client::set_worker_threads(
+        config.worker as usize * config.num_instances.max(1) as usize,
+    );
 
     {
         use network::security_headers::DiscoveryCsp;
         let global = config.discovery_csp.unwrap_or_default();
-        let overrides = routes.routes.iter().filter(|r| r.discovery_csp.is_some_and(|m| m != global)).count();
+        let overrides = routes
+            .routes
+            .iter()
+            .filter(|r| r.discovery_csp.is_some_and(|m| m != global))
+            .count();
         if global == DiscoveryCsp::Auto || overrides > 0 {
             info!(
                 "discovery-csp: {} on HTTPS responses{}",
-                if global == DiscoveryCsp::Auto { "baseline security headers" } else { "off by default" },
-                if overrides > 0 { format!(" ({overrides} route(s) override it)") } else { String::new() }
+                if global == DiscoveryCsp::Auto {
+                    "baseline security headers"
+                } else {
+                    "off by default"
+                },
+                if overrides > 0 {
+                    format!(" ({overrides} route(s) override it)")
+                } else {
+                    String::new()
+                }
             );
         }
         if global == DiscoveryCsp::Auto && !config.tls {
@@ -1034,7 +1050,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addrs: Vec<(String, u16)> = plan
         .ports
         .iter()
-        .flat_map(|&port| bind_addrs.iter().map(move |h| (socket_addr_string(h, port), port)))
+        .flat_map(|&port| {
+            bind_addrs
+                .iter()
+                .map(move |h| (socket_addr_string(h, port), port))
+        })
         .collect();
 
     for (a, _) in &addrs {
@@ -1048,7 +1068,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &ratelimit_summary,
         VERSION,
         config.worker,
-        &addrs.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(", "),
+        &addrs
+            .iter()
+            .map(|(a, _)| a.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         ID,
     );
 
@@ -1056,13 +1080,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut listener = Vec::with_capacity(addrs.len());
         for (a, port) in &addrs {
             listener.push((
-                create_listener(
-                    a,
-                    0,
-                    0,
-                    config.socket_listen.try_into().unwrap(),
-                )
-                .await?,
+                create_listener(a, 0, 0, config.socket_listen.try_into().unwrap()).await?,
                 *port,
             ));
         }
@@ -1149,11 +1167,20 @@ mod tests {
             assert_eq!(before, 1000, "index 15 must be mimalloc's purge_delay");
         }
         apply_purge_delay(Some(0.25));
-        assert_eq!(unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) }, 250);
+        assert_eq!(
+            unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) },
+            250
+        );
         apply_purge_delay(Some(0.0));
-        assert_eq!(unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) }, 0);
+        assert_eq!(
+            unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) },
+            0
+        );
         apply_purge_delay(Some(-1.0)); // refusé : valeur inchangée
-        assert_eq!(unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) }, 0);
+        assert_eq!(
+            unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) },
+            0
+        );
         unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, before) };
     }
 

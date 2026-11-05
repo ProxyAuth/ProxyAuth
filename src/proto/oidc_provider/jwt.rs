@@ -169,7 +169,7 @@ to this specific key, and it is never regenerated automatically."
     }
 
     let meta = fs::metadata(SIGNING_KEY_PATH)
-    .map_err(|e| format!("Failed to stat OIDC signing key at {SIGNING_KEY_PATH}: {e}"))?;
+        .map_err(|e| format!("Failed to stat OIDC signing key at {SIGNING_KEY_PATH}: {e}"))?;
 
     let mode = meta.permissions().mode() & 0o777;
 
@@ -181,7 +181,7 @@ Refusing to start with a signing key that isn't owner-only-readable — fix with
     }
 
     let pem_str = fs::read_to_string(SIGNING_KEY_PATH)
-    .map_err(|e| format!("Failed to read OIDC signing key at {SIGNING_KEY_PATH}: {e}"))?;
+        .map_err(|e| format!("Failed to read OIDC signing key at {SIGNING_KEY_PATH}: {e}"))?;
 
     // Decode the PEM first. `EncodingKey::from_rsa_der()` expects
     // binary DER, not the ASCII PEM representation.
@@ -195,7 +195,7 @@ Refusing to start with a signing key that isn't owner-only-readable — fix with
     // `der::extract_rsa_n_e()` currently expects a PKCS#1
     // `RSAPrivateKey`.
     let pem_doc = pem::parse(&pem_str)
-    .map_err(|e| format!("Failed to parse PEM at {SIGNING_KEY_PATH}: {e}"))?;
+        .map_err(|e| format!("Failed to parse PEM at {SIGNING_KEY_PATH}: {e}"))?;
 
     let (n, e) = der::extract_rsa_n_e(pem_doc.contents()).ok_or_else(|| {
         format!(
@@ -247,8 +247,8 @@ PKCS#1 RSA private key (\"-----BEGIN RSA PRIVATE KEY-----\")? PKCS#8 \
     sign_probe_with_key(&signing_key)?;
 
     SIGNING_KEY
-    .set(signing_key)
-    .map_err(|_| "OIDC signing key already initialized".to_string())?;
+        .set(signing_key)
+        .map_err(|_| "OIDC signing key already initialized".to_string())?;
 
     Ok(())
 }
@@ -281,7 +281,7 @@ Build with exactly one of its providers enabled — in Cargo.toml:\n\n    \
 jsonwebtoken = { version = \"11\", features = [\"aws_lc_rs\"] }\n\n\
 (`aws_lc_rs` is preferred here; `rust_crypto` also works, but pulls in the `rsa` crate, \
 which carries RUSTSEC-2023-0071.)"
-.to_string(),
+                .to_string(),
         ),
     }
 }
@@ -293,8 +293,8 @@ which carries RUSTSEC-2023-0071.)"
 /// caller is expected to handle.
 pub fn signing_key() -> &'static OidcSigningKey {
     SIGNING_KEY
-    .get()
-    .expect("init_signing_key() must run before signing_key() is called")
+        .get()
+        .expect("init_signing_key() must run before signing_key() is called")
 }
 
 /// The JWKS document body for `/oidc/jwks.json` — currently always

@@ -5,11 +5,11 @@
 
 #[cfg(test)]
 mod tests {
+    use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
     use proxyauth::hyper_web::dev::ServiceResponse;
     use proxyauth::hyper_web::http::{StatusCode, header};
     use proxyauth::hyper_web::test::{self, TestRequest};
     use proxyauth::hyper_web::{App, web};
-    use proxyauth::config::config::{AppConfig, AppState, RouteConfig, load_config};
     use proxyauth::network::proxy::global_proxy;
     use proxyauth::network::stats::RequestStats;
     use proxyauth::revoke::load::{pack_rotation, rotated_key};
@@ -284,7 +284,10 @@ vhosts:
 
     // ── caching ──────────────────────────────────────────────
 
-    async fn cache_headers(state: &AppState, req: TestRequest) -> (Option<String>, Option<String>, bool) {
+    async fn cache_headers(
+        state: &AppState,
+        req: TestRequest,
+    ) -> (Option<String>, Option<String>, bool) {
         let resp = call(state, req).await;
         let get = |name| {
             resp.headers()
@@ -296,25 +299,39 @@ vhosts:
             .get_all(header::SET_COOKIE)
             .iter()
             .any(|v| v.to_str().unwrap().starts_with("session_token="));
-        (get(header::CACHE_CONTROL), get(header::EXPIRES), has_session_cookie)
+        (
+            get(header::CACHE_CONTROL),
+            get(header::EXPIRES),
+            has_session_cookie,
+        )
     }
 
     #[tokio::test]
     async fn a_response_carrying_a_new_session_is_never_cached() {
         let state = state();
-        let (cache, expires, renewed) =
-            cache_headers(&state, open(SITE, "/cached/page", &token("cached-renew", 1200, 1200))).await;
+        let (cache, expires, renewed) = cache_headers(
+            &state,
+            open(SITE, "/cached/page", &token("cached-renew", 1200, 1200)),
+        )
+        .await;
         assert!(renewed);
         let cache = cache.expect("cache-control set");
-        assert!(cache.contains("no-store") && cache.contains("private"), "{cache}");
-        assert!(!cache.contains("public"), "the backend's public caching is overridden: {cache}");
+        assert!(
+            cache.contains("no-store") && cache.contains("private"),
+            "{cache}"
+        );
+        assert!(
+            !cache.contains("public"),
+            "the backend's public caching is overridden: {cache}"
+        );
         assert_eq!(expires, None);
     }
 
     #[tokio::test]
     async fn a_response_clearing_the_session_is_never_cached() {
         let state = state();
-        let (cache, _, cleared) = cache_headers(&state, open(SITE, "/cached/page", "garbage")).await;
+        let (cache, _, cleared) =
+            cache_headers(&state, open(SITE, "/cached/page", "garbage")).await;
         assert!(cleared);
         assert!(cache.unwrap().contains("no-store"));
     }
@@ -333,7 +350,6 @@ vhosts:
         let cache = cache.expect("cache-control");
         assert!(cache.starts_with("public"), "{cache}");
         let _ = expires;
-
     }
 
     /// A script or a stylesheet fetched by a page, rather than a page
@@ -356,9 +372,11 @@ vhosts:
         // revalidate would empty the browser cache of anyone signed in —
         // but never as `public`: a shared cache must not hand one
         // signed-in visitor's file to the next.
-        let (cache, expires, cookie) =
-            cache_headers(&state, subresource(SITE, "/asset/app.js", &token("cached-asset", 30, 30)))
-                .await;
+        let (cache, expires, cookie) = cache_headers(
+            &state,
+            subresource(SITE, "/asset/app.js", &token("cached-asset", 30, 30)),
+        )
+        .await;
         assert!(!cookie, "recent session: nothing sent back");
         let cache = cache.expect("cache-control");
         assert!(cache.starts_with("private"), "{cache}");
@@ -397,8 +415,11 @@ vhosts:
         // Public page, recent session: nothing to send back, but the
         // browser must come back to ProxyAuth next time, or the session
         // could not be renewed on this page.
-        let (cache, expires, cookie) =
-            cache_headers(&state, open(SITE, "/cached/page", &token("cached-fresh", 30, 30))).await;
+        let (cache, expires, cookie) = cache_headers(
+            &state,
+            open(SITE, "/cached/page", &token("cached-fresh", 30, 30)),
+        )
+        .await;
         assert!(!cookie, "recent session: nothing sent back");
         assert_eq!(cache.as_deref(), Some("private, no-cache"));
         assert_eq!(expires, None);
@@ -413,8 +434,11 @@ vhosts:
     #[tokio::test]
     async fn renewal_off_leaves_public_caching_alone() {
         let state = state();
-        let (cache, _, cookie) =
-            cache_headers(&state, open(NO_REFRESH, "/cached/page", &token("cached-off", 30, 30))).await;
+        let (cache, _, cookie) = cache_headers(
+            &state,
+            open(NO_REFRESH, "/cached/page", &token("cached-off", 30, 30)),
+        )
+        .await;
         assert!(!cookie);
         assert!(cache.unwrap().starts_with("public"));
     }
@@ -424,7 +448,11 @@ vhosts:
     #[tokio::test]
     async fn a_public_page_renews_a_stale_session() {
         let state = state();
-        let out = send(&state, open(SITE, "/blog/article", &token("public", 1200, 1200))).await;
+        let out = send(
+            &state,
+            open(SITE, "/blog/article", &token("public", 1200, 1200)),
+        )
+        .await;
         assert_eq!(out.status, StatusCode::OK);
         assert_eq!(out.body, "backend:/blog/article");
         let new_token = out.new_token.expect("renewed on a public page too");
@@ -442,7 +470,11 @@ vhosts:
     #[tokio::test]
     async fn a_public_static_page_renews_too() {
         let state = state();
-        let out = send(&state, open(SITE, "/docs/", &token("public-static", 1200, 1200))).await;
+        let out = send(
+            &state,
+            open(SITE, "/docs/", &token("public-static", 1200, 1200)),
+        )
+        .await;
         assert_eq!(out.status, StatusCode::OK);
         assert_eq!(out.body, "public static page");
         assert!(out.new_token.is_some());
@@ -504,13 +536,20 @@ vhosts:
         let second = send(&state, open(SITE, "/b.css", &old)).await;
         assert_eq!(second.status, StatusCode::OK);
         assert!(first.new_token.is_some(), "the page renews the session");
-        assert_eq!(first.new_token, second.new_token, "one renewal for a page and its assets");
+        assert_eq!(
+            first.new_token, second.new_token,
+            "one renewal for a page and its assets"
+        );
     }
 
     #[tokio::test]
     async fn a_public_page_clears_a_session_past_its_max_lifetime() {
         let state = state();
-        let out = send(&state, open(SHORT, "/", &token("public-too-old", 100, 7300))).await;
+        let out = send(
+            &state,
+            open(SHORT, "/", &token("public-too-old", 100, 7300)),
+        )
+        .await;
         assert_eq!(out.status, StatusCode::OK);
         assert!(out.cleared);
     }
@@ -518,7 +557,11 @@ vhosts:
     #[tokio::test]
     async fn a_public_page_does_nothing_when_renewal_is_off() {
         let state = state();
-        let out = send(&state, open(NO_REFRESH, "/", &token("public-off", 1200, 1200))).await;
+        let out = send(
+            &state,
+            open(NO_REFRESH, "/", &token("public-off", 1200, 1200)),
+        )
+        .await;
         assert_eq!(out.status, StatusCode::OK);
         assert_eq!(out.cookie, None);
         assert!(!out.cleared);
@@ -530,7 +573,10 @@ vhosts:
         let req = TestRequest::get()
             .uri("/")
             .insert_header((header::HOST, SITE))
-            .insert_header((header::COOKIE, format!("session_token={}", token("public-http", 1200, 1200))));
+            .insert_header((
+                header::COOKIE,
+                format!("session_token={}", token("public-http", 1200, 1200)),
+            ));
         let resp = call(&state, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get(header::SET_COOKIE).is_none());
@@ -550,7 +596,11 @@ vhosts:
     #[tokio::test]
     async fn renewal_can_be_disabled_per_vhost() {
         let state = state();
-        let out = send(&state, open(NO_REFRESH, "/admin", &token("vhost-off", 1200, 1200))).await;
+        let out = send(
+            &state,
+            open(NO_REFRESH, "/admin", &token("vhost-off", 1200, 1200)),
+        )
+        .await;
         assert_eq!(out.status, StatusCode::OK);
         assert_eq!(out.cookie, None);
     }
@@ -575,13 +625,23 @@ vhosts:
     #[tokio::test]
     async fn a_stale_session_gets_a_new_cookie_and_stays_signed_in() {
         let state = state();
-        let out = send(&state, open(SITE, "/admin/page", &token("stale", 1000, 1000))).await;
+        let out = send(
+            &state,
+            open(SITE, "/admin/page", &token("stale", 1000, 1000)),
+        )
+        .await;
 
         assert_eq!(out.status, StatusCode::OK, "no sign-in asked");
         assert_eq!(out.body, "backend:/admin/page");
 
         let cookie = out.cookie.expect("a renewed session cookie");
-        for attr in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/", "Max-Age=1800"] {
+        for attr in [
+            "HttpOnly",
+            "Secure",
+            "SameSite=Strict",
+            "Path=/",
+            "Max-Age=1800",
+        ] {
             assert!(cookie.contains(attr), "{attr} missing in {cookie}");
         }
 
@@ -594,14 +654,21 @@ vhosts:
     #[tokio::test]
     async fn the_new_token_keeps_the_original_login_time() {
         let state = state();
-        let out = send(&state, open(SITE, "/admin", &token("keeps-login", 1000, 5000))).await;
+        let out = send(
+            &state,
+            open(SITE, "/admin", &token("keeps-login", 1000, 5000)),
+        )
+        .await;
         let new_token = out.new_token.expect("renewed");
 
         let session = proxyauth::token::vault::vault().verify(&new_token).unwrap();
         let data = TokenData::parse(session.data()).unwrap();
         let now = now_secs();
         assert!(now - data.issued_at < 5, "issued just now");
-        assert!((4995..=5005).contains(&(now - data.session_started_at)), "login time kept");
+        assert!(
+            (4995..=5005).contains(&(now - data.session_started_at)),
+            "login time kept"
+        );
         assert!(session.expires_at() >= now + LIFETIME - 5, "full lifetime");
         assert_ne!(session.id(), "keeps-login", "new token id");
     }
@@ -635,14 +702,21 @@ vhosts:
     #[tokio::test]
     async fn using_the_new_token_retires_the_old_one_right_away() {
         let state = state();
-        let old = token("5e1f00000000000000000000000000000000000000000000000000000000a001", 1000, 1000);
+        let old = token(
+            "5e1f00000000000000000000000000000000000000000000000000000000a001",
+            1000,
+            1000,
+        );
         let old_id = "5e1f00000000000000000000000000000000000000000000000000000000a001";
 
         let first = send(&state, open(SITE, "/admin", &old)).await;
         let new_token = first.new_token.expect("renewed");
         let before = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
         let (refuse_before, purge) = proxyauth::revoke::load::unpack_rotation(before);
-        assert!(refuse_before >= now_secs() + GRACE - 2, "full grace until the new token is used");
+        assert!(
+            refuse_before >= now_secs() + GRACE - 2,
+            "full grace until the new token is used"
+        );
 
         // The browser now sends the new token.
         let next = send(&state, open(SITE, "/admin/next", &new_token)).await;
@@ -650,7 +724,10 @@ vhosts:
         let after = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
         let (refuse_after, purge_after) = proxyauth::revoke::load::unpack_rotation(after);
         assert!(refuse_after <= now_secs() + proxyauth::token::refresh::IN_FLIGHT_SECS);
-        assert_eq!(purge_after, purge, "still forgotten when the old token expires");
+        assert_eq!(
+            purge_after, purge,
+            "still forgotten when the old token expires"
+        );
 
         // The session carries the id of the token it replaced.
         let session = proxyauth::token::vault::vault().verify(&new_token).unwrap();
@@ -685,7 +762,10 @@ vhosts:
         let state = state();
         let old_id = "5e1f00000000000000000000000000000000000000000000000000000000a002";
         let old = token(old_id, 1000, 1000);
-        let new_token = send(&state, open(SITE, "/admin", &old)).await.new_token.unwrap();
+        let new_token = send(&state, open(SITE, "/admin", &old))
+            .await
+            .new_token
+            .unwrap();
 
         let _ = send(&state, open(SITE, "/admin/1", &new_token)).await;
         let first = *state.revoked_tokens.get(&rotated_key(old_id)).unwrap();
@@ -725,7 +805,10 @@ vhosts:
             .expect("the predecessor is recorded here");
         let (refuse, purge) = proxyauth::revoke::load::unpack_rotation(entry);
         assert!(refuse <= now_secs() + proxyauth::token::refresh::IN_FLIGHT_SECS);
-        assert!(purge >= now + LIFETIME, "kept as long as the predecessor could live");
+        assert!(
+            purge >= now + LIFETIME,
+            "kept as long as the predecessor could live"
+        );
     }
 
     #[tokio::test]
@@ -733,7 +816,10 @@ vhosts:
         let state = state();
         let old_id = "5e1f00000000000000000000000000000000000000000000000000000000a004";
         let old = token(old_id, 1000, 1000);
-        let new_token = send(&state, open(SITE, "/blog", &old)).await.new_token.unwrap();
+        let new_token = send(&state, open(SITE, "/blog", &old))
+            .await
+            .new_token
+            .unwrap();
         let _ = send(&state, open(SITE, "/blog/next", &new_token)).await;
         let (refuse, _) = proxyauth::revoke::load::unpack_rotation(
             *state.revoked_tokens.get(&rotated_key(old_id)).unwrap(),
@@ -785,7 +871,11 @@ vhosts:
         // Started 5000s ago with a 7200s limit: the session ends before
         // the current token does. The token is still replaced, and the
         // new one ends with the session.
-        let out = send(&state, open(SHORT, "/admin", &token("at-limit", 1000, 5000))).await;
+        let out = send(
+            &state,
+            open(SHORT, "/admin", &token("at-limit", 1000, 5000)),
+        )
+        .await;
         assert_eq!(out.status, StatusCode::OK);
         let new_token = out.new_token.expect("rotated");
         let session = proxyauth::token::vault::vault().verify(&new_token).unwrap();
@@ -821,7 +911,9 @@ vhosts:
         let state = state();
         let out = send(&state, open(SITE, "/admin", &legacy_old_format)).await;
         assert_eq!(out.status, StatusCode::OK);
-        let renewed = out.new_token.expect("an old-format token past the interval is renewed");
+        let renewed = out
+            .new_token
+            .expect("an old-format token past the interval is renewed");
         let session = proxyauth::token::vault::vault().verify(&renewed).unwrap();
         assert!(TokenData::parse(session.data()).unwrap().issued_at > 0);
     }
