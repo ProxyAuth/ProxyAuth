@@ -196,17 +196,34 @@ jobs:
         run: |
           cargo test --locked --doc
 
-      - name: Install routes.yml with the route under test
+      # Since 1.4.0 rate limits live in routes.yml (`ratelimit:` block on a
+      # vhost or a route). `ratelimit_auth` / `ratelimit_proxy` in
+      # config.json are ignored with a warning. Two variants of the same
+      # route are written here: without limits for the functional and
+      # stress tests, with strict limits for the rate-limit tests.
+      - name: Write the routes.yml variants under test
         run: |
           set -eu
-          sudo mkdir -p /etc/proxyauth/config
 
-          sudo tee /etc/proxyauth/config/routes.yml >/dev/null <<'YML'
+          cat > /tmp/routes-base.yml <<'YML'
           routes:
             - prefix: "/app"
               target: "http://127.0.0.1:8500"
               required_login: true
               streaming: true
+              username: ["admin"]
+          YML
+
+          cat > /tmp/routes-ratelimit.yml <<'YML'
+          routes:
+            - prefix: "/app"
+              target: "http://127.0.0.1:8500"
+              required_login: true
+              streaming: true
+              username: ["admin"]
+              # 1 req/s, burst 5 on the proxy; 1 req/s, burst 3 on /auth.
+              # On a catch-all route (no `vhost`), the `auth` block also
+              # covers /auth, /refresh_token and the other login paths.
               ratelimit:
                 limit_req_per_sec: 1
                 burst: 5
@@ -215,9 +232,13 @@ jobs:
                   limit_req_per_sec: 1
                   burst: 3
                   timeout: 0
-              username: ["admin"]
           YML
 
+      - name: Install routes.yml with the route under test
+        run: |
+          set -eu
+          sudo mkdir -p /etc/proxyauth/config
+          sudo cp /tmp/routes-base.yml /etc/proxyauth/config/routes.yml
           sudo chown -R proxyauth:proxyauth /etc/proxyauth/config
 
       - name: Reset test database
@@ -301,9 +322,12 @@ jobs:
 
       - name: Start ProxyAuth in background
         run: |
-          sudo -u proxyauth ./target/release/proxyauth &
+          sudo -u proxyauth ./target/release/proxyauth >> /tmp/proxyauth.log 2>&1 &
           echo $! > proxyauth.pid
-          sleep 2
+          for _ in $(seq 1 30); do
+            curl -k -s -o /dev/null -m 2 https://localhost:8080 && break
+            sleep 0.5
+          done
 
       - name: HTTPS responds
         run: |
@@ -540,17 +564,27 @@ jobs:
           }))
           PY
 
+          # Usage: proxyauth-restart.sh <routes.yml to install> [jq filter for config.json]
+          #
+          # Rate limits are read from routes.yml when ProxyAuth starts, so a
+          # change of limits is a new routes.yml followed by a restart.
           cat > /tmp/proxyauth-restart.sh <<'SH'
           #!/bin/bash
           set -eu
 
-          config=/etc/proxyauth/config/config.json
+          routes_src="${1:?usage: proxyauth-restart.sh <routes.yml> [jq filter for config.json]}"
+          config_filter="${2:-.}"
 
-          PROXYAUTH_BIN="$GITHUB_WORKSPACE/target/debug/proxyauth"
+          config=/etc/proxyauth/config/config.json
+          routes=/etc/proxyauth/config/routes.yml
+
+          # Same binary as the one built and started above.
+          PROXYAUTH_BIN="$GITHUB_WORKSPACE/target/release/proxyauth"
           PID_FILE="$GITHUB_WORKSPACE/proxyauth.pid"
           PROXYAUTH_LOG=/tmp/proxyauth.log
 
           # Stop the exact PID recorded at startup, then wait for clean exit.
+          # 1.4.0 stops within shutdown_timeout (2 s by default).
           if [ -s "$PID_FILE" ]; then
             old_pid="$(cat "$PID_FILE")"
             if [[ "$old_pid" =~ ^[0-9]+$ ]]; then
@@ -577,10 +611,17 @@ jobs:
           rm -f "$PID_FILE"
           sleep 0.5
 
-          jq "$1" "$config" > /tmp/config.json.new
-          sudo tee "$config" < /tmp/config.json.new >/dev/null
-          echo "--- rate limit settings in use ---"
-          jq '{ratelimit_proxy, ratelimit_auth}' "$config"
+          sudo cp "$routes_src" "$routes"
+          sudo chown proxyauth:proxyauth "$routes"
+          echo "--- routes.yml in use ---"
+          cat "$routes"
+
+          if [ "$config_filter" != "." ]; then
+            jq "$config_filter" "$config" > /tmp/config.json.new
+            sudo tee "$config" < /tmp/config.json.new >/dev/null
+          fi
+          echo "--- config.json settings under test ---"
+          jq '{max_body_size, shutdown_timeout}' "$config"
 
           # Detach the restarted server from this step's process group as well.
           sudo -u proxyauth setsid -f "$PROXYAUTH_BIN" \
@@ -596,6 +637,7 @@ jobs:
               fi
               printf '%s\n' "$server_pid" > "$PID_FILE"
               echo "ProxyAuth restarted with PID $server_pid"
+              grep -i 'ratelimit' "$PROXYAUTH_LOG" | tail -n 1 || true
               exit 0
             fi
             sleep 1
@@ -608,19 +650,14 @@ jobs:
           SH
           chmod +x /tmp/proxyauth-restart.sh
 
-      - name: Restart ProxyAuth with strict rate limits
+      - name: Restart ProxyAuth with a known max_body_size
         run: |
           set -eu
 
-          /tmp/proxyauth-restart.sh '
-            .ratelimit_proxy = {"requests_per_second": 1, "burst": 5, "block_delay": 0}
-            | .ratelimit_auth = {"requests_per_second": 1, "burst": 3, "block_delay": 0}
-          '
-          /tmp/proxyauth-restart.sh '.max_body_size = 10485760'
+          /tmp/proxyauth-restart.sh /tmp/routes-base.yml '.max_body_size = 10485760'
 
           /tmp/login.sh > /tmp/token
           [ -s /tmp/token ] || { echo "::error::login failed after restart"; exit 1; }
-
 
       - name: Upload below max_body_size reaches the backend intact
         run: |
@@ -669,37 +706,54 @@ jobs:
               ;;
           esac
 
-      # - name: Large download is streamed intact
-      #   run: |
-      #     set -eu
-      #
-      #     token=$(/tmp/login.sh)
-      #
-      #     code=$(curl -k -s \
-      #       -D /tmp/download.headers \
-      #       -o /tmp/download.bin \
-      #       -w '%{http_code}' \
-      #       https://localhost:8080/app/big \
-      #       -H "Authorization: Bearer $token")
-      #
-      #     size=$(stat -c %s /tmp/download.bin)
-      #     echo "50 MiB download -> $code, $size bytes"
-      #
-      #     if [ "$code" != "200" ]; then
-      #       echo "::error::the download answered $code"
-      #       exit 1
-      #     fi
-      #
-      #     if [ "$(sha256sum /tmp/download.bin | cut -d' ' -f1)" != "$(cat /tmp/big.sha256)" ]; then
-      #       echo "::error::the downloaded file differs from what the backend sent"
-      #       exit 1
-      #     fi
-      #
-      #     if ! grep -qi "^content-length: $size" /tmp/download.headers; then
-      #       echo "::error::the backend's Content-Length was not passed on to the client"
-      #       cat /tmp/download.headers
-      #       exit 1
-      #     fi
+      # A streamed response is relayed with chunked framing (HTTP/1.1) or
+      # DATA frames (HTTP/2): the backend's Content-Length is a hop-by-hop
+      # header and is not passed on. What matters is that every byte
+      # arrives, and that ProxyAuth does not hold the file in memory.
+      - name: Large download is streamed intact
+        run: |
+          set -eu
+
+          token=$(/tmp/login.sh)
+          pid=$(cat proxyauth.pid)
+          rss() { awk '/^VmRSS:/ { print int($2 / 1024) }' "/proc/$pid/status"; }
+          rss_before=$(rss)
+
+          code=$(curl -k -s \
+            -D /tmp/download.headers \
+            -o /tmp/download.bin \
+            -w '%{http_code}' \
+            https://localhost:8080/app/big \
+            -H "Authorization: Bearer $token")
+
+          size=$(stat -c %s /tmp/download.bin)
+          rss_after=$(rss)
+          echo "50 MiB download -> $code, $size bytes; ProxyAuth RSS ${rss_before} MiB -> ${rss_after} MiB"
+
+          if [ "$code" != "200" ]; then
+            echo "::error::the download answered $code"
+            exit 1
+          fi
+
+          if [ "$(sha256sum /tmp/download.bin | cut -d' ' -f1)" != "$(cat /tmp/big.sha256)" ]; then
+            echo "::error::the downloaded file differs from what the backend sent"
+            exit 1
+          fi
+
+          if [ $(( rss_after - rss_before )) -gt 40 ]; then
+            echo "::error::ProxyAuth memory grew by $(( rss_after - rss_before )) MiB for a streamed download"
+            exit 1
+          fi
+          rm -f /tmp/download.bin
+
+      - name: Restart ProxyAuth with strict rate limits
+        run: |
+          set -eu
+
+          /tmp/proxyauth-restart.sh /tmp/routes-ratelimit.yml
+
+          /tmp/login.sh > /tmp/token
+          [ -s /tmp/token ] || { echo "::error::login failed after restart"; exit 1; }
 
       - name: "Rate limit: a burst on the proxy is capped at the configured size"
         run: |
@@ -731,6 +785,7 @@ jobs:
 
           [ "$code" = "429" ] || { echo "::error::no 429 right after exhausting the burst"; exit 1; }
           grep -qi '^retry-after:' /tmp/429.headers || { echo "::error::429 without a Retry-After header"; exit 1; }
+          grep -qi '^x-ratelimit-limit:' /tmp/429.headers || { echo "::error::429 without an x-ratelimit-limit header"; exit 1; }
           jq -e '.code == 429' /tmp/429.body >/dev/null || { echo "::error::429 body is not the expected JSON"; exit 1; }
 
       - name: "Rate limit: access comes back after waiting"
@@ -764,9 +819,14 @@ jobs:
           [ "$other" -eq 0 ] || { echo "::error::unexpected status codes under flood (5xx?)"; exit 1; }
           [ "$ok" -le "$max_ok" ] || { echo "::error::the flood got through the rate limit"; exit 1; }
 
+          # The whole route shares one counter per client (1 req/s here), and
+          # the flood can end in well under a second: wait for one token to
+          # come back before checking that ProxyAuth still serves normally.
+          sleep 2
+
           code=$(curl -k -s -m 5 -o /dev/null -w '%{http_code}' \
             https://localhost:8080/app/after-flood -H "Authorization: Bearer $(cat /tmp/token)") || true
-          echo "request on another path right after the flood -> $code"
+          echo "request on another path 2 s after the flood -> $code"
 
           [ "$code" = "200" ] || { echo "::error::ProxyAuth is no longer serving normally after the flood"; exit 1; }
 
@@ -814,10 +874,14 @@ jobs:
         run: |
           set -eu
 
-          /tmp/proxyauth-restart.sh '
-            .ratelimit_proxy.requests_per_second = 0
-            | .ratelimit_auth.requests_per_second = 0
-          '
+          # No `ratelimit:` block in routes.yml: nothing is rate limited.
+          /tmp/proxyauth-restart.sh /tmp/routes-base.yml
+
+          grep -q 'ratelimit Off' /tmp/proxyauth.log || {
+            echo "::error::ProxyAuth did not report rate limiting as off"
+            tail -n 20 /tmp/proxyauth.log
+            exit 1
+          }
 
           /tmp/login.sh > /tmp/token
           [ -s /tmp/token ] || { echo "::error::login failed after restart"; exit 1; }
@@ -896,6 +960,8 @@ jobs:
       - name: Show logs on failure
         if: failure()
         run: |
+          echo "===== ProxyAuth ====="
+          tail -n 100 /tmp/proxyauth.log 2>/dev/null || true
           echo "===== Backend ====="
           cat /tmp/backend.log 2>/dev/null || true
 
