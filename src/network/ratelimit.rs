@@ -15,7 +15,9 @@
 //!       limit_req_per_sec: 5   # débit soutenu : 5 requêtes / seconde
 //!       burst: 5               # rafale tolérée (défaut : = débit)
 //!       timeout: 10            # blocage de 10 s après un dépassement (0 = aucun)
-//!       key: ip                # ip (défaut) | user | user_ip
+//!       key: ip                # ip (défaut) | user | user_ip | cookie | cookie_ip
+//!       # cookie_name: "app_session"   # avec key: cookie
+//!       # ip_ceiling: { limit_req_per_sec: 50, burst: 100 }   # plafond par IP
 //!       auth:                  # facultatif : plus strict sur /auth & co
 //!         limit_request: 10    # 10 requêtes…
 //!         period: 60           # …par fenêtre de 60 s
@@ -98,7 +100,37 @@ pub enum RateLimitKey {
     /// Aussi accepté : `ip_user`.
     #[serde(alias = "ip_user")]
     UserIp,
+    /// Valeur d'un cookie choisi (`cookie_name`), par exemple le cookie de
+    /// session d'une application : un compteur par session. Sans ce
+    /// cookie, l'IP.
+    ///
+    /// La valeur vient du client : un client qui en change à chaque
+    /// requête obtient chaque fois un compteur neuf. Associez-la à
+    /// `ip_ceiling`, qui plafonne l'adresse quelles que soient les valeurs.
+    /// La valeur n'est jamais stockée telle quelle : seule son empreinte
+    /// (BLAKE3) sert de clé et apparaît dans les journaux.
+    Cookie,
+    /// Cookie **et** IP, avec un plafond par IP intégré : la forme simple
+    /// et sûre de `cookie`.
+    ///
+    /// * Un compteur par couple (valeur du cookie, IP) : chaque session a
+    ///   le sien, et un cookie volé rejoué depuis une autre IP ne vide pas
+    ///   le quota de la vraie session.
+    /// * Un plafond par IP, toujours présent : `ip_ceiling` s'il est écrit,
+    ///   sinon [`IMPLICIT_CEILING_FACTOR`] fois la limite du bloc. Un client
+    ///   qui change de cookie à chaque requête est arrêté par ce plafond.
+    ///
+    /// Aussi accepté : `ip_cookie`.
+    #[serde(alias = "ip_cookie")]
+    CookieIp,
 }
+
+/// Plafond par IP implicite de `key: cookie_ip`, en multiple de la limite
+/// du bloc. Une limite identique à celle d'une session ferait partager un
+/// seul quota à toutes les sessions d'une même IP — exactement `key: ip`.
+/// Dix fois laisse une dizaine de sessions actives derrière un NAT avant
+/// que le plafond ne joue ; `ip_ceiling` permet de régler autrement.
+pub const IMPLICIT_CEILING_FACTOR: u32 = 10;
 
 /// Bloc `ratelimit:` d'un vhost ou d'une route.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
@@ -133,6 +165,23 @@ pub struct RateLimitConfig {
     /// Absente : ces chemins suivent la limite générale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Box<RateLimitConfig>>,
+
+    /// Nom du cookie dont la valeur sert de clé, avec `key: cookie`.
+    /// Aussi accepté : `custom_cookie`.
+    #[serde(
+        default,
+        alias = "custom_cookie",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cookie_name: Option<String>,
+
+    /// Plafond par IP, vérifié en plus de la clé : toutes les requêtes
+    /// d'une adresse, quels que soient leurs cookies ou utilisateurs, ne
+    /// dépassent jamais ce débit. Mêmes champs de débit que le bloc
+    /// (`limit_req_per_sec` ou `limit_request` + `period`, `burst`,
+    /// `timeout`) ; il compte toujours par IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_ceiling: Option<Box<RateLimitConfig>>,
 
     /// Rempli par `expand_vhost_groups` quand une route hérite le bloc de
     /// son groupe `vhosts:` (index du groupe). Les routes d'un même groupe
@@ -220,6 +269,33 @@ impl RateLimitConfig {
                     RateLimitKey::Ip => {}
                     RateLimitKey::User => s.push_str(" key=user"),
                     RateLimitKey::UserIp => s.push_str(" key=user_ip"),
+                    RateLimitKey::Cookie => s.push_str(&format!(
+                        " key=cookie({})",
+                        self.cookie_name.as_deref().unwrap_or("?")
+                    )),
+                    RateLimitKey::CookieIp => s.push_str(&format!(
+                        " key=cookie_ip({})",
+                        self.cookie_name.as_deref().unwrap_or("?")
+                    )),
+                }
+                if let Some(c) = &self.ip_ceiling {
+                    s.push_str(&format!(" ip_ceiling {}", c.describe()));
+                } else if self.key == RateLimitKey::CookieIp {
+                    let rate = if self.limit_req_per_sec.is_some() {
+                        format!("{}/s", q.count.saturating_mul(IMPLICIT_CEILING_FACTOR))
+                    } else {
+                        format!(
+                            "{}/{}s",
+                            q.count.saturating_mul(IMPLICIT_CEILING_FACTOR),
+                            q.period.as_secs()
+                        )
+                    };
+                    s.push_str(&format!(
+                        " ip_ceiling {rate} burst {} (implicit, x{IMPLICIT_CEILING_FACTOR})",
+                        q.burst.saturating_mul(IMPLICIT_CEILING_FACTOR)
+                    ));
+                } else if self.key == RateLimitKey::Cookie {
+                    s.push_str(" — WARNING: no ip_ceiling, a client can send a new cookie value per request to get a fresh counter");
                 }
                 s
             }
@@ -333,6 +409,10 @@ impl Limiter {
 struct Entry {
     limiter: Arc<Limiter>,
     key: RateLimitKey,
+    /// Nom du cookie, pour `key: cookie`.
+    cookie: Option<Arc<str>>,
+    /// Plafond par IP (`ip_ceiling`), vérifié avant la clé.
+    ceiling: Option<Arc<Limiter>>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,8 +466,93 @@ impl RateLimiters {
             };
             let id = (
                 rule.vhost.clone(),
-                format!("{scope}|{what}|{quota:?}|{:?}", cfg.key),
+                format!(
+                    "{scope}|{what}|{quota:?}|{:?}|{:?}",
+                    cfg.key, cfg.cookie_name
+                ),
             );
+            let where_ = || {
+                format!(
+                    "routes.yml: route `{}` (vhost {:?}): ratelimit{what}",
+                    rule.prefix, rule.vhost
+                )
+            };
+            let cookie_kind = matches!(cfg.key, RateLimitKey::Cookie | RateLimitKey::CookieIp);
+            let cookie = match (cookie_kind, cfg.cookie_name.as_deref()) {
+                (true, Some(name)) if valid_cookie_name(name) => Some(Arc::<str>::from(name)),
+                (true, Some(name)) => {
+                    return Err(format!(
+                        "{}: `cookie_name` {name:?} is not a valid cookie name",
+                        where_()
+                    ));
+                }
+                (true, None) => {
+                    return Err(format!(
+                        "{}: `key: {}` needs `cookie_name`",
+                        where_(),
+                        if cfg.key == RateLimitKey::Cookie {
+                            "cookie"
+                        } else {
+                            "cookie_ip"
+                        }
+                    ));
+                }
+                (false, Some(_)) => {
+                    return Err(format!(
+                        "{}: `cookie_name` only applies to `key: cookie` and `key: cookie_ip`",
+                        where_()
+                    ));
+                }
+                (false, None) => None,
+            };
+            let ceiling = match cfg.ip_ceiling.as_deref() {
+                // `cookie_ip` sans plafond écrit : plafond implicite.
+                None if cfg.key == RateLimitKey::CookieIp => {
+                    let q = Quota {
+                        count: quota.count.saturating_mul(IMPLICIT_CEILING_FACTOR),
+                        burst: quota.burst.saturating_mul(IMPLICIT_CEILING_FACTOR),
+                        ..quota
+                    };
+                    let cid = (id.0.clone(), format!("{}|ceiling|{q:?}", id.1));
+                    Some(
+                        shared
+                            .entry(cid)
+                            .or_insert_with(|| {
+                                let l = Arc::new(Limiter::new(q));
+                                all.push(l.clone());
+                                l
+                            })
+                            .clone(),
+                    )
+                }
+                None => None,
+                Some(c) => {
+                    if c.auth.is_some()
+                        || c.ip_ceiling.is_some()
+                        || c.cookie_name.is_some()
+                        || c.key != RateLimitKey::Ip
+                    {
+                        return Err(format!(
+                            "{}: `ip_ceiling` takes only rate fields (limit_req_per_sec / limit_request, period, burst, timeout): it always counts per IP",
+                            where_()
+                        ));
+                    }
+                    let q = c
+                        .quota()
+                        .map_err(|e| format!("{}.ip_ceiling: {e}", where_()))?;
+                    let cid = (id.0.clone(), format!("{}|ceiling|{q:?}", id.1));
+                    Some(
+                        shared
+                            .entry(cid)
+                            .or_insert_with(|| {
+                                let l = Arc::new(Limiter::new(q));
+                                all.push(l.clone());
+                                l
+                            })
+                            .clone(),
+                    )
+                }
+            };
             let limiter = shared
                 .entry(id)
                 .or_insert_with(|| {
@@ -399,6 +564,8 @@ impl RateLimiters {
             Ok(Entry {
                 limiter,
                 key: cfg.key,
+                cookie,
+                ceiling,
             })
         };
 
@@ -554,12 +721,47 @@ fn token_user(req: &ServiceRequest, state: &AppState, ip: &str) -> Option<String
     })
 }
 
-fn key_for(req: &ServiceRequest, state: &AppState, kind: RateLimitKey, ip: &str) -> String {
-    let user = match kind {
+fn key_for(req: &ServiceRequest, state: &AppState, entry: &Entry, ip: &str) -> String {
+    let user = match entry.key {
         RateLimitKey::Ip => return ip.to_string(),
+        RateLimitKey::Cookie | RateLimitKey::CookieIp => {
+            let value = entry
+                .cookie
+                .as_deref()
+                .and_then(|name| req.cookie(name))
+                .map(|c| c.value().to_string());
+            let key = cookie_key(value.as_deref(), ip);
+            // cookie_ip : la même session depuis une autre IP est un autre
+            // compteur. Sans cookie, `cookie_key` a déjà rendu l'IP seule.
+            return if entry.key == RateLimitKey::CookieIp && key != ip {
+                format!("{key}|ip:{ip}")
+            } else {
+                key
+            };
+        }
         RateLimitKey::User | RateLimitKey::UserIp => token_user(req, state, ip),
     };
-    compose_key(kind, user.as_deref(), ip)
+    compose_key(entry.key, user.as_deref(), ip)
+}
+
+/// Clé pour `key: cookie` : l'empreinte de la valeur (jamais la valeur
+/// elle-même, qui peut être un identifiant de session), sinon l'IP.
+fn cookie_key(value: Option<&str>, ip: &str) -> String {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let hash = blake3::hash(v.as_bytes());
+            format!("cookie:{}", &hash.to_hex()[..32])
+        }
+        None => ip.to_string(),
+    }
+}
+
+/// Nom de cookie acceptable (RFC 6265 : un « token » HTTP).
+fn valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 /// La clé du compteur, à partir de l'utilisateur (s'il y en a un) et de
@@ -567,7 +769,9 @@ fn key_for(req: &ServiceRequest, state: &AppState, kind: RateLimitKey, ip: &str)
 /// ne peut jamais tomber sur la clé d'une IP, ni l'inverse.
 fn compose_key(kind: RateLimitKey, user: Option<&str>, ip: &str) -> String {
     match (kind, user) {
-        (RateLimitKey::Ip, _) | (_, None) => ip.to_string(),
+        (RateLimitKey::Ip | RateLimitKey::Cookie | RateLimitKey::CookieIp, _) | (_, None) => {
+            ip.to_string()
+        }
         (RateLimitKey::User, Some(u)) => format!("user:{u}"),
         (RateLimitKey::UserIp, Some(u)) => format!("user:{u}|ip:{ip}"),
     }
@@ -608,10 +812,25 @@ impl Middleware for VhostRateLimit {
             return Box::pin(async move { Ok(req.into_response(res)) });
         };
         let ip = ip.to_string();
-        let key = key_for(&req, state, entry.key, &ip);
-        let quota = entry.limiter.quota();
+        // Plafond par IP d'abord : quelles que soient les clés présentées,
+        // une adresse ne dépasse jamais ce débit.
+        let (key, decision, quota) = match &entry.ceiling {
+            Some(c) => match c.check(&ip) {
+                Decision::Allow { .. } => {
+                    let key = key_for(&req, state, entry, &ip);
+                    let d = entry.limiter.check(&key);
+                    (key, d, entry.limiter.quota())
+                }
+                deny => (format!("ip_ceiling:{ip}"), deny, c.quota()),
+            },
+            None => {
+                let key = key_for(&req, state, entry, &ip);
+                let d = entry.limiter.check(&key);
+                (key, d, entry.limiter.quota())
+            }
+        };
 
-        match entry.limiter.check(&key) {
+        match decision {
             Decision::Allow { remaining } => {
                 let fut = next.call(req);
                 Box::pin(async move {
@@ -784,6 +1003,114 @@ vhosts:
                 "{bad} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn cookie_key_and_ip_ceiling() {
+        let ip = "203.0.113.7";
+        // Same value, same counter; different values, different counters.
+        assert_eq!(
+            cookie_key(Some("abc"), ip),
+            cookie_key(Some("abc"), "198.51.100.1")
+        );
+        assert_ne!(cookie_key(Some("abc"), ip), cookie_key(Some("abd"), ip));
+        // No cookie, or an empty one: the IP.
+        assert_eq!(cookie_key(None, ip), ip);
+        assert_eq!(cookie_key(Some("  "), ip), ip);
+        // The raw value never appears in the key (it may be a session id).
+        assert!(!cookie_key(Some("secret-session-123"), ip).contains("secret"));
+
+        let build = |yaml: &str| {
+            let r: crate::config::config::RouteConfig = serde_yaml::from_str(yaml).unwrap();
+            let r = r.expand_vhost_groups().routes;
+            RateLimiters::from_routes(&r).map(|rl| (rl, r))
+        };
+        let ok = build(
+            r#"
+routes:
+  - prefix: "/"
+    target: "http://127.0.0.1:1"
+    ratelimit:
+      limit_req_per_sec: 1
+      burst: 2
+      key: cookie
+      custom_cookie: "app_session"
+      ip_ceiling: { limit_req_per_sec: 5, burst: 10 }
+"#,
+        );
+        let (rl, routes) = ok.expect("valid cookie block");
+        let e = rl.resolve(&routes, "/x", None).expect("limited");
+        assert_eq!(e.key, RateLimitKey::Cookie);
+        assert_eq!(e.cookie.as_deref(), Some("app_session"));
+        let ceiling = e.ceiling.as_ref().expect("ceiling built");
+        // Rotating cookie values cannot get past the ceiling: 10 then refused.
+        let allowed = (0..30)
+            .filter(|_| matches!(ceiling.check(ip), Decision::Allow { .. }))
+            .count();
+        assert_eq!(allowed, 10);
+
+        for bad in [
+            "{ limit_req_per_sec: 1, key: cookie }", // no cookie_name
+            "{ limit_req_per_sec: 1, cookie_name: \"a\" }", // cookie_name without key: cookie
+            "{ limit_req_per_sec: 1, key: cookie, cookie_name: \"a b\" }", // invalid name
+            "{ limit_req_per_sec: 1, ip_ceiling: { limit_req_per_sec: 1, key: user } }", // ceiling is per IP
+            "{ limit_req_per_sec: 1, ip_ceiling: { burst: 3 } }", // ceiling without a rate
+        ] {
+            let yaml = format!(
+                "routes:\n  - {{ prefix: \"/\", target: \"http://127.0.0.1:1\", ratelimit: {bad} }}\n"
+            );
+            assert!(build(&yaml).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn cookie_ip_has_a_ceiling_built_in() {
+        let build = |yaml: &str| {
+            let r: crate::config::config::RouteConfig = serde_yaml::from_str(yaml).unwrap();
+            let r = r.expand_vhost_groups().routes;
+            RateLimiters::from_routes(&r).map(|rl| (rl, r))
+        };
+        let (rl, routes) = build(
+            r#"
+routes:
+  - prefix: "/"
+    target: "http://127.0.0.1:1"
+    ratelimit: { limit_req_per_sec: 1, burst: 3, key: cookie_ip, cookie_name: "sid" }
+"#,
+        )
+        .expect("valid");
+        let e = rl.resolve(&routes, "/", None).unwrap();
+        assert_eq!(e.key, RateLimitKey::CookieIp);
+        let ceiling = e.ceiling.as_ref().expect("implicit ceiling");
+        assert_eq!(ceiling.quota().burst, 3 * IMPLICIT_CEILING_FACTOR);
+        assert_eq!(ceiling.quota().count, IMPLICIT_CEILING_FACTOR);
+        // An explicit ip_ceiling replaces the implicit one.
+        let (rl, routes) = build(
+            r#"
+routes:
+  - prefix: "/"
+    target: "http://127.0.0.1:1"
+    ratelimit:
+      limit_req_per_sec: 1
+      burst: 3
+      key: ip_cookie
+      cookie_name: "sid"
+      ip_ceiling: { limit_req_per_sec: 7, burst: 9 }
+"#,
+        )
+        .expect("valid");
+        assert_eq!(
+            rl.resolve(&routes, "/", None)
+                .unwrap()
+                .ceiling
+                .as_ref()
+                .unwrap()
+                .quota()
+                .burst,
+            9
+        );
+        // cookie_name is required.
+        assert!(build("routes:\n  - { prefix: \"/\", target: \"http://127.0.0.1:1\", ratelimit: { limit_req_per_sec: 1, key: cookie_ip } }\n").is_err());
     }
 
     #[test]

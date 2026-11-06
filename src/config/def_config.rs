@@ -496,7 +496,7 @@ pub const DEFAULT_ROUTES_YML: &str = concat!(
     "  #       limit_req_per_sec: 5   # or: limit_request: 100 + period: 60\n",
     "  #       burst: 5\n",
     "  #       timeout: 10            # seconds blocked after exceeding\n",
-    "  #       key: ip                # ip | user | user_ip\n",
+    "  #       key: ip                # ip | user | user_ip | cookie | cookie_ip (+ cookie_name)\n",
     "  #       auth:                  # optional, for /auth, /refresh_token...\n",
     "  #         limit_request: 10\n",
     "  #         period: 60\n",
