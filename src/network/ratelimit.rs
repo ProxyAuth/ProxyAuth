@@ -15,7 +15,7 @@
 //!       limit_req_per_sec: 5   # débit soutenu : 5 requêtes / seconde
 //!       burst: 5               # rafale tolérée (défaut : = débit)
 //!       timeout: 10            # blocage de 10 s après un dépassement (0 = aucun)
-//!       key: ip                # ip (défaut) | user
+//!       key: ip                # ip (défaut) | user | user_ip
 //!       auth:                  # facultatif : plus strict sur /auth & co
 //!         limit_request: 10    # 10 requêtes…
 //!         period: 60           # …par fenêtre de 60 s
@@ -87,6 +87,17 @@ pub enum RateLimitKey {
     /// Utilisateur du jeton (Bearer ou cookie de session) si valide,
     /// sinon l'IP — comme l'ancien limiteur « proxy ».
     User,
+    /// Utilisateur **et** IP : un compteur par couple (utilisateur, IP)
+    /// pour les requêtes authentifiées, l'IP seule pour les autres.
+    ///
+    /// Derrière une même IP (NAT d'entreprise, opérateur mobile, proxy),
+    /// chaque utilisateur connecté a son propre compteur : un client
+    /// bruyant ne bloque pas ses voisins. Et un même compte utilisé depuis
+    /// plusieurs endroits n'a pas un seul compteur partagé — un jeton volé
+    /// et rejoué ailleurs ne vide pas le quota du titulaire légitime.
+    /// Aussi accepté : `ip_user`.
+    #[serde(alias = "ip_user")]
+    UserIp,
 }
 
 /// Bloc `ratelimit:` d'un vhost ou d'une route.
@@ -122,6 +133,13 @@ pub struct RateLimitConfig {
     /// Absente : ces chemins suivent la limite générale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Box<RateLimitConfig>>,
+
+    /// Rempli par `expand_vhost_groups` quand une route hérite le bloc de
+    /// son groupe `vhosts:` (index du groupe). Les routes d'un même groupe
+    /// partagent alors un compteur ; une route qui écrit son propre bloc
+    /// (`None`) a toujours le sien, même avec des valeurs identiques.
+    #[serde(skip)]
+    pub inherited_from_group: Option<usize>,
 }
 
 /// Paramètres validés, prêts pour [`Limiter`].
@@ -177,7 +195,16 @@ impl RateLimitConfig {
     }
 
     /// Description d'une ligne pour le démarrage.
+    /// Le bloc ne fixe aucune limite générale (ni `limit_req_per_sec` ni
+    /// `limit_request`) : seulement, peut-être, un bloc `auth`.
+    pub fn has_general_limit(&self) -> bool {
+        self.limit_req_per_sec.is_some() || self.limit_request.is_some()
+    }
+
     pub fn describe(&self) -> String {
+        if !self.has_general_limit() {
+            return "routes unlimited".into();
+        }
         match self.quota() {
             Ok(q) => {
                 let rate = if self.limit_req_per_sec.is_some() {
@@ -189,8 +216,10 @@ impl RateLimitConfig {
                 if !q.block.is_zero() {
                     s.push_str(&format!(" timeout {}s", q.block.as_secs()));
                 }
-                if self.key == RateLimitKey::User {
-                    s.push_str(" key=user");
+                match self.key {
+                    RateLimitKey::Ip => {}
+                    RateLimitKey::User => s.push_str(" key=user"),
+                    RateLimitKey::UserIp => s.push_str(" key=user_ip"),
                 }
                 s
             }
@@ -308,7 +337,8 @@ struct Entry {
 
 #[derive(Debug, Clone)]
 struct RouteLimits {
-    general: Entry,
+    /// `None` : bloc limité aux chemins de connexion (`auth` seul).
+    general: Option<Entry>,
     auth: Option<Entry>,
 }
 
@@ -335,38 +365,69 @@ impl RateLimiters {
         let mut all = Vec::new();
         let mut by_route = Vec::with_capacity(routes.len());
 
-        let mut make =
-            |rule: &RouteRule, cfg: &RateLimitConfig, what: &str| -> Result<Entry, String> {
-                let quota = cfg.quota().map_err(|e| {
-                    format!(
-                        "routes.yml: route `{}` (vhost {:?}): ratelimit{what}: {e}",
-                        rule.prefix, rule.vhost
-                    )
-                })?;
-                let id = (
-                    rule.vhost.clone(),
-                    format!("{what}|{quota:?}|{:?}", cfg.key),
-                );
-                let limiter = shared
-                    .entry(id)
-                    .or_insert_with(|| {
-                        let l = Arc::new(Limiter::new(quota));
-                        all.push(l.clone());
-                        l
-                    })
-                    .clone();
-                Ok(Entry {
-                    limiter,
-                    key: cfg.key,
-                })
+        let mut make = |index: usize,
+                        rule: &RouteRule,
+                        cfg: &RateLimitConfig,
+                        group: Option<usize>,
+                        what: &str|
+         -> Result<Entry, String> {
+            let quota = cfg.quota().map_err(|e| {
+                format!(
+                    "routes.yml: route `{}` (vhost {:?}): ratelimit{what}: {e}",
+                    rule.prefix, rule.vhost
+                )
+            })?;
+            // Portée du compteur : le groupe `vhosts:` dont le bloc est
+            // hérité (compteur partagé par ses routes), ou la route
+            // elle-même quand elle a écrit son propre bloc.
+            let scope = match group {
+                Some(g) => format!("group#{g}"),
+                None => format!("route#{index}"),
             };
+            let id = (
+                rule.vhost.clone(),
+                format!("{scope}|{what}|{quota:?}|{:?}", cfg.key),
+            );
+            let limiter = shared
+                .entry(id)
+                .or_insert_with(|| {
+                    let l = Arc::new(Limiter::new(quota));
+                    all.push(l.clone());
+                    l
+                })
+                .clone();
+            Ok(Entry {
+                limiter,
+                key: cfg.key,
+            })
+        };
 
-        for rule in routes {
+        for (index, rule) in routes.iter().enumerate() {
             let Some(cfg) = rule.ratelimit.as_ref() else {
                 by_route.push(None);
                 continue;
             };
-            let general = make(rule, cfg, "")?;
+            let group = cfg.inherited_from_group;
+            // Un bloc qui ne contient que `auth:` limite les chemins de
+            // connexion sans limiter les routes elles-mêmes. Un bloc vide
+            // (ni limite générale ni `auth`) reste une erreur : il ne
+            // protégerait rien, ce qui n'est sûrement pas l'intention.
+            let general = if cfg.has_general_limit() {
+                Some(make(index, rule, cfg, group, "")?)
+            } else if cfg.auth.is_some() {
+                if cfg.burst.is_some() || cfg.timeout != 0 || cfg.period.is_some() {
+                    return Err(format!(
+                        "routes.yml: route `{}` (vhost {:?}): ratelimit: `burst`, `period` and `timeout` need `limit_req_per_sec` or `limit_request` — put them inside `auth:` to limit only the login paths",
+                        rule.prefix, rule.vhost
+                    ));
+                }
+                None
+            } else {
+                return Err(format!(
+                    "routes.yml: route `{}` (vhost {:?}): ratelimit: set `limit_req_per_sec` or `limit_request`, or an `auth:` block",
+                    rule.prefix, rule.vhost
+                ));
+            };
             let auth = match cfg.auth.as_deref() {
                 Some(a) => {
                     if a.auth.is_some() {
@@ -375,7 +436,7 @@ impl RateLimiters {
                             rule.prefix
                         ));
                     }
-                    Some(make(rule, a, ".auth")?)
+                    Some(make(index, rule, a, group, ".auth")?)
                 }
                 None => None,
             };
@@ -435,9 +496,20 @@ impl RateLimiters {
     /// du vhost.
     fn resolve(&self, routes: &[RouteRule], path: &str, host: Option<&str>) -> Option<&Entry> {
         let idx = match_route_idx(path, host, routes)
+            // Chemin qu'aucune route ne sert sur ce vhost (`/auth`…) : la
+            // limite du vhost, c'est-à-dire celle héritée de son groupe
+            // `vhosts:` — pas celle qu'une route a fixée pour son seul chemin.
             .or_else(|| {
                 let r = find_vhost_route(host, routes)?;
-                routes.iter().position(|x| std::ptr::eq(x, r))
+                routes
+                    .iter()
+                    .position(|x| {
+                        x.vhost == r.vhost
+                            && x.ratelimit
+                                .as_ref()
+                                .is_some_and(|c| c.inherited_from_group.is_some())
+                    })
+                    .or_else(|| routes.iter().position(|x| std::ptr::eq(x, r)))
             })
             // Hôte sans vhost dédié, chemin propre à ProxyAuth (`/auth`…) :
             // première route « catch-all » limitée. Un autre chemin qu'aucune
@@ -451,9 +523,9 @@ impl RateLimiters {
             })?;
         let limits = self.by_route.get(idx)?.as_ref()?;
         if AUTH_PATHS.contains(&path) {
-            Some(limits.auth.as_ref().unwrap_or(&limits.general))
+            limits.auth.as_ref().or(limits.general.as_ref())
         } else {
-            Some(&limits.general)
+            limits.general.as_ref()
         }
     }
 }
@@ -467,25 +539,37 @@ pub struct VhostRateLimit {
     pub limiters: Arc<RateLimiters>,
 }
 
+/// Utilisateur du jeton présenté (Bearer, sinon cookie de session), s'il
+/// est valide.
+fn token_user(req: &ServiceRequest, state: &AppState, ip: &str) -> Option<String> {
+    let from_bearer = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(|t| extract_token_user(t, &state.config, ip.to_string()).ok());
+    from_bearer.or_else(|| {
+        let cookie = req.cookie("session_token")?;
+        extract_token_user(cookie.value(), &state.config, ip.to_string()).ok()
+    })
+}
+
 fn key_for(req: &ServiceRequest, state: &AppState, kind: RateLimitKey, ip: &str) -> String {
-    match kind {
-        RateLimitKey::Ip => ip.to_string(),
-        RateLimitKey::User => {
-            let from_bearer = req
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .and_then(|t| extract_token_user(t, &state.config, ip.to_string()).ok());
-            let user = from_bearer.or_else(|| {
-                let cookie = req.cookie("session_token")?;
-                extract_token_user(cookie.value(), &state.config, ip.to_string()).ok()
-            });
-            match user {
-                Some(u) => format!("user:{u}"),
-                None => ip.to_string(),
-            }
-        }
+    let user = match kind {
+        RateLimitKey::Ip => return ip.to_string(),
+        RateLimitKey::User | RateLimitKey::UserIp => token_user(req, state, ip),
+    };
+    compose_key(kind, user.as_deref(), ip)
+}
+
+/// La clé du compteur, à partir de l'utilisateur (s'il y en a un) et de
+/// l'IP. Les préfixes séparent les espaces de clés : un nom d'utilisateur
+/// ne peut jamais tomber sur la clé d'une IP, ni l'inverse.
+fn compose_key(kind: RateLimitKey, user: Option<&str>, ip: &str) -> String {
+    match (kind, user) {
+        (RateLimitKey::Ip, _) | (_, None) => ip.to_string(),
+        (RateLimitKey::User, Some(u)) => format!("user:{u}"),
+        (RateLimitKey::UserIp, Some(u)) => format!("user:{u}|ip:{ip}"),
     }
 }
 
@@ -605,6 +689,135 @@ routes:
             "a path no route serves must not consume the route's quota"
         );
         assert!(rl.resolve(&routes, "/other", None).is_none());
+    }
+
+    #[test]
+    fn a_route_with_its_own_block_has_its_own_counter() {
+        let routes: crate::config::config::RouteConfig = serde_yaml::from_str(
+            r#"
+vhosts:
+  - vhost: ["app.example.com"]
+    ratelimit: { limit_req_per_sec: 10, burst: 20 }
+    routes:
+      - { prefix: "/", target: "http://127.0.0.1:1" }
+      - { prefix: "/docs", target: "http://127.0.0.1:1" }
+      - prefix: "/search"
+        target: "http://127.0.0.1:1"
+        ratelimit: { limit_req_per_sec: 10, burst: 20 }   # same values, own block
+      - prefix: "/export"
+        target: "http://127.0.0.1:1"
+        ratelimit: { limit_req_per_sec: 10, burst: 20 }
+"#,
+        )
+        .unwrap();
+        let routes = routes.expand_vhost_groups().routes;
+        let rl = RateLimiters::from_routes(&routes).unwrap();
+        let host = Some("app.example.com");
+        let id = |path: &str| {
+            rl.resolve(&routes, path, host)
+                .map(|e| Arc::as_ptr(&e.limiter))
+        };
+
+        assert!(id("/").is_some());
+        assert_eq!(
+            id("/"),
+            id("/docs/x"),
+            "routes inheriting the group share one counter"
+        );
+        assert_ne!(
+            id("/search"),
+            id("/"),
+            "an own block is separate, even with identical values"
+        );
+        assert_ne!(
+            id("/search"),
+            id("/export"),
+            "two own blocks are separate from each other"
+        );
+        assert_eq!(
+            id("/auth"),
+            id("/"),
+            "login paths follow the vhost's (group) limit"
+        );
+    }
+
+    #[test]
+    fn auth_only_block_limits_login_paths_and_not_routes() {
+        let routes: crate::config::config::RouteConfig = serde_yaml::from_str(
+            r#"
+vhosts:
+  - vhost: ["app.example.com"]
+    ratelimit:
+      auth:
+        limit_req_per_sec: 10
+        burst: 3
+        timeout: 300
+        key: ip
+    routes:
+      - { prefix: "/", target: "http://127.0.0.1:1" }
+"#,
+        )
+        .unwrap();
+        let routes = routes.expand_vhost_groups().routes;
+        let rl = RateLimiters::from_routes(&routes).unwrap();
+        let host = Some("app.example.com");
+        assert!(
+            rl.resolve(&routes, "/", host).is_none(),
+            "routes are not limited"
+        );
+        assert!(rl.resolve(&routes, "/page", host).is_none());
+        assert!(
+            rl.resolve(&routes, "/auth", host).is_some(),
+            "login paths are"
+        );
+        assert!(rl.resolve(&routes, "/refresh_token", host).is_some());
+
+        // Nothing at all, or route settings without a rate: refused.
+        for bad in ["{}", "{ burst: 5, auth: { limit_req_per_sec: 1 } }"] {
+            let yaml = format!(
+                "routes:\n  - {{ prefix: \"/\", target: \"http://127.0.0.1:1\", ratelimit: {bad} }}\n"
+            );
+            let r: crate::config::config::RouteConfig = serde_yaml::from_str(&yaml).unwrap();
+            let r = r.expand_vhost_groups().routes;
+            assert!(
+                RateLimiters::from_routes(&r).is_err(),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn key_kinds() {
+        let parse = |k: &str| -> RateLimitConfig {
+            serde_yaml::from_str(&format!("limit_req_per_sec: 1\nkey: {k}")).unwrap()
+        };
+        assert_eq!(parse("ip").key, RateLimitKey::Ip);
+        assert_eq!(parse("user").key, RateLimitKey::User);
+        assert_eq!(parse("user_ip").key, RateLimitKey::UserIp);
+        assert_eq!(parse("ip_user").key, RateLimitKey::UserIp);
+
+        let ip = "203.0.113.7";
+        // Anonymous: the IP, whatever the kind.
+        for k in [RateLimitKey::Ip, RateLimitKey::User, RateLimitKey::UserIp] {
+            assert_eq!(compose_key(k, None, ip), ip);
+        }
+        // Two users behind one IP: separate counters with user and user_ip.
+        assert_ne!(
+            compose_key(RateLimitKey::UserIp, Some("alice"), ip),
+            compose_key(RateLimitKey::UserIp, Some("bob"), ip)
+        );
+        // One user from two IPs: one counter with user, two with user_ip.
+        assert_eq!(
+            compose_key(RateLimitKey::User, Some("alice"), ip),
+            compose_key(RateLimitKey::User, Some("alice"), "198.51.100.9")
+        );
+        assert_ne!(
+            compose_key(RateLimitKey::UserIp, Some("alice"), ip),
+            compose_key(RateLimitKey::UserIp, Some("alice"), "198.51.100.9")
+        );
+        // A username that looks like an IP never shares the IP's counter.
+        assert_ne!(compose_key(RateLimitKey::UserIp, Some(ip), ip), ip);
+        assert_eq!(compose_key(RateLimitKey::Ip, Some("alice"), ip), ip);
     }
 
     #[test]

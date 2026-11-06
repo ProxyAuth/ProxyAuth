@@ -1696,15 +1696,15 @@ fn static_read_error_response(prefix: &str, path: &Path, e: &std::io::Error) -> 
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         warn!(
             "static route \"{prefix}\": permission denied reading {} — the \"proxyauth\" user needs read (and, for directories, execute/traverse) access to this path",
-              path.display()
+            path.display()
         );
         HttpResponse::InternalServerError()
-        .append_header(("server", "ProxyAuth"))
-        .body("500 Internal Server Error")
+            .append_header(("server", "ProxyAuth"))
+            .body("500 Internal Server Error")
     } else {
         HttpResponse::NotFound()
-        .append_header(("server", "ProxyAuth"))
-        .body("404 Not Found")
+            .append_header(("server", "ProxyAuth"))
+            .body("404 Not Found")
     }
 }
 

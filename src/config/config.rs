@@ -1589,7 +1589,7 @@ impl RouteConfig {
             }
         }
 
-        for group in self.vhosts.drain(..) {
+        for (group_index, group) in self.vhosts.drain(..).enumerate() {
             for mut route in group.routes {
                 if !route.if_vhost.is_empty() {
                     // Every entry must be covered by the group's own
@@ -1689,7 +1689,12 @@ impl RouteConfig {
                     route.streaming = group.streaming;
                 }
                 if route.ratelimit.is_none() {
-                    route.ratelimit = group.ratelimit.clone();
+                    // Hérité : le compteur est partagé par les routes du
+                    // groupe. Un bloc écrit sur la route garde le sien.
+                    route.ratelimit = group.ratelimit.clone().map(|mut c| {
+                        c.inherited_from_group = Some(group_index);
+                        c
+                    });
                 }
                 if route.forward_websocket.is_none() {
                     route.forward_websocket = group.forward_websocket;
