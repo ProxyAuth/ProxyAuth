@@ -713,6 +713,23 @@ pub async fn extract_username_for_tags(
 /// every call in this process — read directly from `crate::VERSION`/
 /// `crate::ID` rather than needing to be threaded through as
 /// parameters too.
+/// Échappe `& < > " '` pour insérer une donnée dans du HTML (texte ou
+/// valeur d'attribut entre guillemets).
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn substitute_proxyauth_tags(
     content: &str,
     username: Option<&str>,
@@ -720,7 +737,13 @@ pub fn substitute_proxyauth_tags(
 ) -> String {
     let mut out = content.to_string();
     if let Some(u) = username {
-        out = out.replace("{{ username }}", u).replace("{{username}}", u);
+        // Échappé : un nom de compte est une donnée, pas du HTML. Sans
+        // cela, un compte nommé `<script>…` exécutait du code dans toutes
+        // les pages qui affichent `{{ username }}` (XSS stockée).
+        let u = html_escape(u);
+        out = out
+            .replace("{{ username }}", &u)
+            .replace("{{username}}", &u);
     }
     if let Some(t) = csrf_token {
         out = out
@@ -1112,6 +1135,10 @@ pub fn inject_header(mut builder: Builder, username: &str, config: &AppConfig) -
     if let Some(groups) = config.groups_for_username(username) {
         let groups_str = groups.join(",");
         if let Ok(val) = hyper::header::HeaderValue::from_str(&groups_str) {
+            // `X-User-Groups` est le nom documenté ; `x-groups` reste
+            // envoyé pour les backends qui le lisent déjà. Les deux sont
+            // retirés de ce que le client envoie (voir les filtres).
+            builder = builder.header("x-user-groups", val.clone());
             builder = builder.header("x-groups", val);
         }
     }
@@ -1153,52 +1180,85 @@ pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 fn is_trusted_peer(req: &HttpRequest, config: &AppConfig) -> bool {
-    let Some(peer_ip) = req.peer_addr().map(|addr| addr.ip()) else {
-        return false;
-    };
+    req.peer_addr()
+        .map(|addr| is_trusted_ip(&addr.ip(), config))
+        .unwrap_or(false)
+}
 
-    // Always trust loopback, no matter what the config says
-    if ALWAYS_TRUSTED.iter().any(|net| net.contains(&peer_ip)) {
+/// Relais de confiance : la boucle locale, ou une entrée de
+/// `trust_proxy_forward_for` (adresse ou réseau).
+fn is_trusted_ip(ip: &IpAddr, config: &AppConfig) -> bool {
+    if ALWAYS_TRUSTED.iter().any(|net| net.contains(ip)) {
         return true;
     }
-
-    // Then check the configurable list for anything beyond localhost
-    // (e.g. an internal LB/nginx host on a different machine)
     match &config.trust_proxy_forward_for {
         None => false,
         Some(trusted) => trusted.iter().any(|entry| {
-            entry.parse::<IpAddr>().map_or(false, |ip| ip == peer_ip)
-                || entry
-                    .parse::<IpNet>()
-                    .map_or(false, |net| net.contains(&peer_ip))
+            entry.parse::<IpAddr>().map_or(false, |t| &t == ip)
+                || entry.parse::<IpNet>().map_or(false, |net| net.contains(ip))
         }),
     }
 }
 
 pub fn client_ip(req: &HttpRequest, config: &AppConfig) -> Option<IpAddr> {
-    let peer_ip = req.peer_addr().map(|addr| addr.ip());
+    let peer_ip = req.peer_addr().map(|addr| addr.ip())?;
+    let forwarded: Vec<&str> = req
+        .headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let real_ip = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok());
+    Some(resolve_client_ip(peer_ip, &forwarded, real_ip, |ip| {
+        is_trusted_ip(ip, config)
+    }))
+}
 
-    if is_trusted_peer(req, config) {
-        if let Some(ip) = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        {
-            return Some(ip);
-        }
-        if let Some(ip) = req
-            .headers()
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        {
-            return Some(ip);
-        }
+/// L'adresse du client, à partir de la connexion et des en-têtes posés
+/// par des relais de confiance.
+///
+/// `X-Forwarded-For` se lit **de droite à gauche** : chaque relais ajoute
+/// à droite l'adresse qui l'a contacté, et tout ce qui est à gauche du
+/// dernier relais de confiance a été écrit par le client lui-même. On
+/// remonte donc tant que l'adresse est celle d'un relais de confiance, et
+/// la première qui ne l'est pas est le client. Prendre la première de la
+/// liste, comme avant, laissait un client choisir son IP (`X-Forwarded-For:
+/// 1.2.3.4`) et contourner rate limit, listes de blocage et `allow_ips`.
+///
+/// Une valeur illisible arrête la lecture : on ne fait confiance à rien
+/// au-delà. Sans `X-Forwarded-For`, `X-Real-IP` (posé par le relais) est
+/// utilisé ; sans relais de confiance, l'adresse de la connexion.
+pub fn resolve_client_ip(
+    peer: IpAddr,
+    forwarded_headers: &[&str],
+    real_ip: Option<&str>,
+    trusted: impl Fn(&IpAddr) -> bool,
+) -> IpAddr {
+    if !trusted(&peer) {
+        return peer;
     }
-
-    peer_ip
+    let hops: Vec<&str> = forwarded_headers
+        .iter()
+        .flat_map(|h| h.split(','))
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .collect();
+    if !hops.is_empty() {
+        // Le dernier relais de confiance rencontré, si toute la chaîne
+        // l'est : c'est alors lui le plus proche du client qu'on connaisse.
+        let mut nearest = peer;
+        for hop in hops.iter().rev() {
+            match hop.parse::<IpAddr>() {
+                Ok(ip) if trusted(&ip) => nearest = ip,
+                Ok(ip) => return ip,
+                Err(_) => return nearest,
+            }
+        }
+        return nearest;
+    }
+    real_ip
+        .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer)
 }
 
 /// Whether to ask the backend for an uncompressed body (`identity`), so
@@ -1374,6 +1434,7 @@ async fn proxy_to_redirect_protect_target(
             || name_str == "x-user"
             || name_str == "x-user-roles"
             || name_str == "x-groups"
+            || name_str == "x-user-groups"
         {
             continue;
         }
@@ -3122,6 +3183,7 @@ pub async fn proxy_with_proxy(
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
+            && key_str != "x-user-groups"
             && key_str != "x-forwarded-host"
             && key_str != "x-forwarded-proto"
             && key_str != "x-real-ip"
@@ -3914,6 +3976,7 @@ pub async fn proxy_without_proxy(
             && key_str != "x-user"
             && key_str != "x-user-roles"
             && key_str != "x-groups"
+            && key_str != "x-user-groups"
             && key_str != "x-forwarded-host"
             && key_str != "x-forwarded-proto"
             && key_str != "x-real-ip"
@@ -4389,5 +4452,78 @@ mod cookie_header_tests {
             .append_header(("cookie", "session_token_old=1"))
             .to_http_request();
         assert_eq!(request_cookie(&other, "session_token"), None);
+    }
+}
+
+#[cfg(test)]
+mod forwarded_ip_tests {
+    use super::{html_escape, resolve_client_ip};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+    // 10.0.0.5 is our load balancer; loopback is always trusted.
+    fn trusted(i: &IpAddr) -> bool {
+        i.is_loopback() || *i == ip("10.0.0.5")
+    }
+
+    #[test]
+    fn a_client_cannot_choose_its_ip() {
+        // nginx appends the real address to whatever the client sent.
+        let got = resolve_client_ip(ip("10.0.0.5"), &["1.2.3.4, 203.0.113.9"], None, trusted);
+        assert_eq!(
+            got,
+            ip("203.0.113.9"),
+            "the right-most untrusted hop is the client"
+        );
+        // Two trusted hops in front: still the first untrusted from the right.
+        let got = resolve_client_ip(
+            ip("127.0.0.1"),
+            &["6.6.6.6, 203.0.113.9, 10.0.0.5"],
+            None,
+            trusted,
+        );
+        assert_eq!(got, ip("203.0.113.9"));
+        // Several X-Forwarded-For headers read as one list.
+        let got = resolve_client_ip(ip("10.0.0.5"), &["6.6.6.6", "203.0.113.9"], None, trusted);
+        assert_eq!(got, ip("203.0.113.9"));
+    }
+
+    #[test]
+    fn untrusted_peer_and_garbage() {
+        // Direct connection from the internet: headers ignored.
+        assert_eq!(
+            resolve_client_ip(ip("198.51.100.7"), &["1.2.3.4"], Some("1.2.3.4"), trusted),
+            ip("198.51.100.7")
+        );
+        // Unreadable hop: trust stops there, nearest trusted hop is kept.
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.5"), &["1.2.3.4, garbage"], None, trusted),
+            ip("10.0.0.5")
+        );
+        // Whole chain trusted: the left-most trusted hop.
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.5"), &["127.0.0.1"], None, trusted),
+            ip("127.0.0.1")
+        );
+        // No X-Forwarded-For: X-Real-IP from the relay, else the peer.
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.5"), &[], Some("203.0.113.9"), trusted),
+            ip("203.0.113.9")
+        );
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.5"), &[], Some("nope"), trusted),
+            ip("10.0.0.5")
+        );
+    }
+
+    #[test]
+    fn usernames_are_escaped() {
+        assert_eq!(
+            html_escape("<script>alert('x')</script>&\""),
+            "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&amp;&quot;"
+        );
+        assert_eq!(html_escape("alice"), "alice");
     }
 }

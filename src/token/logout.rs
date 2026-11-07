@@ -75,17 +75,8 @@ pub async fn logout_session(req: HttpRequest, data: web::Data<AppState>) -> Http
     // indefinitely. We now best-effort revoke the token server-side too,
     // via the same revoke_token() used by /adm/revoke.
     if let Some(cookie) = req.cookie("session_token") {
-        let ip = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(|s| s.trim().to_string())
-            .or_else(|| {
-                req.connection_info()
-                    .realip_remote_addr()
-                    .map(|s| s.to_string())
-            })
+        let ip = crate::network::proxy::client_ip(&req, &data.config)
+            .map(|i| i.to_string())
             .unwrap_or_else(|| "-".to_string());
 
         match validate_session(cookie.value(), &data, &data.config, &ip).await {

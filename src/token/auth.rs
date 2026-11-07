@@ -695,18 +695,6 @@ pub async fn auth(
 
     let ip = client_ip(&req, &data.config)
         .map(|s| s.to_string())
-        .or_else(|| {
-            req.headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
-                .or_else(|| {
-                    req.connection_info()
-                        .realip_remote_addr()
-                        .map(|s| s.to_string())
-                })
-        })
         .unwrap_or_else(|| "-".to_string());
 
     if let Some(resp) = existing_session_response(&req, &data, &ip).await {
@@ -1035,17 +1023,8 @@ pub async fn auth(
             "expires_at": expires_at_str,
         }))
     } else {
-        let ip = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(|s| s.trim().to_string())
-            .or_else(|| {
-                req.connection_info()
-                    .realip_remote_addr()
-                    .map(|s| s.to_string())
-            })
+        let ip = crate::network::proxy::client_ip(&req, &data.config)
+            .map(|i| i.to_string())
             .unwrap_or_else(|| "-".to_string());
 
         let user_agent = req

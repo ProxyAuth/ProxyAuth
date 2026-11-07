@@ -140,9 +140,12 @@ pub async fn reset_password_route(
         match set_user_password("/etc/proxyauth/config/config.json", &username, &hash) {
             Ok(updated) => updated,
             Err(e) => {
+                // Le détail (chemin, erreur système) reste dans le journal :
+                // il n'a rien à faire dans une réponse à un client.
+                tracing::error!("password reset: updating config.json failed: {e}");
                 return HttpResponse::InternalServerError()
                     .append_header(("server", "ProxyAuth"))
-                    .body(format!("Failed to update password: {e}"));
+                    .body("Failed to update password");
             }
         };
 

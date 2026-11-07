@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "proxyauth"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "ahash",
  "anyhow",

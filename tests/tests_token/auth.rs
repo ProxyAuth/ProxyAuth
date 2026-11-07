@@ -457,6 +457,8 @@ mod tests {
         let req = test::TestRequest::default()
             .insert_header((header::CONTENT_TYPE, "application/json"))
             .insert_header(("x-forwarded-for", "203.0.113.7"))
+            // Behind a local proxy: only then is X-Forwarded-For trusted.
+            .peer_addr("127.0.0.1:40000".parse().unwrap())
             .set_payload(r#"{"username":"alice","password":"passw0rd","csrf_token":""}"#)
             .to_http_request();
 
@@ -514,6 +516,8 @@ mod tests {
         let req = test::TestRequest::default()
             .insert_header((header::CONTENT_TYPE, "application/json"))
             .insert_header(("x-forwarded-for", "198.51.100.9"))
+            // Behind a local proxy: only then is X-Forwarded-For trusted.
+            .peer_addr("127.0.0.1:40000".parse().unwrap())
             .to_http_request();
 
         let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
@@ -582,6 +586,8 @@ mod tests {
         let req = test::TestRequest::default()
             .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
             .insert_header(("x-forwarded-for", "203.0.113.7"))
+            // Behind a local proxy: only then is X-Forwarded-For trusted.
+            .peer_addr("127.0.0.1:40000".parse().unwrap())
             .set_payload(form)
             .to_http_request();
 
@@ -741,6 +747,8 @@ mod tests {
         let req = test::TestRequest::default()
             .insert_header((header::CONTENT_TYPE, "application/json"))
             .insert_header(("x-forwarded-for", "203.0.113.9"))
+            // Behind a local proxy: only then is X-Forwarded-For trusted.
+            .peer_addr("127.0.0.1:40000".parse().unwrap())
             .to_http_request();
 
         let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {
@@ -793,6 +801,8 @@ mod tests {
             .insert_header((header::CONTENT_TYPE, "application/json"))
             .insert_header((header::ORIGIN, "https://front.example"))
             .insert_header(("x-forwarded-for", "203.0.113.10"))
+            // Behind a local proxy: only then is X-Forwarded-For trusted.
+            .peer_addr("127.0.0.1:40000".parse().unwrap())
             .to_http_request();
 
         let payload = proxyauth::token::auth::EitherAuth::Json(AuthRequest {

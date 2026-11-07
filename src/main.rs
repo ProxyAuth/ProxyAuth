@@ -746,9 +746,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Caches internes (désactivés par défaut) : globaux et par vhost.
     network::fs_cache::init(&config.internal_cache, &routes.routes);
     network::compression::init_compressed_caches(&config.internal_cache, &routes.routes);
-    for line in network::backend_cache::init_backend_caches(&routes.routes) {
-        info!("{line}");
-        println!("{line}");
+    match network::backend_cache::init_backend_caches(&routes.routes) {
+        Ok(lines) => {
+            for line in lines {
+                info!("{line}");
+                println!("{line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 
     // Pushes the in-memory config/routes state to every configured

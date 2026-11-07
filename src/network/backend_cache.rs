@@ -47,6 +47,27 @@
 //! fraîche. `Age` et `X-Cache: HIT | MISS | REVALIDATED` sont ajoutés.
 //! Une seule requête par ressource part vers le backend pendant un
 //! rechargement ; les autres attendent son résultat.
+//!
+//! # force_cache
+//!
+//! `force_cache: true` (avec `ttl`) : ProxyAuth garde les réponses
+//! pendant `ttl` secondes **même si le backend l'interdit** (`no-store`,
+//! `private`, `no-cache`, `max-age=0`, aucun en-tête). Restent exclus :
+//! les statuts d'erreur, les réponses trop grosses, les méthodes autres
+//! que `GET`/`HEAD`. Deux garde-fous :
+//! * une requête qui porte une identité reçoit **sa propre copie** (clé
+//!   dérivée de `X-User`, sinon `Authorization`, sinon `Cookie`) : un
+//!   utilisateur ne voit jamais la page d'un autre ;
+//! * `Set-Cookie` n'est jamais gardé : il part avec la réponse qui l'a
+//!   reçu, pas avec les copies.
+//!
+//! # type: ram | disk
+//!
+//! `ram` (défaut) : en mémoire, perdu au redémarrage. `disk` : LMDB sous
+//! `/opt/proxyauth/db/backend_cache/<cache>/`, conservé au redémarrage ;
+//! `max_size` (ou `max_memory`) en fixe la taille. Les dates étant
+//! enregistrées en temps Unix, le TTL est respecté de la même façon dans
+//! les deux cas.
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -75,6 +96,14 @@ pub struct BackendCacheConfig {
     /// Ajoute `X-Cache-Reason` aux réponses : pourquoi une réponse n'a pas
     /// été gardée (ou qu'elle vient de l'être). Pour la mise au point.
     pub debug: bool,
+    /// Où sont gardées les réponses : `ram` (défaut) ou `disk` (LMDB sous
+    /// `/opt/proxyauth/db/backend_cache/`, conservé après un redémarrage).
+    #[serde(rename = "type")]
+    pub kind: StoreKind,
+    /// Garder les réponses même si le backend l'interdit (`no-store`,
+    /// `private`, pas d'en-tête…), pendant `ttl` secondes. Voir
+    /// [`force_cache`](self#force_cache).
+    pub force_cache: bool,
     /// Rempli par `expand_vhost_groups` quand la route hérite le bloc de
     /// son groupe : les routes du groupe partagent alors un seul cache.
     #[serde(skip)]
@@ -89,9 +118,20 @@ impl Default for BackendCacheConfig {
             max_object_size: None,
             default_ttl: 0,
             debug: false,
+            kind: StoreKind::Ram,
+            force_cache: false,
             inherited_from_group: None,
         }
     }
+}
+
+/// `type:` de `cache_backend`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreKind {
+    #[default]
+    Ram,
+    Disk,
 }
 
 #[derive(Deserialize)]
@@ -103,10 +143,18 @@ struct BlockForm {
     max_memory: Option<ByteSize>,
     #[serde(default)]
     max_object_size: Option<ByteSize>,
-    #[serde(default)]
+    #[serde(default, alias = "ttl")]
     default_ttl: u64,
     #[serde(default)]
     debug: bool,
+    #[serde(default, rename = "type")]
+    kind: StoreKind,
+    #[serde(default)]
+    force_cache: bool,
+    /// Taille du cache ; synonyme de `max_memory` (plus parlant en
+    /// `type: disk`).
+    #[serde(default)]
+    max_size: Option<ByteSize>,
 }
 
 fn yes() -> bool {
@@ -129,10 +177,12 @@ impl<'de> Deserialize<'de> for BackendCacheConfig {
             },
             RawForm::Block(b) => Self {
                 enabled: b.enabled,
-                max_memory: b.max_memory,
+                max_memory: b.max_memory.or(b.max_size),
                 max_object_size: b.max_object_size,
                 default_ttl: b.default_ttl,
                 debug: b.debug,
+                kind: b.kind,
+                force_cache: b.force_cache,
                 inherited_from_group: None,
             },
         })
@@ -162,10 +212,20 @@ impl BackendCacheConfig {
     }
     pub fn describe(&self) -> String {
         format!(
-            "max_memory {} MB, max_object_size {} KB, default_ttl {}s{}",
+            "type {}, size {} MB, max_object_size {} KB, ttl {}s{}{}",
+            if self.kind == StoreKind::Disk {
+                "disk (LMDB)"
+            } else {
+                "ram"
+            },
             self.max_memory() / (1024 * 1024),
             self.max_object_size() / 1024,
             self.default_ttl,
+            if self.force_cache {
+                ", force_cache (backend directives ignored)"
+            } else {
+                ""
+            },
             if self.debug {
                 ", debug (X-Cache-Reason)"
             } else {
@@ -240,20 +300,407 @@ impl quick_cache::Weighter<[u8; 32], Slot> for SlotWeighter {
 /// Un cache : un vhost (routes qui héritent du groupe) ou une route.
 pub struct BackendCache {
     cfg: BackendCacheConfig,
-    slots: quick_cache::sync::Cache<[u8; 32], Slot, SlotWeighter>,
+    slots: SlotStore,
     inflight: DashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl BackendCache {
-    fn new(cfg: BackendCacheConfig) -> Self {
+    fn new(cfg: BackendCacheConfig, scope: &str) -> Result<Self, String> {
         let budget = cfg.max_memory().max(1024 * 1024);
         let estimated = (budget / (16 * 1024)).clamp(64, 1 << 20) as usize;
-        Self {
-            slots: quick_cache::sync::Cache::with_weighter(estimated, budget, SlotWeighter),
+        let slots = match cfg.kind {
+            StoreKind::Ram => SlotStore::Ram(quick_cache::sync::Cache::with_weighter(
+                estimated,
+                budget,
+                SlotWeighter,
+            )),
+            StoreKind::Disk => SlotStore::Disk {
+                db: Arc::new(DiskStore::open(scope, budget)?),
+                passes: quick_cache::sync::Cache::new(4096),
+            },
+        };
+        Ok(Self {
+            slots,
             inflight: DashMap::new(),
             cfg,
+        })
+    }
+}
+
+/// Le stockage d'un cache. Le reste du module ne voit que `get` et
+/// `insert` : la RAM et le disque se comportent pareil, TTL compris.
+enum SlotStore {
+    Ram(quick_cache::sync::Cache<[u8; 32], Slot, SlotWeighter>),
+    /// Réponses dans LMDB ; les marques « à ne pas mettre en cache » (10 s)
+    /// restent en mémoire, elles n'ont pas à survivre à un redémarrage.
+    Disk {
+        db: Arc<DiskStore>,
+        passes: quick_cache::sync::Cache<[u8; 32], Instant>,
+    },
+}
+
+impl SlotStore {
+    fn get(&self, key: &[u8; 32]) -> Option<Slot> {
+        match self {
+            SlotStore::Ram(c) => c.get(key),
+            SlotStore::Disk { db, passes } => {
+                if let Some(until) = passes.get(key) {
+                    if until > Instant::now() {
+                        return Some(Slot::Pass(until));
+                    }
+                    passes.remove(key);
+                }
+                db.get(key).map(Slot::Variants)
+            }
         }
     }
+
+    fn insert(&self, key: [u8; 32], slot: Slot) {
+        match self {
+            SlotStore::Ram(c) => c.insert(key, slot),
+            SlotStore::Disk { db, passes } => match slot {
+                Slot::Pass(until) => passes.insert(key, until),
+                Slot::Variants(vs) => {
+                    passes.remove(&key);
+                    db.put(&key, &vs);
+                }
+            },
+        }
+    }
+}
+
+// ───────────────────────────────────────────── disk (LMDB)
+
+const DISK_ROOT: &str = "/opt/proxyauth/db/backend_cache";
+const DISK_FORMAT: u8 = 1;
+
+/// Réponses gardées sur disque, une base LMDB par cache. Les dates sont
+/// enregistrées en temps Unix, pour rester valables après un redémarrage :
+/// une entrée périmée n'est jamais servie, et une tâche de fond les
+/// supprime chaque minute.
+pub struct DiskStore {
+    path: std::path::PathBuf,
+    size: u64,
+    /// Ouvert au premier usage, donc après l'abandon des privilèges root :
+    /// les fichiers appartiennent à `run_user`, qui peut les écrire.
+    opened: OnceLock<Option<(lmdb::Environment, lmdb::Database)>>,
+}
+
+impl DiskStore {
+    fn open(scope: &str, size: u64) -> Result<Self, String> {
+        let path =
+            std::path::Path::new(DISK_ROOT).join(&blake3::hash(scope.as_bytes()).to_hex()[..16]);
+        Ok(Self {
+            path,
+            size: size.max(16 * 1024 * 1024),
+            opened: OnceLock::new(),
+        })
+    }
+
+    fn handle(&self) -> Option<(&lmdb::Environment, lmdb::Database)> {
+        self.opened
+            .get_or_init(|| match self.open_now() {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::error!("cache_backend: {e} — this cache stays empty");
+                    None
+                }
+            })
+            .as_ref()
+            .map(|(env, db)| (env, *db))
+    }
+
+    fn open_now(&self) -> Result<(lmdb::Environment, lmdb::Database), String> {
+        std::fs::create_dir_all(&self.path)
+            .map_err(|e| format!("cannot create {}: {e}", self.path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(DISK_ROOT, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
+        }
+        let env = lmdb::Environment::new()
+            .set_max_dbs(1)
+            .set_map_size(self.size as usize)
+            // Un cache se reconstruit : inutile de forcer chaque écriture
+            // sur le disque, c'est ce qui coûterait le plus cher.
+            .set_flags(lmdb::EnvironmentFlags::NO_SYNC | lmdb::EnvironmentFlags::NO_META_SYNC)
+            .open(&self.path)
+            .map_err(|e| format!("cannot open LMDB at {}: {e}", self.path.display()))?;
+        let db = env
+            .create_db(Some("responses"), lmdb::DatabaseFlags::empty())
+            .map_err(|e| {
+                format!(
+                    "cannot create LMDB database at {}: {e}",
+                    self.path.display()
+                )
+            })?;
+        Ok((env, db))
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<Vec<Arc<Cached>>> {
+        use lmdb::Transaction;
+        let (env, db) = self.handle()?;
+        let txn = env.begin_ro_txn().ok()?;
+        let bytes = txn.get(db, key).ok()?;
+        let variants = decode_variants(bytes)?;
+        let now = Instant::now();
+        let live: Vec<Arc<Cached>> = variants
+            .into_iter()
+            .filter(|c| c.keep_until > now)
+            .collect();
+        (!live.is_empty()).then_some(live)
+    }
+
+    fn put(&self, key: &[u8; 32], variants: &[Arc<Cached>]) {
+        use lmdb::{Transaction, WriteFlags};
+        let Some((env, db)) = self.handle() else {
+            return;
+        };
+        let bytes = encode_variants(variants);
+        let write = |bytes: &[u8]| -> Result<(), lmdb::Error> {
+            let mut txn = env.begin_rw_txn()?;
+            txn.put(db, key, &bytes, WriteFlags::empty())?;
+            txn.commit()
+        };
+        match write(&bytes) {
+            Ok(()) => {}
+            Err(lmdb::Error::MapFull) => {
+                // Plein : on retire ce qui a expiré ; si cela ne suffit
+                // pas, on repart d'un cache vide plutôt que de refuser
+                // indéfiniment toute nouvelle entrée.
+                if self.purge_expired() == 0 {
+                    self.clear();
+                }
+                if let Err(e) = write(&bytes) {
+                    tracing::warn!(
+                        "cache_backend: disk cache at {} is full: {e}",
+                        self.path.display()
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                "cache_backend: disk write failed at {}: {e}",
+                self.path.display()
+            ),
+        }
+    }
+
+    /// Supprime les entrées dont toutes les variantes ont expiré.
+    fn purge_expired(&self) -> usize {
+        use lmdb::{Cursor, Transaction};
+        let Some((env, db)) = self.handle() else {
+            return 0;
+        };
+        let expired: Vec<Vec<u8>> = {
+            let Ok(txn) = env.begin_ro_txn() else {
+                return 0;
+            };
+            let Ok(mut cursor) = txn.open_ro_cursor(db) else {
+                return 0;
+            };
+            let now = unix_ms();
+            cursor
+                .iter()
+                .filter_map(|item| item.ok())
+                .filter(|(_, v)| keep_until_ms(v).is_none_or(|k| k <= now))
+                .map(|(k, _)| k.to_vec())
+                .collect()
+        };
+        if expired.is_empty() {
+            return 0;
+        }
+        if let Ok(mut txn) = env.begin_rw_txn() {
+            for k in &expired {
+                let _ = txn.del(db, k, None);
+            }
+            let _ = txn.commit();
+        }
+        expired.len()
+    }
+
+    fn clear(&self) {
+        use lmdb::Transaction;
+        let Some((env, db)) = self.handle() else {
+            return;
+        };
+        if let Ok(mut txn) = env.begin_rw_txn() {
+            let _ = txn.clear_db(db);
+            let _ = txn.commit();
+        }
+    }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `Instant` ↔ temps Unix (ms), par rapport à maintenant.
+fn instant_to_ms(t: Instant) -> u64 {
+    let now_i = Instant::now();
+    let now_ms = unix_ms();
+    if t >= now_i {
+        now_ms + (t - now_i).as_millis() as u64
+    } else {
+        now_ms.saturating_sub((now_i - t).as_millis() as u64)
+    }
+}
+
+fn ms_to_instant(ms: u64) -> Instant {
+    let now_i = Instant::now();
+    let now_ms = unix_ms();
+    if ms >= now_ms {
+        now_i + Duration::from_millis(ms - now_ms)
+    } else {
+        now_i
+            .checked_sub(Duration::from_millis(now_ms - ms))
+            .unwrap_or(now_i)
+    }
+}
+
+struct Writer(Vec<u8>);
+impl Writer {
+    fn u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
+    fn u16(&mut self, v: u16) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.0.extend_from_slice(b);
+    }
+}
+
+struct Reader<'a>(&'a [u8]);
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.0.len() < n {
+            return None;
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Some(a)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
+}
+
+/// Format : version, plus grande date de conservation (pour la purge sans
+/// tout décoder), nombre de variantes, puis chaque variante.
+fn encode_variants(variants: &[Arc<Cached>]) -> Vec<u8> {
+    let mut w = Writer(Vec::new());
+    w.u8(DISK_FORMAT);
+    w.u64(
+        variants
+            .iter()
+            .map(|c| instant_to_ms(c.keep_until))
+            .max()
+            .unwrap_or(0),
+    );
+    w.u16(variants.len() as u16);
+    for c in variants {
+        w.u16(c.status.as_u16());
+        w.u8(u8::from(c.shared_explicit) | (u8::from(c.always_revalidate) << 1));
+        w.u64(instant_to_ms(c.stored_at));
+        w.u64(c.initial_age);
+        w.u64(instant_to_ms(c.fresh_until));
+        w.u64(instant_to_ms(c.keep_until));
+        w.u32(c.headers.len() as u32);
+        for (k, v) in &c.headers {
+            w.bytes(k.as_str().as_bytes());
+            w.bytes(v.as_bytes());
+        }
+        w.u16(c.vary.len() as u16);
+        for (k, v) in &c.vary {
+            w.bytes(k.as_str().as_bytes());
+            match v {
+                Some(v) => {
+                    w.u8(1);
+                    w.bytes(v.as_bytes());
+                }
+                None => w.u8(0),
+            }
+        }
+        w.bytes(&c.body);
+    }
+    w.0
+}
+
+fn keep_until_ms(bytes: &[u8]) -> Option<u64> {
+    let mut r = Reader(bytes);
+    (r.u8()? == DISK_FORMAT).then_some(())?;
+    r.u64()
+}
+
+fn decode_variants(bytes: &[u8]) -> Option<Vec<Arc<Cached>>> {
+    let mut r = Reader(bytes);
+    if r.u8()? != DISK_FORMAT {
+        return None;
+    }
+    r.u64()?;
+    let n = r.u16()?;
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let status = StatusCode::from_u16(r.u16()?).ok()?;
+        let flags = r.u8()?;
+        let stored_at = ms_to_instant(r.u64()?);
+        let initial_age = r.u64()?;
+        let fresh_until = ms_to_instant(r.u64()?);
+        let keep_until = ms_to_instant(r.u64()?);
+        let mut headers = HeaderMap::new();
+        for _ in 0..r.u32()? {
+            let k = HeaderName::from_bytes(r.bytes()?).ok()?;
+            let v = HeaderValue::from_bytes(r.bytes()?).ok()?;
+            headers.append(k, v);
+        }
+        let mut vary = Vec::new();
+        for _ in 0..r.u16()? {
+            let k = HeaderName::from_bytes(r.bytes()?).ok()?;
+            let v = match r.u8()? {
+                1 => Some(HeaderValue::from_bytes(r.bytes()?).ok()?),
+                _ => None,
+            };
+            vary.push((k, v));
+        }
+        let body = Bytes::copy_from_slice(r.bytes()?);
+        out.push(Arc::new(Cached {
+            status,
+            headers,
+            body,
+            stored_at,
+            initial_age,
+            fresh_until,
+            keep_until,
+            shared_explicit: flags & 1 != 0,
+            always_revalidate: flags & 2 != 0,
+            vary,
+        }));
+    }
+    Some(out)
 }
 
 // ───────────────────────────────────────────── registry
@@ -281,21 +728,53 @@ fn scope_of(rule: &RouteRule, cfg: &BackendCacheConfig) -> String {
 
 /// Construit les caches au démarrage. Un `cache_backend` ajouté plus tard
 /// par un rechargement de routes.yml prend effet au redémarrage suivant.
-pub fn init_backend_caches(routes: &[RouteRule]) -> Vec<String> {
+pub fn init_backend_caches(routes: &[RouteRule]) -> Result<Vec<String>, String> {
     let mut by_scope: HashMap<String, Arc<BackendCache>> = HashMap::new();
     let mut summary = Vec::new();
+    let mut disks = Vec::new();
     for rule in routes {
         let Some(cfg) = rule.cache_backend.as_ref().filter(|c| c.enabled) else {
             continue;
         };
+        if cfg.force_cache && cfg.default_ttl == 0 {
+            return Err(format!(
+                "routes.yml: route `{}` (vhost {:?}): cache_backend: `force_cache: true` needs a `ttl` (seconds) — ProxyAuth decides how long responses are kept",
+                rule.prefix, rule.vhost
+            ));
+        }
         let scope = scope_of(rule, cfg);
-        by_scope.entry(scope.clone()).or_insert_with(|| {
+        if by_scope.contains_key(&scope) {
+            continue;
+        }
+        let cache = Arc::new(BackendCache::new(cfg.clone(), &scope)?);
+        if let SlotStore::Disk { db, .. } = &cache.slots {
+            summary.push(format!(
+                "cache_backend {scope}: {} — {}",
+                cfg.describe(),
+                db.path.display()
+            ));
+            disks.push(db.clone());
+        } else {
             summary.push(format!("cache_backend {scope}: {}", cfg.describe()));
-            Arc::new(BackendCache::new(cfg.clone()))
-        });
+        }
+        by_scope.insert(scope, cache);
+    }
+    if !disks.is_empty() {
+        // Les entrées expirées ne sont jamais servies ; cette tâche libère
+        // leur place sur le disque.
+        let _ = std::thread::Builder::new()
+            .name("backend-cache-purge".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                    for d in &disks {
+                        d.purge_expired();
+                    }
+                }
+            });
     }
     let _ = REGISTRY.set(Registry { by_scope });
-    summary
+    Ok(summary)
 }
 
 fn cache_for(rule: &RouteRule) -> Option<Arc<BackendCache>> {
@@ -526,8 +1005,25 @@ pub async fn begin(
             .get(header::PRAGMA)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("no-cache"));
-    let authenticated = is_authenticated(request);
-    let key = base_key(true, url, request);
+    let mut authenticated = is_authenticated(request);
+    let mut key = base_key(true, url, request);
+    // force_cache : le backend n'a plus son mot à dire sur le partage. Une
+    // requête qui porte une identité reçoit donc sa propre copie — clé
+    // dérivée de cette identité — et ne voit jamais celle d'un autre.
+    if cache.cfg.force_cache && authenticated {
+        let identity = request
+            .get("x-user")
+            .or_else(|| request.get(header::AUTHORIZATION))
+            .or_else(|| request.get(header::COOKIE))
+            .map(|v| v.as_bytes())
+            .unwrap_or_default();
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"\nidentity\n");
+        h.update(identity);
+        key = *h.finalize().as_bytes();
+        authenticated = false;
+    }
     let now = Instant::now();
 
     let mut pending = Pending {
@@ -677,7 +1173,19 @@ impl Pending {
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
-        let fresh = freshness(&parts.headers, &d, cfg.default_ttl);
+        let forced = cfg.force_cache;
+        // force_cache : la durée est `ttl`, quoi que dise le backend, et
+        // `Vary: *` est ignoré (les autres `Vary` restent respectés).
+        let vary_names = if forced {
+            vary_names.or_else(|| Some(Vec::new()))
+        } else {
+            vary_names
+        };
+        let fresh = if forced {
+            Some(Duration::from_secs(cfg.default_ttl))
+        } else {
+            freshness(&parts.headers, &d, cfg.default_ttl)
+        };
         let has_validator = parts.headers.contains_key(header::ETAG)
             || parts.headers.contains_key(header::LAST_MODIFIED);
         let shared_explicit = d.public || d.s_maxage.is_some();
@@ -685,7 +1193,20 @@ impl Pending {
         // Première règle non remplie, ou `None` si la réponse peut être
         // gardée. Taille annoncée : bornée d'avance ; réponse en flux (sans
         // `Content-Length`) : lue jusqu'à `max_object_size`, plus bas.
-        let refused: Option<String> = if !CACHEABLE_STATUS.contains(&parts.status.as_u16()) {
+        let refused: Option<String> = if forced {
+            // Seules restent les limites qui protègent ProxyAuth lui-même :
+            // pas d'erreurs gardées, taille bornée.
+            if !CACHEABLE_STATUS.contains(&parts.status.as_u16()) {
+                Some(format!("status {} is not cacheable", parts.status.as_u16()))
+            } else if let Some(l) = length.filter(|&l| l > cfg.max_object_size()) {
+                Some(format!(
+                    "too large: {l} bytes > max_object_size {}",
+                    cfg.max_object_size()
+                ))
+            } else {
+                None
+            }
+        } else if !CACHEABLE_STATUS.contains(&parts.status.as_u16()) {
             Some(format!("status {} is not cacheable", parts.status.as_u16()))
         } else if d.no_store {
             Some("backend: Cache-Control no-store".into())
@@ -823,9 +1344,13 @@ impl Pending {
                 (n, v)
             })
             .collect();
+        // Un cookie posé par le backend n'est destiné qu'à ce client-ci : il
+        // part avec cette réponse, jamais avec la copie gardée.
+        let mut stored_headers = parts.headers.clone();
+        stored_headers.remove(header::SET_COOKIE);
         let entry = Arc::new(Cached {
             status: parts.status,
-            headers: parts.headers.clone(),
+            headers: stored_headers,
             body: bytes.clone(),
             stored_at: now,
             initial_age,
@@ -837,8 +1362,8 @@ impl Pending {
                 } else {
                     Duration::ZERO
                 },
-            shared_explicit,
-            always_revalidate: d.no_cache,
+            shared_explicit: shared_explicit || forced,
+            always_revalidate: d.no_cache && !forced,
             vary,
         });
         self.insert_variant(entry);
@@ -850,8 +1375,13 @@ impl Pending {
             &mut parts.headers,
             cfg.debug,
             &format!(
-                "stored for {}s{}",
+                "stored for {}s{}{}",
                 fresh.as_secs(),
+                if forced {
+                    " (force_cache: backend directives ignored)"
+                } else {
+                    ""
+                },
                 if self.forced {
                     " (client asked for a fresh response: no-cache)"
                 } else {
@@ -909,6 +1439,16 @@ mod tests {
         assert!(!b.debug);
         let d: BackendCacheConfig = serde_yaml::from_str("{ debug: true }").unwrap();
         assert!(d.enabled && d.debug);
+        let f: BackendCacheConfig = serde_yaml::from_str(
+            "{ type: disk, force_cache: true, ttl: 120, max_size: \"256MB\" }",
+        )
+        .unwrap();
+        assert_eq!(f.kind, StoreKind::Disk);
+        assert!(f.force_cache);
+        assert_eq!(f.default_ttl, 120);
+        assert_eq!(f.max_memory(), 256 * 1024 * 1024);
+        assert_eq!(BackendCacheConfig::default().kind, StoreKind::Ram);
+        assert!(serde_yaml::from_str::<BackendCacheConfig>("{ type: tape }").is_err());
     }
 
     #[test]
@@ -944,6 +1484,53 @@ mod tests {
         // default_ttl never overrides a backend that spoke (e.g. no-cache).
         let m = h(&[("cache-control", "no-cache")]);
         assert_eq!(freshness(&m, &directives(&m), 30), None);
+    }
+
+    #[test]
+    fn disk_format_roundtrip_keeps_ttl() {
+        let now = Instant::now();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        headers.append("x-multi", HeaderValue::from_static("a"));
+        headers.append("x-multi", HeaderValue::from_static("b"));
+        let c = Arc::new(Cached {
+            status: StatusCode::OK,
+            headers,
+            body: Bytes::from_static(b"hello"),
+            stored_at: now,
+            initial_age: 3,
+            fresh_until: now + Duration::from_secs(60),
+            keep_until: now + Duration::from_secs(60),
+            shared_explicit: true,
+            always_revalidate: false,
+            vary: vec![
+                (
+                    header::ACCEPT_LANGUAGE,
+                    Some(HeaderValue::from_static("fr")),
+                ),
+                (header::ACCEPT, None),
+            ],
+        });
+        let bytes = encode_variants(&[c.clone()]);
+        let back = decode_variants(&bytes).unwrap();
+        assert_eq!(back.len(), 1);
+        let b = &back[0];
+        assert_eq!(b.status, StatusCode::OK);
+        assert_eq!(b.body, c.body);
+        assert_eq!(b.headers.get_all("x-multi").iter().count(), 2);
+        assert_eq!(b.vary, c.vary);
+        assert!(b.shared_explicit && !b.always_revalidate && b.initial_age == 3);
+        // Lifetime survives the round trip (to the millisecond).
+        let left = b
+            .fresh_until
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        assert!((58..=60).contains(&left), "{left}");
+        assert!(keep_until_ms(&bytes).unwrap() > unix_ms());
+        assert!(
+            decode_variants(&bytes[..bytes.len() - 1]).is_none(),
+            "truncated data is rejected"
+        );
     }
 
     #[test]
