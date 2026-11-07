@@ -56,6 +56,7 @@ fn default_route(prefix: &str, target: &str) -> RouteRule {
         forward_websocket: None,
         internal_cache: None,
         discovery_csp: None,
+        cache_backend: None,
         port: None,
         protocol: None,
         if_vhost: Vec::new(),

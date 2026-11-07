@@ -915,6 +915,11 @@ pub struct RouteRule {
     #[serde(default)]
     pub internal_cache: Option<crate::config::internal_cache::InternalCacheConfig>,
 
+    /// Cache des réponses du backend (voir `network::backend_cache`).
+    /// `true`, `false` ou un bloc. Hérité du groupe `vhosts:`.
+    #[serde(default)]
+    pub cache_backend: Option<crate::network::backend_cache::BackendCacheConfig>,
+
     /// Relaie les connexions WebSocket (`Upgrade: websocket`) vers
     /// `target`, qui peut alors être en `ws://` ou `wss://`. Voir
     /// `network::websocket`. Hérité du groupe `vhosts:` ; défaut : non.
@@ -1462,6 +1467,11 @@ pub struct VhostGroup {
     #[serde(default)]
     pub internal_cache: Option<crate::config::internal_cache::InternalCacheConfig>,
 
+    /// Cache des réponses du backend (voir `network::backend_cache`).
+    /// `true`, `false` ou un bloc. Hérité du groupe `vhosts:`.
+    #[serde(default)]
+    pub cache_backend: Option<crate::network::backend_cache::BackendCacheConfig>,
+
     /// Relais WebSocket pour les routes du vhost (voir
     /// `RouteRule::forward_websocket`).
     #[serde(default)]
@@ -1704,6 +1714,12 @@ impl RouteConfig {
                 }
                 if route.discovery_csp.is_none() {
                     route.discovery_csp = group.discovery_csp;
+                }
+                if route.cache_backend.is_none() {
+                    route.cache_backend = group.cache_backend.clone().map(|mut c| {
+                        c.inherited_from_group = Some(group_index);
+                        c
+                    });
                 }
                 if route.port.is_none() {
                     route.port = group.port;

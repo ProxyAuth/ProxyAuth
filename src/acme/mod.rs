@@ -201,7 +201,55 @@ pub fn names_sharing_cert(routes: &[RouteRule], cert_path: &std::path::Path) -> 
             }
         }
     }
-    names
+    let (kept, dropped) = drop_names_covered_by_wildcards(names);
+    for (name, wildcard) in &dropped {
+        println!(
+            "note: {name} is already covered by {wildcard} — left out of the certificate request"
+        );
+    }
+    kept
+}
+
+/// Retire de la liste les noms déjà couverts par un joker de la même
+/// liste : Let's Encrypt refuse une commande qui contient à la fois
+/// `www.example.com` et `*.example.com` (« redundant with a wildcard
+/// domain »). Un joker couvre exactement un niveau (RFC 6125, la même
+/// règle que le routage) :
+///
+/// * `*.example.com` couvre `www.example.com`, `api.example.com` ;
+/// * pas `example.com` (le domaine nu), ni `a.b.example.com` — qui reste
+///   donc demandé, sauf si `*.b.example.com` est aussi dans la liste ;
+/// * deux jokers ne se couvrent jamais (`*.a.example.com` reste à côté de
+///   `*.example.com`).
+///
+/// Le certificat obtenu sert quand même tous ces noms : le joker les
+/// couvre. Renvoie `(gardés, [(retiré, joker qui le couvre)])`, dans
+/// l'ordre d'origine.
+pub fn drop_names_covered_by_wildcards(names: Vec<String>) -> (Vec<String>, Vec<(String, String)>) {
+    let wildcards: Vec<String> = names
+        .iter()
+        .filter(|n| n.starts_with("*."))
+        .cloned()
+        .collect();
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for name in names {
+        if name.starts_with("*.") {
+            kept.push(name);
+            continue;
+        }
+        let covering = wildcards.iter().find(|w| {
+            let parent = &w[2..];
+            name.strip_suffix(parent)
+                .and_then(|label| label.strip_suffix('.'))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+        });
+        match covering {
+            Some(w) => dropped.push((name, w.clone())),
+            None => kept.push(name),
+        }
+    }
+    (kept, dropped)
 }
 
 /// Every distinct vhost across `routes` that has a usable `vhost_cert`
@@ -689,5 +737,67 @@ mod tests {
     #[test]
     fn read_cert_info_none_for_missing_file() {
         assert!(read_cert_info(std::path::Path::new("/nonexistent/cert.pem")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wildcard_coverage_tests {
+    use super::drop_names_covered_by_wildcards;
+
+    fn v(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn names_under_a_wildcard_are_left_out() {
+        let (kept, dropped) = drop_names_covered_by_wildcards(v(&[
+            "proxyauth.app",
+            "www.proxyauth.app",
+            "*.proxyauth.app",
+            "api.proxyauth.app",
+            "x.a.proxyauth.app",
+            "*.a.proxyauth.app",
+            "y.b.proxyauth.app",
+            "other.example",
+        ]));
+        assert_eq!(
+            kept,
+            v(&[
+                "proxyauth.app",
+                "*.proxyauth.app",
+                "*.a.proxyauth.app",
+                "y.b.proxyauth.app",
+                "other.example"
+            ])
+        );
+        assert_eq!(
+            dropped,
+            vec![
+                (
+                    "www.proxyauth.app".to_string(),
+                    "*.proxyauth.app".to_string()
+                ),
+                (
+                    "api.proxyauth.app".to_string(),
+                    "*.proxyauth.app".to_string()
+                ),
+                (
+                    "x.a.proxyauth.app".to_string(),
+                    "*.a.proxyauth.app".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_wildcard_nothing_changes() {
+        let names = v(&["proxyauth.app", "www.proxyauth.app"]);
+        let (kept, dropped) = drop_names_covered_by_wildcards(names.clone());
+        assert_eq!(kept, names);
+        assert!(dropped.is_empty());
+        // A look-alike suffix is not a subdomain.
+        let (kept, _) =
+            drop_names_covered_by_wildcards(v(&["*.proxyauth.app", "evilproxyauth.app"]));
+        assert_eq!(kept, v(&["*.proxyauth.app", "evilproxyauth.app"]));
     }
 }

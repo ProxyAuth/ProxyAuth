@@ -3227,7 +3227,30 @@ pub async fn proxy_with_proxy(
     };
 
     // ── send upstream ───────────────────────────────────────────────
-    let response_result: hyper::Response<ResponseBody> = if !rule.backends.is_empty() {
+    // ── Backend cache (`cache_backend`) ─────────────────────────────
+    let mut hyper_req = hyper_req;
+    let (cached_response, cache_pending) = match crate::network::backend_cache::begin(
+        rule,
+        hyper_req.method(),
+        hyper_req.headers(),
+        &full_url,
+        data.config.backend_timeout_duration(),
+    )
+    .await
+    {
+        crate::network::backend_cache::Step::Hit(r) => (Some(r), None),
+        crate::network::backend_cache::Step::Fetch(p) => {
+            for (name, value) in p.conditional_headers() {
+                hyper_req.headers_mut().insert(name, value);
+            }
+            (None, Some(p))
+        }
+        crate::network::backend_cache::Step::Off => (None, None),
+    };
+
+    let response_result: hyper::Response<ResponseBody> = if let Some(r) = cached_response {
+        r
+    } else if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
             .backends
             .iter()
@@ -3276,6 +3299,10 @@ pub async fn proxy_with_proxy(
                 }));
             }
         }
+    };
+    let response_result = match cache_pending {
+        Some(p) => p.finish(response_result).await,
+        None => response_result,
     };
 
     let status = response_result.status();
@@ -4033,8 +4060,31 @@ pub async fn proxy_without_proxy(
         }
     };
 
+    // ── Backend cache (`cache_backend`) ─────────────────────────────
+    let mut hyper_req = hyper_req;
+    let (cached_response, cache_pending) = match crate::network::backend_cache::begin(
+        rule,
+        hyper_req.method(),
+        hyper_req.headers(),
+        &full_url,
+        data.config.backend_timeout_duration(),
+    )
+    .await
+    {
+        crate::network::backend_cache::Step::Hit(r) => (Some(r), None),
+        crate::network::backend_cache::Step::Fetch(p) => {
+            for (name, value) in p.conditional_headers() {
+                hyper_req.headers_mut().insert(name, value);
+            }
+            (None, Some(p))
+        }
+        crate::network::backend_cache::Step::Off => (None, None),
+    };
+
     // ── Send upstream ────────────────────────────────────────────────
-    let response_result: hyper::Response<ResponseBody> = if !rule.backends.is_empty() {
+    let response_result: hyper::Response<ResponseBody> = if let Some(r) = cached_response {
+        r
+    } else if !rule.backends.is_empty() {
         let backends: Vec<BackendConfig> = rule
             .backends
             .iter()
@@ -4100,6 +4150,10 @@ pub async fn proxy_without_proxy(
                 }));
             }
         }
+    };
+    let response_result = match cache_pending {
+        Some(p) => p.finish(response_result).await,
+        None => response_result,
     };
 
     // ── Upstream status ──────────────────────────────────────────────
