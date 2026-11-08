@@ -55,6 +55,9 @@
 //! `private`, `no-cache`, `max-age=0`, aucun en-tête). Restent exclus :
 //! les statuts d'erreur, les réponses trop grosses, les méthodes autres
 //! que `GET`/`HEAD`. Deux garde-fous :
+//! * le client non plus n'a pas son mot à dire : `Cache-Control: no-cache`
+//!   (rechargement du navigateur), `Pragma: no-cache` ou `no-store` côté
+//!   requête n'empêchent pas de servir la copie ;
 //! * une requête qui porte une identité reçoit **sa propre copie** (clé
 //!   dérivée de `X-User`, sinon `Authorization`, sinon `Cookie`) : un
 //!   utilisateur ne voit jamais la page d'un autre ;
@@ -996,15 +999,21 @@ pub async fn begin(
         return bypass("request: Range");
     }
     let req_cc = directives(request);
-    if req_cc.no_store {
+    // force_cache : c'est le proxy qui décide, ni le backend ni le client.
+    // Un rechargement du navigateur (`Cache-Control: no-cache`, `Pragma`)
+    // ou un `no-store` client ne font donc pas repartir la requête vers le
+    // backend : la copie est servie tant que son `ttl` court.
+    let forced = cache.cfg.force_cache;
+    if req_cc.no_store && !forced {
         return bypass("request: Cache-Control no-store");
     }
-    let force_fresh = req_cc.no_cache
-        || req_cc.max_age == Some(0)
-        || request
-            .get(header::PRAGMA)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_ascii_lowercase().contains("no-cache"));
+    let force_fresh = !forced
+        && (req_cc.no_cache
+            || req_cc.max_age == Some(0)
+            || request
+                .get(header::PRAGMA)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("no-cache")));
     let mut authenticated = is_authenticated(request);
     let mut key = base_key(true, url, request);
     // force_cache : le backend n'a plus son mot à dire sur le partage. Une

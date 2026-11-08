@@ -76,8 +76,23 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+// L'allocateur est choisi à la compilation : mimalloc par défaut,
+// jemalloc avec `--features jemalloc`. Il sert avant même la lecture de
+// config.json, d'où l'impossibilité de le régler là.
+#[cfg(not(feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Nom de l'allocateur compilé, affiché au démarrage.
+const ALLOCATOR: &str = if cfg!(feature = "jemalloc") {
+    "jemalloc"
+} else {
+    "mimalloc"
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ID: &str = env!("id");
@@ -91,6 +106,7 @@ impl FormatTime for LocalTime {
 }
 
 /// `mi_option_purge_delay` (même position dans mimalloc v2 et v3).
+#[cfg(not(feature = "jemalloc"))]
 const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
 
 /// Applique `purge_delay` (config.json, en secondes) à l'allocateur.
@@ -107,11 +123,40 @@ fn apply_purge_delay(seconds: Option<f64>) {
         eprintln!("warning: config.json: purge_delay must be a number of seconds >= 0 (ignored)");
         return;
     }
-    let ms = (secs * 1000.0).round().min(i32::MAX as f64) as std::os::raw::c_long;
+    let ms = (secs * 1000.0).round().min(i32::MAX as f64);
+    set_allocator_purge_delay_ms(ms as i64);
+    info!("allocator ({ALLOCATOR}) purge delay set to {ms} ms");
+}
+
+#[cfg(not(feature = "jemalloc"))]
+fn set_allocator_purge_delay_ms(ms: i64) {
     // SAFETY: réglage d'une option de mimalloc, sans pointeur ; mimalloc
     // le prend en compte aux prochaines purges.
-    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, ms) };
-    info!("allocator purge delay set to {ms} ms");
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, ms as std::os::raw::c_long) };
+}
+
+/// jemalloc : l'équivalent de `purge_delay` est le délai de « décroissance »
+/// des pages libérées (`dirty_decay_ms`, puis `muzzy_decay_ms`). Réglé pour
+/// les arènes à venir (`arenas.*`) et pour toutes celles qui existent déjà
+/// (`arena.4096.*`, 4096 = MALLCTL_ARENAS_ALL).
+#[cfg(feature = "jemalloc")]
+fn set_allocator_purge_delay_ms(ms: i64) {
+    let value = ms as isize;
+    for name in [
+        &b"arenas.dirty_decay_ms\0"[..],
+        &b"arenas.muzzy_decay_ms\0"[..],
+        &b"arena.4096.dirty_decay_ms\0"[..],
+        &b"arena.4096.muzzy_decay_ms\0"[..],
+    ] {
+        // SAFETY: noms d'options jemalloc terminés par NUL, valeur de type
+        // ssize_t comme le documente jemalloc pour ces options.
+        if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(name, value) } {
+            warn!(
+                "jemalloc: cannot set {}: {e}",
+                String::from_utf8_lossy(&name[..name.len() - 1])
+            );
+        }
+    }
 }
 
 fn print_launcher(ratelimits: &[String], version: &str, worker: u8, addr: &str, id: &str) {
@@ -122,8 +167,8 @@ fn print_launcher(ratelimits: &[String], version: &str, worker: u8, addr: &str, 
     };
 
     println!(
-        "\nlaunch ProxyAuth v{} [{}] \n{}\nstarting service: \"proxyauth-service\" worker: {} listening on {}",
-        version, id, msg, worker, addr
+        "\nlaunch ProxyAuth v{} [{}] (allocator: {})\n{}\nstarting service: \"proxyauth-service\" worker: {} listening on {}",
+        version, id, ALLOCATOR, msg, worker, addr
     );
 }
 
@@ -434,6 +479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
 
+    info!("allocator: {ALLOCATOR}");
     apply_purge_delay(config.purge_delay);
 
     // Limite de fichiers ouverts : 1024 par défaut sous Linux, soit un
@@ -1171,6 +1217,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    #[cfg(not(feature = "jemalloc"))]
     #[test]
     fn purge_delay_reaches_mimalloc() {
         let before = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
@@ -1194,6 +1241,19 @@ mod tests {
             0
         );
         unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, before) };
+    }
+
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn purge_delay_reaches_jemalloc() {
+        let read = |name: &[u8]| unsafe { tikv_jemalloc_ctl::raw::read::<isize>(name) }.unwrap();
+        apply_purge_delay(Some(0.25));
+        assert_eq!(read(b"arenas.dirty_decay_ms\0"), 250);
+        assert_eq!(read(b"arenas.muzzy_decay_ms\0"), 250);
+        apply_purge_delay(Some(0.0));
+        assert_eq!(read(b"arenas.dirty_decay_ms\0"), 0);
+        apply_purge_delay(Some(-1.0)); // refusé : valeur inchangée
+        assert_eq!(read(b"arenas.dirty_decay_ms\0"), 0);
     }
 
     #[test]
