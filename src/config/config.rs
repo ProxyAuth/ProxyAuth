@@ -169,6 +169,17 @@ pub struct RedirectProtectConfig {
 /// below) rather than checking ProxyAuth's own `session_token` — this
 /// is genuine authentication, delegated to whatever the backend's own
 /// auth scheme actually is, not a hidden bypass value.
+impl ProtectedPathRule {
+    /// The rule covers `path`: `regex` matches it, and none of `exclude`
+    /// does.
+    pub fn applies_to(&self, path: &str) -> bool {
+        self.regex_compiled
+            .as_ref()
+            .is_some_and(|re| re.is_match(path))
+            && !self.exclude_compiled.iter().any(|re| re.is_match(path))
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProtectedPathRule {
     /// Matched against the request path the same way `RouteRule.regex`
@@ -178,6 +189,28 @@ pub struct ProtectedPathRule {
 
     #[serde(skip)]
     pub regex_compiled: Option<Regex>,
+
+    /// Paths the rule must **not** apply to, even though `regex` matches
+    /// them: any one of these regexes matching the request path takes it
+    /// out of this rule. The Rust regex engine has no look-ahead, so
+    /// `src(/(?!.*\.png$).*)?` cannot be written; instead:
+    ///
+    /// ```yaml
+    /// - regex: '^/ProxyAuth/[^/]+/src(/.*)?$'
+    ///   exclude: ['\.png$', '\.svg$', '^/ProxyAuth/[^/]+/src/branch/main/docs/']
+    /// ```
+    ///
+    /// Also accepted as `excludes` or `exclude_regex`.
+    #[serde(
+        default,
+        alias = "excludes",
+        alias = "exclude_regex",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub exclude: Vec<String>,
+
+    #[serde(skip)]
+    pub exclude_compiled: Vec<Regex>,
 
     /// A path on this route's own backend to probe, e.g. `"/api/user"`
     /// — appended to `target` (the leading `/` is expected as part of

@@ -309,6 +309,18 @@ pub fn compile_regex_on_routes(routes: &mut [RouteRule]) {
                         r.prefix, pp.regex
                     )
                 }));
+                pp.exclude_compiled = pp
+                    .exclude
+                    .iter()
+                    .map(|x| {
+                        Regex::new(x).unwrap_or_else(|e| {
+                            panic!(
+                                "routes.yml: route \"{}\": invalid `redirect_protect.paths` exclude regex \"{}\": {e}",
+                                r.prefix, x
+                            )
+                        })
+                    })
+                    .collect();
             }
         }
     }
@@ -836,11 +848,7 @@ async fn apply_hidden_blocks(
     let request_path = req.uri().path();
 
     for pp in &rp.paths {
-        let matches = pp
-            .regex_compiled
-            .as_ref()
-            .is_some_and(|re| re.is_match(request_path));
-        if !matches || pp.hidden_blocks.is_empty() {
+        if !pp.applies_to(request_path) || pp.hidden_blocks.is_empty() {
             continue;
         }
         // One check per matching `paths` entry, reused for every
@@ -2399,10 +2407,8 @@ async fn global_proxy_inner(
             // begin with.
             let request_path = req.uri().path();
             for pp in &rp.paths {
-                let Some(re) = &pp.regex_compiled else {
-                    continue;
-                };
-                if !re.is_match(request_path) {
+                // `regex` matches and no `exclude` does.
+                if !pp.applies_to(request_path) {
                     continue;
                 }
                 // A `paths` entry with `hidden_blocks` configured
@@ -4525,5 +4531,48 @@ mod forwarded_ip_tests {
             "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&amp;&quot;"
         );
         assert_eq!(html_escape("alice"), "alice");
+    }
+}
+
+#[cfg(test)]
+mod protected_path_exclude_tests {
+    use crate::config::config::ProtectedPathRule;
+    use regex::Regex;
+
+    fn rule(yaml: &str) -> ProtectedPathRule {
+        let mut r: ProtectedPathRule = serde_yaml::from_str(yaml).unwrap();
+        r.regex_compiled = Some(Regex::new(&r.regex).unwrap());
+        r.exclude_compiled = r.exclude.iter().map(|x| Regex::new(x).unwrap()).collect();
+        r
+    }
+
+    #[test]
+    fn excluded_paths_are_left_out() {
+        let r = rule(
+            r#"
+regex: '^/ProxyAuth/[^/]+/src(/.*)?$'
+check_path: "/notifications"
+exclude: ['\.png$', '\.svg$', '^/ProxyAuth/[^/]+/src/branch/main/docs/']
+"#,
+        );
+        assert!(r.applies_to("/ProxyAuth/ProxyAuth/src"));
+        assert!(r.applies_to("/ProxyAuth/ProxyAuth/src/branch/main/main.rs"));
+        assert!(!r.applies_to("/ProxyAuth/ProxyAuth/src/branch/main/logo.png"));
+        assert!(!r.applies_to("/ProxyAuth/ProxyAuth/src/branch/main/icon.svg"));
+        assert!(!r.applies_to("/ProxyAuth/ProxyAuth/src/branch/main/docs/index.md"));
+        assert!(
+            !r.applies_to("/ProxyAuth/ProxyAuth/issues"),
+            "regex itself still decides first"
+        );
+    }
+
+    #[test]
+    fn aliases_and_no_exclude() {
+        let r = rule("regex: '^/a'\ncheck_path: \"/x\"\nexcludes: ['\\.png$']\n");
+        assert!(!r.applies_to("/a/b.png"));
+        let r = rule("regex: '^/a'\ncheck_path: \"/x\"\nexclude_regex: ['\\.png$']\n");
+        assert!(!r.applies_to("/a/b.png"));
+        let r = rule("regex: '^/a'\ncheck_path: \"/x\"\n");
+        assert!(r.exclude.is_empty() && r.applies_to("/a/b.png"));
     }
 }

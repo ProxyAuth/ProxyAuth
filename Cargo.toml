@@ -36,8 +36,8 @@ mimalloc = { version = "0.1", default-features = false }
 # tirée par `mimalloc`.
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 # Allocateur alternatif, choisi à la compilation : `--features jemalloc`.
-tikv-jemallocator = { version = "0.7", optional = true }
-tikv-jemalloc-ctl = { version = "0.7", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "blocking", "charset", "http2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.33"
