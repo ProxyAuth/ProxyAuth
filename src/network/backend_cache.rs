@@ -64,6 +64,12 @@
 //! * `Set-Cookie` n'est jamais gardé : il part avec la réponse qui l'a
 //!   reçu, pas avec les copies.
 //!
+//! `identity_cookie: <nom>` : seul ce cookie identifie l'utilisateur (sa
+//! session) ; les autres (`_csrf`, statistiques) ne créent plus une copie
+//! par valeur, et une requête sans lui est anonyme. `shared: true` (avec
+//! `force_cache`) : une seule copie pour tous, identité ignorée — pour un
+//! contenu identique pour tout le monde.
+//!
 //! # type: ram | disk
 //!
 //! `ram` (défaut) : en mémoire, perdu au redémarrage. `disk` : LMDB sous
@@ -107,6 +113,17 @@ pub struct BackendCacheConfig {
     /// `private`, pas d'en-tête…), pendant `ttl` secondes. Voir
     /// [`force_cache`](self#force_cache).
     pub force_cache: bool,
+    /// Le cookie qui identifie un utilisateur (son cookie de session, par
+    /// exemple `i_like_gitea`). Seul lui distingue les copies : les autres
+    /// cookies (`_csrf`, statistiques…) sont ignorés, et une requête sans
+    /// lui compte comme anonyme. Sans ce réglage, tout l'en-tête `Cookie`
+    /// sert d'identité — et un cookie qui change à chaque page empêche
+    /// toute réutilisation.
+    pub identity_cookie: Option<String>,
+    /// Avec `force_cache` : une seule copie pour **tous** les visiteurs,
+    /// cookies et identité ignorés. Seulement pour un contenu identique
+    /// pour tout le monde.
+    pub shared: bool,
     /// Rempli par `expand_vhost_groups` quand la route hérite le bloc de
     /// son groupe : les routes du groupe partagent alors un seul cache.
     #[serde(skip)]
@@ -123,6 +140,8 @@ impl Default for BackendCacheConfig {
             debug: false,
             kind: StoreKind::Ram,
             force_cache: false,
+            identity_cookie: None,
+            shared: false,
             inherited_from_group: None,
         }
     }
@@ -154,6 +173,10 @@ struct BlockForm {
     kind: StoreKind,
     #[serde(default)]
     force_cache: bool,
+    #[serde(default)]
+    identity_cookie: Option<String>,
+    #[serde(default)]
+    shared: bool,
     /// Taille du cache ; synonyme de `max_memory` (plus parlant en
     /// `type: disk`).
     #[serde(default)]
@@ -186,6 +209,8 @@ impl<'de> Deserialize<'de> for BackendCacheConfig {
                 debug: b.debug,
                 kind: b.kind,
                 force_cache: b.force_cache,
+                identity_cookie: b.identity_cookie,
+                shared: b.shared,
                 inherited_from_group: None,
             },
         })
@@ -224,10 +249,16 @@ impl BackendCacheConfig {
             self.max_memory() / (1024 * 1024),
             self.max_object_size() / 1024,
             self.default_ttl,
-            if self.force_cache {
-                ", force_cache (backend directives ignored)"
-            } else {
-                ""
+            match (
+                self.force_cache,
+                self.shared,
+                self.identity_cookie.as_deref()
+            ) {
+                (true, true, _) => ", force_cache shared by all visitors".to_string(),
+                (true, false, Some(c)) => format!(", force_cache per user (cookie {c})"),
+                (true, false, None) => ", force_cache (backend directives ignored)".to_string(),
+                (false, _, Some(c)) => format!(", identity cookie {c}"),
+                _ => String::new(),
             },
             if self.debug {
                 ", debug (X-Cache-Reason)"
@@ -739,6 +770,31 @@ pub fn init_backend_caches(routes: &[RouteRule]) -> Result<Vec<String>, String> 
         let Some(cfg) = rule.cache_backend.as_ref().filter(|c| c.enabled) else {
             continue;
         };
+        let place = format!(
+            "routes.yml: route `{}` (vhost {:?}): cache_backend",
+            rule.prefix, rule.vhost
+        );
+        if cfg.shared && !cfg.force_cache {
+            return Err(format!(
+                "{place}: `shared: true` only applies with `force_cache: true` — without it, the backend decides what is shared (Cache-Control: public)"
+            ));
+        }
+        if cfg.shared && cfg.identity_cookie.is_some() {
+            return Err(format!(
+                "{place}: `shared` and `identity_cookie` contradict each other — one copy for everyone, or one per user"
+            ));
+        }
+        if let Some(name) = cfg.identity_cookie.as_deref() {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+            {
+                return Err(format!(
+                    "{place}: `identity_cookie` {name:?} is not a valid cookie name"
+                ));
+            }
+        }
         if cfg.force_cache && cfg.default_ttl == 0 {
             return Err(format!(
                 "routes.yml: route `{}` (vhost {:?}): cache_backend: `force_cache: true` needs a `ttl` (seconds) — ProxyAuth decides how long responses are kept",
@@ -864,10 +920,53 @@ fn freshness(headers: &HeaderMap, d: &Directives, default_ttl: u64) -> Option<Du
 const CACHEABLE_STATUS: &[u16] = &[200, 203, 204, 300, 301, 308, 404, 410];
 
 /// La requête porte une identité : sa réponse peut être propre à quelqu'un.
+#[cfg(test)]
 fn is_authenticated(req: &HeaderMap) -> bool {
+    is_authenticated_with(req, None)
+}
+
+/// La requête porte une identité. Avec `identity_cookie`, seul ce cookie
+/// compte : une requête qui n'a que `_csrf` ou des cookies de statistiques
+/// est anonyme.
+fn is_authenticated_with(req: &HeaderMap, identity_cookie: Option<&str>) -> bool {
     req.contains_key(header::AUTHORIZATION)
-        || req.contains_key(header::COOKIE)
         || req.contains_key("x-user")
+        || match identity_cookie {
+            Some(name) => cookie_value(req, name).is_some(),
+            None => req.contains_key(header::COOKIE),
+        }
+}
+
+/// Valeur d'un cookie de la requête (premier trouvé, tous en-têtes
+/// `Cookie` confondus).
+fn cookie_value<'a>(req: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    req.get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
+}
+
+/// L'identité qui distingue les copies sous `force_cache`.
+fn identity_of<'a>(req: &'a HeaderMap, identity_cookie: Option<&str>) -> &'a [u8] {
+    if let Some(u) = req.get("x-user") {
+        return u.as_bytes();
+    }
+    if let Some(v) = identity_cookie.and_then(|name| cookie_value(req, name)) {
+        return v.as_bytes();
+    }
+    if let Some(a) = req.get(header::AUTHORIZATION) {
+        return a.as_bytes();
+    }
+    if identity_cookie.is_none() {
+        if let Some(c) = req.get(header::COOKIE) {
+            return c.as_bytes();
+        }
+    }
+    b""
 }
 
 fn base_key(method_get: bool, url: &str, req: &HeaderMap) -> [u8; 32] {
@@ -910,6 +1009,9 @@ pub struct Pending {
     bypass: Option<&'static str>,
     /// Le client a demandé une réponse fraîche (`no-cache`).
     forced: bool,
+    /// Sous `force_cache` : copie partagée ou propre à l'utilisateur (pour
+    /// `X-Cache-Reason`).
+    copy_scope: Option<&'static str>,
 }
 
 /// `X-Cache-Reason`, en mode debug.
@@ -987,6 +1089,7 @@ pub async fn begin(
                 lock_key: None,
                 bypass: Some(reason),
                 forced: false,
+                copy_scope: None,
             })
         } else {
             Step::Off
@@ -1014,18 +1117,21 @@ pub async fn begin(
                 .get(header::PRAGMA)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.to_ascii_lowercase().contains("no-cache")));
-    let mut authenticated = is_authenticated(request);
+    let identity_cookie = cache.cfg.identity_cookie.as_deref();
+    let mut authenticated = is_authenticated_with(request, identity_cookie);
     let mut key = base_key(true, url, request);
-    // force_cache : le backend n'a plus son mot à dire sur le partage. Une
-    // requête qui porte une identité reçoit donc sa propre copie — clé
-    // dérivée de cette identité — et ne voit jamais celle d'un autre.
-    if cache.cfg.force_cache && authenticated {
-        let identity = request
-            .get("x-user")
-            .or_else(|| request.get(header::AUTHORIZATION))
-            .or_else(|| request.get(header::COOKIE))
-            .map(|v| v.as_bytes())
-            .unwrap_or_default();
+    let mut copy_scope: Option<&'static str> = None;
+    if cache.cfg.force_cache && cache.cfg.shared {
+        // `shared` : une seule copie pour tout le monde, identité ignorée.
+        authenticated = false;
+        copy_scope = Some("shared by all visitors");
+    } else if cache.cfg.force_cache && authenticated {
+        // force_cache : le backend n'a plus son mot à dire sur le partage.
+        // Une requête qui porte une identité reçoit donc sa propre copie —
+        // clé dérivée de cette identité — et ne voit jamais celle d'un
+        // autre. Avec `identity_cookie`, seul ce cookie la définit.
+        let identity = identity_of(request, identity_cookie);
+        copy_scope = Some("copy for this user");
         let mut h = blake3::Hasher::new();
         h.update(&key);
         h.update(b"\nidentity\n");
@@ -1045,6 +1151,7 @@ pub async fn begin(
         lock_key: None,
         bypass: None,
         forced: force_fresh,
+        copy_scope,
     };
 
     let lookup = |cache: &BackendCache| -> Result<Option<Arc<Cached>>, ()> {
@@ -1384,13 +1491,16 @@ impl Pending {
             &mut parts.headers,
             cfg.debug,
             &format!(
-                "stored for {}s{}{}",
+                "stored for {}s{}{}{}",
                 fresh.as_secs(),
                 if forced {
                     " (force_cache: backend directives ignored)"
                 } else {
                     ""
                 },
+                self.copy_scope
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default(),
                 if self.forced {
                     " (client asked for a fresh response: no-cache)"
                 } else {
@@ -1540,6 +1650,49 @@ mod tests {
             decode_variants(&bytes[..bytes.len() - 1]).is_none(),
             "truncated data is rejected"
         );
+    }
+
+    #[test]
+    fn identity_cookie_ignores_other_cookies() {
+        let with = |c: &'static str| h(&[("cookie", c)]);
+        // Only the session cookie makes a request "signed in".
+        assert!(!is_authenticated_with(
+            &with("_csrf=abc; lang=fr"),
+            Some("i_like_gitea")
+        ));
+        assert!(is_authenticated_with(
+            &with("_csrf=abc; i_like_gitea=s1"),
+            Some("i_like_gitea")
+        ));
+        assert!(
+            is_authenticated_with(&with("_csrf=abc"), None),
+            "without identity_cookie any cookie counts"
+        );
+        // A rotating _csrf does not change the identity.
+        assert_eq!(
+            identity_of(&with("_csrf=one; i_like_gitea=s1"), Some("i_like_gitea")),
+            identity_of(&with("i_like_gitea=s1; _csrf=two"), Some("i_like_gitea"))
+        );
+        assert_ne!(
+            identity_of(&with("i_like_gitea=s1"), Some("i_like_gitea")),
+            identity_of(&with("i_like_gitea=s2"), Some("i_like_gitea"))
+        );
+        // X-User (set by ProxyAuth) wins over cookies.
+        let mut m = with("i_like_gitea=s1");
+        m.insert("x-user", HeaderValue::from_static("alice"));
+        assert_eq!(identity_of(&m, Some("i_like_gitea")), b"alice");
+        // Names must match exactly.
+        assert_eq!(
+            cookie_value(&with("i_like_gitea_x=1"), "i_like_gitea"),
+            None
+        );
+        let s: BackendCacheConfig =
+            serde_yaml::from_str("{ force_cache: true, ttl: 60, shared: true }").unwrap();
+        assert!(s.shared && s.identity_cookie.is_none());
+        let i: BackendCacheConfig =
+            serde_yaml::from_str("{ force_cache: true, ttl: 60, identity_cookie: i_like_gitea }")
+                .unwrap();
+        assert_eq!(i.identity_cookie.as_deref(), Some("i_like_gitea"));
     }
 
     #[test]

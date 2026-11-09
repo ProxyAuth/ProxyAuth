@@ -1684,7 +1684,7 @@ pub(crate) fn content_type_for(path: &Path) -> &'static str {
     guess_content_type(path)
 }
 
-fn guess_content_type(path: &Path) -> &'static str {
+pub(crate) fn guess_content_type(path: &Path) -> &'static str {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

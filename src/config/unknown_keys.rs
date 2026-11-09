@@ -73,6 +73,7 @@ fn route_keys() -> BTreeSet<String> {
         "session_cookie_age",
         "login_page_url",
         "certbot_rew",
+        "bandwith_max",
         "routes",
     ] {
         keys.insert(extra.to_string());

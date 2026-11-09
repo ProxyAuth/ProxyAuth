@@ -953,6 +953,12 @@ pub struct RouteRule {
     #[serde(default)]
     pub cache_backend: Option<crate::network::backend_cache::BackendCacheConfig>,
 
+    /// Plafond global de requêtes par seconde, tous clients confondus ; le
+    /// surplus reçoit une page statique (voir `network::ratelimit`). Aussi
+    /// accepté : `bandwith_max`.
+    #[serde(default, alias = "bandwith_max")]
+    pub bandwidth_max: Option<crate::network::ratelimit::BandwidthMax>,
+
     /// Relaie les connexions WebSocket (`Upgrade: websocket`) vers
     /// `target`, qui peut alors être en `ws://` ou `wss://`. Voir
     /// `network::websocket`. Hérité du groupe `vhosts:` ; défaut : non.
@@ -1505,6 +1511,12 @@ pub struct VhostGroup {
     #[serde(default)]
     pub cache_backend: Option<crate::network::backend_cache::BackendCacheConfig>,
 
+    /// Plafond global de requêtes par seconde, tous clients confondus ; le
+    /// surplus reçoit une page statique (voir `network::ratelimit`). Aussi
+    /// accepté : `bandwith_max`.
+    #[serde(default, alias = "bandwith_max")]
+    pub bandwidth_max: Option<crate::network::ratelimit::BandwidthMax>,
+
     /// Relais WebSocket pour les routes du vhost (voir
     /// `RouteRule::forward_websocket`).
     #[serde(default)]
@@ -1747,6 +1759,12 @@ impl RouteConfig {
                 }
                 if route.discovery_csp.is_none() {
                     route.discovery_csp = group.discovery_csp;
+                }
+                if route.bandwidth_max.is_none() {
+                    route.bandwidth_max = group.bandwidth_max.clone().map(|mut b| {
+                        b.inherited_from_group = Some(group_index);
+                        b
+                    });
                 }
                 if route.cache_backend.is_none() {
                     route.cache_backend = group.cache_backend.clone().map(|mut c| {

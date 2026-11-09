@@ -183,12 +183,202 @@ pub struct RateLimitConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip_ceiling: Option<Box<RateLimitConfig>>,
 
+    /// Pénalité progressive : chaque récidive multiplie `timeout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub penalty: Option<PenaltyConfig>,
+
+    /// Coût des requêtes : une archive peut valoir 10 requêtes simples.
+    /// La première règle qui correspond s'applique ; sinon 1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub costs: Vec<CostRule>,
+
+    /// Limites resserrées quand le processeur sature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive: Option<AdaptiveConfig>,
+
     /// Rempli par `expand_vhost_groups` quand une route hérite le bloc de
     /// son groupe `vhosts:` (index du groupe). Les routes d'un même groupe
     /// partagent alors un compteur ; une route qui écrit son propre bloc
     /// (`None`) a toujours le sien, même avec des valeurs identiques.
     #[serde(skip)]
     pub inherited_from_group: Option<usize>,
+}
+
+/// `bandwidth_max:` — plafond **global** d'un vhost ou d'une route : tous
+/// clients confondus, au plus `request_per_second` requêtes par seconde.
+/// Le surplus reçoit `static_page` (statut 503, `Retry-After: 1`) au lieu
+/// d'atteindre le backend.
+///
+/// ```yaml
+/// bandwidth_max:                 # aussi accepté : bandwith_max
+///   request_per_second: 500      # ou requests_per_second
+///   burst: 1000                  # facultatif, défaut = request_per_second
+///   static_page: "/var/www/busy.html"
+/// ```
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BandwidthMax {
+    #[serde(alias = "requests_per_second", alias = "limit_req_per_sec")]
+    pub request_per_second: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+    #[serde(alias = "page")]
+    pub static_page: String,
+    /// Adresses soumises au plafond (IP ou réseau CIDR). Vide : toutes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_filtered: Vec<String>,
+    /// Adresses jamais soumises au plafond, ni comptées : réseau interne,
+    /// supervision… Prioritaire sur `ip_filtered`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_nofiltered: Vec<String>,
+    /// Rempli par `expand_vhost_groups` quand la route hérite le bloc de
+    /// son groupe : tout le vhost partage alors un seul plafond.
+    #[serde(skip)]
+    pub inherited_from_group: Option<usize>,
+}
+
+/// Un plafond global : son compteur et la page servie au surplus.
+#[derive(Debug)]
+struct Cap {
+    limiter: Arc<Limiter>,
+    page: Arc<CapPage>,
+    rps: u32,
+    filtered: Vec<ipnet::IpNet>,
+    nofiltered: Vec<ipnet::IpNet>,
+}
+
+impl Cap {
+    /// Le plafond s'applique-t-il à ce client ? Les adresses de
+    /// `ip_nofiltered` passent toujours, sans être comptées ; sinon celles
+    /// de `ip_filtered` (toutes si la liste est vide). Sans IP connue, le
+    /// plafond s'applique.
+    fn applies_to(&self, ip: Option<std::net::IpAddr>) -> bool {
+        let Some(ip) = ip else { return true };
+        if self.nofiltered.iter().any(|n| n.contains(&ip)) {
+            return false;
+        }
+        self.filtered.is_empty() || self.filtered.iter().any(|n| n.contains(&ip))
+    }
+}
+
+/// Une adresse ou un réseau CIDR (`10.0.0.1`, `192.168.0.0/24`, `::1`,
+/// `fe80::/64`).
+fn parse_net(entry: &str) -> Result<ipnet::IpNet, String> {
+    let e = entry.trim();
+    e.parse::<ipnet::IpNet>()
+        .or_else(|_| e.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+        .map_err(|_| {
+            format!(
+                "{entry:?} is not an IP address or a CIDR network (e.g. 192.168.0.0/24, fe80::/64)"
+            )
+        })
+}
+
+/// La page de surplus, gardée en mémoire et relue si le fichier change
+/// (vérifié au plus toutes les 5 s) : elle est servie précisément quand
+/// le serveur est le plus chargé.
+#[derive(Debug)]
+struct CapPage {
+    path: std::path::PathBuf,
+    content_type: String,
+    cached: std::sync::Mutex<(bytes::Bytes, Option<std::time::SystemTime>, Instant)>,
+}
+
+impl CapPage {
+    fn load(path: &str) -> Result<Self, String> {
+        let p = std::path::PathBuf::from(path);
+        let body =
+            std::fs::read(&p).map_err(|e| format!("cannot read `static_page` {path}: {e}"))?;
+        let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+        Ok(Self {
+            content_type: crate::network::proxy::guess_content_type(&p).to_string(),
+            path: p,
+            cached: std::sync::Mutex::new((bytes::Bytes::from(body), mtime, Instant::now())),
+        })
+    }
+
+    fn body(&self) -> bytes::Bytes {
+        let mut c = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if c.2.elapsed() >= Duration::from_secs(5) {
+            c.2 = Instant::now();
+            let mtime = std::fs::metadata(&self.path)
+                .and_then(|m| m.modified())
+                .ok();
+            if mtime != c.1 {
+                if let Ok(b) = std::fs::read(&self.path) {
+                    c.0 = bytes::Bytes::from(b);
+                    c.1 = mtime;
+                }
+            }
+        }
+        c.0.clone()
+    }
+}
+
+/// `penalty:` — le blocage d'une récidive dure `timeout × factor^n`
+/// (n = récidives précédentes), plafonné à `max`. Les récidives sont
+/// oubliées après `forget_after` secondes sans dépassement.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PenaltyConfig {
+    #[serde(default = "default_penalty_factor")]
+    pub factor: u32,
+    /// Plafond du blocage, en secondes.
+    #[serde(default = "default_penalty_max")]
+    pub max: u64,
+    /// Oubli des récidives, en secondes.
+    #[serde(default = "default_penalty_forget")]
+    pub forget_after: u64,
+}
+fn default_penalty_factor() -> u32 {
+    2
+}
+fn default_penalty_max() -> u64 {
+    3600
+}
+fn default_penalty_forget() -> u64 {
+    600
+}
+
+/// Une règle de `costs:` : `regex` (sur le chemin) et/ou `methods`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    pub cost: u32,
+}
+
+/// `adaptive:` — au-delà de `cpu_threshold` % d'occupation processeur, le
+/// coût de chaque requête augmente, jusqu'à `1 / min_factor` à 100 %.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveConfig {
+    #[serde(default = "default_cpu_threshold")]
+    pub cpu_threshold: u32,
+    #[serde(default = "default_min_factor")]
+    pub min_factor: f64,
+}
+fn default_cpu_threshold() -> u32 {
+    75
+}
+fn default_min_factor() -> f64 {
+    0.25
+}
+
+impl AdaptiveConfig {
+    /// Facteur de débit (1 = normal) pour une occupation `cpu` en %.
+    pub fn factor(&self, cpu: u32) -> f64 {
+        let thr = self.cpu_threshold.min(99) as f64;
+        let cpu = (cpu.min(100)) as f64;
+        if cpu <= thr {
+            return 1.0;
+        }
+        let over = (cpu - thr) / (100.0 - thr);
+        (1.0 - over * (1.0 - self.min_factor)).clamp(self.min_factor, 1.0)
+    }
 }
 
 /// Paramètres validés, prêts pour [`Limiter`].
@@ -199,6 +389,10 @@ pub struct Quota {
     pub period: Duration,
     pub burst: u32,
     pub block: Duration,
+    /// Pénalité progressive : 1 = sans (le blocage dure toujours `block`).
+    pub penalty_factor: u32,
+    pub penalty_max: Duration,
+    pub penalty_forget: Duration,
 }
 
 impl RateLimitConfig {
@@ -235,11 +429,63 @@ impl RateLimitConfig {
         if burst == 0 {
             return Err("`burst` must be at least 1".into());
         }
+        let (penalty_factor, penalty_max, penalty_forget) = match &self.penalty {
+            None => (1, Duration::ZERO, Duration::ZERO),
+            Some(p) => {
+                if self.timeout == 0 {
+                    return Err(
+                        "`penalty` multiplies `timeout`: set a `timeout` (seconds) first".into(),
+                    );
+                }
+                if p.factor < 2 {
+                    return Err("`penalty.factor` must be at least 2".into());
+                }
+                if p.max < self.timeout {
+                    return Err("`penalty.max` must be at least `timeout`".into());
+                }
+                if p.forget_after == 0 {
+                    return Err("`penalty.forget_after` must be at least 1 second".into());
+                }
+                (
+                    p.factor,
+                    Duration::from_secs(p.max),
+                    Duration::from_secs(p.forget_after),
+                )
+            }
+        };
+        for c in &self.costs {
+            if c.cost == 0 {
+                return Err("a `costs` entry must have `cost` of at least 1".into());
+            }
+            if c.cost > burst {
+                return Err(format!(
+                    "a `costs` entry costs {} but `burst` is {burst}: such a request could never pass — raise `burst`",
+                    c.cost
+                ));
+            }
+            if c.regex.is_none() && c.methods.is_empty() {
+                return Err("a `costs` entry needs a `regex`, `methods`, or both".into());
+            }
+            if let Some(r) = &c.regex {
+                regex::Regex::new(r).map_err(|e| format!("invalid `costs` regex {r:?}: {e}"))?;
+            }
+        }
+        if let Some(a) = &self.adaptive {
+            if !(1..=99).contains(&a.cpu_threshold) {
+                return Err("`adaptive.cpu_threshold` must be between 1 and 99 (%)".into());
+            }
+            if !(a.min_factor > 0.0 && a.min_factor <= 1.0) {
+                return Err("`adaptive.min_factor` must be in (0, 1]".into());
+            }
+        }
         Ok(Quota {
             count,
             period,
             burst,
             block: Duration::from_secs(self.timeout),
+            penalty_factor,
+            penalty_max,
+            penalty_forget,
         })
     }
 
@@ -264,6 +510,19 @@ impl RateLimitConfig {
                 let mut s = format!("{rate} burst {}", q.burst);
                 if !q.block.is_zero() {
                     s.push_str(&format!(" timeout {}s", q.block.as_secs()));
+                }
+                if q.penalty_factor > 1 {
+                    s.push_str(&format!(
+                        " penalty x{} up to {}s",
+                        q.penalty_factor,
+                        q.penalty_max.as_secs()
+                    ));
+                }
+                if !self.costs.is_empty() {
+                    s.push_str(&format!(" costs {}", self.costs.len()));
+                }
+                if let Some(a) = &self.adaptive {
+                    s.push_str(&format!(" adaptive >{}% cpu", a.cpu_threshold));
                 }
                 match self.key {
                     RateLimitKey::Ip => {}
@@ -312,6 +571,10 @@ struct KeyState {
     tat: u64,
     /// Fin du blocage `timeout`, en ns depuis `Limiter::start`.
     blocked_until: u64,
+    /// Blocages déjà subis (pénalité progressive).
+    strikes: u32,
+    /// Dernier blocage, en ns depuis `Limiter::start`.
+    last_strike: u64,
 }
 
 /// Résultat d'une vérification.
@@ -353,15 +616,51 @@ impl Limiter {
         self.start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
     }
 
+    #[allow(dead_code)] // tests et diagnostic ; le middleware pèse ses requêtes
     pub fn check(&self, key: &str) -> Decision {
         self.check_at(key, self.now_ns())
     }
 
+    /// Requête de poids `weight` (coût × charge ; 1.0 = une requête).
+    pub fn check_weighted(&self, key: &str, weight: f64) -> Decision {
+        self.check_weighted_at(key, self.now_ns(), weight)
+    }
+
     /// Cœur de l'algorithme, à horloge explicite (testable).
+    #[allow(dead_code)] // tests
     pub fn check_at(&self, key: &str, now: u64) -> Decision {
+        self.check_weighted_at(key, now, 1.0)
+    }
+
+    /// Durée du blocage d'une `strikes`-ième récidive.
+    fn block_for(&self, strikes: u32) -> u64 {
+        if self.quota.penalty_factor <= 1 {
+            return self.block_ns;
+        }
+        let max = self.quota.penalty_max.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let mut b = self.block_ns;
+        for _ in 0..strikes {
+            b = b.saturating_mul(u64::from(self.quota.penalty_factor));
+            if b >= max {
+                return max;
+            }
+        }
+        b.min(max)
+    }
+
+    pub fn check_weighted_at(&self, key: &str, now: u64, weight: f64) -> Decision {
+        // Poids d'une requête en « temps de bucket ». Plafonné à la
+        // tolérance : un bucket plein laisse toujours passer une requête,
+        // même très chère ou sous forte charge.
+        let increment = ((self.emission_ns as f64) * weight.max(0.0))
+            .round()
+            .clamp(1.0, self.tolerance_ns.max(self.emission_ns) as f64)
+            as u64;
         let mut st = self.states.entry(key.to_owned()).or_insert(KeyState {
             tat: now,
             blocked_until: 0,
+            strikes: 0,
+            last_strike: 0,
         });
 
         if st.blocked_until > now {
@@ -370,13 +669,26 @@ impl Limiter {
             };
         }
 
-        let new_tat = st.tat.max(now).saturating_add(self.emission_ns);
+        let new_tat = st.tat.max(now).saturating_add(increment);
         let allowed_from = new_tat.saturating_sub(self.tolerance_ns);
         if allowed_from > now {
             let mut wait = allowed_from - now;
             if self.block_ns > 0 {
-                st.blocked_until = now.saturating_add(self.block_ns);
-                wait = wait.max(self.block_ns);
+                // Pénalité progressive : les récidives anciennes sont
+                // oubliées, les récentes allongent le blocage.
+                let forget = self
+                    .quota
+                    .penalty_forget
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                if st.strikes > 0 && now.saturating_sub(st.last_strike) > forget {
+                    st.strikes = 0;
+                }
+                let block = self.block_for(st.strikes);
+                st.strikes = st.strikes.saturating_add(1);
+                st.last_strike = now;
+                st.blocked_until = now.saturating_add(block);
+                wait = wait.max(block);
             }
             return Decision::Deny {
                 retry_after: Duration::from_nanos(wait),
@@ -392,8 +704,17 @@ impl Limiter {
     /// Oublie les clés revenues à l'état neuf (ni dette, ni blocage).
     pub fn purge(&self) {
         let now = self.now_ns();
-        self.states
-            .retain(|_, st| st.tat > now || st.blocked_until > now);
+        let forget = self
+            .quota
+            .penalty_forget
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        self.states.retain(|_, st| {
+            st.tat > now
+                || st.blocked_until > now
+                // Une récidive récente doit être retenue pour la suivante.
+                || (st.strikes > 0 && now.saturating_sub(st.last_strike) <= forget)
+        });
         self.states.shrink_to_fit();
     }
 
@@ -409,6 +730,9 @@ impl Limiter {
 struct Entry {
     limiter: Arc<Limiter>,
     key: RateLimitKey,
+    /// Règles de coût compilées : (regex, méthodes, coût).
+    costs: Arc<Vec<(Option<regex::Regex>, Vec<String>, u32)>>,
+    adaptive: Option<AdaptiveConfig>,
     /// Nom du cookie, pour `key: cookie`.
     cookie: Option<Arc<str>>,
     /// Plafond par IP (`ip_ceiling`), vérifié avant la clé.
@@ -432,6 +756,8 @@ struct RouteLimits {
 pub struct RateLimiters {
     /// Index de route → limites.
     by_route: Vec<Option<RouteLimits>>,
+    /// Index de route → plafond global (`bandwidth_max`).
+    caps_by_route: Vec<Option<Arc<Cap>>>,
     /// Tous les compteurs distincts (pour la purge et le résumé).
     all: Vec<Arc<Limiter>>,
 }
@@ -561,9 +887,32 @@ impl RateLimiters {
                     l
                 })
                 .clone();
+            let costs = cfg
+                .costs
+                .iter()
+                .map(|c| {
+                    let re = c.regex.as_deref().map(regex::Regex::new).transpose();
+                    re.map(|re| {
+                        (
+                            re,
+                            c.methods
+                                .iter()
+                                .map(|m| m.to_ascii_uppercase())
+                                .collect::<Vec<_>>(),
+                            c.cost,
+                        )
+                    })
+                    .map_err(|e| format!("{}: invalid `costs` regex: {e}", where_()))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            if cfg.adaptive.is_some() {
+                start_cpu_sampler();
+            }
             Ok(Entry {
                 limiter,
                 key: cfg.key,
+                costs: Arc::new(costs),
+                adaptive: cfg.adaptive.clone(),
                 cookie,
                 ceiling,
             })
@@ -610,11 +959,98 @@ impl RateLimiters {
             by_route.push(Some(RouteLimits { general, auth }));
         }
 
-        Ok(RateLimiters { by_route, all })
+        // Plafonds globaux : un par groupe `vhosts:` (routes qui héritent),
+        // ou par route qui écrit le sien.
+        let mut caps: HashMap<String, Arc<Cap>> = HashMap::new();
+        let mut caps_by_route = Vec::with_capacity(routes.len());
+        for (index, rule) in routes.iter().enumerate() {
+            let Some(bw) = rule.bandwidth_max.as_ref() else {
+                caps_by_route.push(None);
+                continue;
+            };
+            let place = format!(
+                "routes.yml: route `{}` (vhost {:?}): bandwidth_max",
+                rule.prefix, rule.vhost
+            );
+            if bw.request_per_second == 0 {
+                return Err(format!("{place}: `request_per_second` must be at least 1"));
+            }
+            let scope = match bw.inherited_from_group {
+                Some(g) => format!("group#{g}"),
+                None => format!("route#{index}"),
+            };
+            let cap = match caps.get(&scope) {
+                Some(c) => c.clone(),
+                None => {
+                    let quota = Quota {
+                        count: bw.request_per_second,
+                        period: Duration::from_secs(1),
+                        burst: bw.burst.unwrap_or(bw.request_per_second).max(1),
+                        block: Duration::ZERO,
+                        penalty_factor: 1,
+                        penalty_max: Duration::ZERO,
+                        penalty_forget: Duration::ZERO,
+                    };
+                    let page = Arc::new(
+                        CapPage::load(&bw.static_page).map_err(|e| format!("{place}: {e}"))?,
+                    );
+                    let limiter = Arc::new(Limiter::new(quota));
+                    all.push(limiter.clone());
+                    let nets = |list: &[String],
+                                field: &str|
+                     -> Result<Vec<ipnet::IpNet>, String> {
+                        list.iter()
+                            .map(|e| parse_net(e).map_err(|err| format!("{place}.{field}: {err}")))
+                            .collect()
+                    };
+                    let c = Arc::new(Cap {
+                        limiter,
+                        page,
+                        rps: bw.request_per_second,
+                        filtered: nets(&bw.ip_filtered, "ip_filtered")?,
+                        nofiltered: nets(&bw.ip_nofiltered, "ip_nofiltered")?,
+                    });
+                    caps.insert(scope, c.clone());
+                    c
+                }
+            };
+            caps_by_route.push(Some(cap));
+        }
+
+        Ok(RateLimiters {
+            by_route,
+            caps_by_route,
+            all,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
         self.all.is_empty()
+    }
+
+    /// Plafond global applicable : celui de la route, sinon (chemin
+    /// qu'aucune route ne sert) celui du vhost. Les défis ACME n'y sont
+    /// jamais soumis : un renouvellement de certificat ne doit pas échouer
+    /// parce que le site est saturé.
+    fn resolve_cap(
+        &self,
+        routes: &[RouteRule],
+        path: &str,
+        host: Option<&str>,
+    ) -> Option<&Arc<Cap>> {
+        if path.starts_with("/.well-known/acme-challenge/") {
+            return None;
+        }
+        let idx = match_route_idx(path, host, routes).or_else(|| {
+            let r = find_vhost_route(host, routes)?;
+            routes.iter().position(|x| {
+                x.vhost == r.vhost
+                    && x.bandwidth_max
+                        .as_ref()
+                        .is_some_and(|b| b.inherited_from_group.is_some())
+            })
+        })?;
+        self.caps_by_route.get(idx)?.as_ref()
     }
 
     /// Lance la purge périodique des clés inactives (sur le runtime
@@ -641,12 +1077,38 @@ impl RateLimiters {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for r in routes {
-            let Some(cfg) = &r.ratelimit else { continue };
             let label = if r.vhost.is_empty() {
                 "(catch-all)".to_string()
             } else {
                 r.vhost.join(", ")
             };
+            if let Some(bw) = &r.bandwidth_max {
+                let line = format!(
+                    "bandwidth_max {label}{}: {} req/s{} → {} (503){}{}",
+                    if bw.inherited_from_group.is_some() {
+                        String::new()
+                    } else {
+                        format!(" {}", r.prefix)
+                    },
+                    bw.request_per_second,
+                    bw.burst.map(|b| format!(" burst {b}")).unwrap_or_default(),
+                    bw.static_page,
+                    if bw.ip_filtered.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", only {}", bw.ip_filtered.join(" "))
+                    },
+                    if bw.ip_nofiltered.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", never {}", bw.ip_nofiltered.join(" "))
+                    }
+                );
+                if seen.insert(line.clone()) {
+                    out.push(line);
+                }
+            }
+            let Some(cfg) = &r.ratelimit else { continue };
             let mut line = format!("ratelimit {label}: {}", cfg.describe());
             if let Some(a) = &cfg.auth {
                 line.push_str(&format!(" | auth: {}", a.describe()));
@@ -699,11 +1161,111 @@ impl RateLimiters {
 
 // ─── Middleware hyper ────────────────────────────────────────────────
 
+/// La page de surplus de `bandwidth_max`.
+fn over_capacity_response(cap: &Cap) -> HttpResponse {
+    HttpResponse::ServiceUnavailable()
+        .insert_header((header::CONTENT_TYPE, cap.page.content_type.as_str()))
+        .insert_header((header::RETRY_AFTER, "1"))
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .insert_header(("x-bandwidth-max", cap.rps.to_string()))
+        .body(cap.page.body())
+}
+
+/// Route sans `ratelimit` mais avec `bandwidth_max` : seul le plafond.
+fn over_capacity_or_next(
+    cap: Arc<Cap>,
+    req: ServiceRequest,
+    next: Next,
+    host: Option<&str>,
+) -> ServiceFuture {
+    match cap.limiter.check("*") {
+        Decision::Allow { .. } => next.call(req),
+        Decision::Deny { .. } => {
+            tracing::warn!(
+                host = %host.unwrap_or("-"),
+                path = %req.path(),
+                limit = cap.rps,
+                "bandwidth_max reached: request served the static page (503)"
+            );
+            Box::pin(async move { Ok(req.into_response(over_capacity_response(&cap))) })
+        }
+    }
+}
+
 /// Middleware de limitation de débit, à enregistrer avec
 /// `App::wrap(VhostRateLimit { .. })`.
 pub struct VhostRateLimit {
     pub state: web::Data<AppState>,
     pub limiters: Arc<RateLimiters>,
+}
+
+impl Entry {
+    /// Coût de la requête (première règle de `costs` qui correspond, sinon
+    /// 1), divisé par le facteur de charge (`adaptive`).
+    fn weight(&self, method: &str, path: &str) -> (f64, u32, f64) {
+        let cost = self
+            .costs
+            .iter()
+            .find(|(re, methods, _)| {
+                re.as_ref().is_none_or(|re| re.is_match(path))
+                    && (methods.is_empty() || methods.iter().any(|m| m == method))
+            })
+            .map(|(_, _, c)| *c)
+            .unwrap_or(1);
+        let factor = self
+            .adaptive
+            .as_ref()
+            .map(|a| a.factor(cpu_percent()))
+            .unwrap_or(1.0);
+        (f64::from(cost) / factor, cost, factor)
+    }
+}
+
+static CPU_PERCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CPU_SAMPLER: std::sync::Once = std::sync::Once::new();
+
+/// Occupation du processeur de la machine (toutes les cœurs), en %,
+/// mesurée chaque seconde depuis `/proc/stat`.
+pub fn cpu_percent() -> u32 {
+    CPU_PERCENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Démarré une seule fois, et seulement si un bloc utilise `adaptive`.
+fn start_cpu_sampler() {
+    CPU_SAMPLER.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("ratelimit-cpu".into())
+            .spawn(|| {
+                let read = || -> Option<(u64, u64)> {
+                    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+                    let line = stat.lines().next()?;
+                    let v: Vec<u64> = line
+                        .split_whitespace()
+                        .skip(1)
+                        .filter_map(|x| x.parse().ok())
+                        .collect();
+                    if v.len() < 4 {
+                        return None;
+                    }
+                    let idle = v[3] + v.get(4).copied().unwrap_or(0); // idle + iowait
+                    Some((v.iter().sum(), idle))
+                };
+                let mut prev = read();
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let cur = read();
+                    if let (Some((t0, i0)), Some((t1, i1))) = (prev, cur) {
+                        let total = t1.saturating_sub(t0);
+                        let idle = i1.saturating_sub(i0);
+                        if total > 0 {
+                            let busy = ((total - idle.min(total)) * 100 / total) as u32;
+                            CPU_PERCENT.store(busy, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    prev = cur;
+                }
+            });
+    });
 }
 
 /// Utilisateur du jeton présenté (Bearer, sinon cookie de session), s'il
@@ -798,11 +1360,25 @@ impl Middleware for VhostRateLimit {
         }
         let state = &self.state;
         let host = request_host(req.request());
+        let cap = self
+            .limiters
+            .resolve_cap(&state.routes.routes, req.path(), host.as_deref())
+            .cloned();
         let Some(entry) = self
             .limiters
             .resolve(&state.routes.routes, req.path(), host.as_deref())
         else {
-            return next.call(req);
+            return match cap {
+                Some(cap) => {
+                    let ip = client_ip(req.request(), &state.config);
+                    if cap.applies_to(ip) {
+                        over_capacity_or_next(cap, req, next, host.as_deref())
+                    } else {
+                        next.call(req)
+                    }
+                }
+                None => next.call(req),
+            };
         };
 
         let Some(ip) = client_ip(req.request(), &state.config) else {
@@ -811,26 +1387,43 @@ impl Middleware for VhostRateLimit {
             let res = HttpResponse::InternalServerError().body("Unable to determine client IP");
             return Box::pin(async move { Ok(req.into_response(res)) });
         };
+        let ip_addr = ip;
         let ip = ip.to_string();
+        // Le plafond global ne concerne pas les adresses exemptées.
+        let cap = cap.filter(|c| c.applies_to(Some(ip_addr)));
+        // Poids de la requête : son coût (`costs`), divisé par le facteur
+        // de charge (`adaptive`). 1.0 pour une requête ordinaire au calme.
+        let (weight, cost, load_factor) = entry.weight(req.method().as_str(), req.path());
         // Plafond par IP d'abord : quelles que soient les clés présentées,
         // une adresse ne dépasse jamais ce débit.
         let (key, decision, quota) = match &entry.ceiling {
-            Some(c) => match c.check(&ip) {
+            Some(c) => match c.check_weighted(&ip, weight) {
                 Decision::Allow { .. } => {
                     let key = key_for(&req, state, entry, &ip);
-                    let d = entry.limiter.check(&key);
+                    let d = entry.limiter.check_weighted(&key, weight);
                     (key, d, entry.limiter.quota())
                 }
                 deny => (format!("ip_ceiling:{ip}"), deny, c.quota()),
             },
             None => {
                 let key = key_for(&req, state, entry, &ip);
-                let d = entry.limiter.check(&key);
+                let d = entry.limiter.check_weighted(&key, weight);
                 (key, d, entry.limiter.quota())
             }
         };
 
         match decision {
+            // Le plafond global ne compte que les requêtes que la limite
+            // par client aurait laissées passer : un client déjà refusé ne
+            // consomme pas la capacité des autres.
+            Decision::Allow { .. }
+                if cap
+                    .as_ref()
+                    .is_some_and(|c| !matches!(c.limiter.check("*"), Decision::Allow { .. })) =>
+            {
+                let cap = cap.expect("checked above");
+                Box::pin(async move { Ok(req.into_response(over_capacity_response(&cap))) })
+            }
             Decision::Allow { remaining } => {
                 let fut = next.call(req);
                 Box::pin(async move {
@@ -854,6 +1447,8 @@ impl Middleware for VhostRateLimit {
                     host = %host.as_deref().unwrap_or("-"),
                     path = %req.path(),
                     user_agent = %user_agent,
+                    cost = cost,
+                    load_factor = %format!("{load_factor:.2}"),
                     retry_after_secs = retry_after.as_secs(),
                     "Rate limit exceeded (429)"
                 );
@@ -1145,6 +1740,234 @@ routes:
         // A username that looks like an IP never shares the IP's counter.
         assert_ne!(compose_key(RateLimitKey::UserIp, Some(ip), ip), ip);
         assert_eq!(compose_key(RateLimitKey::Ip, Some("alice"), ip), ip);
+    }
+
+    #[test]
+    fn bandwidth_max_is_one_counter_for_the_whole_vhost() {
+        let dir = std::env::temp_dir().join(format!("pa-bw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("busy.html");
+        std::fs::write(&page, "<h1>busy</h1>").unwrap();
+        let yaml = format!(
+            r#"
+vhosts:
+  - vhost: ["app.example.com"]
+    bandwith_max:                       # the spelling from the request works too
+      request_per_second: 3
+      static_page: "{}"
+    routes:
+      - {{ prefix: "/", target: "http://127.0.0.1:1" }}
+      - {{ prefix: "/api", target: "http://127.0.0.1:1" }}
+"#,
+            page.display()
+        );
+        let routes: crate::config::config::RouteConfig = serde_yaml::from_str(&yaml).unwrap();
+        let routes = routes.expand_vhost_groups().routes;
+        let rl = RateLimiters::from_routes(&routes).unwrap();
+        assert!(!rl.is_empty());
+        let host = Some("app.example.com");
+        let a = rl.resolve_cap(&routes, "/", host).unwrap();
+        let b = rl.resolve_cap(&routes, "/api/x", host).unwrap();
+        assert!(
+            Arc::ptr_eq(a, b),
+            "routes inheriting the vhost share one cap"
+        );
+        assert!(
+            rl.resolve_cap(&routes, "/.well-known/acme-challenge/t", host)
+                .is_none()
+        );
+        // 3 requests pass, whatever path or client; the 4th gets the page.
+        for _ in 0..3 {
+            assert!(matches!(a.limiter.check("*"), Decision::Allow { .. }));
+        }
+        assert!(matches!(b.limiter.check("*"), Decision::Deny { .. }));
+        assert_eq!(&a.page.body()[..], b"<h1>busy</h1>");
+        assert_eq!(a.page.content_type, "text/html; charset=utf-8");
+        // Who is subject to the cap.
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        assert!(a.applies_to(ip("203.0.113.9")), "no lists: everyone");
+        let filtered_yaml = yaml.replace(
+            "      static_page:",
+            "      ip_filtered: [\"0.0.0.0/0\", \"::/0\"]\n      ip_nofiltered: [\"192.168.0.0/24\", \"fe80::/64\", \"10.1.2.3\"]\n      static_page:",
+        );
+        let routes2: crate::config::config::RouteConfig =
+            serde_yaml::from_str(&filtered_yaml).unwrap();
+        let routes2 = routes2.expand_vhost_groups().routes;
+        let rl2 = RateLimiters::from_routes(&routes2).unwrap();
+        let c = rl2.resolve_cap(&routes2, "/", host).unwrap();
+        assert!(
+            c.applies_to(ip("203.0.113.9")),
+            "an outside address is capped"
+        );
+        assert!(c.applies_to(ip("2001:db8::1")));
+        assert!(
+            !c.applies_to(ip("192.168.0.42")),
+            "the internal network never is"
+        );
+        assert!(!c.applies_to(ip("fe80::1234")));
+        assert!(!c.applies_to(ip("10.1.2.3")), "a single address works too");
+        assert!(c.applies_to(None), "unknown address: capped");
+        // Only some addresses capped.
+        let only = yaml.replace(
+            "      static_page:",
+            "      ip_filtered: [\"203.0.113.0/24\"]\n      static_page:",
+        );
+        let r3: crate::config::config::RouteConfig = serde_yaml::from_str(&only).unwrap();
+        let r3 = r3.expand_vhost_groups().routes;
+        let rl3 = RateLimiters::from_routes(&r3).unwrap();
+        let c3 = rl3.resolve_cap(&r3, "/", host).unwrap();
+        assert!(c3.applies_to(ip("203.0.113.7")) && !c3.applies_to(ip("198.51.100.1")));
+        // Invalid entries stop startup — `fe80::00::00/64` has two `::`.
+        let bad_net = yaml.replace(
+            "      static_page:",
+            "      ip_nofiltered: [\"fe80::00::00/64\"]\n      static_page:",
+        );
+        let r4: crate::config::config::RouteConfig = serde_yaml::from_str(&bad_net).unwrap();
+        let err = RateLimiters::from_routes(&r4.expand_vhost_groups().routes).unwrap_err();
+        assert!(
+            err.contains("ip_nofiltered") && err.contains("fe80::00::00/64"),
+            "{err}"
+        );
+        // A missing page stops startup.
+        let bad = yaml.replace("busy.html", "missing.html");
+        let routes: crate::config::config::RouteConfig = serde_yaml::from_str(&bad).unwrap();
+        assert!(RateLimiters::from_routes(&routes.expand_vhost_groups().routes).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const SEC: u64 = 1_000_000_000;
+
+    #[test]
+    fn progressive_penalty_grows_then_is_forgotten() {
+        let q = cfg("limit_req_per_sec: 1\nburst: 1\ntimeout: 10\npenalty: { factor: 3, max: 60, forget_after: 300 }")
+            .quota()
+            .unwrap();
+        let l = Limiter::new(q);
+        let deny_secs = |d: Decision| match d {
+            Decision::Deny { retry_after } => retry_after.as_secs(),
+            Decision::Allow { .. } => 0,
+        };
+        let mut t = 0;
+        assert!(matches!(l.check_at("k", t), Decision::Allow { .. }));
+        // 1st offence: 10 s; 2nd: 30 s; 3rd: 90 s capped at 60 s.
+        assert_eq!(deny_secs(l.check_at("k", t)), 10);
+        t += 11 * SEC;
+        assert!(matches!(l.check_at("k", t), Decision::Allow { .. }));
+        assert_eq!(deny_secs(l.check_at("k", t)), 30);
+        t += 31 * SEC;
+        assert!(matches!(l.check_at("k", t), Decision::Allow { .. }));
+        assert_eq!(deny_secs(l.check_at("k", t)), 60);
+        // Requests refused during a block do not extend it.
+        assert_eq!(deny_secs(l.check_at("k", t + SEC)), 59);
+        // Quiet for longer than forget_after: back to the base timeout.
+        t += 400 * SEC;
+        assert!(matches!(l.check_at("k", t), Decision::Allow { .. }));
+        assert_eq!(deny_secs(l.check_at("k", t)), 10);
+        // Without penalty: always the same timeout.
+        let plain = Limiter::new(
+            cfg("limit_req_per_sec: 1\nburst: 1\ntimeout: 10")
+                .quota()
+                .unwrap(),
+        );
+        for i in 0..3u64 {
+            let at = i * 11 * SEC;
+            assert!(matches!(plain.check_at("k", at), Decision::Allow { .. }));
+            assert_eq!(deny_secs(plain.check_at("k", at)), 10);
+        }
+    }
+
+    #[test]
+    fn expensive_requests_use_more_of_the_bucket() {
+        let l = Limiter::new(cfg("limit_req_per_sec: 1\nburst: 10").quota().unwrap());
+        // A request costing 4 uses four tokens: two pass, the third does not.
+        assert!(matches!(
+            l.check_weighted_at("k", 0, 4.0),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            l.check_weighted_at("k", 0, 4.0),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            l.check_weighted_at("k", 0, 4.0),
+            Decision::Deny { .. }
+        ));
+        // Two plain requests still fit in what is left.
+        assert!(matches!(
+            l.check_weighted_at("k", 0, 1.0),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            l.check_weighted_at("k", 0, 1.0),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            l.check_weighted_at("k", 0, 1.0),
+            Decision::Deny { .. }
+        ));
+        // A full bucket always admits one request, however heavy.
+        let l = Limiter::new(cfg("limit_req_per_sec: 1\nburst: 2").quota().unwrap());
+        assert!(matches!(
+            l.check_weighted_at("k", 0, 50.0),
+            Decision::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn cost_rules_and_adaptive_factor() {
+        let c = cfg(r#"
+limit_req_per_sec: 5
+burst: 20
+costs:
+  - { regex: '\.(zip|tar\.gz)$', cost: 10 }
+  - { methods: ["post", "PUT"], cost: 2 }
+adaptive: { cpu_threshold: 70, min_factor: 0.25 }
+"#);
+        c.quota().unwrap();
+        let routes: crate::config::config::RouteConfig = serde_yaml::from_str(
+            r#"
+routes:
+  - prefix: "/"
+    target: "http://127.0.0.1:1"
+    ratelimit:
+      limit_req_per_sec: 5
+      burst: 20
+      costs:
+        - { regex: '\.(zip|tar\.gz)$', cost: 10 }
+        - { methods: ["post", "PUT"], cost: 2 }
+"#,
+        )
+        .unwrap();
+        let routes = routes.expand_vhost_groups().routes;
+        let rl = RateLimiters::from_routes(&routes).unwrap();
+        let e = rl.resolve(&routes, "/x", None).unwrap();
+        assert_eq!(e.weight("GET", "/repo/archive/main.zip").1, 10);
+        assert_eq!(e.weight("GET", "/repo/archive/main.tar.gz").1, 10);
+        assert_eq!(e.weight("POST", "/form").1, 2);
+        assert_eq!(e.weight("GET", "/page").1, 1);
+
+        let a = AdaptiveConfig {
+            cpu_threshold: 70,
+            min_factor: 0.25,
+        };
+        assert_eq!(a.factor(50), 1.0);
+        assert_eq!(a.factor(70), 1.0);
+        assert!(
+            (a.factor(85) - 0.625).abs() < 1e-9,
+            "halfway: halfway between 1 and 0.25"
+        );
+        assert_eq!(a.factor(100), 0.25);
+
+        for bad in [
+            "limit_req_per_sec: 1\nburst: 5\ncosts: [{ regex: 'x', cost: 6 }]", // cost > burst
+            "limit_req_per_sec: 1\ncosts: [{ cost: 2 }]", // no regex nor methods
+            "limit_req_per_sec: 1\npenalty: { factor: 2 }", // penalty without timeout
+            "limit_req_per_sec: 1\ntimeout: 10\npenalty: { factor: 1 }", // factor < 2
+            "limit_req_per_sec: 1\nadaptive: { cpu_threshold: 100 }", // threshold out of range
+            "limit_req_per_sec: 1\nadaptive: { min_factor: 0 }", // factor out of range
+        ] {
+            assert!(cfg(bad).quota().is_err(), "{bad} must be refused");
+        }
     }
 
     #[test]

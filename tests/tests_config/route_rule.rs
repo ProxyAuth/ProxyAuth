@@ -59,6 +59,7 @@ mod tests {
             internal_cache: None,
             discovery_csp: None,
             cache_backend: None,
+            bandwidth_max: None,
             port: None,
             protocol: None,
             if_vhost: Vec::new(),
