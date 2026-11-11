@@ -225,6 +225,91 @@ pub async fn prompt() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        Some(Commands::Antibot { action }) => {
+            let config: Arc<AppConfig> = load_config("/etc/proxyauth/config/config.json");
+            switch_to_user(config.effective_run_user())?;
+            ensure_running_as(config.effective_run_user());
+            // Les bannissements vivent dans la mémoire du serveur : la
+            // commande passe par son socket local (permissions 0600).
+            let command = match &action {
+                crate::cli::command::AntibotAction::Unban { ip } => {
+                    if ip.trim().parse::<std::net::IpAddr>().is_err() {
+                        eprintln!("{ip:?} is not an IPv4 or IPv6 address");
+                        std::process::exit(2);
+                    }
+                    format!("ANTIBOT UNBAN {}\n", ip.trim())
+                }
+                crate::cli::command::AntibotAction::List => "ANTIBOT LIST\n".to_string(),
+            };
+            let socket_path = crate::network::stats::STATS_SOCKET_PATH;
+            let mut stream = match tokio::net::UnixStream::connect(socket_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to connect to {socket_path}: {e} — is ProxyAuth running?");
+                    std::process::exit(1);
+                }
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Err(e) = stream.write_all(command.as_bytes()).await {
+                eprintln!("Failed to send the command: {e}");
+                std::process::exit(1);
+            }
+            let mut buf = Vec::new();
+            if let Err(e) = stream.read_to_end(&mut buf).await {
+                eprintln!("Failed to read the answer: {e}");
+                std::process::exit(1);
+            }
+            let v: serde_json::Value = serde_json::from_slice(&buf).unwrap_or_default();
+            if v["ok"] != serde_json::Value::Bool(true) {
+                eprintln!(
+                    "error: {}",
+                    v["error"]
+                        .as_str()
+                        .unwrap_or("no answer — is this server version recent enough?")
+                );
+                std::process::exit(1);
+            }
+            match action {
+                crate::cli::command::AntibotAction::Unban { .. } => {
+                    let ip = v["ip"].as_str().unwrap_or_default();
+                    let vhosts: Vec<&str> = v["vhosts"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                        .unwrap_or_default();
+                    if vhosts.is_empty() {
+                        println!("{ip} was not banned (its detections, if any, are forgotten)");
+                    } else {
+                        println!("{ip} unbanned on: {}", vhosts.join(", "));
+                    }
+                }
+                crate::cli::command::AntibotAction::List => {
+                    let bans = v["bans"].as_array().cloned().unwrap_or_default();
+                    if bans.is_empty() {
+                        println!("no address is banned");
+                    } else {
+                        println!(
+                            "{:<24} {:<40} {:>10} {:>10}  REASON",
+                            "VHOST", "IP", "REMAINING", "DETECTIONS"
+                        );
+                        for b in bans {
+                            println!(
+                                "{:<24} {:<40} {:>9}s {:>10}  {}",
+                                b["vhost"].as_str().unwrap_or_default(),
+                                b["ip"].as_str().unwrap_or_default(),
+                                b["remaining_secs"].as_u64().unwrap_or(0),
+                                b["detections"].as_u64().unwrap_or(0),
+                                b["reason"]
+                                    .as_str()
+                                    .filter(|r| !r.is_empty())
+                                    .unwrap_or("-")
+                            );
+                        }
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+
         Some(Commands::DbAddUser {
             username,
             password,

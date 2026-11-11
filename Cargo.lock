@@ -2637,14 +2637,14 @@ dependencies = [
 
 [[package]]
 name = "proxyauth"
-version = "1.4.5"
+version = "1.5.0-beta0"
 dependencies = [
  "ahash",
  "anyhow",
  "arc-swap",
  "argon2 0.6.0",
  "base32",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "brotli",
  "bytes",
@@ -2678,6 +2678,7 @@ dependencies = [
  "itoa",
  "jsonwebtoken",
  "lettre",
+ "libc",
  "libmimalloc-sys",
  "lmdb-rkv",
  "lru",

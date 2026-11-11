@@ -1207,6 +1207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     def_config::ensure_running_as(config.effective_run_user());
 
     let results = join_all(server_futures).await;
+    // Anti-bot : bannissements et détections gardés pour le prochain
+    // démarrage (`ban.store`).
+    network::antibot::save_all_stores();
     for r in results {
         match r {
             Ok(Err(e)) => error!("Server exited with error: {}", e),

@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.4.5"
+version = "1.5.0-beta0"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -36,13 +36,15 @@ mimalloc = { version = "0.1", default-features = false }
 # tirée par `mimalloc`.
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 # Allocateur alternatif, choisi à la compilation : `--features jemalloc`.
+# Résolution DNS inverse (antibot `hostname_nofiltered`).
+libc = "0.2"
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "blocking", "charset", "http2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.33"
 serde_json = { version = "1.0.140", features = ["preserve_order"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 sha2 = "0.11.0-rc.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

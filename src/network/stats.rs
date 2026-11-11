@@ -221,9 +221,38 @@ pub async fn spawn_stats_socket(
         let stats = stats.clone();
         let counter = counter.clone();
         tokio::spawn(async move {
-            let active_sessions = counter.count_active_sessions();
-            let resp = build_stats_response(&stats, active_sessions);
-            if let Ok(json) = serde_json::to_vec(&resp) {
+            // Une commande d'administration peut précéder (une ligne,
+            // envoyée par `proxyauth antibot …`) ; sans rien reçu dans les
+            // 150 ms, c'est `proxyauth stats`, qui n'envoie rien.
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 256];
+            let n =
+                match tokio::time::timeout(TokioDuration::from_millis(150), stream.read(&mut buf))
+                    .await
+                {
+                    Ok(Ok(n)) => n,
+                    _ => 0,
+                };
+            let line = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+            let reply = if let Some(ip) = line.strip_prefix("ANTIBOT UNBAN ") {
+                match ip.trim().parse::<std::net::IpAddr>() {
+                    Ok(ip) => {
+                        serde_json::json!({ "ok": true, "ip": ip.to_string(), "vhosts": crate::network::antibot::unban(ip) })
+                    }
+                    Err(_) => {
+                        serde_json::json!({ "ok": false, "error": format!("{:?} is not an IP address", ip.trim()) })
+                    }
+                }
+            } else if line == "ANTIBOT LIST" {
+                serde_json::json!({ "ok": true, "bans": crate::network::antibot::bans() })
+            } else if !line.is_empty() {
+                serde_json::json!({ "ok": false, "error": "unknown command" })
+            } else {
+                let active_sessions = counter.count_active_sessions();
+                serde_json::to_value(build_stats_response(&stats, active_sessions))
+                    .unwrap_or_default()
+            };
+            if let Ok(json) = serde_json::to_vec(&reply) {
                 let _ = stream.write_all(&json).await;
             }
         });

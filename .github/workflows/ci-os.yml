@@ -55,8 +55,12 @@ jobs:
               ;;
 
             "Arch Linux")
-              pacman -Sy --noconfirm archlinux-keyring
-              pacman -Sy --noconfirm nodejs npm
+              pacman-key --init \
+              && pacman-key --populate archlinux \
+              && pacman -Sy --noconfirm archlinux-keyring \
+              && pacman -Syu --noconfirm \
+              && pacman -S --needed --noconfirm nodejs npm \
+              && pacman -Scc --noconfirm
               node --version
               npm --version
               ;;

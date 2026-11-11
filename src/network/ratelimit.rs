@@ -376,12 +376,49 @@ pub struct AdaptiveConfig {
     pub cpu_threshold: u32,
     #[serde(default = "default_min_factor")]
     pub min_factor: f64,
+    /// Intervalle de mesure du processeur (`/proc/stat`), en secondes :
+    /// `2`, `"2s"`, `"500ms"`. Une seule mesure tourne pour tout le
+    /// serveur ; si plusieurs blocs en donnent un, le plus court l'emporte.
+    #[serde(
+        default = "default_sample_interval",
+        alias = "interval",
+        deserialize_with = "de_interval"
+    )]
+    pub sample_interval: f64,
 }
 fn default_cpu_threshold() -> u32 {
     75
 }
 fn default_min_factor() -> f64 {
     0.25
+}
+fn default_sample_interval() -> f64 {
+    2.0
+}
+
+fn de_interval<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum V {
+        N(f64),
+        S(String),
+    }
+    match V::deserialize(d)? {
+        V::N(n) => Ok(n),
+        V::S(s) => {
+            let t = s.trim();
+            let (num, mult) = if let Some(v) = t.strip_suffix("ms") {
+                (v, 0.001)
+            } else if let Some(v) = t.strip_suffix('s') {
+                (v, 1.0)
+            } else {
+                (t, 1.0)
+            };
+            num.trim().parse::<f64>().map(|n| n * mult).map_err(|_| {
+                serde::de::Error::custom(format!("{s:?} is not a duration (e.g. 2s, 500ms)"))
+            })
+        }
+    }
 }
 
 impl AdaptiveConfig {
@@ -493,6 +530,9 @@ impl RateLimitConfig {
             if !(a.min_factor > 0.0 && a.min_factor <= 1.0) {
                 return Err("`adaptive.min_factor` must be in (0, 1]".into());
             }
+            if !(0.5..=60.0).contains(&a.sample_interval) {
+                return Err("`adaptive.sample_interval` must be between 0.5 and 60 seconds".into());
+            }
         }
         Ok(Quota {
             count,
@@ -538,7 +578,10 @@ impl RateLimitConfig {
                     s.push_str(&format!(" costs {}", self.costs.len()));
                 }
                 if let Some(a) = &self.adaptive {
-                    s.push_str(&format!(" adaptive >{}% cpu", a.cpu_threshold));
+                    s.push_str(&format!(
+                        " adaptive >{}% cpu (sampled every {}s)",
+                        a.cpu_threshold, a.sample_interval
+                    ));
                 }
                 match self.key {
                     RateLimitKey::Ip => {}
@@ -922,7 +965,12 @@ impl RateLimiters {
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             if cfg.adaptive.is_some() {
-                start_cpu_sampler();
+                start_cpu_sampler(
+                    cfg.adaptive
+                        .as_ref()
+                        .map(|a| a.sample_interval)
+                        .unwrap_or(2.0),
+                );
             }
             Ok(Entry {
                 limiter,
@@ -1264,7 +1312,12 @@ pub fn cpu_percent() -> u32 {
 }
 
 /// Démarré une seule fois, et seulement si un bloc utilise `adaptive`.
-fn start_cpu_sampler() {
+/// Intervalle de mesure en ms : le plus court demandé par les blocs.
+static CPU_INTERVAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn start_cpu_sampler(interval_secs: f64) {
+    let ms = (interval_secs * 1000.0).round().max(500.0) as u64;
+    CPU_INTERVAL_MS.fetch_min(ms, std::sync::atomic::Ordering::Relaxed);
     CPU_SAMPLER.call_once(|| {
         let _ = std::thread::Builder::new()
             .name("ratelimit-cpu".into())
@@ -1285,7 +1338,10 @@ fn start_cpu_sampler() {
                 };
                 let mut prev = read();
                 loop {
-                    std::thread::sleep(Duration::from_secs(1));
+                    let ms = CPU_INTERVAL_MS
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .clamp(500, 60_000);
+                    std::thread::sleep(Duration::from_millis(ms));
                     let cur = read();
                     if let (Some((t0, i0)), Some((t1, i1))) = (prev, cur) {
                         let total = t1.saturating_sub(t0);
@@ -1935,6 +1991,26 @@ vhosts:
     }
 
     #[test]
+    fn cpu_sampling_interval() {
+        let a: AdaptiveConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(a.sample_interval, 2.0, "every 2 s by default");
+        for (y, v) in [
+            ("{ sample_interval: 5 }", 5.0),
+            ("{ sample_interval: \"3s\" }", 3.0),
+            ("{ interval: \"500ms\" }", 0.5),
+        ] {
+            assert_eq!(
+                serde_yaml::from_str::<AdaptiveConfig>(y)
+                    .unwrap()
+                    .sample_interval,
+                v,
+                "{y}"
+            );
+        }
+        assert!(serde_yaml::from_str::<AdaptiveConfig>("{ sample_interval: soon }").is_err());
+    }
+
+    #[test]
     fn expensive_requests_use_more_of_the_bucket() {
         let l = Limiter::new(cfg("limit_req_per_sec: 1\nburst: 10").quota().unwrap());
         // A request costing 4 uses four tokens: two pass, the third does not.
@@ -2007,6 +2083,7 @@ routes:
         let a = AdaptiveConfig {
             cpu_threshold: 70,
             min_factor: 0.25,
+            sample_interval: 2.0,
         };
         assert_eq!(a.factor(50), 1.0);
         assert_eq!(a.factor(70), 1.0);
@@ -2023,6 +2100,7 @@ routes:
             "limit_req_per_sec: 1\ntimeout: 10\npenalty: { factor: 1 }", // factor < 2
             "limit_req_per_sec: 1\nadaptive: { cpu_threshold: 100 }", // threshold out of range
             "limit_req_per_sec: 1\nadaptive: { min_factor: 0 }", // factor out of range
+            "limit_req_per_sec: 1\nadaptive: { sample_interval: 0.1 }", // too often
         ] {
             assert!(cfg(bad).quota().is_err(), "{bad} must be refused");
         }

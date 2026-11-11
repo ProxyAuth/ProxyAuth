@@ -33,6 +33,11 @@ pub enum Commands {
         insecure: bool,
     },
     Stats,
+    /// Anti-bot administration, on the running server.
+    Antibot {
+        #[command(subcommand)]
+        action: AntibotAction,
+    },
     Sync {
         target: Option<String>,
     },
@@ -242,6 +247,18 @@ pub enum QuickstartAction {
     /// route lets an already-signed-in visitor reach. Shows what is in
     /// force first, resolved exactly the way the server resolves it.
     VhostAccess,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AntibotAction {
+    /// Lifts the ban of an address on every vhost, and forgets its
+    /// detections: `proxyauth antibot unban 203.0.113.9`.
+    Unban {
+        /// The IPv4 or IPv6 address to unban.
+        ip: String,
+    },
+    /// Lists the addresses currently banned.
+    List,
 }
 
 #[derive(Subcommand)]
