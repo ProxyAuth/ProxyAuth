@@ -376,6 +376,11 @@ macro_rules! build_app {
             // * AccessLogger, le plus extérieur, pour journaliser le statut
             //   final de *toute* requête, 421/429/505 compris, avec la
             //   taille réellement envoyée (compressée).
+            // Anti-bot (`antibot:`) : à l'intérieur du rate limit, qui
+            // protège donc aussi la page de vérification et sa réponse.
+            .wrap(network::antibot::AntiBot {
+                state: state.clone(),
+            })
             .wrap(VhostRateLimit {
                 state: state.clone(),
                 limiters: $limiters.clone(),
@@ -792,6 +797,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Caches internes (désactivés par défaut) : globaux et par vhost.
     network::fs_cache::init(&config.internal_cache, &routes.routes);
     network::compression::init_compressed_caches(&config.internal_cache, &routes.routes);
+    match network::antibot::init(&routes.routes, &config.secret) {
+        Ok(lines) => {
+            for line in lines {
+                info!("{line}");
+                println!("{line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
     match network::backend_cache::init_backend_caches(&routes.routes) {
         Ok(lines) => {
             for line in lines {

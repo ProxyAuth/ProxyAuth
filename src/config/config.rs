@@ -959,6 +959,11 @@ pub struct RouteRule {
     #[serde(default, alias = "bandwith_max")]
     pub bandwidth_max: Option<crate::network::ratelimit::BandwidthMax>,
 
+    /// Anti-bot par preuve de travail (voir `network::antibot`). Hérité du
+    /// groupe `vhosts:`.
+    #[serde(default)]
+    pub antibot: Option<crate::network::antibot::AntiBotConfig>,
+
     /// Relaie les connexions WebSocket (`Upgrade: websocket`) vers
     /// `target`, qui peut alors être en `ws://` ou `wss://`. Voir
     /// `network::websocket`. Hérité du groupe `vhosts:` ; défaut : non.
@@ -1517,6 +1522,11 @@ pub struct VhostGroup {
     #[serde(default, alias = "bandwith_max")]
     pub bandwidth_max: Option<crate::network::ratelimit::BandwidthMax>,
 
+    /// Anti-bot par preuve de travail (voir `network::antibot`). Hérité du
+    /// groupe `vhosts:`.
+    #[serde(default)]
+    pub antibot: Option<crate::network::antibot::AntiBotConfig>,
+
     /// Relais WebSocket pour les routes du vhost (voir
     /// `RouteRule::forward_websocket`).
     #[serde(default)]
@@ -1759,6 +1769,9 @@ impl RouteConfig {
                 }
                 if route.discovery_csp.is_none() {
                     route.discovery_csp = group.discovery_csp;
+                }
+                if route.antibot.is_none() {
+                    route.antibot = group.antibot.clone();
                 }
                 if route.bandwidth_max.is_none() {
                     route.bandwidth_max = group.bandwidth_max.clone().map(|mut b| {

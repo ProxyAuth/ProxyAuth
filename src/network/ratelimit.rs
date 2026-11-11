@@ -231,6 +231,16 @@ pub struct BandwidthMax {
     /// supervision… Prioritaire sur `ip_filtered`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ip_nofiltered: Vec<String>,
+    /// Chemins jamais soumis au plafond, ni comptés (regex sur le chemin) :
+    /// fichiers statiques, page de surplus elle-même, sondes de santé…
+    /// Aussi accepté : `excludes`, `exclude_regex`.
+    #[serde(
+        default,
+        alias = "excludes",
+        alias = "exclude_regex",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub exclude: Vec<String>,
     /// Rempli par `expand_vhost_groups` quand la route hérite le bloc de
     /// son groupe : tout le vhost partage alors un seul plafond.
     #[serde(skip)]
@@ -245,9 +255,15 @@ struct Cap {
     rps: u32,
     filtered: Vec<ipnet::IpNet>,
     nofiltered: Vec<ipnet::IpNet>,
+    exclude: Vec<regex::Regex>,
 }
 
 impl Cap {
+    /// Le chemin est exclu du plafond (une regex de `exclude` y correspond).
+    fn excludes(&self, path: &str) -> bool {
+        self.exclude.iter().any(|re| re.is_match(path))
+    }
+
     /// Le plafond s'applique-t-il à ce client ? Les adresses de
     /// `ip_nofiltered` passent toujours, sans être comptées ; sinon celles
     /// de `ip_filtered` (toutes si la liste est vide). Sans IP connue, le
@@ -1009,6 +1025,15 @@ impl RateLimiters {
                         rps: bw.request_per_second,
                         filtered: nets(&bw.ip_filtered, "ip_filtered")?,
                         nofiltered: nets(&bw.ip_nofiltered, "ip_nofiltered")?,
+                        exclude: bw
+                            .exclude
+                            .iter()
+                            .map(|r| {
+                                regex::Regex::new(r).map_err(|e| {
+                                    format!("{place}.exclude: invalid regex {r:?}: {e}")
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?,
                     });
                     caps.insert(scope, c.clone());
                     c
@@ -1050,7 +1075,11 @@ impl RateLimiters {
                         .is_some_and(|b| b.inherited_from_group.is_some())
             })
         })?;
-        self.caps_by_route.get(idx)?.as_ref()
+        self.caps_by_route
+            .get(idx)?
+            .as_ref()
+            // Chemin exclu : ni plafonné, ni compté.
+            .filter(|c| !c.excludes(path))
     }
 
     /// Lance la purge périodique des clés inactives (sur le runtime
@@ -1103,7 +1132,11 @@ impl RateLimiters {
                     } else {
                         format!(", never {}", bw.ip_nofiltered.join(" "))
                     }
-                );
+                ) + &if bw.exclude.is_empty() {
+                    String::new()
+                } else {
+                    format!(", paths excluded: {}", bw.exclude.join(" "))
+                };
                 if seen.insert(line.clone()) {
                     out.push(line);
                 }
@@ -1827,6 +1860,31 @@ vhosts:
         assert!(
             err.contains("ip_nofiltered") && err.contains("fe80::00::00/64"),
             "{err}"
+        );
+        // Excluded paths: never capped, never counted.
+        let ex = yaml.replace(
+            "      static_page:",
+            "      exclude: ['\\.(css|js|png|svg|woff2)$', '^/healthz$']\n      static_page:",
+        );
+        let r5: crate::config::config::RouteConfig = serde_yaml::from_str(&ex).unwrap();
+        let r5 = r5.expand_vhost_groups().routes;
+        let rl5 = RateLimiters::from_routes(&r5).unwrap();
+        assert!(rl5.resolve_cap(&r5, "/static/app.js", host).is_none());
+        assert!(rl5.resolve_cap(&r5, "/img/logo.png", host).is_none());
+        assert!(rl5.resolve_cap(&r5, "/healthz", host).is_none());
+        assert!(
+            rl5.resolve_cap(&r5, "/page", host).is_some(),
+            "other paths are still capped"
+        );
+        let bad_re = yaml.replace(
+            "      static_page:",
+            "      exclude: ['(']\n      static_page:",
+        );
+        let r6: crate::config::config::RouteConfig = serde_yaml::from_str(&bad_re).unwrap();
+        assert!(
+            RateLimiters::from_routes(&r6.expand_vhost_groups().routes)
+                .unwrap_err()
+                .contains("exclude")
         );
         // A missing page stops startup.
         let bad = yaml.replace("busy.html", "missing.html");

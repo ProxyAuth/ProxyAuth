@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod accesslog;
+pub mod antibot;
 pub mod backend_cache;
 pub mod canonical_url;
 pub mod compression;

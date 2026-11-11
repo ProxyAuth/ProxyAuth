@@ -60,6 +60,7 @@ fn minimal_rule(prefix: &str) -> RouteRule {
         discovery_csp: None,
         cache_backend: None,
         bandwidth_max: None,
+        antibot: None,
         port: None,
         protocol: None,
         if_vhost: Vec::new(),
