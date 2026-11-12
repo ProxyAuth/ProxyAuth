@@ -1,6 +1,6 @@
 [package]
 name = "proxyauth"
-version = "1.5.0-beta0"
+version = "1.5.0"
 edition = "2024"
 authors = ["Vladimir S"]
 repository = "https://git.proxyauth.app/ProxyAuth/ProxyAuth"
@@ -44,7 +44,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.33"
 serde_json = { version = "1.0.140", features = ["preserve_order"] }
-base64 = "0.23.1"
+base64 = "0.22.1"
 sha2 = "0.11.0-rc.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

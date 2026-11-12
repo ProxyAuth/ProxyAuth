@@ -838,9 +838,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ip_blocklist: Arc<arc_swap::ArcSwap<Vec<ipnet::IpNet>>> =
         Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+    // Deux parts, fusionnées dans `ip_blocklist` : les sources
+    // `ip_blocklists`, et (`antibots_auto`) les fichiers `ban.export` de
+    // l'anti-bot, relus toutes les 15 s.
+    let bl_sources: Arc<arc_swap::ArcSwap<Vec<ipnet::IpNet>>> =
+        Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+    let bl_antibot: Arc<arc_swap::ArcSwap<Vec<ipnet::IpNet>>> =
+        Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+    let merge_blocklists = {
+        let (a, b, out) = (
+            Arc::clone(&bl_sources),
+            Arc::clone(&bl_antibot),
+            Arc::clone(&ip_blocklist),
+        );
+        move || {
+            let mut all: Vec<ipnet::IpNet> =
+                a.load().iter().chain(b.load().iter()).copied().collect();
+            all.sort();
+            all.dedup();
+            out.store(Arc::new(all));
+        }
+    };
+    let antibot_exports = network::antibot::export_paths(&routes.routes);
+    if config.antibots_auto {
+        if antibot_exports.is_empty() {
+            println!(
+                "[ip_blocklist] antibots_auto: no `ban.export` file in routes.yml, nothing to load"
+            );
+        } else {
+            let store = Arc::clone(&bl_antibot);
+            let merge = merge_blocklists.clone();
+            let paths = antibot_exports.clone();
+            println!(
+                "[ip_blocklist] antibots_auto: loading {} every 15 s",
+                paths.join(", ")
+            );
+            tokio::spawn(async move {
+                let mut last = usize::MAX;
+                loop {
+                    let mut nets = Vec::new();
+                    for p in &paths {
+                        if let Ok(text) = tokio::fs::read_to_string(p).await {
+                            nets.extend(
+                                text.lines()
+                                    .map(str::trim)
+                                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                                    .filter_map(|l| {
+                                        l.parse::<ipnet::IpNet>().ok().or_else(|| {
+                                            l.parse::<std::net::IpAddr>()
+                                                .ok()
+                                                .map(ipnet::IpNet::from)
+                                        })
+                                    }),
+                            );
+                        }
+                    }
+                    if nets.len() != last {
+                        println!(
+                            "[ip_blocklist] antibots_auto: {} banned address(es)",
+                            nets.len()
+                        );
+                        last = nets.len();
+                    }
+                    store.store(Arc::new(nets));
+                    merge();
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            });
+        }
+    }
     if !config.ip_blocklists.is_empty() {
         let bl_config = Arc::clone(&config);
-        let bl_store = Arc::clone(&ip_blocklist);
+        let bl_store = Arc::clone(&bl_sources);
+        let bl_merge = merge_blocklists.clone();
         tokio::spawn(async move {
             let fresh = crate::network::ipblocklist::refresh_all(&bl_config).await;
             println!(
@@ -849,6 +919,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bl_config.ip_blocklists.len()
             );
             bl_store.store(Arc::new(fresh));
+            bl_merge();
 
             if bl_config.ip_blocklist_refresh_interval_secs == 0 {
                 return;
@@ -862,6 +933,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let fresh = crate::network::ipblocklist::refresh_all(&bl_config).await;
                 println!("[ip_blocklist] refreshed: {} entr(y/ies)", fresh.len());
                 bl_store.store(Arc::new(fresh));
+                bl_merge();
             }
         });
     }
