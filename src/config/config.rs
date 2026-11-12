@@ -2180,6 +2180,13 @@ pub struct AppConfig {
     #[serde(default = "default_ip_blocklist_refresh_interval")]
     pub ip_blocklist_refresh_interval_secs: u64,
 
+    /// Bloquer sur tout le serveur, avant toute route, les adresses que
+    /// l'anti-bot a bannies : ProxyAuth relit toutes les 15 s les fichiers
+    /// `ban.export` de `routes.yml` et les ajoute à `ip_blocklists`. Un
+    /// bannissement expiré ou levé disparaît du fichier, donc du blocage.
+    #[serde(default)]
+    pub antibots_auto: bool,
+
     /// How often every `redirect_protect.allow_url_ips`/`deny_url_ips`
     /// source, across every route, is re-fetched — same shape and
     /// same default as `ip_blocklist_refresh_interval_secs`, kept as
@@ -2479,6 +2486,7 @@ impl Serialize for AppConfig {
             "ip_blocklist_refresh_interval_secs",
             &self.ip_blocklist_refresh_interval_secs,
         )?;
+        state.serialize_field("antibots_auto", &self.antibots_auto)?;
         state.serialize_field("max_body_size", &self.max_body_size)?;
         state.serialize_field("page_change_password", &self.page_change_password)?;
         state.serialize_field(

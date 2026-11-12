@@ -221,6 +221,388 @@ pub struct HostnameCheckLimit {
     pub scope: LoadScope,
 }
 
+/// `gpu_check` : une recherche de nonce sur la carte graphique.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuCheck {
+    /// `auto` (WebGPU, sinon WebGL 2), `webgpu`, `webgl2`.
+    #[serde(default)]
+    pub mode: GpuMode,
+    /// Bits nuls exigés : 2^bits essais en moyenne (28 ≈ 268 millions).
+    #[serde(default = "default_gpu_bits")]
+    pub bits: u8,
+    /// Temps accordé au navigateur ; au-delà, il abandonne (`timeout`).
+    #[serde(default = "default_gpu_budget", deserialize_with = "de_seconds")]
+    pub budget: f64,
+    /// En dessous de ce temps, mesuré par le serveur, la carte compte
+    /// comme un vrai GPU (`hardware`) ; au-dessus, `slow`.
+    #[serde(default = "default_gpu_budget", deserialize_with = "de_seconds")]
+    pub hardware_under: f64,
+    /// Que faire d'un client **sans vrai GPU** (`software`, `slow`,
+    /// `timeout`, `invalid`, `unavailable`) : `allow` (le laisser, simple
+    /// signal), `harder` (preuve de travail alourdie de `software_extra`
+    /// crans), `detect` (le laisser, mais compter une détection), `refuse`.
+    #[serde(default)]
+    pub on_software: OnSoftware,
+    /// Crans de difficulté ajoutés avec `harder` (1 à 4 ; chaque cran ×16).
+    #[serde(default = "default_software_extra")]
+    pub software_extra: u8,
+    /// Montée en puissance sous une vague de clients sans vrai GPU : au-delà
+    /// de `request` en `period` secondes, `on_software` et/ou
+    /// `software_extra` passent à la valeur du palier (le plus sévère des
+    /// paliers atteints l'emporte), au moins `software_hold` secondes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub software_levels: Vec<SoftwareLevel>,
+    /// Durée minimale d'une montée en puissance après le dernier
+    /// dépassement (défaut 60 s).
+    #[serde(default = "default_software_hold", deserialize_with = "de_seconds_u64")]
+    pub software_hold: u64,
+}
+fn default_software_hold() -> u64 {
+    60
+}
+
+/// `lockdown:` — sous un trafic extrême, tout client qui se présente comme
+/// un navigateur doit le prouver entièrement, sans les exceptions
+/// habituelles. Chaque mesure de `refuse` peut être choisie ; par défaut,
+/// toutes.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockdownConfig {
+    /// Requêtes en `period` secondes au-delà desquelles le verrouillage
+    /// s'active.
+    pub request: u64,
+    #[serde(default = "default_period")]
+    pub period: u64,
+    /// Trafic compté : ce vhost (défaut) ou tout le serveur.
+    #[serde(default)]
+    pub scope: LoadScope,
+    /// Durée minimale du verrouillage après le dernier dépassement.
+    #[serde(default = "default_lockdown_hold", deserialize_with = "de_seconds_u64")]
+    pub hold: u64,
+    /// Ce qui est refusé pendant le verrouillage (défaut : tout).
+    #[serde(default = "all_lockdown_rules")]
+    pub refuse: Vec<LockdownRule>,
+    /// Ce que `request` compte (comme dans `load_levels`).
+    #[serde(default)]
+    pub count: LevelCount,
+}
+fn default_lockdown_hold() -> u64 {
+    120
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockdownRule {
+    /// Pas de vraie carte graphique à l'épreuve GPU (avec `gpu_check`).
+    NoGpu,
+    /// Rendu WebGL logiciel annoncé (SwiftShader, llvmpipe, WARP).
+    SoftwareRenderer,
+    /// Pas de rendu WebGL valide.
+    NoWebgl,
+    /// `navigator.webdriver`, fenêtre 0×0.
+    Headless,
+    /// Les clients qui ne s'annoncent pas comme navigateurs : refusés au
+    /// lieu de passer (`only_browsers`).
+    NonBrowsers,
+    /// Les robots vérifiés par nom d'hôte ne sont plus exemptés.
+    Crawlers,
+    /// Les laissez-passer délivrés avant le verrouillage sont redemandés.
+    OldPasses,
+}
+
+fn all_lockdown_rules() -> Vec<LockdownRule> {
+    use LockdownRule::*;
+    vec![
+        NoGpu,
+        SoftwareRenderer,
+        NoWebgl,
+        Headless,
+        NonBrowsers,
+        Crawlers,
+        OldPasses,
+    ]
+}
+
+/// L'état du verrouillage d'un vhost.
+#[derive(Debug)]
+pub struct LockdownState {
+    cfg: LockdownConfig,
+    until: std::sync::atomic::AtomicU64,
+    started: std::sync::atomic::AtomicU64,
+}
+
+impl LockdownState {
+    fn new(cfg: LockdownConfig) -> Self {
+        Self {
+            cfg,
+            until: Default::default(),
+            started: Default::default(),
+        }
+    }
+    fn active(&self, sec: u64) -> bool {
+        self.until.load(std::sync::atomic::Ordering::Relaxed) > sec
+    }
+    fn refuses(&self, sec: u64, r: LockdownRule) -> bool {
+        self.active(sec) && self.cfg.refuse.contains(&r)
+    }
+    /// Réévalue d'après le trafic compté, et journalise les changements.
+    fn update(&self, sec: u64, vhost_traffic: &Traffic, vhost_software: Option<&Traffic>) {
+        use std::sync::atomic::Ordering;
+        let none = Traffic::new();
+        let traffic = match (self.cfg.count, self.cfg.scope) {
+            (LevelCount::Requests, LoadScope::Vhost) => vhost_traffic,
+            (LevelCount::Requests, LoadScope::Server) => server_traffic(),
+            (LevelCount::Software, LoadScope::Vhost) => vhost_software.unwrap_or(&none),
+            (LevelCount::Software, LoadScope::Server) => server_software(),
+        };
+        let was = self.active(sec);
+        if traffic.count(sec, self.cfg.period) >= self.cfg.request {
+            if !was {
+                self.started.store(sec, Ordering::Relaxed);
+                tracing::warn!(
+                    "antibot: LOCKDOWN — more than {} requests in {}s: every client must prove it is a real browser ({}), for at least {}s",
+                    self.cfg.request,
+                    self.cfg.period,
+                    self.cfg
+                        .refuse
+                        .iter()
+                        .map(|r| format!("{r:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    self.cfg.hold
+                );
+            }
+            self.until.store(sec + self.cfg.hold, Ordering::Relaxed);
+        } else if !was && self.started.load(Ordering::Relaxed) != 0 {
+            self.started.store(0, Ordering::Relaxed);
+            tracing::info!("antibot: lockdown over");
+        }
+    }
+}
+
+/// Un palier de `software_levels`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoftwareLevel {
+    /// Clients sans vrai GPU vus pendant `period` secondes.
+    pub request: u64,
+    #[serde(default = "default_period")]
+    pub period: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_software: Option<OnSoftware>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_extra: Option<u8>,
+    /// Compter sur ce vhost (défaut) ou sur tout le serveur.
+    #[serde(default)]
+    pub scope: LoadScope,
+    /// `software` ici (les clients sans vrai GPU) ; `requests` pour les
+    /// paliers venus de `load_levels`.
+    #[serde(default = "count_software")]
+    pub count: LevelCount,
+}
+fn count_software() -> LevelCount {
+    LevelCount::Software
+}
+
+impl OnSoftware {
+    /// Du plus doux au plus sévère.
+    fn severity(self) -> u8 {
+        match self {
+            OnSoftware::Allow => 0,
+            OnSoftware::Detect => 1,
+            OnSoftware::Harder => 2,
+            OnSoftware::Refuse => 3,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            OnSoftware::Allow => "allow",
+            OnSoftware::Detect => "detect",
+            OnSoftware::Harder => "harder",
+            OnSoftware::Refuse => "refuse",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "allow" => Some(OnSoftware::Allow),
+            "detect" => Some(OnSoftware::Detect),
+            "harder" => Some(OnSoftware::Harder),
+            "refuse" => Some(OnSoftware::Refuse),
+            _ => None,
+        }
+    }
+}
+
+/// Clients sans vrai GPU vus par tout le serveur (`scope: server`).
+static SERVER_SOFTWARE: OnceLock<Traffic> = OnceLock::new();
+fn server_software() -> &'static Traffic {
+    SERVER_SOFTWARE.get_or_init(Traffic::new)
+}
+
+/// L'état de `on_software` d'un vhost : compteur des clients sans vrai GPU
+/// et montée en puissance en cours.
+#[derive(Debug)]
+pub struct SoftwareGuard {
+    cfg: GpuCheck,
+    /// `gpu_check.software_levels` et les paliers de `load_levels` qui
+    /// fixent `on_software` / `software_extra`.
+    levels: Vec<SoftwareLevel>,
+    /// Les requêtes du vhost (paliers `count: requests`).
+    requests: Arc<Traffic>,
+    seen: Traffic,
+    /// Décision imposée jusqu'à `until` (secondes Unix).
+    escalated: Mutex<Option<(OnSoftware, u8, u64)>>,
+}
+
+impl SoftwareGuard {
+    fn new(cfg: GpuCheck, load_levels: &[LoadLevel], requests: Arc<Traffic>) -> Self {
+        let mut levels = cfg.software_levels.clone();
+        levels.extend(
+            load_levels
+                .iter()
+                .filter(|l| l.on_software.is_some() || l.software_extra.is_some())
+                .map(|l| SoftwareLevel {
+                    request: l.request,
+                    period: l.period,
+                    on_software: l.on_software,
+                    software_extra: l.software_extra,
+                    scope: l.scope,
+                    count: l.count,
+                }),
+        );
+        Self {
+            cfg,
+            levels,
+            requests,
+            seen: Traffic::new(),
+            escalated: Mutex::new(None),
+        }
+    }
+
+    /// Compte un client sans vrai GPU.
+    fn record(&self, sec: u64) {
+        self.seen.record(sec);
+        server_software().record(sec);
+    }
+
+    /// Le mode et les crans en vigueur maintenant.
+    fn decision(&self, sec: u64) -> (OnSoftware, u8) {
+        let (mut mode, mut extra) = (self.cfg.on_software, self.cfg.software_extra);
+        let mut reached = false;
+        for l in &self.levels {
+            let traffic = match (l.count, l.scope) {
+                (LevelCount::Software, LoadScope::Vhost) => &self.seen,
+                (LevelCount::Software, LoadScope::Server) => server_software(),
+                (LevelCount::Requests, LoadScope::Vhost) => &*self.requests,
+                (LevelCount::Requests, LoadScope::Server) => server_traffic(),
+            };
+            if traffic.count(sec, l.period) >= l.request {
+                reached = true;
+                if let Some(m) = l.on_software.filter(|m| m.severity() > mode.severity()) {
+                    mode = m;
+                }
+                if let Some(x) = l.software_extra {
+                    extra = extra.max(x);
+                }
+            }
+        }
+        let mut esc = self.escalated.lock().unwrap_or_else(|e| e.into_inner());
+        if reached {
+            let changed = esc
+                .map(|(m, x, until)| until <= sec || m != mode || x != extra)
+                .unwrap_or(true);
+            if changed {
+                tracing::warn!(
+                    "antibot: wave of clients without a real GPU — on_software now {} (software_extra {extra}) for at least {}s",
+                    mode.name(),
+                    self.cfg.software_hold
+                );
+            }
+            *esc = Some((mode, extra, sec + self.cfg.software_hold));
+            return (mode, extra);
+        }
+        match *esc {
+            Some((m, x, until)) if until > sec => (m, x),
+            Some(_) => {
+                *esc = None;
+                tracing::info!(
+                    "antibot: the wave is over — on_software back to {}",
+                    self.cfg.on_software.name()
+                );
+                (self.cfg.on_software, self.cfg.software_extra)
+            }
+            None => (mode, extra),
+        }
+    }
+}
+fn default_software_extra() -> u8 {
+    2
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnSoftware {
+    #[default]
+    Allow,
+    Harder,
+    Detect,
+    Refuse,
+}
+
+/// Le résultat de l'épreuve GPU ne montre pas une vraie carte graphique.
+pub fn no_hardware_gpu(class: &str) -> bool {
+    matches!(
+        class,
+        "software" | "slow" | "timeout" | "invalid" | "unavailable" | "not run"
+    )
+}
+fn default_gpu_bits() -> u8 {
+    28
+}
+fn default_gpu_budget() -> f64 {
+    2.0
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuMode {
+    #[default]
+    Auto,
+    Webgpu,
+    Webgl2,
+}
+
+impl GpuMode {
+    fn name(self) -> &'static str {
+        match self {
+            GpuMode::Auto => "auto",
+            GpuMode::Webgpu => "webgpu",
+            GpuMode::Webgl2 => "webgl2",
+        }
+    }
+}
+
+/// Le hachage de l'épreuve GPU : 32 tours d'un mélangeur d'entiers 32 bits.
+/// Le même code tourne en WGSL (WebGPU), en GLSL (WebGL 2) et ici, où une
+/// seule évaluation suffit à vérifier une solution.
+pub fn gpu_hash(seed: u32, n: u32) -> u32 {
+    let mut x = seed ^ n;
+    for i in 0..32u32 {
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^= x >> 16;
+        x = x.wrapping_add(0x9e37_79b9u32.wrapping_add(i));
+    }
+    x
+}
+
+pub fn gpu_meets(h: u32, bits: u8) -> bool {
+    bits == 0 || (h >> (32 - u32::from(bits.min(31)))) == 0
+}
+
 /// Langue des pages de l'anti-bot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -241,6 +623,7 @@ pub struct Texts {
     pub noscript: &'static str,
     pub need_https: &'static str,
     pub need_webgl: &'static str,
+    pub gpu: &'static str,
     pub starting: &'static str,
     pub running: &'static str,
     pub core: &'static str,
@@ -265,6 +648,7 @@ impl Language {
                 noscript: "JavaScript est nécessaire pour terminer cette vérification.",
                 need_https: "Cette vérification nécessite un navigateur récent en HTTPS.",
                 need_webgl: "Cette vérification nécessite WebGL, désactivé ou indisponible dans ce navigateur.",
+                gpu: "Veuillez patienter…",
                 starting: "Démarrage de la vérification dans {s} s…",
                 running: "Vérification en cours (difficulté {d}, {a}, {n} {cores})…",
                 core: "cœur",
@@ -285,6 +669,7 @@ impl Language {
                 noscript: "JavaScript is required to complete this check.",
                 need_https: "This check needs a recent browser over HTTPS.",
                 need_webgl: "This check needs WebGL, which is disabled or unavailable in this browser.",
+                gpu: "Please wait…",
                 starting: "Starting the check in {s} s…",
                 running: "Checking (difficulty {d}, {a}, {n} {cores})…",
                 core: "core",
@@ -336,6 +721,61 @@ pub struct LoadLevel {
         skip_serializing_if = "Option::is_none"
     )]
     pub client_cores: Option<CoreUsage>,
+    /// Ce palier déclenche le verrouillage : `true` (toutes les règles,
+    /// 120 s), ou `{ hold, refuse }`. Un seul palier peut le faire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockdown: Option<LockdownSpec>,
+    /// À ce palier, `gpu_check.on_software` devient au moins celui-ci.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_software: Option<OnSoftware>,
+    /// À ce palier, `gpu_check.software_extra` devient au moins celui-ci.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_extra: Option<u8>,
+    /// Ce que `request` compte : `requests` (défaut) ou `software`.
+    #[serde(default)]
+    pub count: LevelCount,
+}
+
+/// Ce qu'un palier compte : toutes les requêtes (défaut), ou les clients
+/// sans vrai GPU à l'épreuve `gpu_check` (`software`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LevelCount {
+    #[default]
+    Requests,
+    Software,
+}
+
+/// `lockdown:` dans un palier de `load_levels`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum LockdownSpec {
+    On(bool),
+    Rules {
+        #[serde(default = "default_lockdown_hold", deserialize_with = "de_seconds_u64")]
+        hold: u64,
+        #[serde(default = "all_lockdown_rules")]
+        refuse: Vec<LockdownRule>,
+    },
+}
+
+impl LoadLevel {
+    /// Le verrouillage que ce palier déclenche, avec son seuil.
+    fn lockdown_config(&self) -> Option<LockdownConfig> {
+        let (hold, refuse) = match self.lockdown.as_ref()? {
+            LockdownSpec::On(false) => return None,
+            LockdownSpec::On(true) => (default_lockdown_hold(), all_lockdown_rules()),
+            LockdownSpec::Rules { hold, refuse } => (*hold, refuse.clone()),
+        };
+        Some(LockdownConfig {
+            request: self.request,
+            period: self.period,
+            scope: self.scope,
+            hold,
+            refuse,
+            count: self.count,
+        })
+    }
 }
 fn default_period() -> u64 {
     10
@@ -373,6 +813,14 @@ pub struct BanConfig {
     /// au démarrage. Sans lui, un redémarrage remet tout à zéro.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    /// Fichier texte des adresses bannies en ce moment, au format de
+    /// `ip_blocklists` : une IP par ligne, précédée d'un commentaire `#`
+    /// (date du bannissement, vhost, raisons). Réécrit dès qu'il change ;
+    /// un bannissement expiré ou levé en sort. Chargé automatiquement avec
+    /// `antibots_auto: true` (config.json), ou par n'importe quelle source
+    /// `ip_blocklists`, y compris sur d'autres serveurs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<String>,
 }
 fn default_ban_after() -> u32 {
     100
@@ -445,6 +893,14 @@ pub struct AntiBotConfig {
     /// `slow` reste toujours sur un seul cœur.
     #[serde(default, alias = "cpu_usage", alias = "cores")]
     pub client_cores: CoreUsage,
+    /// Deuxième épreuve, sur la carte graphique (WebGPU, sinon WebGL 2) :
+    /// mesurée par le serveur et journalisée (`gpu_check`). Un signal, pas
+    /// une barrière : personne n'est refusé sur ce seul critère.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_check: Option<GpuCheck>,
+    /// Verrouillage sous trafic extrême (voir [`LockdownConfig`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockdown: Option<LockdownConfig>,
     /// Langue des pages (vérification, échec, blocage) : `fr` ou `en`.
     #[serde(default, alias = "lang")]
     pub language: Language,
@@ -875,7 +1331,7 @@ fn csv_line(fields: &[&str]) -> String {
     line
 }
 
-const CSV_HEADER: &str = "timestamp,host,ip,user_agent,reason,path,gpu,renderer,vendor,webgl_version,viewport,screen,pixel_ratio,cores,webdriver,language,platform,timezone,difficulty,algorithm,solve_ms,workers,bits,server_ms,proxyauth_version\n";
+const CSV_HEADER: &str = "timestamp,host,ip,user_agent,reason,path,gpu,renderer,vendor,webgl_version,viewport,screen,pixel_ratio,cores,webdriver,language,platform,timezone,difficulty,algorithm,solve_ms,workers,bits,server_ms,gpu_check,gpu_api,gpu_ms,gpu_adapter,proxyauth_version\n";
 
 /// Ce que le navigateur a rapporté en envoyant sa solution. Vide pour les
 /// détections faites sans solution (page redemandée, POST…).
@@ -903,6 +1359,13 @@ pub struct ClientInfo {
     /// réception de la solution (délai de démarrage compris) — contrairement
     /// à `solve_ms`, mesuré par le navigateur, il ne peut pas être falsifié.
     pub server_ms: String,
+    /// Épreuve GPU, mesurée par le serveur : `hardware`, `slow`, `timeout`,
+    /// `unavailable`, `invalid`, ou vide sans `gpu_check`.
+    pub gpu_check: String,
+    pub gpu_api: String,
+    pub gpu_ms: String,
+    /// Fabricant / architecture annoncés par WebGPU (`nvidia/pascal`).
+    pub gpu_adapter: String,
 }
 
 impl ClientInfo {
@@ -944,6 +1407,10 @@ impl ClientInfo {
             workers: g("wk"),
             bits: String::new(),
             server_ms: String::new(),
+            gpu_check: g("gpu_check"),
+            gpu_api: g("gpu_api"),
+            gpu_ms: g("gpu_ms"),
+            gpu_adapter: g("ga"),
         }
     }
 
@@ -1039,6 +1506,9 @@ struct Offender {
     reasons: Vec<(String, u32)>,
     /// Résumé figé au moment du bannissement (`proxyauth antibot list`).
     ban_reason: String,
+    /// Début du bannissement (secondes Unix).
+    #[serde(default)]
+    banned_at: u64,
 }
 
 impl Offender {
@@ -1049,6 +1519,7 @@ impl Offender {
             banned_until: 0,
             reasons: Vec::new(),
             ban_reason: String::new(),
+            banned_at: 0,
         }
     }
 
@@ -1116,6 +1587,10 @@ impl Detector {
                 &info.workers,
                 &info.bits,
                 &info.server_ms,
+                &info.gpu_check,
+                &info.gpu_api,
+                &info.gpu_ms,
+                &info.gpu_adapter,
                 crate::VERSION,
             ]);
             let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send(line);
@@ -1241,6 +1716,7 @@ impl Detector {
         if o.count >= ban.after {
             o.banned_until = sec + ban.duration;
             o.ban_reason = o.summary();
+            o.banned_at = sec;
             let detections = o.count;
             drop(o);
             tracing::warn!(client_ip = %ip, host = %host, "antibot: address banned for {}s after {detections} detections", ban.duration);
@@ -1280,6 +1756,22 @@ struct Pending {
     created: u64,
     key_ttl: u64,
     served: bool,
+    /// Épreuve GPU : graine, bits, début de la mesure (ms), résultat.
+    gpu: Option<GpuPending>,
+}
+
+struct GpuPending {
+    seed: u32,
+    bits: u8,
+    hardware_under_ms: u64,
+    started: Option<u64>,
+    result: Option<(&'static str, String, u64)>,
+    /// Bits ajoutés à la preuve de travail (`on_software: harder`).
+    penalty_bits: u32,
+    /// Le mode retenu à la fin de l'épreuve (paliers compris).
+    decision: OnSoftware,
+    guard: Arc<SoftwareGuard>,
+    lockdown: Option<Arc<LockdownState>>,
 }
 
 static PENDING: OnceLock<dashmap::DashMap<String, Pending>> = OnceLock::new();
@@ -1295,7 +1787,30 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 /// Enregistre une vérification ; renvoie son jeton et sa clé.
+#[cfg(test)]
 fn register_pending(params: String, ip: &str, ua: &str, key_ttl: u64) -> (String, [u8; 32]) {
+    register_pending_with(params, ip, ua, key_ttl, None)
+}
+
+#[cfg(test)]
+fn register_pending_with(
+    params: String,
+    ip: &str,
+    ua: &str,
+    key_ttl: u64,
+    gpu: Option<&Arc<SoftwareGuard>>,
+) -> (String, [u8; 32]) {
+    register_pending_full(params, ip, ua, key_ttl, gpu, None)
+}
+
+fn register_pending_full(
+    params: String,
+    ip: &str,
+    ua: &str,
+    key_ttl: u64,
+    gpu: Option<&Arc<SoftwareGuard>>,
+    lockdown: Option<&Arc<LockdownState>>,
+) -> (String, [u8; 32]) {
     let map = pending();
     let sec = now_ms() / 1000;
     if map.len() > 100_000 {
@@ -1307,6 +1822,19 @@ fn register_pending(params: String, ip: &str, ua: &str, key_ttl: u64) -> (String
     }
     let token = hex::encode(random_bytes::<16>());
     let key = random_bytes::<32>();
+    let gpu = gpu
+        .map(|guard| (guard, &guard.cfg))
+        .map(|(guard, g)| GpuPending {
+            seed: u32::from_le_bytes(random_bytes::<4>()),
+            bits: g.bits,
+            hardware_under_ms: (g.hardware_under * 1000.0) as u64,
+            started: None,
+            result: None,
+            penalty_bits: 0,
+            decision: OnSoftware::Allow,
+            guard: guard.clone(),
+            lockdown: lockdown.cloned(),
+        });
     map.insert(
         token.clone(),
         Pending {
@@ -1317,6 +1845,7 @@ fn register_pending(params: String, ip: &str, ua: &str, key_ttl: u64) -> (String
             created: sec,
             key_ttl,
             served: false,
+            gpu,
         },
     );
     (token, key)
@@ -1343,6 +1872,123 @@ fn serve_script(token: &str, ip: &str, ua: &str) -> Option<String> {
             .replace("__TOKEN__", token)
             .replace("__WORKER__", &worker),
     )
+}
+
+/// Préfixe des deux points d'entrée de l'épreuve GPU.
+pub const GPU_PREFIX: &str = "/.proxyauth/antibot/gpu/";
+
+/// Début de l'épreuve GPU : la graine n'est révélée qu'à cet instant, et
+/// le serveur démarre son chronomètre. Une seule fois par vérification.
+fn gpu_start(token: &str, ip: &str, ua: &str) -> Option<String> {
+    let mut p = pending().get_mut(token)?;
+    if p.ip != ip || p.ua != ua || !p.served {
+        return None;
+    }
+    let g = p.gpu.as_mut()?;
+    if g.started.is_some() {
+        return None;
+    }
+    g.started = Some(now_ms());
+    Some(serde_json::json!({ "seed": g.seed, "bits": g.bits }).to_string())
+}
+
+/// Fin de l'épreuve GPU : temps mesuré par le serveur et classement.
+fn gpu_done(token: &str, ip: &str, ua: &str, q: &str) -> Option<&'static str> {
+    let mut p = pending().get_mut(token)?;
+    if p.ip != ip || p.ua != ua {
+        return None;
+    }
+    let g = p.gpu.as_mut()?;
+    if g.result.is_some() {
+        return None;
+    }
+    let api: String = query_param(q, "api")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(16)
+        .collect();
+    let class = match (
+        g.started,
+        query_param(q, "n").and_then(|n| n.parse::<i64>().ok()),
+    ) {
+        (None, _) => "unavailable",
+        (Some(_), None) | (Some(_), Some(-1)) => "timeout",
+        (Some(_), Some(n))
+            if !(0..=i64::from(u32::MAX)).contains(&n)
+                || !gpu_meets(gpu_hash(g.seed, n as u32), g.bits) =>
+        {
+            "invalid"
+        }
+        (Some(t0), Some(_)) => {
+            if now_ms().saturating_sub(t0) <= g.hardware_under_ms {
+                "hardware"
+            } else {
+                "slow"
+            }
+        }
+    };
+    let ms = g.started.map(|t0| now_ms().saturating_sub(t0)).unwrap_or(0);
+    // Le navigateur dit lui-même faire le rendu en logiciel.
+    let reported = format!(
+        "{} {}",
+        query_param(q, "r").unwrap_or_default(),
+        query_param(q, "ga").unwrap_or_default()
+    );
+    let class = if matches!(class, "hardware" | "slow") && software_renderer(&reported) {
+        "software"
+    } else {
+        class
+    };
+    g.result = Some((class, api, ms));
+    if no_hardware_gpu(class) {
+        // Compté, puis décision du moment : sous une vague, les paliers
+        // durcissent `on_software` pour tous les clients sans vrai GPU.
+        let sec = now_ms() / 1000;
+        g.guard.record(sec);
+        let (mode, extra) = g.guard.decision(sec);
+        // Verrouillage : pas de vrai GPU, pas de passage.
+        let mode = if g
+            .lockdown
+            .as_ref()
+            .is_some_and(|l| l.refuses(sec, LockdownRule::NoGpu))
+        {
+            OnSoftware::Refuse
+        } else {
+            mode
+        };
+        g.decision = mode;
+        g.penalty_bits = if mode == OnSoftware::Harder {
+            4 * u32::from(extra)
+        } else {
+            0
+        };
+    }
+    Some(class)
+}
+
+/// Classement GPU retenu : celui du serveur, ou `software` si le navigateur
+/// annonce un rendu logiciel.
+fn effective_gpu_class(q: &str) -> String {
+    let class = query_param(q, "gpu_check").unwrap_or_default();
+    let reported = format!(
+        "{} {}",
+        query_param(q, "r").unwrap_or_default(),
+        query_param(q, "ga").unwrap_or_default()
+    );
+    if matches!(class.as_str(), "hardware" | "slow") && software_renderer(&reported) {
+        "software".into()
+    } else {
+        class
+    }
+}
+
+/// Les bits supplémentaires que le navigateur doit maintenant chercher.
+fn gpu_penalty(token: &str) -> u32 {
+    pending()
+        .get(token)
+        .and_then(|p| p.gpu.as_ref().map(|g| g.penalty_bits))
+        .unwrap_or(0)
 }
 
 /// Déchiffre une solution (AES-256-GCM, le jeton en données associées).
@@ -1386,8 +2032,34 @@ fn take_solution(q: &str, ip: &str, ua: &str) -> Result<String, &'static str> {
         &query_param(q, "c").unwrap_or_default(),
     )
     .ok_or("solution could not be decrypted")?;
-    let map: serde_json::Map<String, serde_json::Value> =
+    let mut map: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(&plain).map_err(|_| "solution could not be decrypted")?;
+    // Le résultat GPU vient du serveur, jamais du client.
+    for k in [
+        "gpu_check",
+        "gpu_api",
+        "gpu_ms",
+        "gpu_penalty_bits",
+        "gpu_decision",
+    ] {
+        map.remove(k);
+    }
+    if let Some(g) = &p.gpu {
+        let (class, api, ms) = g.result.clone().unwrap_or(("not run", String::new(), 0));
+        map.insert("gpu_check".into(), class.into());
+        map.insert("gpu_api".into(), api.into());
+        map.insert(
+            "gpu_ms".into(),
+            if ms > 0 {
+                ms.to_string()
+            } else {
+                String::new()
+            }
+            .into(),
+        );
+        map.insert("gpu_penalty_bits".into(), g.penalty_bits.to_string().into());
+        map.insert("gpu_decision".into(), g.decision.name().into());
+    }
     Ok(map
         .iter()
         .map(|(k, v)| {
@@ -1525,6 +2197,103 @@ fn load_store(path: &str, detectors: &[Arc<Detector>]) -> (usize, usize) {
     (banned, counting)
 }
 
+// ───────────────────────────────────────────── export of bans (ip_blocklists format)
+
+fn iso(sec: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(sec as i64, 0)
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
+}
+
+/// Le contenu du fichier `ban.export` : seulement les bannissements en
+/// cours. La durée restante n'y figure pas — elle reste gérée par
+/// l'anti-bot (et `ban.store`) ; quand elle s'achève, l'IP sort du fichier.
+fn export_text(detectors: &[Arc<Detector>], sec: u64) -> String {
+    let mut bans: Vec<(u64, String, IpAddr, String)> = Vec::new();
+    for d in detectors {
+        for e in d.offenders.iter() {
+            if e.banned_until > sec {
+                bans.push((e.banned_at, d.label.clone(), *e.key(), e.ban_reason.clone()));
+            }
+        }
+    }
+    bans.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+    bans.dedup_by(|a, b| a.2 == b.2);
+    let mut out = format!(
+        "# ProxyAuth anti-bot bans — {} address(es)\n# Format: ip_blocklists (one IP per line). Loaded with \"antibots_auto\": true.\n",
+        bans.len()
+    );
+    for (at, vhost, ip, reason) in bans {
+        let reason = reason.replace(['\n', '\r'], " ");
+        out.push_str(&format!(
+            "\n# {} · {vhost} · {}\n{ip}\n",
+            if at > 0 { iso(at) } else { "-".into() },
+            if reason.is_empty() { "-" } else { &reason }
+        ));
+    }
+    out
+}
+
+static EXPORTED: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+
+/// Réécrit les fichiers `ban.export` dont le contenu a changé
+/// (atomiquement, mode 0644). Appelé toutes les 5 s, et aussitôt après
+/// `unban`.
+pub fn write_exports() {
+    let sec = now_ms() / 1000;
+    let mut paths: Vec<String> = all_detectors()
+        .iter()
+        .filter_map(|d| d.ban.as_ref().and_then(|b| b.export.clone()))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let last = EXPORTED.get_or_init(Default::default);
+    for path in paths {
+        let ds: Vec<Arc<Detector>> = all_detectors()
+            .into_iter()
+            .filter(|d| d.ban.as_ref().and_then(|b| b.export.as_deref()) == Some(path.as_str()))
+            .collect();
+        let text = export_text(&ds, sec);
+        let mut l = last.lock().unwrap_or_else(|e| e.into_inner());
+        // L'en-tête ne change qu'avec la liste : on compare tout.
+        if l.get(&path) == Some(&text) {
+            continue;
+        }
+        let tmp = format!("{path}.tmp");
+        let res = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o644);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        })();
+        match res {
+            Ok(()) => {
+                l.insert(path, text);
+            }
+            Err(e) => tracing::warn!("antibot: cannot write {path}: {e}"),
+        }
+    }
+}
+
+/// Les fichiers `ban.export` de ces routes (pour `antibots_auto`).
+pub fn export_paths(routes: &[RouteRule]) -> Vec<String> {
+    let mut v: Vec<String> = routes
+        .iter()
+        .filter_map(|r| r.antibot.as_ref()?.ban.as_ref()?.export.clone())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 // ───────────────────────────────────────────── administration
 
 /// Une adresse bannie, pour `proxyauth antibot list`.
@@ -1575,6 +2344,7 @@ pub fn unban(ip: IpAddr) -> Vec<String> {
     }
     if !lifted.is_empty() {
         save_all_stores();
+        write_exports();
     }
     lifted
 }
@@ -1618,6 +2388,10 @@ struct Rule {
     /// La vérification par nom d'hôte est-elle coupée (pour journaliser
     /// le changement d'état une seule fois) ?
     hostname_off: std::sync::atomic::AtomicBool,
+    /// `gpu_check.on_software` et ses paliers.
+    software: Option<Arc<SoftwareGuard>>,
+    /// `lockdown`.
+    lockdown: Option<Arc<LockdownState>>,
 }
 
 impl Rule {
@@ -1719,30 +2493,38 @@ impl Rule {
 
     /// Le palier est-il atteint, d'après le trafic qu'il compte ?
     fn level_reached(&self, level: &LoadLevel, sec: u64) -> bool {
-        let traffic = match level.scope {
-            LoadScope::Vhost => &*self.traffic,
-            LoadScope::Server => server_traffic(),
+        let traffic = match (level.count, level.scope) {
+            (LevelCount::Requests, LoadScope::Vhost) => &*self.traffic,
+            (LevelCount::Requests, LoadScope::Server) => server_traffic(),
+            (LevelCount::Software, LoadScope::Vhost) => match &self.software {
+                Some(g) => &g.seen,
+                None => return false,
+            },
+            (LevelCount::Software, LoadScope::Server) => server_software(),
         };
         traffic.count(sec, level.period) >= level.request
     }
 
-    fn flags(&self) -> u8 {
-        (if self.cfg.webgl { FLAG_WEBGL } else { 0 })
-            | (if self.cfg.reject_software_gl {
-                FLAG_REJECT_SOFTWARE_GL
-            } else {
-                0
-            })
-            | (if self.cfg.reject_headless {
-                FLAG_REJECT_HEADLESS
-            } else {
-                0
-            })
-            | (if self.cfg.scale_with_workers {
-                FLAG_SCALE_WORKERS
-            } else {
-                0
-            })
+    /// Les contrôles de la page, durcis pendant un verrouillage.
+    fn flags_at(&self, sec: u64) -> u8 {
+        let lock = |r| self.lockdown.as_ref().is_some_and(|l| l.refuses(sec, r));
+        (if self.cfg.webgl || lock(LockdownRule::NoWebgl) || lock(LockdownRule::SoftwareRenderer) {
+            FLAG_WEBGL
+        } else {
+            0
+        }) | (if self.cfg.reject_software_gl || lock(LockdownRule::SoftwareRenderer) {
+            FLAG_REJECT_SOFTWARE_GL
+        } else {
+            0
+        }) | (if self.cfg.reject_headless || lock(LockdownRule::Headless) {
+            FLAG_REJECT_HEADLESS
+        } else {
+            0
+        }) | (if self.cfg.scale_with_workers {
+            FLAG_SCALE_WORKERS
+        } else {
+            0
+        })
     }
 
     /// Paramètres tirés pour un visiteur : difficulté (relevée par les
@@ -1837,6 +2619,69 @@ fn validate(cfg: &AntiBotConfig, place: &str) -> Result<(), String> {
             ));
         }
     }
+    let level_lockdowns = cfg
+        .load_levels
+        .iter()
+        .filter(|l| l.lockdown_config().is_some())
+        .count();
+    if level_lockdowns > 1 || (level_lockdowns == 1 && cfg.lockdown.is_some()) {
+        return Err(format!(
+            "{place}: only one lockdown — one `load_levels` entry with `lockdown`, or the `lockdown` block"
+        ));
+    }
+    if let Some(LockdownSpec::Rules { refuse, .. }) =
+        cfg.load_levels.iter().find_map(|l| l.lockdown.as_ref())
+    {
+        if refuse.is_empty() {
+            return Err(format!("{place}: a lockdown `refuse` list is empty"));
+        }
+    }
+    if let Some(l) = &cfg.lockdown {
+        if l.request == 0 || !(1..=60).contains(&l.period) {
+            return Err(format!(
+                "{place}: `lockdown` needs `request` ≥ 1 and `period` between 1 and 60 seconds"
+            ));
+        }
+        if l.refuse.is_empty() {
+            return Err(format!(
+                "{place}: `lockdown.refuse` is empty — remove `lockdown` instead"
+            ));
+        }
+    }
+    if let Some(g) = &cfg.gpu_check {
+        if !(16..=31).contains(&g.bits) {
+            return Err(format!(
+                "{place}: `gpu_check.bits` must be between 16 and 31"
+            ));
+        }
+        for l in &g.software_levels {
+            if l.request == 0 || !(1..=60).contains(&l.period) {
+                return Err(format!(
+                    "{place}: a `software_levels` entry needs `request` ≥ 1 and `period` between 1 and 60 seconds"
+                ));
+            }
+            if l.on_software.is_none() && l.software_extra.is_none() {
+                return Err(format!(
+                    "{place}: a `software_levels` entry needs `on_software`, `software_extra`, or both"
+                ));
+            }
+            if l.software_extra.is_some_and(|x| !(1..=4).contains(&x)) {
+                return Err(format!(
+                    "{place}: a `software_levels` software_extra must be between 1 and 4"
+                ));
+            }
+        }
+        if !(1..=4).contains(&g.software_extra) {
+            return Err(format!(
+                "{place}: `gpu_check.software_extra` must be between 1 and 4"
+            ));
+        }
+        if !(0.2..=30.0).contains(&g.budget) || !(0.05..=30.0).contains(&g.hardware_under) {
+            return Err(format!(
+                "{place}: `gpu_check.budget` and `hardware_under` must be between 0.2 and 30 seconds"
+            ));
+        }
+    }
     if !(0.01..=5.0).contains(&cfg.dns_timeout) {
         return Err(format!(
             "{place}: `dns_timeout` must be between 10ms and 5s"
@@ -1848,6 +2693,16 @@ fn validate(cfg: &AntiBotConfig, place: &str) -> Result<(), String> {
         ));
     }
     if let Some(b) = &cfg.ban {
+        if let Some(export) = &b.export {
+            let dir = std::path::Path::new(export)
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty());
+            if dir.is_some_and(|d| !d.is_dir()) {
+                return Err(format!(
+                    "{place}: the directory of `ban.export` {export} does not exist"
+                ));
+            }
+        }
         if let Some(store) = &b.store {
             let dir = std::path::Path::new(store)
                 .parent()
@@ -1889,9 +2744,29 @@ fn validate(cfg: &AntiBotConfig, place: &str) -> Result<(), String> {
                 "{place}: a `load_levels` cookie_time_challenge must be at least 60 seconds"
             ));
         }
-        if l.difficulty.is_none() && l.cookie_ttl.is_none() && l.client_cores.is_none() {
+        if (l.on_software.is_some()
+            || l.software_extra.is_some()
+            || l.count == LevelCount::Software)
+            && cfg.gpu_check.is_none()
+        {
             return Err(format!(
-                "{place}: a `load_levels` entry needs a `difficulty`, a `cookie_time_challenge` or a `client_cores`"
+                "{place}: a `load_levels` entry with `on_software`, `software_extra` or `count: software` needs `gpu_check`"
+            ));
+        }
+        if l.software_extra.is_some_and(|x| !(1..=4).contains(&x)) {
+            return Err(format!(
+                "{place}: a `load_levels` software_extra must be between 1 and 4"
+            ));
+        }
+        if l.difficulty.is_none()
+            && l.cookie_ttl.is_none()
+            && l.client_cores.is_none()
+            && l.lockdown.is_none()
+            && l.on_software.is_none()
+            && l.software_extra.is_none()
+        {
+            return Err(format!(
+                "{place}: a `load_levels` entry needs a `difficulty`, a `cookie_time_challenge`, a `client_cores`, a `lockdown`, an `on_software` or a `software_extra`"
             ));
         }
         if l.request == 0 || !(1..=60).contains(&l.period) {
@@ -2000,7 +2875,12 @@ pub fn init(routes: &[RouteRule], secret: &str) -> Result<Vec<String>, String> {
             match cfg.request {
                 Some(r) => format!("active above {r} req / {}s (hold {}s), ", cfg.period, cfg.hold),
                 None => "always active, ".to_string(),
-            },
+            } + &cfg
+                .lockdown
+                .clone()
+                .or_else(|| cfg.load_levels.iter().find_map(LoadLevel::lockdown_config))
+                .map(|l| format!("lockdown above {} req / {}s, ", l.request, l.period))
+                .unwrap_or_default(),
             algs.join("/"),
             cfg.min_start,
             cfg.max_start.max(cfg.min_start),
@@ -2065,16 +2945,26 @@ pub fn init(routes: &[RouteRule], secret: &str) -> Result<Vec<String>, String> {
             recent: dashmap::DashMap::new(),
         });
         detectors.push(detector.clone());
+        let traffic = Arc::new(Traffic::new());
         let rule = Arc::new(Rule {
             cfg: cfg.clone(),
             exclude,
             nofiltered,
-            traffic: Arc::new(Traffic::new()),
+            traffic: traffic.clone(),
             page,
             active_until: std::sync::atomic::AtomicU64::new(0),
             detector,
             challenged: dashmap::DashMap::new(),
             hostname_off: std::sync::atomic::AtomicBool::new(false),
+            software: cfg
+                .gpu_check
+                .clone()
+                .map(|g| Arc::new(SoftwareGuard::new(g, &cfg.load_levels, traffic.clone()))),
+            lockdown: cfg
+                .lockdown
+                .clone()
+                .or_else(|| cfg.load_levels.iter().find_map(LoadLevel::lockdown_config))
+                .map(|l| Arc::new(LockdownState::new(l))),
         });
         shared.insert(scope, rule.clone());
         by_route.push(Some(rule));
@@ -2096,6 +2986,21 @@ pub fn init(routes: &[RouteRule], secret: &str) -> Result<Vec<String>, String> {
         summary.push(format!(
             "antibot ban store {path}: {banned} banned, {counting} being counted, restored"
         ));
+    }
+    if detectors
+        .iter()
+        .any(|d| d.ban.as_ref().is_some_and(|b| b.export.is_some()))
+    {
+        let _ = std::thread::Builder::new()
+            .name("antibot-export".into())
+            .spawn(|| {
+                loop {
+                    // Une IP bannie apparaît dans les 5 s ; un bannissement expiré
+                    // ou levé en sort de même.
+                    std::thread::sleep(Duration::from_secs(5));
+                    write_exports();
+                }
+            });
     }
     if detectors.iter().any(|d| d.ban.is_some()) {
         let with_store = !stores.is_empty();
@@ -2226,6 +3131,8 @@ fn software_renderer(r: &str) -> bool {
         "softpipe",
         "software",
         "mesa offscreen",
+        "microsoft basic render",
+        "warp",
     ]
     .iter()
     .any(|s| r.contains(s))
@@ -2351,6 +3258,30 @@ impl Middleware for AntiBot {
         server_traffic().record(now_ms() / 1000);
         let path = req.path().to_string();
         let host = request_host(req.request());
+        if let Some(rest) = path.strip_prefix(GPU_PREFIX) {
+            let ip = client_ip(req.request(), &self.state.config)
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            let ua = user_agent(&req);
+            let res = match rest.split_once('/') {
+                Some((token, "start")) => match gpu_start(token, &ip, &ua) {
+                    Some(json) => HttpResponse::Ok()
+                        .insert_header((header::CONTENT_TYPE, "application/json"))
+                        .insert_header((header::CACHE_CONTROL, "no-store"))
+                        .body(json),
+                    None => HttpResponse::NotFound().finish(),
+                },
+                Some((token, "done")) => match gpu_done(token, &ip, &ua, req.query_string()) {
+                    Some(_) => HttpResponse::Ok()
+                        .insert_header((header::CONTENT_TYPE, "application/json"))
+                        .insert_header((header::CACHE_CONTROL, "no-store"))
+                        .body(format!("{{\"extra\":{}}}", gpu_penalty(token))),
+                    None => HttpResponse::NotFound().finish(),
+                },
+                _ => HttpResponse::NotFound().finish(),
+            };
+            return Box::pin(async move { Ok(req.into_response(res)) });
+        }
         if let Some(token) = path
             .strip_prefix(JS_PREFIX)
             .and_then(|t| t.strip_suffix(".js"))
@@ -2408,7 +3339,14 @@ impl Middleware for AntiBot {
                 async move { Ok(req.into_response(banned_response(until - sec, lang))) },
             );
         }
-        if !rule.active(sec) {
+        // Verrouillage : réévalué à chaque requête d'après le trafic compté ;
+        // tant qu'il dure, l'anti-bot est actif quel que soit son seuil.
+        let lockdown = rule.lockdown.as_ref().map(|l| {
+            l.update(sec, &rule.traffic, rule.software.as_ref().map(|g| &g.seen));
+            l
+        });
+        let locked = |r| lockdown.is_some_and(|l| l.refuses(sec, r));
+        if !rule.active(sec) && !lockdown.is_some_and(|l| l.active(sec)) {
             bypass("below the activation threshold (request / period)");
             return next.call(req);
         }
@@ -2424,6 +3362,24 @@ impl Middleware for AntiBot {
             bypass("Authorization header (trust_authorization)");
             return next.call(req);
         }
+        if !ua.contains("Mozilla") && locked(LockdownRule::NonBrowsers) {
+            rule.detector.note(
+                &host_s,
+                ip,
+                &ua,
+                "non-browser client refused during lockdown",
+                &path,
+            );
+            return Box::pin(async move {
+                Ok(req.into_response(
+                    HttpResponse::ServiceUnavailable()
+                        .insert_header((header::RETRY_AFTER, "120"))
+                        .insert_header((header::CACHE_CONTROL, "no-store"))
+                        .insert_header(("x-antibot-reason", "lockdown"))
+                        .finish(),
+                ))
+            });
+        }
         if rule.cfg.only_browsers && !ua.contains("Mozilla") {
             bypass("User-Agent is not a browser (only_browsers)");
             return next.call(req);
@@ -2433,7 +3389,12 @@ impl Middleware for AntiBot {
         if req
             .cookie(COOKIE)
             .and_then(|c| pass_issued(&reg.key, c.value(), &ua))
-            .is_some_and(|issued| sec.saturating_sub(issued) <= rule.pass_max_age(sec))
+            .is_some_and(|issued| {
+                sec.saturating_sub(issued) <= rule.pass_max_age(sec)
+                    // Verrouillage : seuls les laissez-passer obtenus depuis.
+                    && !(locked(LockdownRule::OldPasses)
+                        && lockdown.is_some_and(|l| issued <= l.started.load(std::sync::atomic::Ordering::Relaxed)))
+            })
         {
             return next.call(req);
         }
@@ -2441,7 +3402,10 @@ impl Middleware for AntiBot {
         // résolution seulement maintenant, quand le client allait être
         // défié — jamais pour les requêtes qui passent déjà.
         // Coupée au-delà de `hostname_check_limit` : plus de DNS du tout.
-        if !rule.cfg.hostname_nofiltered.is_empty() && rule.hostname_check_enabled(sec) {
+        if !rule.cfg.hostname_nofiltered.is_empty()
+            && rule.hostname_check_enabled(sec)
+            && !locked(LockdownRule::Crawlers)
+        {
             if let Some(addr) = ip {
                 return Box::pin(async move {
                     let wait = Duration::from_secs_f64(rule.cfg.dns_timeout);
@@ -2650,10 +3614,25 @@ fn verify_pass(
         } else {
             0
         };
-        if !meets_bits(&hash, 4 * u32::from(d) + extra) {
+        // `on_software: harder` : bits fixés par le serveur à la fin de
+        // l'épreuve GPU, jamais par le client.
+        let penalty: u32 = query_param(q, "gpu_penalty_bits")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if !meets_bits(&hash, 4 * u32::from(d) + extra + penalty) {
             return Err("proof of work not met");
         }
-        Ok((ttl, ts, 4 * u32::from(d) + extra))
+        // Mode décidé par le serveur à la fin de l'épreuve GPU (paliers
+        // compris) ; un client qui a sauté l'épreuve reçoit celui du moment.
+        let decision = query_param(q, "gpu_decision").and_then(|d| OnSoftware::parse(&d));
+        let decision = decision.or_else(|| {
+            rule.and_then(|r| r.software.as_ref())
+                .map(|g| g.decision(now_ms() / 1000).0)
+        });
+        if decision == Some(OnSoftware::Refuse) && no_hardware_gpu(&effective_gpu_class(q)) {
+            return Err("no hardware GPU (gpu_check)");
+        }
+        Ok((ttl, ts, 4 * u32::from(d) + extra + penalty))
     })();
 
     match outcome {
@@ -2670,6 +3649,13 @@ fn verify_pass(
                 }
             );
             let mut info = ClientInfo::from_query(q);
+            // Un rendu logiciel annoncé par le navigateur lui-même (WebGL ou
+            // WebGPU) n'est jamais un vrai GPU, quel que soit le temps.
+            if matches!(info.gpu_check.as_str(), "hardware" | "slow")
+                && (software_renderer(&info.renderer) || software_renderer(&info.gpu_adapter))
+            {
+                info.gpu_check = "software".into();
+            }
             let server_ms = now_ms().saturating_sub(ts);
             info.bits = bits.to_string();
             info.server_ms = server_ms.to_string();
@@ -2681,9 +3667,24 @@ fn verify_pass(
                 workers = %info.workers,
                 solve_ms = %info.solve_ms,
                 server_ms = server_ms,
+                gpu_check = %info.gpu_check,
+                gpu_ms = %info.gpu_ms,
                 "antibot: challenge solved in {} ms (browser) / {server_ms} ms (server), pass issued for {ttl}s",
                 if info.solve_ms.is_empty() { "?" } else { info.solve_ms.as_str() }
             );
+            if let Some(r) = rule {
+                let detect = query_param(q, "gpu_decision").as_deref() == Some("detect");
+                if r.cfg.gpu_check.is_some() && detect && no_hardware_gpu(&info.gpu_check) {
+                    r.detector.detect(
+                        sec,
+                        host.unwrap_or(""),
+                        ip_addr,
+                        &ua,
+                        &format!("no hardware GPU (gpu_check: {})", info.gpu_check),
+                        &redirect,
+                    );
+                }
+            }
             if let Some(r) = rule.filter(|r| r.cfg.log_passes) {
                 r.detector
                     .passed(host.unwrap_or(""), &ip, &ua, &redirect, &info);
@@ -2753,7 +3754,7 @@ fn challenge_page(
     let ts = now_ms();
     let t = rule.cfg.language.texts();
     let (d, alg, start_ms) = rule.draw(ts / 1000);
-    let flags = rule.flags();
+    let flags = rule.flags_at(ts / 1000);
     // Sous charge, un laissez-passer plus court (palier `cookie_time_challenge`).
     let ttl = rule.pass_max_age(ts / 1000);
     let challenge = challenge_for(&reg.key, ts, d, alg, ttl, start_ms, flags, ip, ua);
@@ -2765,16 +3766,24 @@ fn challenge_page(
         "challenge": challenge, "ts": ts, "d": d, "a": alg.name(), "algo": alg.webcrypto(),
         "single": alg.single_thread(), "cores": rule.client_cores(ts / 1000).divisor(), "scale": flags & FLAG_SCALE_WORKERS != 0, "ttl": ttl, "s": start_ms, "f": flags,
         "webgl": flags & FLAG_WEBGL != 0, "redir": redir, "pass": PASS_PATH,
+        "gpu": rule.cfg.gpu_check.as_ref().map(|g| serde_json::json!({ "mode": g.mode.name(), "budget": (g.budget * 1000.0) as u64 })),
         "t": {
             "need_https": t.need_https, "need_webgl": t.need_webgl, "starting": t.starting,
             "running": t.running, "core": t.core, "cores": t.cores, "done": t.done,
-            "worker_failed": t.worker_failed,
+            "worker_failed": t.worker_failed, "gpu": t.gpu,
         },
     });
     let params = params.to_string().replace("</", "<\\/");
     // Clé AES et script propres à cette page : le script est servi une
     // seule fois, à une URL que seule cette page connaît.
-    let (token, _key) = register_pending(params, ip, ua, rule.cfg.key_ttl);
+    let (token, _key) = register_pending_full(
+        params,
+        ip,
+        ua,
+        rule.cfg.key_ttl,
+        rule.software.as_ref(),
+        rule.lockdown.as_ref(),
+    );
     let script = SCRIPT_HTML
         .replace("__PREPARING__", t.preparing)
         .replace("__NOSCRIPT__", t.noscript)
@@ -2810,283 +3819,15 @@ const SCRIPT_HTML: &str = r##"<div class="centered-div" id="pa-antibot">
 </div>
 <script src="__SRC__"></script>"##;
 
-/// Le script de la vérification, servi une seule fois à `/.proxyauth/antibot/js/<jeton>.js`.
-const MAIN_JS: &str = r##"(function () {
-  const P = __PARAMS__;
-  const KEY = "__KEY__", TOKEN = "__TOKEN__", WORKER = __WORKER__;
-  // The solution travels encrypted (AES-256-GCM) with a key that exists only
-  // for this challenge, sent in this script — served once, at a URL unique
-  // to this page — and forgotten by ProxyAuth after one use or two minutes.
-  const b64u = (b) => btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(b))))
-    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  const unb64 = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
-  async function seal(text) {
-    const enc = new TextEncoder();
-    const k = await crypto.subtle.importKey("raw", unb64(KEY), "AES-GCM", false, ["encrypt"]);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv, additionalData: enc.encode(TOKEN) }, k, enc.encode(text));
-    return { iv: b64u(iv), c: b64u(ct) };
-  }
-  const $ = (id) => document.getElementById(id);
-  const say = (t) => { $("status").textContent = t; };
-  const fail = (t) => { say(t); $("status").style.color = "#ff6868"; };
-  const pct = (p, extra) => { $("pa-fill").style.width = p.toFixed(1) + "%"; if (extra !== undefined) $("pa-stats").textContent = extra; };
+/// Le script de la vérification, servi une seule fois à
+/// `/.proxyauth/antibot/js/<jeton>.js` : version minifiée, sans aucun
+/// commentaire, de `antibot_js/challenge.js` (`tools/minify-antibot-js.sh`
+/// la régénère après une modification de la source).
+const MAIN_JS: &str = include_str!("antibot_js/challenge.min.js");
 
-  // The search runs in plain JavaScript; WebCrypto only encrypts the answer.
-  if (!window.Worker || !window.crypto || !crypto.subtle) { fail(P.t.need_https); return; }
-  const w = window.innerWidth || 0, h = window.innerHeight || 0;
-  const wd = navigator.webdriver ? 1 : 0;
-
-  // ── Rendu WebGL : 4 passes d'un shader dont la couleur dépend du challenge.
-  let wg = "", renderer = "", vendor = "", glver = "";
-  function webgl() {
-    const c = document.createElement("canvas"); c.width = c.height = 16;
-    const gl = c.getContext("webgl", { preserveDrawingBuffer: true, antialias: false }) || c.getContext("experimental-webgl");
-    if (!gl) return false;
-    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
-    renderer = String(dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
-    vendor = String(dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR));
-    glver = String(gl.getParameter(gl.VERSION));
-    const sh = (t, s) => { const x = gl.createShader(t); gl.shaderSource(x, s); gl.compileShader(x); return x; };
-    const prog = gl.createProgram();
-    gl.attachShader(prog, sh(gl.VERTEX_SHADER, "attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}"));
-    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER,
-      "precision highp float;uniform vec3 u;uniform float k;" +
-      "void main(){vec3 v=mod(u*7.0+vec3(k*31.0,k*17.0+3.0,k*13.0+11.0),256.0);gl_FragColor=vec4(v/255.0,1.0);}"));
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return false;
-    gl.useProgram(prog);
-    const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(prog, "p"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    const uu = gl.getUniformLocation(prog, "u"), uk = gl.getUniformLocation(prog, "k");
-    const px = new Uint8Array(4), out = [];
-    for (let k = 0; k < 4; k++) {
-      const b = (i) => parseInt(P.challenge.substr((k * 3 + i) * 2, 2), 16);
-      gl.uniform3f(uu, b(0), b(1), b(2)); gl.uniform1f(uk, k);
-      gl.viewport(0, 0, 16, 16); gl.drawArrays(gl.TRIANGLES, 0, 3);
-      gl.readPixels(8, 8, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
-      out.push(px[0], px[1], px[2]);
-    }
-    wg = out.map((x) => x.toString(16).padStart(2, "0")).join("");
-    return true;
-  }
-
-  // ── Preuve de travail.
-  function work() {
-    // `client_cores`: every core (0), or cores / n - 1, at least 1.
-    const hw = navigator.hardwareConcurrency || 2;
-    const threads = P.single ? 1 : (P.cores ? Math.max(1, Math.floor(hw / P.cores) - 1) : Math.max(1, hw));
-    // `scale_with_workers`: one more bit (twice the work) per doubling of
-    // the workers, so every visitor waits about as long.
-    const extra = P.scale ? Math.min(8, Math.floor(Math.log2(threads))) : 0;
-    const bits = 4 * P.d + extra;
-    const expected = Math.pow(2, bits);
-    const src = WORKER;
-    const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
-    const workers = []; let total = 0, finished = false; const t0 = performance.now();
-    say(P.t.running.replace("{d}", P.d + (extra ? " +" + extra + " bits" : "")).replace("{a}", P.a).replace("{n}", threads).replace("{cores}", threads > 1 ? P.t.cores : P.t.core));
-    for (let i = 0; i < threads; i++) {
-      const wk = new Worker(url);
-      wk.onmessage = (e) => {
-        if (finished) return;
-        if (e.data.progress) {
-          total += e.data.progress;
-          const s = (performance.now() - t0) / 1000;
-          pct(Math.min(99, (1 - Math.exp(-total / expected)) * 100),
-              total.toLocaleString() + " hashes · " + (s > 0.2 ? Math.round(total / s).toLocaleString() + " H/s" : "–"));
-          return;
-        }
-        if (e.data.found !== undefined) {
-          finished = true; total += e.data.done;
-          workers.forEach((x) => x.terminate());
-          pct(100, total.toLocaleString() + " hashes");
-          say(P.t.done);
-          const q = new URLSearchParams({ challenge: P.challenge, ts: P.ts, d: P.d, a: P.a, ttl: P.ttl, s: P.s, f: P.f,
-            nonce: e.data.found, redir: P.redir, wk: threads, wg: wg, r: renderer, v: vendor, gv: glver, w: w, h: h, wd: wd,
-            sw: (screen && screen.width) || 0, sh: (screen && screen.height) || 0, dpr: window.devicePixelRatio || 1,
-            c: navigator.hardwareConcurrency || 0, l: navigator.language || "",
-            p: (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "",
-            tz: (Intl.DateTimeFormat().resolvedOptions().timeZone) || "",
-            elapsed: Math.round(performance.now() - t0) });
-          const payload = JSON.stringify(Object.fromEntries(q.entries()));
-          seal(payload)
-            .then((x) => location.replace(P.pass + "?t=" + TOKEN + "&iv=" + x.iv + "&c=" + x.c))
-            .catch(() => fail(P.t.need_https));
-        }
-      };
-      wk.onerror = () => fail(P.t.worker_failed);
-      wk.postMessage({ challenge: P.challenge, bits: bits, a: P.a, start: i, step: threads });
-      workers.push(wk);
-    }
-  }
-
-  // Le rendu est toujours tenté (ses informations vont au journal) ; il
-  // n'est exigé qu'avec `webgl: true`.
-  let glOk = false; try { glOk = webgl(); } catch (e) { glOk = false; }
-  if (P.webgl && !glOk) { fail(P.t.need_webgl); return; }
-  // ── Délai de démarrage, imposé par le serveur.
-  const begin = performance.now();
-  (function tick() {
-    const left = P.s - (performance.now() - begin);
-    if (left <= 0) { pct(0, ""); work(); return; }
-    say(P.t.starting.replace("{s}", Math.ceil(left / 1000)));
-    pct(0, "");
-    setTimeout(tick, Math.min(250, left));
-  })();
-})();
-"##;
-
-/// La recherche de nonce, exécutée dans les Web Workers.
-const WORKER_JS: &str = r##"// Proof-of-work search, synchronous: one worker keeps its core busy at
-// 100 %, with no await per hash. SHA-256 uses a midstate: the challenge
-// is exactly 64 bytes, one block, hashed once; each nonce only costs the
-// second block. SHA-512 fits challenge + nonce in a single block.
-const K256 = new Int32Array([
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]);
-const W = new Int32Array(64);
-function c256(st, out) {
-  for (let i = 16; i < 64; i++) {
-    const a = W[i - 15], b = W[i - 2];
-    const s0 = ((a >>> 7) | (a << 25)) ^ ((a >>> 18) | (a << 14)) ^ (a >>> 3);
-    const s1 = ((b >>> 17) | (b << 15)) ^ ((b >>> 19) | (b << 13)) ^ (b >>> 10);
-    W[i] = (W[i - 16] + s0 + W[i - 7] + s1) | 0;
-  }
-  let A = st[0], B = st[1], C = st[2], D = st[3], E = st[4], F = st[5], G = st[6], H = st[7];
-  for (let i = 0; i < 64; i++) {
-    const S1 = ((E >>> 6) | (E << 26)) ^ ((E >>> 11) | (E << 21)) ^ ((E >>> 25) | (E << 7));
-    const t1 = (H + S1 + ((E & F) ^ (~E & G)) + K256[i] + W[i]) | 0;
-    const S0 = ((A >>> 2) | (A << 30)) ^ ((A >>> 13) | (A << 19)) ^ ((A >>> 22) | (A << 10));
-    const t2 = (S0 + ((A & B) ^ (A & C) ^ (B & C))) | 0;
-    H = G; G = F; F = E; E = (D + t1) | 0; D = C; C = B; B = A; A = (t1 + t2) | 0;
-  }
-  out[0] = (st[0] + A) | 0; out[1] = (st[1] + B) | 0; out[2] = (st[2] + C) | 0; out[3] = (st[3] + D) | 0;
-  out[4] = (st[4] + E) | 0; out[5] = (st[5] + F) | 0; out[6] = (st[6] + G) | 0; out[7] = (st[7] + H) | 0;
-}
-const IV256 = new Int32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
-function words(bytes, n) { for (let i = 0; i < n; i++) W[i] = (bytes[4 * i] << 24) | (bytes[4 * i + 1] << 16) | (bytes[4 * i + 2] << 8) | bytes[4 * i + 3]; }
-function ascii(s) { const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i); return b; }
-
-// SHA-256 of challenge (64 bytes) + decimal nonce; first word in out[0].
-function sha256Searcher(challenge) {
-  const mid = new Int32Array(8);
-  words(ascii(challenge), 16); c256(IV256, mid);
-  const blk = new Uint8Array(64), out = new Int32Array(8);
-  return function (nonce) {
-    const s = String(nonce), L = s.length;
-    blk.fill(0);
-    for (let i = 0; i < L; i++) blk[i] = s.charCodeAt(i);
-    blk[L] = 0x80;
-    const bits = (64 + L) * 8;
-    blk[62] = (bits >>> 8) & 0xff; blk[63] = bits & 0xff;
-    words(blk, 16); c256(mid, out);
-    return out;
-  };
-}
-
-// SHA-512 with 32-bit halves (hi, lo).
-const K512 = new Int32Array([
-  0x428a2f98, 0xd728ae22, 0x71374491, 0x23ef65cd, 0xb5c0fbcf, 0xec4d3b2f, 0xe9b5dba5, 0x8189dbbc, 0x3956c25b, 0xf348b538,
-  0x59f111f1, 0xb605d019, 0x923f82a4, 0xaf194f9b, 0xab1c5ed5, 0xda6d8118, 0xd807aa98, 0xa3030242, 0x12835b01, 0x45706fbe,
-  0x243185be, 0x4ee4b28c, 0x550c7dc3, 0xd5ffb4e2, 0x72be5d74, 0xf27b896f, 0x80deb1fe, 0x3b1696b1, 0x9bdc06a7, 0x25c71235,
-  0xc19bf174, 0xcf692694, 0xe49b69c1, 0x9ef14ad2, 0xefbe4786, 0x384f25e3, 0x0fc19dc6, 0x8b8cd5b5, 0x240ca1cc, 0x77ac9c65,
-  0x2de92c6f, 0x592b0275, 0x4a7484aa, 0x6ea6e483, 0x5cb0a9dc, 0xbd41fbd4, 0x76f988da, 0x831153b5, 0x983e5152, 0xee66dfab,
-  0xa831c66d, 0x2db43210, 0xb00327c8, 0x98fb213f, 0xbf597fc7, 0xbeef0ee4, 0xc6e00bf3, 0x3da88fc2, 0xd5a79147, 0x930aa725,
-  0x06ca6351, 0xe003826f, 0x14292967, 0x0a0e6e70, 0x27b70a85, 0x46d22ffc, 0x2e1b2138, 0x5c26c926, 0x4d2c6dfc, 0x5ac42aed,
-  0x53380d13, 0x9d95b3df, 0x650a7354, 0x8baf63de, 0x766a0abb, 0x3c77b2a8, 0x81c2c92e, 0x47edaee6, 0x92722c85, 0x1482353b,
-  0xa2bfe8a1, 0x4cf10364, 0xa81a664b, 0xbc423001, 0xc24b8b70, 0xd0f89791, 0xc76c51a3, 0x0654be30, 0xd192e819, 0xd6ef5218,
-  0xd6990624, 0x5565a910, 0xf40e3585, 0x5771202a, 0x106aa070, 0x32bbd1b8, 0x19a4c116, 0xb8d2d0c8, 0x1e376c08, 0x5141ab53,
-  0x2748774c, 0xdf8eeb99, 0x34b0bcb5, 0xe19b48a8, 0x391c0cb3, 0xc5c95a63, 0x4ed8aa4a, 0xe3418acb, 0x5b9cca4f, 0x7763e373,
-  0x682e6ff3, 0xd6b2b8a3, 0x748f82ee, 0x5defb2fc, 0x78a5636f, 0x43172f60, 0x84c87814, 0xa1f0ab72, 0x8cc70208, 0x1a6439ec,
-  0x90befffa, 0x23631e28, 0xa4506ceb, 0xde82bde9, 0xbef9a3f7, 0xb2c67915, 0xc67178f2, 0xe372532b, 0xca273ece, 0xea26619c,
-  0xd186b8c7, 0x21c0c207, 0xeada7dd6, 0xcde0eb1e, 0xf57d4f7f, 0xee6ed178, 0x06f067aa, 0x72176fba, 0x0a637dc5, 0xa2c898a6,
-  0x113f9804, 0xbef90dae, 0x1b710b35, 0x131c471b, 0x28db77f5, 0x23047d84, 0x32caab7b, 0x40c72493, 0x3c9ebe0a, 0x15c9bebc,
-  0x431d67c4, 0x9c100d4c, 0x4cc5d4be, 0xcb3e42b6, 0x597f299c, 0xfc657e2a, 0x5fcb6fab, 0x3ad6faec, 0x6c44198c, 0x4a475817]);
-const IV512 = new Int32Array([0x6a09e667, 0xf3bcc908, 0xbb67ae85, 0x84caa73b, 0x3c6ef372, 0xfe94f82b, 0xa54ff53a, 0x5f1d36f1,
-  0x510e527f, 0xade682d1, 0x9b05688c, 0x2b3e6c1f, 0x1f83d9ab, 0xfb41bd6b, 0x5be0cd19, 0x137e2179]);
-const W5 = new Int32Array(160);
-function c512(st, out) {
-  const w = W5;
-  for (let i = 16; i < 80; i++) {
-    let xh = w[(i - 15) * 2], xl = w[(i - 15) * 2 + 1];
-    const s0h = ((xh >>> 1) | (xl << 31)) ^ ((xh >>> 8) | (xl << 24)) ^ (xh >>> 7);
-    const s0l = ((xl >>> 1) | (xh << 31)) ^ ((xl >>> 8) | (xh << 24)) ^ ((xl >>> 7) | (xh << 25));
-    xh = w[(i - 2) * 2]; xl = w[(i - 2) * 2 + 1];
-    const s1h = ((xh >>> 19) | (xl << 13)) ^ ((xl >>> 29) | (xh << 3)) ^ (xh >>> 6);
-    const s1l = ((xl >>> 19) | (xh << 13)) ^ ((xh >>> 29) | (xl << 3)) ^ ((xl >>> 6) | (xh << 26));
-    let l = (s0l >>> 0) + (s1l >>> 0) + (w[(i - 7) * 2 + 1] >>> 0) + (w[(i - 16) * 2 + 1] >>> 0);
-    const h = s0h + s1h + w[(i - 7) * 2] + w[(i - 16) * 2] + ((l / 0x100000000) | 0);
-    w[i * 2] = h | 0; w[i * 2 + 1] = l | 0;
-  }
-  let ah = st[0], al = st[1], bh = st[2], bl = st[3], ch = st[4], cl = st[5], dh = st[6], dl = st[7];
-  let eh = st[8], el = st[9], fh = st[10], fl = st[11], gh = st[12], gl = st[13], hh = st[14], hl = st[15];
-  for (let i = 0; i < 80; i++) {
-    const S1h = ((eh >>> 14) | (el << 18)) ^ ((eh >>> 18) | (el << 14)) ^ ((el >>> 9) | (eh << 23));
-    const S1l = ((el >>> 14) | (eh << 18)) ^ ((el >>> 18) | (eh << 14)) ^ ((eh >>> 9) | (el << 23));
-    const chh = (eh & fh) ^ (~eh & gh), chl = (el & fl) ^ (~el & gl);
-    let l = (hl >>> 0) + (S1l >>> 0) + (chl >>> 0) + (K512[i * 2 + 1] >>> 0) + (W5[i * 2 + 1] >>> 0);
-    const t1h = hh + S1h + chh + K512[i * 2] + W5[i * 2] + ((l / 0x100000000) | 0);
-    const t1l = l | 0;
-    const S0h = ((ah >>> 28) | (al << 4)) ^ ((al >>> 2) | (ah << 30)) ^ ((al >>> 7) | (ah << 25));
-    const S0l = ((al >>> 28) | (ah << 4)) ^ ((ah >>> 2) | (al << 30)) ^ ((ah >>> 7) | (al << 25));
-    const mjh = (ah & bh) ^ (ah & ch) ^ (bh & ch), mjl = (al & bl) ^ (al & cl) ^ (bl & cl);
-    l = (S0l >>> 0) + (mjl >>> 0);
-    const t2h = S0h + mjh + ((l / 0x100000000) | 0), t2l = l | 0;
-    hh = gh; hl = gl; gh = fh; gl = fl; fh = eh; fl = el;
-    l = (dl >>> 0) + (t1l >>> 0); eh = (dh + t1h + ((l / 0x100000000) | 0)) | 0; el = l | 0;
-    dh = ch; dl = cl; ch = bh; cl = bl; bh = ah; bl = al;
-    l = (t1l >>> 0) + (t2l >>> 0); ah = (t1h + t2h + ((l / 0x100000000) | 0)) | 0; al = l | 0;
-  }
-  const v = [ah, al, bh, bl, ch, cl, dh, dl, eh, el, fh, fl, gh, gl, hh, hl];
-  for (let i = 0; i < 16; i += 2) {
-    const l = (st[i + 1] >>> 0) + (v[i + 1] >>> 0);
-    out[i] = (st[i] + v[i] + ((l / 0x100000000) | 0)) | 0; out[i + 1] = l | 0;
-  }
-}
-function sha512Searcher(challenge) {
-  const pre = ascii(challenge), blk = new Uint8Array(128), out = new Int32Array(16);
-  return function (nonce) {
-    const s = String(nonce), L = pre.length + s.length;
-    blk.fill(0); blk.set(pre);
-    for (let i = 0; i < s.length; i++) blk[pre.length + i] = s.charCodeAt(i);
-    blk[L] = 0x80;
-    const bits = L * 8;
-    blk[126] = (bits >>> 8) & 0xff; blk[127] = bits & 0xff;
-    for (let i = 0; i < 32; i++) W5[i] = (blk[4 * i] << 24) | (blk[4 * i + 1] << 16) | (blk[4 * i + 2] << 8) | blk[4 * i + 3];
-    c512(IV512, out);
-    return out;
-  };
-}
-
-// difficulty hex zeros = the top 4*d bits of the first 32-bit word (d ≤ 8).
-function meets(h, bits) {
-  // The top `bits` bits are zero, across as many 32-bit words as needed.
-  let i = 0;
-  while (bits >= 32) { if (h[i] !== 0) return false; bits -= 32; i++; }
-  return bits === 0 || (h[i] >>> (32 - bits)) === 0;
-}
-
-
-onmessage = (e) => {
-  const { challenge, bits, a, start, step } = e.data;
-  const hash = a === "sha512" ? sha512Searcher(challenge) : sha256Searcher(challenge);
-  let nonce = start, done = 0;
-  for (;;) {
-    const h = hash(nonce);
-    done++;
-    if (meets(h, bits)) { postMessage({ found: nonce, done }); return; }
-    nonce += step;
-    if (done === 50000) { postMessage({ progress: done }); done = 0; }
-  }
-};
-"##;
+/// La recherche de nonce, exécutée dans les Web Workers : version minifiée
+/// de `antibot_js/worker.js`.
+const WORKER_JS: &str = include_str!("antibot_js/worker.min.js");
 
 /// Page par défaut, au style de ProxyAuth. `{{ title }}` et `{{ script }}`
 /// sont remplacés à chaque envoi.
@@ -3304,6 +4045,8 @@ mod tests {
             }),
             challenged: dashmap::DashMap::new(),
             hostname_off: std::sync::atomic::AtomicBool::new(false),
+            software: None,
+            lockdown: None,
         };
         assert!(rule.hostname_check_enabled(7000), "quiet: on");
         for _ in 0..10 {
@@ -3332,6 +4075,7 @@ mod tests {
             period: 60,
             duration: 600,
             store: Some(path.clone()),
+            export: None,
         };
         let mk = |label: &str| {
             Arc::new(Detector {
@@ -3394,12 +4138,385 @@ mod tests {
     }
 
     #[test]
+    fn a_wave_of_software_clients_escalates_then_calms_down() {
+        let cfg: AntiBotConfig = serde_yaml::from_str(
+            r#"{ gpu_check: { on_software: harder, software_extra: 2, software_hold: 30,
+                 software_levels: [ { request: 10, period: 10, software_extra: 3 },
+                                    { request: 20, period: 10, on_software: refuse } ] } }"#,
+        )
+        .unwrap();
+        validate(&cfg, "t").unwrap();
+        let guard = SoftwareGuard::new(cfg.gpu_check.unwrap(), &[], Arc::new(Traffic::new()));
+        assert_eq!(guard.decision(5000), (OnSoftware::Harder, 2), "quiet");
+        for _ in 0..10 {
+            guard.record(5000);
+        }
+        assert_eq!(
+            guard.decision(5000),
+            (OnSoftware::Harder, 3),
+            "10 in 10 s: heavier"
+        );
+        for _ in 0..10 {
+            guard.record(5001);
+        }
+        assert_eq!(
+            guard.decision(5001).0,
+            OnSoftware::Refuse,
+            "20 in 10 s: refuse"
+        );
+        // The wave stops: still refuse during software_hold, then back.
+        assert_eq!(guard.decision(5020).0, OnSoftware::Refuse, "held");
+        assert_eq!(
+            guard.decision(5032),
+            (OnSoftware::Harder, 2),
+            "back to normal"
+        );
+        let bad: AntiBotConfig =
+            serde_yaml::from_str("{ gpu_check: { software_levels: [ { request: 5 } ] } }").unwrap();
+        assert!(validate(&bad, "t").is_err());
+    }
+
+    #[test]
+    fn on_software_in_load_levels() {
+        let c: AntiBotConfig = serde_yaml::from_str(
+            r#"{ gpu_check: { on_software: harder, software_extra: 2, software_hold: 30 },
+                 load_levels: [ { request: 10, period: 10, software_extra: 3 },
+                                { request: 5, period: 10, count: software, on_software: refuse } ] }"#,
+        )
+        .unwrap();
+        validate(&c, "t").unwrap();
+        let requests = Arc::new(Traffic::new());
+        let g = SoftwareGuard::new(
+            c.gpu_check.clone().unwrap(),
+            &c.load_levels,
+            requests.clone(),
+        );
+        assert_eq!(g.decision(9000), (OnSoftware::Harder, 2), "quiet");
+        for _ in 0..10 {
+            requests.record(9000);
+        }
+        assert_eq!(
+            g.decision(9000),
+            (OnSoftware::Harder, 3),
+            "10 requests in 10 s: heavier"
+        );
+        for _ in 0..5 {
+            g.record(9001);
+        }
+        assert_eq!(
+            g.decision(9001).0,
+            OnSoftware::Refuse,
+            "5 clients without a GPU: refuse"
+        );
+        let bad: AntiBotConfig =
+            serde_yaml::from_str("{ load_levels: [ { request: 5, on_software: refuse } ] }")
+                .unwrap();
+        assert!(validate(&bad, "t").is_err(), "needs gpu_check");
+    }
+
+    #[test]
+    fn lockdown_as_a_load_level() {
+        let c: AntiBotConfig = serde_yaml::from_str(
+            r#"{ load_levels: [ { request: 1000, period: 10, difficulty: 6 },
+                                { request: 20000, period: 10, lockdown: true } ] }"#,
+        )
+        .unwrap();
+        validate(&c, "t").unwrap();
+        let l = c.load_levels[1].lockdown_config().unwrap();
+        assert_eq!(
+            (l.request, l.period, l.hold, l.refuse.len()),
+            (20000, 10, 120, 7)
+        );
+        assert!(c.load_levels[0].lockdown_config().is_none());
+        let c: AntiBotConfig = serde_yaml::from_str(
+            "{ load_levels: [ { request: 500, scope: server, lockdown: { hold: 30s, refuse: [non_browsers, headless] } } ] }",
+        )
+        .unwrap();
+        validate(&c, "t").unwrap();
+        let l = c.load_levels[0].lockdown_config().unwrap();
+        assert_eq!(
+            (l.hold, l.scope, l.refuse.clone()),
+            (
+                30,
+                LoadScope::Server,
+                vec![LockdownRule::NonBrowsers, LockdownRule::Headless]
+            )
+        );
+        for bad in [
+            "{ load_levels: [ { request: 5, lockdown: true }, { request: 9, lockdown: true } ] }",
+            "{ lockdown: { request: 5 }, load_levels: [ { request: 9, lockdown: true } ] }",
+            "{ load_levels: [ { request: 5, lockdown: { refuse: [] } } ] }",
+        ] {
+            let c: AntiBotConfig = serde_yaml::from_str(bad).unwrap();
+            assert!(validate(&c, "t").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn lockdown_switches_everything_on() {
+        let c: AntiBotConfig = serde_yaml::from_str(
+            "{ webgl: false, reject_headless: false, lockdown: { request: 10, period: 10, hold: 30 } }",
+        )
+        .unwrap();
+        validate(&c, "t").unwrap();
+        assert_eq!(
+            c.lockdown.as_ref().unwrap().refuse,
+            all_lockdown_rules(),
+            "everything by default"
+        );
+        let rule = Rule {
+            lockdown: c.lockdown.clone().map(|l| Arc::new(LockdownState::new(l))),
+            cfg: c,
+            exclude: vec![],
+            nofiltered: vec![],
+            traffic: Arc::new(Traffic::new()),
+            page: Arc::new(Page::load(None).unwrap()),
+            active_until: std::sync::atomic::AtomicU64::new(0),
+            detector: Arc::new(Detector {
+                label: String::new(),
+                log: None,
+                ban: None,
+                offenders: dashmap::DashMap::new(),
+                recent: dashmap::DashMap::new(),
+            }),
+            challenged: dashmap::DashMap::new(),
+            hostname_off: std::sync::atomic::AtomicBool::new(false),
+            software: None,
+        };
+        let l = rule.lockdown.as_ref().unwrap();
+        l.update(8000, &rule.traffic, None);
+        assert!(!l.active(8000));
+        assert_eq!(
+            rule.flags_at(8000) & (FLAG_WEBGL | FLAG_REJECT_HEADLESS | FLAG_REJECT_SOFTWARE_GL),
+            0,
+            "relaxed config"
+        );
+        for _ in 0..10 {
+            rule.traffic.record(8000);
+        }
+        l.update(8000, &rule.traffic, None);
+        assert!(l.active(8000) && l.refuses(8000, LockdownRule::NonBrowsers));
+        let f = rule.flags_at(8000);
+        assert!(
+            f & FLAG_WEBGL != 0
+                && f & FLAG_REJECT_HEADLESS != 0
+                && f & FLAG_REJECT_SOFTWARE_GL != 0,
+            "all checks forced on"
+        );
+        l.update(8025, &rule.traffic, None);
+        assert!(l.active(8025), "held");
+        l.update(8031, &rule.traffic, None);
+        assert!(!l.active(8031), "over");
+        let only: AntiBotConfig =
+            serde_yaml::from_str("{ lockdown: { request: 5, refuse: [non_browsers, crawlers] } }")
+                .unwrap();
+        assert_eq!(
+            only.lockdown.unwrap().refuse,
+            vec![LockdownRule::NonBrowsers, LockdownRule::Crawlers]
+        );
+        assert!(
+            serde_yaml::from_str::<AntiBotConfig>(
+                "{ lockdown: { request: 5, refuse: [everything] } }"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn export_lists_current_bans_in_blocklist_format() {
+        let ban = BanConfig {
+            after: 2,
+            period: 60,
+            duration: 600,
+            store: None,
+            export: None,
+        };
+        let d = Arc::new(Detector {
+            label: "git.example.com".into(),
+            log: None,
+            ban: Some(ban),
+            offenders: dashmap::DashMap::new(),
+            recent: dashmap::DashMap::new(),
+        });
+        let sec = 1_800_000_000;
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        d.detect(sec, "h", Some(ip), "ua", "POST request without a pass", "/");
+        d.detect(sec, "h", Some(ip), "ua", "POST request without a pass", "/");
+        d.detect(
+            sec,
+            "h",
+            Some("198.51.100.7".parse().unwrap()),
+            "ua",
+            "x",
+            "/",
+        );
+        let text = export_text(&[d.clone()], sec + 1);
+        assert!(text.contains("# 2027-01-15T08:00:00Z · git.example.com · POST request without a pass ×2\n203.0.113.9\n"), "{text}");
+        assert!(
+            !text.contains("198.51.100.7"),
+            "counted but not banned: not listed"
+        );
+        // Every non-comment line parses as an IP, as ip_blocklists expects.
+        for line in text
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            assert!(line.parse::<IpAddr>().is_ok(), "{line}");
+        }
+        // Once the ban has run out, the address leaves the file.
+        assert!(!export_text(&[d], sec + 601).contains("203.0.113.9"));
+    }
+
+    #[test]
     fn dns_timeout_defaults_to_300ms() {
         let c: AntiBotConfig = serde_yaml::from_str("{}").unwrap();
         assert_eq!(c.dns_timeout, 0.3);
         let c: AntiBotConfig = serde_yaml::from_str("{ dns_timeout: 150ms }").unwrap();
         assert_eq!(c.dns_timeout, 0.15);
         let c: AntiBotConfig = serde_yaml::from_str("{ dns_timeout: 30 }").unwrap();
+        assert!(validate(&c, "t").is_err());
+    }
+
+    #[test]
+    fn gpu_hash_matches_the_shaders() {
+        // Same values as the JavaScript / WGSL / GLSL version.
+        assert_eq!(
+            [
+                (0, 0),
+                (1, 2),
+                (0xdeadbeef, 123456),
+                (4294967295, 4294967295),
+                (305419896, 99999999)
+            ]
+            .map(|(s, n)| gpu_hash(s, n)),
+            [4135262099, 3724419150, 3846698384, 4135262099, 1118002738]
+        );
+        assert!(gpu_meets(0x0000_ffff, 16) && !gpu_meets(0x0001_0000, 16));
+    }
+
+    #[test]
+    fn gpu_check_flow() {
+        let g = Arc::new(SoftwareGuard::new(
+            GpuCheck {
+                mode: GpuMode::Auto,
+                bits: 16,
+                budget: 2.0,
+                hardware_under: 2.0,
+                on_software: OnSoftware::Allow,
+                software_extra: 2,
+                software_levels: vec![],
+                software_hold: 60,
+            },
+            &[],
+            Arc::new(Traffic::new()),
+        ));
+        let (token, _) = register_pending_with("{}".into(), "ip", "UA", 120, Some(&g));
+        assert!(
+            gpu_start(&token, "ip", "UA").is_none(),
+            "script not loaded yet"
+        );
+        serve_script(&token, "ip", "UA").unwrap();
+        let st: serde_json::Value =
+            serde_json::from_str(&gpu_start(&token, "ip", "UA").unwrap()).unwrap();
+        assert!(gpu_start(&token, "ip", "UA").is_none(), "started once");
+        let seed = st["seed"].as_u64().unwrap() as u32;
+        let n = (0u32..)
+            .find(|n| gpu_meets(gpu_hash(seed, *n), 16))
+            .unwrap();
+        assert_eq!(
+            gpu_done(&token, "ip", "UA", &format!("api=webgpu&n={n}")),
+            Some("hardware")
+        );
+        assert!(
+            gpu_done(&token, "ip", "UA", "api=x&n=1").is_none(),
+            "one result only"
+        );
+        // A wrong nonce, a timeout, no GPU at all.
+        let (t2, _) = register_pending_with("{}".into(), "ip", "UA", 120, Some(&g));
+        serve_script(&t2, "ip", "UA").unwrap();
+        let st: serde_json::Value =
+            serde_json::from_str(&gpu_start(&t2, "ip", "UA").unwrap()).unwrap();
+        let seed = st["seed"].as_u64().unwrap() as u32;
+        let bad = (0u32..)
+            .find(|n| !gpu_meets(gpu_hash(seed, *n), 16))
+            .unwrap();
+        assert_eq!(
+            gpu_done(&t2, "ip", "UA", &format!("api=webgl2&n={bad}")),
+            Some("invalid")
+        );
+        let (t3, _) = register_pending_with("{}".into(), "ip", "UA", 120, Some(&g));
+        serve_script(&t3, "ip", "UA").unwrap();
+        gpu_start(&t3, "ip", "UA").unwrap();
+        assert_eq!(
+            gpu_done(&t3, "ip", "UA", "api=webgl2&n=-1"),
+            Some("timeout")
+        );
+        let (t4, _) = register_pending_with("{}".into(), "ip", "UA", 120, Some(&g));
+        serve_script(&t4, "ip", "UA").unwrap();
+        assert_eq!(gpu_done(&t4, "ip", "UA", "api=none"), Some("unavailable"));
+        // on_software: harder → the server sets the extra bits when the GPU
+        // test shows no real GPU, and tells the browser.
+        let h = Arc::new(SoftwareGuard::new(
+            GpuCheck {
+                mode: GpuMode::Auto,
+                bits: 16,
+                budget: 2.0,
+                hardware_under: 2.0,
+                on_software: OnSoftware::Harder,
+                software_extra: 3,
+                software_levels: vec![],
+                software_hold: 60,
+            },
+            &[],
+            Arc::new(Traffic::new()),
+        ));
+        let (t5, _) = register_pending_with("{}".into(), "ip", "UA", 120, Some(&h));
+        serve_script(&t5, "ip", "UA").unwrap();
+        let st: serde_json::Value =
+            serde_json::from_str(&gpu_start(&t5, "ip", "UA").unwrap()).unwrap();
+        let seed = st["seed"].as_u64().unwrap() as u32;
+        let n = (0u32..)
+            .find(|n| gpu_meets(gpu_hash(seed, *n), 16))
+            .unwrap();
+        assert_eq!(
+            gpu_done(
+                &t5,
+                "ip",
+                "UA",
+                &format!("api=webgl2&n={n}&r=Google%20SwiftShader")
+            ),
+            Some("software"),
+            "fast, but announced software"
+        );
+        assert_eq!(gpu_penalty(&t5), 12, "3 steps = 12 bits");
+        let (t6, _) = register_pending_with("{}".into(), "ip", "UA", 120, Some(&h));
+        serve_script(&t6, "ip", "UA").unwrap();
+        let st: serde_json::Value =
+            serde_json::from_str(&gpu_start(&t6, "ip", "UA").unwrap()).unwrap();
+        let seed = st["seed"].as_u64().unwrap() as u32;
+        let n = (0u32..)
+            .find(|n| gpu_meets(gpu_hash(seed, *n), 16))
+            .unwrap();
+        assert_eq!(
+            gpu_done(
+                &t6,
+                "ip",
+                "UA",
+                &format!("api=webgpu&n={n}&ga=nvidia%2Fampere")
+            ),
+            Some("hardware")
+        );
+        assert_eq!(gpu_penalty(&t6), 0, "a real GPU pays nothing more");
+        assert!(
+            no_hardware_gpu("timeout")
+                && no_hardware_gpu("unavailable")
+                && !no_hardware_gpu("hardware")
+        );
+        let c: AntiBotConfig =
+            serde_yaml::from_str("{ gpu_check: { on_software: refuse, software_extra: 9 } }")
+                .unwrap();
+        assert!(validate(&c, "t").is_err());
+        let c: AntiBotConfig = serde_yaml::from_str("{ gpu_check: { bits: 40 } }").unwrap();
         assert!(validate(&c, "t").is_err());
     }
 
@@ -3612,6 +4729,8 @@ mod tests {
             }),
             challenged: dashmap::DashMap::new(),
             hostname_off: std::sync::atomic::AtomicBool::new(false),
+            software: None,
+            lockdown: None,
         };
         let mut seen_d = std::collections::HashSet::new();
         let mut seen_a = std::collections::HashSet::new();
@@ -3680,6 +4799,8 @@ mod tests {
             }),
             challenged: dashmap::DashMap::new(),
             hostname_off: std::sync::atomic::AtomicBool::new(false),
+            software: None,
+            lockdown: None,
         };
         // Quiet: 19 requests in 10 s — nobody is challenged.
         for i in 0..19 {
@@ -3722,6 +4843,7 @@ mod tests {
                 period: 60,
                 duration: 600,
                 store: None,
+                export: None,
             }),
             offenders: dashmap::DashMap::new(),
             recent: dashmap::DashMap::new(),
@@ -3869,7 +4991,7 @@ mod tests {
             recent: dashmap::DashMap::new(),
         };
         let _ = &d;
-        let row = csv_line(&[""; 25]);
+        let row = csv_line(&[""; 29]);
         assert_eq!(
             row.matches("\",\"").count() + 1,
             CSV_HEADER.split(',').count()
@@ -3900,6 +5022,8 @@ mod tests {
             }),
             challenged: dashmap::DashMap::new(),
             hostname_off: std::sync::atomic::AtomicBool::new(false),
+            software: None,
+            lockdown: None,
         };
         // This vhost is quiet; the server, through other vhosts, is not.
         let sec = 9_000_000;
@@ -3968,6 +5092,8 @@ mod tests {
             }),
             challenged: dashmap::DashMap::new(),
             hostname_off: std::sync::atomic::AtomicBool::new(false),
+            software: None,
+            lockdown: None,
         };
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         assert!(
@@ -4047,6 +5173,7 @@ mod tests {
                 period: 60,
                 duration: 600,
                 store: None,
+                export: None,
             }),
             offenders: dashmap::DashMap::new(),
             recent: dashmap::DashMap::new(),
@@ -4084,6 +5211,7 @@ mod tests {
                 period: 60,
                 duration: 600,
                 store: None,
+                export: None,
             }),
             offenders: dashmap::DashMap::new(),
             recent: dashmap::DashMap::new(),
@@ -4170,6 +5298,8 @@ mod tests {
             }),
             challenged: dashmap::DashMap::new(),
             hostname_off: std::sync::atomic::AtomicBool::new(false),
+            software: None,
+            lockdown: None,
         };
         assert_eq!(rule.client_cores(3000), CoreUsage::Divide(3));
         for _ in 0..10 {
@@ -4187,6 +5317,27 @@ mod tests {
         let only: AntiBotConfig =
             serde_yaml::from_str("{ load_levels: [ { request: 5, client_cores: 2 } ] }").unwrap();
         validate(&only, "t").unwrap();
+    }
+
+    #[test]
+    fn served_scripts_are_minified_and_in_sync() {
+        for (name, js) in [("challenge", MAIN_JS), ("worker", WORKER_JS)] {
+            assert!(!js.trim_end().contains('\n'), "{name}: one line");
+            assert!(
+                !js.contains("/*") && !js.contains("\n//") && !js.contains(" // "),
+                "{name}: no comment"
+            );
+            let src_len = std::fs::read_to_string(format!(
+                "{}/src/network/antibot_js/{name}.js",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+            assert!(js.len() < src_len, "{name}: smaller than its source");
+        }
+        for p in ["__PARAMS__", "__KEY__", "__TOKEN__", "__WORKER__"] {
+            assert!(MAIN_JS.contains(p), "placeholder {p} kept");
+        }
     }
 
     #[test]
